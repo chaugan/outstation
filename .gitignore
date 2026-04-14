@@ -21,6 +21,9 @@ Cargo.lock.bak
 /var/lib/pcapreplay/
 /tmp/pcapreplay-captures/
 
+# Internal handover / design notes — not for publication
+/HANDOVER/
+
 # Per-host secrets / credentials (belt and braces)
 *.env
 *.key

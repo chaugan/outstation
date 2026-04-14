@@ -368,8 +368,7 @@ sudo sysctl net.ipv4.ip_forward=0
 
 ## Kontakt og ressurser
 
-- Kildekode og README: `HANDOVER/HANDOVER.md` i dette repoet.
-- Arkitektur og designnotater: `HANDOVER/PLAN.md`.
+- Prosjektets README: [`README.md`](../README.md) i rotmappen.
 - Protokollkode: `crates/proto_iec104/`.
 - SCADA-gateway-implementasjon: `crates/netctl/src/lib.rs` (søk etter `GatewayGuard`).
 
