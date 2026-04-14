@@ -1,0 +1,19 @@
+[package]
+name = "pcapload"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "pcapinspect"
+path = "src/bin/pcapinspect.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pcap-file = { workspace = true }

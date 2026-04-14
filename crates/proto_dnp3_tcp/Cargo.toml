@@ -1,0 +1,11 @@
+[package]
+name = "proto_dnp3_tcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+protoplay = { path = "../protoplay" }

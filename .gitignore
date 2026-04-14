@@ -1,0 +1,30 @@
+# Rust build artifacts
+/target/
+Cargo.lock.bak
+**/*.rs.bk
+
+# Editor / IDE
+/.vscode/
+/.idea/
+*.swp
+*~
+.DS_Store
+
+# Local pcap samples and scratch files
+*.pcap.local
+/analysis_run*.json
+/iec104.pcap
+/captured_iec104.pcap
+/captured_iec104.pcapng
+
+# Runtime state (systemd)
+/var/lib/pcapreplay/
+/tmp/pcapreplay-captures/
+
+# Per-host secrets / credentials (belt and braces)
+*.env
+*.key
+*.pem
+id_rsa*
+credentials*
+secrets*

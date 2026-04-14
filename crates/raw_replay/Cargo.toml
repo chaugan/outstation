@@ -1,0 +1,21 @@
+[package]
+name = "raw_replay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[[bin]]
+name = "replay"
+path = "src/bin/replay.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+libc = { workspace = true }
+pcapload = { path = "../pcapload" }
+rewrite = { path = "../rewrite" }

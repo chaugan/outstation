@@ -1,0 +1,17 @@
+[package]
+name = "sched"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+netctl = { path = "../netctl" }
+pcapload = { path = "../pcapload" }
+rewrite = { path = "../rewrite" }
+raw_replay = { path = "../raw_replay" }
+protoplay = { path = "../protoplay" }

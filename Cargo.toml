@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/netctl",
+    "crates/rewrite",
+    "crates/pcapload",
+    "crates/raw_replay",
+    "crates/sched",
+    "crates/pcapreplay",
+    "crates/tcp_session",
+    "crates/protoplay",
+    "crates/proto_iec104",
+    "crates/proto_modbus_tcp",
+    "crates/proto_dnp3_tcp",
+    "crates/proto_iec61850_mms",
+    "crates/proto_iec60870_6_iccp",
+    "crates/webui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+libc = "0.2"
+socket2 = { version = "0.5", features = ["all"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+axum = { version = "0.7", features = ["multipart"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+pcap-file = "2"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

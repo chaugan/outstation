@@ -1,0 +1,13 @@
+[package]
+name = "protoplay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+socket2 = { workspace = true }

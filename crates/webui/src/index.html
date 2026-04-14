@@ -1,0 +1,3479 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>pcapreplay</title>
+<style>
+  :root {
+    --bg:          #f5f5f2;
+    --surface:     #ffffff;
+    --surface-2:   #f0efea;
+    --ink:         #0e0e0c;
+    --ink-2:       #2a2a27;
+    --dim:         #6a6a65;
+    --dim-2:       #898983;
+    --rule:        #d8d7d0;
+    --rule-soft:   #e6e5de;
+    --accent:      #b8441a;
+    --accent-hv:   #972f10;
+    --accent-soft: rgba(184,68,26,0.10);
+    --blue:        #1f4a78;
+    --blue-soft:   rgba(31,74,120,0.10);
+    --ok:          #3f6430;
+    --warn:        #8e6216;
+    --err:         #922626;
+    --err-soft:    rgba(146,38,38,0.08);
+    --sans:        -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'Noto Sans', 'Liberation Sans', sans-serif;
+    --mono:        ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, 'Liberation Mono', 'DejaVu Sans Mono', monospace;
+  }
+  *, *::before, *::after { box-sizing: border-box; }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--ink);
+    font-family: var(--sans);
+    font-size: 13px;
+    line-height: 1.5;
+    -webkit-font-smoothing: antialiased;
+    text-rendering: optimizeLegibility;
+    font-feature-settings: "ss01", "cv11";
+  }
+  main {
+    max-width: 1160px;
+    margin: 0 auto;
+    padding: 28px 32px 80px;
+  }
+  @media (max-width: 760px) {
+    main { padding: 20px 16px 56px; }
+  }
+
+  /* ---------- masthead ---------- */
+  .masthead {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding-bottom: 12px;
+    margin-bottom: 32px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .masthead .logo {
+    font-family: var(--sans);
+    font-size: 14px;
+    font-weight: 600;
+    letter-spacing: -0.005em;
+    color: var(--ink);
+  }
+  .masthead .v {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--dim);
+  }
+  .masthead .host {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .masthead .host .ok-dot {
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    border-radius: 50%;
+    background: var(--ok);
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+
+  /* ---------- section ---------- */
+  .section { margin-bottom: 40px; }
+  .section-head {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding-bottom: 8px;
+    margin-bottom: 14px;
+    border-bottom: 1px solid var(--rule);
+  }
+  .section-head h2 {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: var(--ink);
+    margin: 0;
+  }
+  .section-head .meta {
+    margin-left: auto;
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+  }
+
+  /* ---------- panels ---------- */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+  }
+  .panel-body { padding: 16px 18px; }
+
+  /* ---------- library ---------- */
+  .lib-grid {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 16px;
+  }
+  @media (max-width: 820px) {
+    .lib-grid { grid-template-columns: 1fr; }
+  }
+  .dropzone {
+    border: 1px dashed var(--rule);
+    padding: 28px 18px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 100ms, background 100ms;
+    background: var(--surface);
+  }
+  .dropzone:hover { border-color: var(--ink-2); }
+  .dropzone.drag {
+    border-color: var(--accent);
+    border-style: solid;
+    background: var(--accent-soft);
+  }
+  .dropzone .title {
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink);
+    letter-spacing: 0.02em;
+  }
+  .dropzone .sub {
+    font-size: 11px;
+    color: var(--dim);
+    margin-top: 4px;
+  }
+  .dropzone input[type=file] { display: none; }
+
+  .pcap-list {
+    display: flex;
+    flex-direction: column;
+    border: 1px solid var(--rule);
+    background: var(--surface);
+  }
+  .pcap-row {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    align-items: center;
+    padding: 9px 12px;
+    border-bottom: 1px solid var(--rule-soft);
+    cursor: pointer;
+    transition: background 80ms;
+  }
+  .pcap-row:last-child { border-bottom: 0; }
+  .pcap-row:hover { background: var(--surface-2); }
+  .pcap-row.selected {
+    background: var(--accent-soft);
+    box-shadow: inset 2px 0 0 var(--accent);
+  }
+  .pcap-row .name {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink);
+    word-break: break-word;
+  }
+  .pcap-row .meta {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    margin-top: 1px;
+  }
+  .pcap-row .actions { display: flex; gap: 12px; }
+  .pcap-row .actions button {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    background: transparent;
+    border: 0;
+    color: var(--dim);
+    cursor: pointer;
+    padding: 2px 0;
+  }
+  .pcap-row .actions button:hover { color: var(--accent); }
+  .pcap-row .badge {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: 9px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 2px 7px;
+    margin-left: 8px;
+    border: 1px solid currentColor;
+    vertical-align: middle;
+  }
+  .pcap-row .badge.ok       { color: var(--ok); }
+  .pcap-row .badge.caution  { color: var(--warn); }
+  .pcap-row .badge.heavy    { color: var(--accent); }
+  .pcap-row .badge.not_recommended { color: var(--err); }
+  .pcap-row .badge.analyzing {
+    color: var(--blue);
+    animation: pcr-pulse 1.4s ease-in-out infinite;
+  }
+  .pcap-row .badge.mac_warn { color: var(--warn); }
+  @keyframes pcr-pulse {
+    0%, 100% { opacity: 0.45; }
+    50%      { opacity: 1; }
+  }
+  .selected-box .verdict {
+    margin-left: auto;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 3px 8px;
+    border: 1px solid currentColor;
+  }
+  .selected-box .verdict.ok       { color: var(--ok); }
+  .selected-box .verdict.caution  { color: var(--warn); }
+  .selected-box .verdict.heavy    { color: var(--accent); }
+  .selected-box .verdict.not_recommended { color: var(--err); }
+  .selected-box .verdict.analyzing {
+    color: var(--blue);
+    animation: pcr-pulse 1.4s ease-in-out infinite;
+  }
+  .viability-card {
+    margin-top: 8px;
+    padding: 10px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--dim);
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    line-height: 1.55;
+  }
+  .viability-card.ok       { border-left-color: var(--ok); }
+  .viability-card.caution  { border-left-color: var(--warn); }
+  .viability-card.heavy    { border-left-color: var(--accent); }
+  .viability-card.not_recommended { border-left-color: var(--err); }
+  .viability-card .reason {
+    color: var(--ink);
+    font-weight: 500;
+    margin-bottom: 4px;
+  }
+  .viability-card .note { color: var(--dim); padding: 1px 0; }
+  .lib-empty {
+    padding: 14px 16px;
+    font-size: 11px;
+    color: var(--dim);
+    font-family: var(--mono);
+  }
+
+  /* ---------- form ---------- */
+  .run-form {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 14px 16px;
+  }
+  @media (max-width: 820px) {
+    .run-form { grid-template-columns: 1fr 1fr; }
+  }
+  .field { display: flex; flex-direction: column; }
+  .field.span-2 { grid-column: span 2; }
+  .field.span-4 { grid-column: span 4; }
+  @media (max-width: 820px) {
+    .field.span-2, .field.span-4 { grid-column: span 2; }
+  }
+  label {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--dim);
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    margin-bottom: 5px;
+  }
+  label .opt {
+    font-weight: 400;
+    letter-spacing: 0;
+    text-transform: none;
+    color: var(--dim-2);
+  }
+  input[type=text], input[type=number], select {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    padding: 7px 10px;
+    background: var(--surface);
+    color: var(--ink);
+    border: 1px solid var(--rule);
+    outline: none;
+    transition: border-color 100ms;
+    border-radius: 0;
+  }
+  input[type=text]:focus, input[type=number]:focus, select:focus {
+    border-color: var(--ink);
+  }
+  input[type=text]::placeholder { color: var(--dim-2); }
+  .field input, .field select { width: 100%; }
+  .checks {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px 20px;
+    margin: 2px 0;
+  }
+  .checks label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--sans);
+    font-size: 12px;
+    font-weight: 400;
+    color: var(--ink-2);
+    text-transform: none;
+    letter-spacing: 0;
+    margin: 0;
+    cursor: pointer;
+  }
+  input[type=checkbox], input[type=radio] {
+    accent-color: var(--accent);
+    width: 14px;
+    height: 14px;
+    margin: 0;
+  }
+
+  .selected-box {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 8px 12px;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    min-height: 38px;
+    font-family: var(--mono);
+    font-size: 12px;
+  }
+  .selected-box .name { color: var(--ink); font-weight: 500; }
+  .selected-box .sub { color: var(--dim); font-size: 11px; }
+  .selected-box .empty { color: var(--dim); font-weight: 400; }
+
+  .raw-hatch {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-top: 6px;
+  }
+  .raw-hatch label {
+    margin: 0;
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim-2);
+    font-weight: 500;
+  }
+  .raw-hatch input[type=text] {
+    flex: 1;
+    font-size: 11px;
+    padding: 5px 8px;
+  }
+  .raw-hatch button {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    background: var(--surface);
+    color: var(--dim);
+    border: 1px solid var(--rule);
+    padding: 6px 12px;
+    cursor: pointer;
+  }
+  .raw-hatch button:hover { color: var(--ink); border-color: var(--ink); }
+
+  /* benchmark sub-panel */
+  .bench-panel {
+    grid-column: span 4;
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--accent);
+    padding: 14px 18px;
+  }
+  @media (max-width: 820px) {
+    .bench-panel { grid-column: span 2; }
+  }
+  .bench-panel .hd {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--accent);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 10px;
+  }
+  .bench-panel .hd::before {
+    content: '';
+    display: inline-block;
+    width: 6px;
+    height: 6px;
+    background: var(--accent);
+    margin-right: 8px;
+    vertical-align: middle;
+  }
+  .bench-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr 1fr 1fr;
+    gap: 12px 16px;
+  }
+  .bench-grid .span-2 { grid-column: span 2; }
+  .bench-grid .span-4 { grid-column: span 4; }
+  .bench-note {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    margin-top: 10px;
+    padding-top: 8px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  @media (max-width: 820px) {
+    .bench-grid { grid-template-columns: 1fr 1fr; }
+    .bench-grid .span-4, .bench-grid .span-2 { grid-column: span 2; }
+  }
+
+  /* actions row */
+  .actions-row {
+    grid-column: span 4;
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule);
+    margin-top: 4px;
+  }
+  @media (max-width: 820px) {
+    .actions-row { grid-column: span 2; }
+  }
+  button.primary {
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 9px 22px;
+    background: var(--ink);
+    color: var(--bg);
+    border: 1px solid var(--ink);
+    cursor: pointer;
+    transition: background 100ms;
+    border-radius: 0;
+  }
+  button.primary:hover { background: var(--accent); border-color: var(--accent); }
+  button.primary:disabled { opacity: 0.4; cursor: not-allowed; }
+  button.primary:disabled:hover { background: var(--ink); border-color: var(--ink); }
+
+  /* ---------- inspect result ---------- */
+  .inspect-card {
+    margin-top: 12px;
+    padding: 12px 16px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+  }
+  .inspect-card .summary {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    margin-bottom: 8px;
+    letter-spacing: 0.02em;
+  }
+  .inspect-card .summary b { color: var(--ink); font-weight: 600; }
+
+  /* ---------- tables ---------- */
+  table.t {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: var(--mono);
+    font-size: 11px;
+    margin-top: 4px;
+  }
+  table.t th {
+    font-family: var(--sans);
+    font-weight: 600;
+    color: var(--dim);
+    text-align: left;
+    border-bottom: 1px solid var(--rule);
+    padding: 6px 10px 6px 0;
+    font-size: 9px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+  }
+  table.t td {
+    padding: 5px 10px 5px 0;
+    border-bottom: 1px solid var(--rule-soft);
+    vertical-align: top;
+  }
+  table.t td.num, table.t th.num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+    padding-right: 6px;
+  }
+  table.t tr:last-child td { border-bottom: 0; }
+
+  /* ---------- runs list ---------- */
+  .run {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    margin-bottom: 10px;
+    padding: 14px 18px;
+    position: relative;
+  }
+  .run::before {
+    content: '';
+    position: absolute;
+    left: 0; top: 0; bottom: 0;
+    width: 2px;
+    background: var(--dim-2);
+  }
+  .run.running::before    { background: var(--accent); }
+  .run.completed::before  { background: var(--ok); }
+  .run.failed::before     { background: var(--err); }
+  .run.stopped::before    { background: var(--warn); }
+  .run .head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    margin-bottom: 8px;
+  }
+  .run .head .num {
+    font-family: var(--mono);
+    font-size: 10px;
+    font-weight: 600;
+    color: var(--dim);
+    letter-spacing: 0.04em;
+  }
+  .run .head .title {
+    font-family: var(--mono);
+    font-weight: 500;
+    font-size: 12px;
+    color: var(--ink);
+    flex: 1;
+    word-break: break-word;
+  }
+  .run .head .title .arrow { color: var(--dim-2); margin: 0 6px; }
+  .run .head .status {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 2px 8px;
+    border: 1px solid currentColor;
+  }
+  .run .head .status.running { color: var(--accent); }
+  .run .head .status.completed { color: var(--ok); }
+  .run .head .status.stopped { color: var(--warn); }
+  .run .head .status.failed { color: var(--err); }
+  .run .submeta {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    margin-bottom: 12px;
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  .run .submeta .k { color: var(--dim-2); }
+  .run .actions-inline {
+    display: flex;
+    gap: 18px;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  .run .actions-inline a, .run .actions-inline button {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+    padding: 0;
+    text-decoration: none;
+  }
+  .run .actions-inline a:hover, .run .actions-inline button:hover { color: var(--accent); }
+  .run .actions-inline button.stop { color: var(--err); }
+
+  /* progress bars */
+  .pbar {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 10px;
+    align-items: center;
+    margin: 4px 0;
+  }
+  .pbar .plabel {
+    font-family: var(--sans);
+    color: var(--dim);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .pbar .ptrack {
+    grid-column: 1 / -1;
+    height: 6px;
+    background: var(--rule-soft);
+    position: relative;
+    overflow: hidden;
+  }
+  .pbar .pfill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    background: var(--accent);
+    transition: width 500ms ease-out;
+  }
+  .pbar.completed .pfill { background: var(--ok); }
+  .pbar.stopped .pfill { background: var(--warn); }
+  .pbar.failed .pfill { background: var(--err); }
+  .pbar .pcount {
+    font-family: var(--mono);
+    font-variant-numeric: tabular-nums;
+    color: var(--ink-2);
+    font-size: 11px;
+    font-weight: 500;
+  }
+
+  .per-source-list {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  .per-source-bar {
+    display: grid;
+    grid-template-columns: 170px 1fr 130px;
+    gap: 14px;
+    align-items: center;
+    padding: 3px 0;
+  }
+  .per-source-bar .nm {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .per-source-bar .mini-track {
+    height: 3px;
+    background: var(--rule-soft);
+    position: relative;
+    overflow: hidden;
+  }
+  .per-source-bar .mini-fill {
+    position: absolute;
+    inset: 0;
+    width: 0;
+    background: var(--accent);
+    transition: width 400ms ease-out;
+  }
+  .per-source-bar.completed .mini-fill { background: var(--ok); }
+  .per-source-bar.stopped .mini-fill { background: var(--warn); }
+  .per-source-bar.failed .mini-fill { background: var(--err); }
+  .per-source-bar .cnt {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* slave-benchmark list */
+  .slave-list {
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule-soft);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .slave-row {
+    border: 1px solid var(--rule);
+    padding: 8px 12px;
+    background: var(--surface-2);
+  }
+  .slave-row .slave-meta {
+    display: grid;
+    grid-template-columns: 70px 140px 1fr auto;
+    gap: 14px;
+    align-items: center;
+  }
+  .slave-ip-cell {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .slave-ip-input {
+    font-family: var(--mono);
+    font-size: 11px;
+    padding: 4px 6px;
+    width: 110px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    color: var(--ink);
+    border-radius: 0;
+  }
+  .slave-port-badge {
+    color: var(--dim);
+    font-weight: 500;
+  }
+  .slave-verify {
+    font-size: 10px;
+    color: var(--dim);
+    font-style: italic;
+  }
+  .slave-btn.verify {
+    padding: 4px 10px;
+    font-size: 9px;
+    background: var(--surface);
+    color: var(--ink-2);
+    border: 1px solid var(--rule);
+  }
+  .slave-btn.verify:hover { background: var(--ink); color: var(--bg); border-color: var(--ink); }
+  .slave-btn.abort {
+    padding: 6px 10px;
+    font-size: 10px;
+    background: var(--surface);
+    color: var(--err);
+    border: 1px solid var(--err);
+    margin-left: 6px;
+  }
+  .slave-btn.abort:hover { background: var(--err); color: var(--bg); }
+  .slave-state {
+    font-family: var(--sans);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.1em;
+    text-transform: uppercase;
+  }
+  .slave-rtu {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-weight: 500;
+    color: var(--ink);
+  }
+  .slave-port {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--blue);
+    font-weight: 500;
+  }
+  .slave-right {
+    justify-self: end;
+  }
+  .slave-btn {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    padding: 6px 14px;
+    background: var(--ink);
+    color: var(--bg);
+    border: 1px solid var(--ink);
+    cursor: pointer;
+    border-radius: 0;
+  }
+  .slave-btn:hover { background: var(--accent); border-color: var(--accent); }
+  .slave-wait {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-style: italic;
+    color: var(--accent);
+  }
+  .slave-count {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+  }
+  .slave-bar {
+    margin-top: 8px;
+    height: 4px;
+    background: var(--rule-soft);
+    position: relative;
+    overflow: hidden;
+  }
+  .slave-fill {
+    position: absolute;
+    inset: 0;
+    width: 0;
+    background: var(--accent);
+    transition: width 400ms ease-out;
+  }
+  .slave-fill.completed { background: var(--ok); }
+
+  /* detail panel */
+  .detail {
+    margin-top: 14px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+  }
+  .detail h3 {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin: 18px 0 8px;
+    color: var(--dim);
+    padding-bottom: 6px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .detail h3:first-child { margin-top: 0; }
+  .kv {
+    display: grid;
+    grid-template-columns: 130px 1fr;
+    gap: 4px 18px;
+    margin-bottom: 12px;
+  }
+  .kv .k {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+    padding-top: 1px;
+  }
+  .kv .v {
+    font-family: var(--mono);
+    font-size: 12px;
+    font-variant-numeric: tabular-nums;
+    color: var(--ink);
+  }
+
+  /* error box */
+  .err-box {
+    background: var(--err-soft);
+    border: 1px solid var(--err);
+    border-left-width: 2px;
+    color: var(--err);
+    padding: 8px 12px;
+    margin: 10px 0;
+    font-size: 11px;
+    font-family: var(--mono);
+    white-space: pre-wrap;
+  }
+
+  /* chart container + tooltip */
+  .chart-wrap {
+    position: relative;
+    margin: 6px 0 18px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 12px 14px;
+  }
+  .chart-wrap .legend {
+    display: flex;
+    gap: 18px;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 500;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    color: var(--dim);
+    margin-bottom: 8px;
+    padding-bottom: 8px;
+    border-bottom: 1px solid var(--rule-soft);
+    flex-wrap: wrap;
+  }
+  .chart-wrap .legend span { display: inline-flex; align-items: center; gap: 6px; }
+  .chart-wrap .legend .swatch {
+    width: 14px;
+    height: 3px;
+    display: inline-block;
+  }
+  .chart-wrap .legend .muted {
+    text-transform: none;
+    letter-spacing: 0;
+    font-family: var(--mono);
+    font-weight: 400;
+  }
+  .tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--ink);
+    color: var(--bg);
+    padding: 6px 9px;
+    font-family: var(--mono);
+    font-size: 10px;
+    line-height: 1.5;
+    white-space: nowrap;
+    opacity: 0;
+    transform: translate(-50%, -110%);
+    transition: opacity 80ms;
+    z-index: 100;
+    border-left: 2px solid var(--accent);
+  }
+  .tooltip.on { opacity: 1; }
+  .tooltip b { color: var(--bg); font-weight: 600; }
+  .chart-svg { display: block; width: 100%; height: auto; }
+
+  /* sparkline inline */
+  .sparkrow {
+    display: grid;
+    grid-template-columns: 140px 1fr auto;
+    gap: 14px;
+    align-items: center;
+    margin-top: 10px;
+    padding-top: 10px;
+    border-top: 1px solid var(--rule-soft);
+  }
+  .sparkrow .lbl {
+    font-family: var(--sans);
+    font-size: 9px;
+    font-weight: 600;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+  }
+  .sparkrow .val {
+    font-family: var(--mono);
+    font-size: 11px;
+    font-weight: 500;
+    color: var(--ink-2);
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+  }
+
+  /* protocols */
+  .protocols {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 14px 22px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+  }
+  .protocols .row { display: flex; gap: 8px; align-items: center; }
+  .protocols .dot {
+    width: 6px;
+    height: 6px;
+    background: var(--dim-2);
+    display: inline-block;
+  }
+  .protocols .dot.ready { background: var(--ok); }
+  .protocols .name { color: var(--ink-2); font-weight: 500; }
+  .protocols .ports { color: var(--dim); }
+
+  /* analysis */
+  .an-grid {
+    display: grid;
+    grid-template-columns: 260px 1fr;
+    gap: 22px;
+    align-items: start;
+  }
+  @media (max-width: 820px) { .an-grid { grid-template-columns: 1fr; } }
+  .an-card {
+    margin-top: 18px;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 14px 16px;
+  }
+  .an-verdict {
+    display: inline-block;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    padding: 4px 10px;
+    border: 1px solid currentColor;
+  }
+  .an-verdict.identical { color: var(--ok); }
+  .an-verdict.structurally_identical { color: var(--ok); }
+  .an-verdict.good_delivery { color: var(--ok); }
+  .an-verdict.partial, .an-verdict.partial_delivery { color: var(--warn); }
+  .an-verdict.subset_script { color: var(--blue); }
+  .an-verdict.divergent_script { color: var(--blue); }
+  .an-verdict.target_silent { color: var(--warn); }
+  .an-verdict.handshake_incomplete, .an-verdict.no_delivery, .an-verdict.no_session, .an-verdict.unknown { color: var(--err); }
+  .an-summary {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+  }
+  .an-summary .reason {
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--ink-2);
+  }
+  .an-score {
+    font-family: var(--mono);
+    font-size: 20px;
+    font-weight: 600;
+    color: var(--ink);
+  }
+  .an-note {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    padding: 4px 0;
+  }
+  .an-h {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--dim);
+    margin: 16px 0 6px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .an-kv {
+    display: grid;
+    grid-template-columns: 170px 1fr;
+    gap: 3px 16px;
+    font-family: var(--mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+  }
+  .an-kv .k { color: var(--dim); }
+  .an-kv .v { color: var(--ink); }
+  .an-kv .v.ok { color: var(--ok); }
+  .an-kv .v.bad { color: var(--err); }
+  .an-kv .v.warn { color: var(--warn); }
+  .an-tid-seq {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-2);
+    word-break: break-all;
+    background: var(--surface-2);
+    padding: 6px 8px;
+    margin-top: 4px;
+  }
+  .an-diff-row {
+    font-family: var(--mono);
+    font-size: 10px;
+    padding: 4px 0;
+    border-bottom: 1px dashed var(--rule-soft);
+  }
+  .an-diff-row .lbl { color: var(--dim); }
+
+  /* live network diagram */
+  .diagram-section {
+    margin: 14px 0 0;
+    border: 1px solid var(--rule);
+    border-left: 2px solid var(--accent);
+    background: var(--surface-2);
+    position: relative;
+  }
+  /* Downward connector arrow that visually ties the diagram to the
+     running run row immediately below it. Pure CSS pseudo-element. */
+  .diagram-section::after {
+    content: '';
+    position: absolute;
+    left: 28px;
+    bottom: -10px;
+    width: 0;
+    height: 0;
+    border-left: 8px solid transparent;
+    border-right: 8px solid transparent;
+    border-top: 10px solid var(--accent);
+    z-index: 5;
+    pointer-events: none;
+  }
+  .diagram-section::before {
+    content: '';
+    position: absolute;
+    left: 35px;
+    bottom: -16px;
+    width: 2px;
+    height: 18px;
+    background: var(--accent);
+    z-index: 4;
+    pointer-events: none;
+  }
+  /* Highlight the running run row so the visual chain
+     diagram → connector → row is obvious. The base border-left is
+     applied by .run.running (existing), here we just thicken the
+     top edge so it picks up the descending connector. */
+  .run.running {
+    border-top: 2px solid var(--accent);
+    box-shadow: 0 0 0 1px var(--accent-soft);
+  }
+  .diagram-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 14px;
+    border-bottom: 1px solid var(--rule-soft);
+  }
+  .diagram-head h3 {
+    margin: 0;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.12em;
+    color: var(--accent);
+  }
+  .diagram-head .meta {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  .diagram-head button {
+    margin-left: auto;
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.08em;
+    background: transparent;
+    color: var(--dim);
+    border: 1px solid var(--rule);
+    padding: 4px 10px;
+    cursor: pointer;
+  }
+  .diagram-head button:hover { color: var(--accent); border-color: var(--accent); }
+  .diagram-card {
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 16px 18px;
+  }
+  .diagram-stats {
+    display: grid;
+    grid-template-columns: repeat(6, 1fr);
+    gap: 4px 18px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    margin-bottom: 10px;
+  }
+  .diagram-stats .stat { display: flex; flex-direction: column; }
+  .diagram-stats .stat .k {
+    font-family: var(--sans);
+    font-size: 9px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: var(--dim);
+  }
+  .diagram-stats .stat .v {
+    font-size: 14px;
+    color: var(--ink);
+    font-variant-numeric: tabular-nums;
+  }
+  .diagram-stats .stat .v.accent { color: var(--accent); }
+  .diagram-stats .stat .v.blue { color: var(--blue); }
+  .diagram-stats .stat .v.ok { color: var(--ok); }
+  .diagram-stats .stat .v.warn { color: var(--warn); }
+  @media (max-width: 820px) {
+    .diagram-stats { grid-template-columns: repeat(3, 1fr); }
+  }
+  .diagram-progress {
+    display: grid;
+    grid-template-columns: 1fr auto;
+    gap: 4px 14px;
+    align-items: center;
+    margin-bottom: 14px;
+  }
+  .diagram-progress-track {
+    height: 8px;
+    background: var(--rule-soft);
+    position: relative;
+    overflow: hidden;
+    grid-column: 1;
+  }
+  .diagram-progress-fill {
+    position: absolute;
+    inset: 0;
+    width: 0%;
+    background: var(--accent);
+    transition: width 300ms linear;
+  }
+  .diagram-progress-label {
+    grid-column: 2;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--dim);
+    font-variant-numeric: tabular-nums;
+  }
+  .diagram-canvas-wrap {
+    position: relative;
+    background: var(--bg);
+    border-top: 1px solid var(--rule-soft);
+    padding-top: 10px;
+    height: 480px;
+  }
+  #diagram-canvas { width: 100%; height: 100%; }
+  #diagram-overlay-mount .diagram-canvas-wrap { flex: 1; min-height: 0; height: auto; }
+  #diagram-overlay-mount #diagram-canvas { height: 100%; }
+
+  /* fullscreen overlay */
+  .diagram-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(14, 14, 12, 0.95);
+    z-index: 200;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+  }
+  .diagram-overlay-inner {
+    width: 96vw;
+    height: 96vh;
+    background: var(--surface);
+    border: 1px solid var(--rule);
+    padding: 28px 34px;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+  .diagram-overlay-close {
+    position: absolute;
+    top: 14px;
+    right: 18px;
+    background: transparent;
+    border: 1px solid var(--rule);
+    color: var(--dim);
+    font-family: var(--sans);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    padding: 6px 14px;
+    cursor: pointer;
+  }
+  .diagram-overlay-close:hover { color: var(--accent); border-color: var(--accent); }
+  #diagram-overlay-mount {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  #diagram-overlay-mount .diagram-card {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+  }
+  #diagram-overlay-mount .diagram-canvas-wrap {
+    flex: 1;
+    min-height: 0;
+    height: auto;
+  }
+
+  /* misc */
+  .muted { color: var(--dim); }
+  code {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-2);
+  }
+  footer {
+    margin-top: 48px;
+    padding-top: 14px;
+    border-top: 1px solid var(--rule);
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--dim-2);
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+  }
+  footer .k { color: var(--dim-2); text-transform: uppercase; letter-spacing: 0.08em; font-family: var(--sans); font-weight: 600; }
+  footer .v { color: var(--ink-2); }
+</style>
+</head>
+<body>
+<main>
+
+<header class="masthead">
+  <div class="logo">pcapreplay</div>
+  <div class="v" id="version">—</div>
+  <div class="host"><span class="ok-dot"></span><span id="host-label">—</span></div>
+</header>
+
+<!-- ================ library ================ -->
+<section class="section">
+  <div class="section-head">
+    <h2>PCAP LIBRARY</h2>
+    <span class="meta" id="lib-meta">—</span>
+  </div>
+  <div class="lib-grid">
+    <div>
+      <label for="lib-file" class="dropzone" id="dropzone">
+        <input type="file" id="lib-file" accept=".pcap,.pcapng,.cap" multiple>
+        <div class="title">DROP PCAP TO UPLOAD</div>
+        <div class="sub">or click to browse &middot; .pcap, .pcapng, .cap</div>
+        <div class="sub" id="upload-status" style="margin-top:10px;color:var(--accent);display:none"></div>
+      </label>
+    </div>
+    <div class="pcap-list" id="pcap-list">
+      <div class="lib-empty">no pcaps uploaded</div>
+    </div>
+  </div>
+</section>
+
+<!-- ================ run ================ -->
+<section class="section">
+  <div class="section-head">
+    <h2>RUN CONFIGURATION</h2>
+  </div>
+
+  <div class="panel"><div class="panel-body">
+    <div class="run-form">
+
+      <div class="field span-4">
+        <label>source pcap</label>
+        <div class="selected-box" id="selected-box">
+          <span class="empty" id="selected-label">no pcap selected &mdash; pick one from the library above</span>
+        </div>
+        <div class="raw-hatch">
+          <label>raw path</label>
+          <input id="raw-path" type="text" placeholder="/absolute/path/to/file.pcap" spellcheck="false">
+          <button onclick="inspectRaw()">inspect</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>target ip</label>
+        <input id="run-target-ip" type="text" placeholder="10.0.0.50" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>target mac <span class="opt">(raw only)</span></label>
+        <div style="display:flex;gap:6px">
+          <input id="run-target-mac" type="text" placeholder="aa:bb:cc:dd:ee:ff" spellcheck="false" style="flex:1">
+          <button class="ghost-btn" onclick="arpProbe()" id="arp-btn" type="button" style="padding:6px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em">ARP</button>
+        </div>
+        <div id="arp-status" class="muted" style="font-family:var(--mono);font-size:10px;margin-top:3px;min-height:12px"></div>
+      </div>
+      <div class="field">
+        <label>speed</label>
+        <input id="run-speed" type="number" step="0.1" value="1.0">
+      </div>
+      <div class="field">
+        <label>warmup (s)</label>
+        <input id="run-warmup" type="number" step="1" value="5">
+      </div>
+      <div class="field">
+        <label>iterations <span class="opt">(0 = unlimited)</span></label>
+        <input id="run-iterations" type="number" step="1" min="0" value="1">
+      </div>
+
+      <div class="field span-2">
+        <label>egress nic <span class="opt">(optional)</span></label>
+        <select id="run-nic"><option value="">(none — bridge stays isolated)</option></select>
+      </div>
+      <div class="field span-2">
+        <label>bridge name</label>
+        <input id="run-bridge" type="text" value="pcr_br0" spellcheck="false">
+      </div>
+
+      <div class="field span-4">
+        <label>flags</label>
+        <div class="checks">
+          <label><input id="run-top-speed" type="checkbox"> top speed</label>
+          <label><input id="run-realtime" type="checkbox"> realtime (sched_fifo)</label>
+          <label><input id="run-skip-non-ip" type="checkbox"> skip non-ip</label>
+          <label><input id="run-benchmark" type="checkbox" onchange="toggleBenchmarkControls()"> benchmark mode</label>
+        </div>
+      </div>
+
+      <div class="bench-panel" id="bench-controls" style="display:none">
+        <div class="hd">BENCHMARK MODE &middot; STATEFUL SESSION REPLAY</div>
+        <div class="bench-grid">
+          <div class="field span-4">
+            <label>role &middot; which side the target is</label>
+            <div class="checks">
+              <label><input type="radio" name="run-role" value="master" checked onchange="toggleRoleControls()"> target is server &middot; tool connects out as master (client)</label>
+              <label><input type="radio" name="run-role" value="slave" onchange="toggleRoleControls()"> target is master &middot; tool listens as slave (server)</label>
+            </div>
+          </div>
+          <div class="field" id="bench-target-port-field">
+            <label>target port</label>
+            <input id="run-target-port" type="number" value="2404">
+          </div>
+          <div class="field" id="bench-listen-port-field" style="display:none">
+            <label>listen port base</label>
+            <input id="run-listen-port-base" type="number" value="2404">
+          </div>
+          <div class="field">
+            <label>protocol</label>
+            <select id="run-proto">
+              <option value="iec104">iec104</option>
+              <option value="modbus_tcp" disabled>modbus_tcp (stub)</option>
+              <option value="dnp3_tcp" disabled>dnp3_tcp (stub)</option>
+              <option value="iec61850_mms" disabled>iec61850_mms (stub)</option>
+              <option value="iec60870_6_iccp" disabled>iec60870_6_iccp (stub)</option>
+            </select>
+          </div>
+          <div class="field span-2" id="bench-concurrency-field">
+            <label>concurrency</label>
+            <div class="checks">
+              <label><input type="radio" name="run-concurrency" value="all_at_once" checked> all at once</label>
+              <label><input type="radio" name="run-concurrency" value="staggered"> staggered to pcap timing</label>
+            </div>
+          </div>
+          <div class="field span-4">
+            <label>pacing &middot; how fast to emit each i-frame</label>
+            <div class="checks">
+              <label><input type="radio" name="run-pacing" value="fast" checked> as fast as possible <span class="opt">(benchmark — throughput test)</span></label>
+              <label><input type="radio" name="run-pacing" value="original"> original pcap timing <span class="opt">(soak test, realism · scaled by speed)</span></label>
+            </div>
+          </div>
+          <div class="field span-4">
+            <label>asdu rewrite map <span class="opt">(optional json)</span></label>
+            <textarea id="run-proto-config" rows="4" placeholder='{"common_address":{"1":100},"cot":{},"ioa":{"1001":2001}}' spellcheck="false" style="font-family:var(--mono);font-size:11px;padding:8px 10px;background:var(--surface);color:var(--ink);border:1px solid var(--rule);outline:none;resize:vertical;width:100%"></textarea>
+          </div>
+
+          <div class="field span-4" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:2px">
+            <label><input id="run-scada-gw-enable" type="checkbox" onchange="toggleScadaGwControls()"> act as scada gateway <span class="opt">(isolated virtual switch setup — see doc/scada-lab.md)</span></label>
+          </div>
+          <div class="field span-2" id="run-scada-gw-ip-field" style="display:none">
+            <label>scada-side gateway ip <span class="opt">(/32 alias on inner nic)</span></label>
+            <input id="run-scada-gw-ip" type="text" placeholder="10.0.0.1" spellcheck="false">
+          </div>
+          <div class="field span-2" id="run-scada-gw-iface-field" style="display:none">
+            <label>inner nic <span class="opt">(vnic facing scada)</span></label>
+            <select id="run-scada-gw-iface"><option value="">(select nic)</option></select>
+          </div>
+          <div class="field span-4" id="run-scada-upstream-field" style="display:none">
+            <label>upstream nat nic <span class="opt">(optional — masquerade scada's non-capture egress)</span></label>
+            <select id="run-scada-upstream"><option value="">(none — scada has no upstream)</option></select>
+          </div>
+        </div>
+        <div class="bench-note" id="bench-note-master">master mode &middot; one outbound tcp session per captured rtu &middot; pipelined to k=12 unacked i-frames &middot; latency measured send→ack</div>
+        <div class="bench-note" id="bench-note-slave" style="display:none">slave mode &middot; one listener per captured rtu on 0.0.0.0:(base + index) &middot; target master connects in &middot; server i-frames driven through the same windowed send loop</div>
+      </div>
+
+      <div class="actions-row">
+        <button class="primary" id="start-btn" onclick="startRun()">START RUN</button>
+        <span id="run-result" class="muted" style="font-family:var(--mono);font-size:11px"></span>
+      </div>
+    </div>
+  </div></div>
+
+  <div id="inspect-result"></div>
+</section>
+
+<script src="/echarts.min.js"></script>
+
+<!-- Fullscreen overlay for the live diagram. The diagram-card gets
+     portal'd into here on FULLSCREEN click, then portal'd back. -->
+<div id="diagram-overlay" class="diagram-overlay" style="display:none">
+  <div class="diagram-overlay-inner">
+    <button class="diagram-overlay-close" onclick="toggleDiagramFullscreen()">&times; CLOSE</button>
+    <div id="diagram-overlay-mount"></div>
+  </div>
+</div>
+
+<!-- ================ runs ================ -->
+<section class="section">
+  <div class="section-head">
+    <h2>RUNS</h2>
+    <span class="meta" id="runs-meta">—</span>
+  </div>
+
+  <!-- Live diagram: stable sibling of #runs-list. Never moved in the
+       DOM (which means refreshRuns()'s innerHTML rewrite of #runs-list
+       leaves it alone), just shown/hidden based on whether a run is
+       currently running. Sits visually between the section header
+       and the list of runs. -->
+  <div id="diagram-section" class="diagram-section" style="display:none">
+    <div class="diagram-head">
+      <h3>LIVE TRAFFIC</h3>
+      <span class="meta" id="diagram-meta">—</span>
+      <button id="diagram-fs-btn" type="button" onclick="toggleDiagramFullscreen()">FULLSCREEN</button>
+    </div>
+    <div id="diagram-card" class="diagram-card">
+      <div class="diagram-stats" id="diagram-stats"></div>
+      <div class="diagram-progress">
+        <div class="diagram-progress-track"><div class="diagram-progress-fill" id="diagram-pfill"></div></div>
+        <div class="diagram-progress-label" id="diagram-plabel">—</div>
+      </div>
+      <div class="diagram-canvas-wrap">
+        <div id="diagram-canvas"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="runs-list"><div class="lib-empty">no runs recorded</div></div>
+</section>
+
+<!-- ================ analysis ================ -->
+<section class="section">
+  <div class="section-head">
+    <h2>ANALYSIS</h2>
+    <span class="meta">compare a captured pcap against the most recent run</span>
+  </div>
+  <div class="panel"><div class="panel-body">
+    <div class="an-grid">
+      <div>
+        <label for="an-file" class="dropzone" id="an-dropzone">
+          <input type="file" id="an-file" accept=".pcap,.pcapng,.cap">
+          <div class="title">DROP CAPTURED PCAP</div>
+          <div class="sub">wireshark output from the target side</div>
+          <div class="sub" id="an-upload-status" style="margin-top:10px;color:var(--accent);display:none"></div>
+        </label>
+      </div>
+      <div>
+        <label>target correctness mode</label>
+        <div class="checks" style="flex-direction:column;gap:10px;align-items:flex-start">
+          <label><input type="radio" name="an-mode" value="generic" checked> <b>generic</b> &middot; target is different software &middot; only check that we delivered the expected frames and the handshake held up</label>
+          <label><input type="radio" name="an-mode" value="correct"> <b>correct</b> &middot; target is the same rtu/scada as the pcap &middot; target's replies should match the original byte-for-byte</label>
+        </div>
+        <div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap">
+          <button class="primary" id="an-run-btn" onclick="runAnalysis()" disabled>ANALYZE</button>
+          <a id="an-download-json" style="display:none;font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);text-decoration:none">DOWNLOAD JSON</a>
+          <span id="an-msg" class="muted" style="font-family:var(--mono);font-size:11px"></span>
+        </div>
+      </div>
+    </div>
+    <div id="an-result"></div>
+  </div></div>
+</section>
+
+<!-- ================ protocols ================ -->
+<section class="section">
+  <div class="section-head">
+    <h2>REGISTERED PROTOCOLS</h2>
+  </div>
+  <div class="protocols" id="protocols-list">&mdash;</div>
+</section>
+
+<footer>
+  <span><span class="k">ENGINE</span> <span class="v">af_packet</span></span>
+  <span><span class="k">TOPOLOGY</span> <span class="v">veth-per-source</span></span>
+  <span><span class="k">PROTOS</span> <span class="v">iec104 · raw</span></span>
+  <span><span class="k">UI</span> <span class="v" id="foot-version">—</span></span>
+</footer>
+
+</main>
+
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+// =========================================================================
+//  helpers
+// =========================================================================
+const el  = id => document.getElementById(id);
+const esc = s  => (s ?? '').toString().replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const fmt = n  => (typeof n === 'number' && !isNaN(n)) ? n.toLocaleString(undefined, {maximumFractionDigits:1}) : (n ?? '—');
+const fmtBytes = b => {
+  if (b == null) return '—';
+  const k = 1024;
+  if (b < k) return b + ' B';
+  if (b < k*k) return (b/k).toFixed(1) + ' KB';
+  if (b < k*k*k) return (b/(k*k)).toFixed(1) + ' MB';
+  return (b/(k*k*k)).toFixed(1) + ' GB';
+};
+const fmtDuration = ms => {
+  if (ms == null) return '—';
+  if (ms < 1000) return ms.toFixed(0) + ' ms';
+  if (ms < 60000) return (ms / 1000).toFixed(1) + ' s';
+  const m = Math.floor(ms / 60000);
+  const s = Math.round((ms % 60000) / 1000);
+  return `${m}m ${s}s`;
+};
+const fmtTimeAgo = tsMs => {
+  const d = Math.floor((Date.now() - tsMs) / 1000);
+  if (d < 2) return 'just now';
+  if (d < 60) return `${d}s ago`;
+  if (d < 3600) return `${Math.floor(d/60)}m ago`;
+  if (d < 86400) return `${Math.floor(d/3600)}h ago`;
+  return `${Math.floor(d/86400)}d ago`;
+};
+const basename = p => (p || '').split('/').pop() || (p || '');
+
+async function api(path, method='GET', body=null) {
+  const opts = { method, headers: {} };
+  if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
+  const r = await fetch(path, opts);
+  const text = await r.text();
+  let data;
+  try { data = JSON.parse(text); } catch { data = text; }
+  return { ok: r.ok, status: r.status, data };
+}
+
+// =========================================================================
+//  tooltip
+// =========================================================================
+const tip = el('tooltip');
+function showTip(html, clientX, clientY) {
+  tip.innerHTML = html;
+  tip.classList.add('on');
+  tip.style.left = clientX + 'px';
+  tip.style.top = clientY + 'px';
+}
+function hideTip() { tip.classList.remove('on'); }
+
+// =========================================================================
+//  library
+// =========================================================================
+let libraryPcaps = [];
+let selectedPcapId = null;
+let selectedRawPath = null;  // if set, overrides library selection
+
+async function refreshLibrary() {
+  const res = await api('/api/pcaps');
+  if (!res.ok) { return; }
+  libraryPcaps = res.data || [];
+  el('lib-meta').textContent = libraryPcaps.length
+    ? `${libraryPcaps.length} pcap${libraryPcaps.length===1?'':'s'}`
+    : '—';
+  renderLibrary();
+  if (selectedPcapId && !libraryPcaps.find(p => p.id === selectedPcapId)) {
+    selectedPcapId = null;
+    updateSelectedLabel();
+  }
+}
+
+function renderLibrary() {
+  const list = el('pcap-list');
+  if (!libraryPcaps.length) {
+    list.innerHTML = '<div class="lib-empty">no pcaps uploaded</div>';
+    return;
+  }
+  let h = '';
+  for (const p of libraryPcaps) {
+    const sel = selectedPcapId === p.id ? 'selected' : '';
+    const srcDesc = p.ip_sources + (p.non_ip_sources ? `+${p.non_ip_sources} l2` : '') + ' src';
+    let badge = '';
+    if (p.viability && p.viability.verdict) {
+      badge = `<span class="badge ${esc(p.viability.verdict)}">${esc(p.viability.verdict.replace('_',' '))}</span>`;
+    } else {
+      // viability=null means the background analyzer hasn't finished
+      // walking the pcap yet. Show a pulsing "ANALYZING" badge.
+      badge = `<span class="badge analyzing">ANALYZING</span>`;
+    }
+    if (p.mac_collisions && p.mac_collisions > 0) {
+      badge += `<span class="badge mac_warn" title="${p.mac_collisions} source IP(s) had multiple MACs in the pcap — replay uses most-common pick">MAC ${p.mac_collisions}</span>`;
+    }
+    h += `<div class="pcap-row ${sel}" onclick="selectPcap('${esc(p.id)}')">`;
+    h += `  <div>`;
+    h += `    <div class="name">${esc(p.name)}${badge}</div>`;
+    h += `    <div class="meta">${p.packets.toLocaleString()} pkts &middot; ${srcDesc} &middot; ${p.tcp_flows} flows &middot; ${fmtDuration(p.duration_ms)} &middot; ${fmtBytes(p.size_bytes)} &middot; ${fmtTimeAgo(p.uploaded_at_ms)}</div>`;
+    h += `  </div>`;
+    h += `  <div class="actions">`;
+    h += `    <button onclick="event.stopPropagation(); renamePcap('${esc(p.id)}')">rename</button>`;
+    h += `    <button onclick="event.stopPropagation(); deletePcap('${esc(p.id)}')">delete</button>`;
+    h += `  </div>`;
+    h += `</div>`;
+  }
+  list.innerHTML = h;
+}
+
+function selectPcap(id) {
+  selectedPcapId = id;
+  selectedRawPath = null;
+  el('raw-path').value = '';
+  renderLibrary();
+  updateSelectedLabel();
+}
+
+function updateSelectedLabel() {
+  const box = el('selected-box');
+  let viaCard = el('viability-card');
+  if (viaCard) viaCard.remove();
+  if (selectedRawPath) {
+    box.innerHTML = `<span class="name">${esc(selectedRawPath)}</span><span class="sub">&middot; raw path</span>`;
+  } else if (selectedPcapId) {
+    const p = libraryPcaps.find(x => x.id === selectedPcapId);
+    if (p) {
+      let verdictHtml = '';
+      if (p.viability && p.viability.verdict) {
+        verdictHtml = `<span class="verdict ${esc(p.viability.verdict)}">${esc(p.viability.verdict.replace('_',' '))}</span>`;
+      } else {
+        verdictHtml = `<span class="verdict analyzing">ANALYZING…</span>`;
+      }
+      const meta = p.viability
+        ? `${p.packets.toLocaleString()} pkts &middot; ${p.ip_sources} src &middot; ${fmtDuration(p.duration_ms)} &middot; ${fmtBytes(p.size_bytes)}`
+        : `${fmtBytes(p.size_bytes)} &middot; server is parsing — refreshes automatically`;
+      box.innerHTML = `<span class="name">${esc(p.name)}</span><span class="sub">&middot; ${meta}</span>${verdictHtml}`;
+      // Render full viability advisory below the box.
+      if (p.viability) {
+        const v = p.viability;
+        let card = `<div class="viability-card ${esc(v.verdict)}" id="viability-card">`;
+        card += `<div class="reason">${esc(v.verdict_reason)}</div>`;
+        card += `<div class="note">est. peak ram: ${v.estimated_peak_mb} MB &middot; master sessions: ${v.sessions_master_mode} &middot; slave sessions: ${v.sessions_slave_mode}</div>`;
+        for (const n of v.notes) {
+          card += `<div class="note">&middot; ${esc(n)}</div>`;
+        }
+        card += `</div>`;
+        box.insertAdjacentHTML('afterend', card);
+      }
+    }
+  } else {
+    box.innerHTML = '<span class="empty">no pcap selected &mdash; pick one from the library above</span>';
+  }
+}
+
+async function deletePcap(id) {
+  if (!confirm('delete this pcap?')) return;
+  await api(`/api/pcaps/${id}`, 'DELETE');
+  if (selectedPcapId === id) selectedPcapId = null;
+  updateSelectedLabel();
+  refreshLibrary();
+}
+
+async function renamePcap(id) {
+  const p = libraryPcaps.find(x => x.id === id);
+  const name = prompt('new name:', p ? p.name : '');
+  if (!name) return;
+  await api(`/api/pcaps/${id}`, 'PATCH', { name });
+  refreshLibrary();
+}
+
+// drop zone + upload
+const dz = el('dropzone');
+dz.addEventListener('dragover', e => { e.preventDefault(); dz.classList.add('drag'); });
+dz.addEventListener('dragleave', () => dz.classList.remove('drag'));
+dz.addEventListener('drop', async e => {
+  e.preventDefault();
+  dz.classList.remove('drag');
+  for (const f of e.dataTransfer.files) await uploadFile(f);
+});
+el('lib-file').addEventListener('change', async e => {
+  for (const f of e.target.files) await uploadFile(f);
+  e.target.value = '';
+});
+
+async function uploadFile(file) {
+  const status = el('upload-status');
+  status.style.display = 'block';
+
+  // Pre-upload size advisory. For >100 MB pcaps the upload itself
+  // takes long enough on a LAN that a confirmation is friendly; for
+  // anything in the gigabytes ask explicitly so the user doesn't
+  // accidentally shove a multi-GB file at the host.
+  const mb = file.size / (1024 * 1024);
+  if (mb >= 100) {
+    const gb = mb / 1024;
+    const sizeStr = gb >= 1 ? `${gb.toFixed(2)} GB` : `${mb.toFixed(0)} MB`;
+    // ~12.5 MB/s is a common LAN floor (100 Mbps); 1 Gbps is ~125 MB/s.
+    // Quote the conservative estimate so the user isn't surprised.
+    const slowSec = Math.round(mb / 12.5);
+    const fastSec = Math.round(mb / 125);
+    const ok = confirm(
+      `${file.name} is ${sizeStr}.\n\n` +
+      `Estimated upload time: ${fastSec}–${slowSec} seconds depending on network speed.\n` +
+      `Estimated parse time after upload: ${Math.round(mb / 60)}–${Math.round(mb / 30)} seconds.\n\n` +
+      `The browser will show progress while uploading and the library row will say ANALYZING while the server parses it. ` +
+      `Continue?`
+    );
+    if (!ok) {
+      status.style.display = 'none';
+      return;
+    }
+  }
+
+  // Switch to XHR so we can hook upload.onprogress for a real bar.
+  return new Promise((resolve) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', '/api/pcaps', true);
+    xhr.upload.onprogress = e => {
+      if (!e.lengthComputable) return;
+      const pct = Math.round((e.loaded / e.total) * 100);
+      const sentMb = (e.loaded / (1024 * 1024)).toFixed(1);
+      const totalMb = (e.total / (1024 * 1024)).toFixed(1);
+      status.innerHTML = `
+        <div style="text-align:left;font-family:var(--mono);font-size:11px;color:var(--ink-2)">
+          uploading ${esc(file.name)}<br>
+          <div style="margin-top:6px;height:6px;background:var(--rule-soft);position:relative;overflow:hidden">
+            <div style="position:absolute;inset:0;width:${pct}%;background:var(--accent);transition:width 200ms"></div>
+          </div>
+          <div style="margin-top:4px;color:var(--dim)">${pct}% &middot; ${sentMb} / ${totalMb} MB</div>
+        </div>
+      `;
+    };
+    xhr.upload.onerror = () => {
+      status.innerHTML = `<span style="color:var(--err)">upload network error</span>`;
+      setTimeout(() => { status.style.display = 'none'; }, 4000);
+      resolve();
+    };
+    xhr.onload = async () => {
+      if (xhr.status < 200 || xhr.status >= 300) {
+        let errText = xhr.responseText || `HTTP ${xhr.status}`;
+        try { const j = JSON.parse(errText); errText = j.error || errText; } catch {}
+        status.innerHTML = `<span style="color:var(--err)">upload failed: ${esc(errText)}</span>`;
+        setTimeout(() => { status.style.display = 'none'; }, 6000);
+        resolve();
+        return;
+      }
+      let entry;
+      try { entry = JSON.parse(xhr.responseText); } catch (e) {
+        status.innerHTML = `<span style="color:var(--err)">bad server reply</span>`;
+        setTimeout(() => { status.style.display = 'none'; }, 4000);
+        resolve();
+        return;
+      }
+      status.innerHTML = `
+        <div style="text-align:left;font-family:var(--mono);font-size:11px">
+          <span style="color:var(--ok)">uploaded</span>
+          <span style="color:var(--dim)">&middot; ${esc(entry.name)} &middot; server is parsing…</span>
+        </div>
+      `;
+      await refreshLibrary();
+      selectPcap(entry.id);
+      // Begin polling the library every 2s while any entry is still
+      // analyzing. Stops automatically once everything is done.
+      kickAnalyzePoll();
+      setTimeout(() => { status.style.display = 'none'; }, 5000);
+      resolve();
+    };
+    const fd = new FormData();
+    fd.append('file', file);
+    xhr.send(fd);
+  });
+}
+
+let analyzePollTimer = null;
+function kickAnalyzePoll() {
+  if (analyzePollTimer) return;
+  const tick = async () => {
+    await refreshLibrary();
+    const stillAnalyzing = libraryPcaps.some(p => !p.viability);
+    if (stillAnalyzing) {
+      analyzePollTimer = setTimeout(tick, 2000);
+    } else {
+      analyzePollTimer = null;
+    }
+  };
+  analyzePollTimer = setTimeout(tick, 2000);
+}
+
+// raw-path escape hatch
+el('raw-path').addEventListener('input', e => {
+  const v = e.target.value.trim();
+  selectedRawPath = v || null;
+  if (v) {
+    selectedPcapId = null;
+    renderLibrary();
+  }
+  updateSelectedLabel();
+});
+
+async function inspectRaw() {
+  const path = el('raw-path').value.trim();
+  if (!path) return;
+  const res = await api('/api/inspect', 'POST', { path });
+  const out = el('inspect-result');
+  if (!res.ok) {
+    out.innerHTML = `<div class="err-box">${esc(res.data.error || res.data)}</div>`;
+    return;
+  }
+  const d = res.data;
+  let h = `<div class="inspect-card">`;
+  h += `<div class="summary"><b>${d.packets.toLocaleString()}</b> packets &middot; <b>${d.sources.length}</b> ipv4 sources &middot; <b>${d.tcp_flows.length}</b> tcp flows &middot; <b>${fmt(d.duration_ms/1000)}</b>s</div>`;
+  if (d.sources.length) {
+    h += `<table class="t"><tr><th>src ip</th><th>mac</th><th class="num">pkts</th><th class="num">bytes</th><th class="num">flows</th></tr>`;
+    for (const s of d.sources) {
+      h += `<tr><td>${esc(s.src_ip)}</td><td><code>${esc(s.src_mac)}</code></td><td class="num">${s.packet_count}</td><td class="num">${fmtBytes(s.byte_count)}</td><td class="num">${s.flow_count}</td></tr>`;
+    }
+    h += `</table>`;
+  }
+  h += `</div>`;
+  out.innerHTML = h;
+}
+
+// =========================================================================
+//  run start / stop
+// =========================================================================
+function toggleBenchmarkControls() {
+  const on = el('run-benchmark').checked;
+  el('bench-controls').style.display = on ? 'block' : 'none';
+}
+
+function toggleRoleControls() {
+  const role = document.querySelector('input[name="run-role"]:checked')?.value || 'master';
+  const isSlave = role === 'slave';
+  el('bench-target-port-field').style.display = isSlave ? 'none' : '';
+  el('bench-listen-port-field').style.display = isSlave ? '' : 'none';
+  el('bench-concurrency-field').style.display = isSlave ? 'none' : '';
+  el('bench-note-master').style.display = isSlave ? 'none' : '';
+  el('bench-note-slave').style.display = isSlave ? '' : 'none';
+}
+
+async function startRun() {
+  const isBench = el('run-benchmark').checked;
+  const concurrency = document.querySelector('input[name="run-concurrency"]:checked')?.value || 'all_at_once';
+  if (!selectedPcapId && !selectedRawPath) {
+    alert('select a pcap from the library or enter a raw path');
+    return;
+  }
+  const pc = el('run-proto-config').value.trim();
+  const role = document.querySelector('input[name="run-role"]:checked')?.value || 'master';
+  const pacing = document.querySelector('input[name="run-pacing"]:checked')?.value || 'fast';
+  const body = {
+    target_ip:   el('run-target-ip').value.trim() || '0.0.0.0',
+    target_mac:  el('run-target-mac').value.trim(),
+    speed:       parseFloat(el('run-speed').value) || 1.0,
+    bridge:      el('run-bridge').value.trim() || 'pcr_br0',
+    nic:         el('run-nic').value.trim() || null,
+    top_speed:   el('run-top-speed').checked,
+    realtime:    el('run-realtime').checked,
+    skip_non_ip: el('run-skip-non-ip').checked,
+    warmup_secs: parseInt(el('run-warmup').value) || 0,
+    // 0 is the "unlimited" sentinel — treat as a valid value, not falsy.
+    iterations: (() => {
+      const raw = parseInt(el('run-iterations').value);
+      return Number.isFinite(raw) && raw >= 0 ? raw : 1;
+    })(),
+    mode:        isBench ? 'benchmark' : 'raw',
+    target_port: parseInt(el('run-target-port').value) || 2404,
+    proto_name:  el('run-proto').value,
+    concurrency,
+    proto_config: pc || null,
+    role,
+    listen_port_base: parseInt(el('run-listen-port-base').value) || 2404,
+    pacing,
+  };
+  if (isBench && el('run-scada-gw-enable').checked) {
+    const gw = el('run-scada-gw-ip').value.trim();
+    const iface = el('run-scada-gw-iface').value.trim();
+    if (!gw || !iface) {
+      alert('scada-gateway mode: fill in both gateway ip and inner nic, or disable the checkbox');
+      return;
+    }
+    body.scada_gateway_ip = gw;
+    body.scada_gateway_iface = iface;
+    const up = el('run-scada-upstream').value.trim();
+    if (up) body.upstream_nat_iface = up;
+  }
+  if (selectedPcapId) body.pcap_id = selectedPcapId;
+  else body.pcap = selectedRawPath;
+
+  const btn = el('start-btn');
+  btn.disabled = true;
+  const res = await api('/api/run', 'POST', body);
+  btn.disabled = false;
+  const out = el('run-result');
+  if (!res.ok) {
+    out.innerHTML = `<span style="color:var(--err)">${esc(res.data.error || res.data)}</span>`;
+    return;
+  }
+  out.innerHTML = `<span style="color:var(--ok)">started &middot; run #${res.data.id}</span>`;
+  setTimeout(() => { out.textContent = ''; }, 3000);
+  currentDetailId = res.data.id;
+  refreshRuns();
+}
+
+async function stopRun(id) {
+  await api(`/api/runs/${id}/stop`, 'POST');
+  refreshRuns();
+}
+
+async function deleteRun(id) {
+  if (!confirm(`Delete run #${id}? This removes it from history and deletes its captured pcap.`)) return;
+  const res = await api(`/api/runs/${id}`, 'DELETE');
+  if (!res.ok) {
+    const msg = (res.data && (res.data.error || res.data)) || `HTTP ${res.status}`;
+    alert(`Delete failed: ${msg}`);
+    return;
+  }
+  if (currentDetailId === id) currentDetailId = null;
+  refreshRuns();
+}
+
+async function startSlave(runId, idx) {
+  await api(`/api/runs/${runId}/slaves/${idx}/start`, 'POST');
+  refreshRuns();
+}
+
+function renderSlaveRow(r, p, idx) {
+  const stateColor = {
+    pending:    'var(--dim)',
+    listening:  'var(--accent)',
+    connected:  'var(--blue)',
+    active:     'var(--accent)',
+    completed:  'var(--ok)',
+    failed:     'var(--err)',
+  }[p.state] || 'var(--dim)';
+  const stateLabel = (p.state || 'pending').toUpperCase();
+  const frac = p.planned ? (p.sent / p.planned) : 0;
+  const pct = Math.round(frac * 100);
+  const nm = p.src_ip || p.src_mac;
+  const rowId = `slave-${r.id}-${idx}`;
+
+  // The IP input and verify button are only editable while PENDING.
+  let ipField;
+  if (p.state === 'pending') {
+    const verifyStatus = (slaveVerifyStatus[`${r.id}/${idx}`] || '').trim();
+    ipField = `
+      <input class="slave-ip-input" id="${rowId}-ip" type="text" value="${esc(p.listen_ip || '0.0.0.0')}" spellcheck="false"
+        onblur="patchSlaveIp(${r.id}, ${idx}, this.value)">
+      <span class="slave-port-badge">:${p.listen_port}</span>
+      <button class="slave-btn verify" onclick="verifySlaveIp(${r.id}, ${idx})">VERIFY</button>
+      <span class="slave-verify" id="${rowId}-verify">${verifyStatus}</span>
+    `;
+  } else {
+    ipField = `<span class="slave-port">${esc(p.listen_ip || '0.0.0.0')}:${p.listen_port}</span>`;
+  }
+
+  let right = '';
+  if (p.state === 'pending') {
+    if (p.cancelled) {
+      right = `<span class="slave-count" style="color:var(--err)">cancelled</span>`;
+    } else {
+      right = `
+        <button class="slave-btn start" onclick="startSlave(${r.id}, ${idx})">START LISTENING</button>
+        <button class="slave-btn abort" onclick="stopSlave(${r.id}, ${idx})">ABORT</button>
+      `;
+    }
+  } else if (p.state === 'listening') {
+    right = `
+      <span class="slave-wait">waiting for master…</span>
+      <button class="slave-btn abort" onclick="stopSlave(${r.id}, ${idx})">ABORT</button>
+    `;
+  } else if (p.state === 'connected' || p.state === 'active') {
+    right = `
+      <span class="slave-count">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>
+      <button class="slave-btn abort" onclick="stopSlave(${r.id}, ${idx})">STOP</button>
+    `;
+  } else if (p.state === 'completed') {
+    right = `<span class="slave-count" style="color:var(--ok)">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>`;
+  } else if (p.state === 'failed') {
+    right = `<span class="slave-count" style="color:var(--err)">failed</span>`;
+  }
+
+  let h = `<div class="slave-row">`;
+  h += `  <div class="slave-meta">`;
+  h += `    <span class="slave-state" style="color:${stateColor}">${stateLabel}</span>`;
+  h += `    <span class="slave-rtu">rtu ${esc(nm)}</span>`;
+  h += `    <span class="slave-ip-cell">${ipField}</span>`;
+  h += `    <span class="slave-right">${right}</span>`;
+  h += `  </div>`;
+  if (p.state === 'active' || p.state === 'completed') {
+    h += `  <div class="slave-bar"><div class="slave-fill ${p.state}" style="width:${pct}%"></div></div>`;
+  }
+  h += `</div>`;
+  return h;
+}
+
+async function stopSlave(runId, idx) {
+  await api(`/api/runs/${runId}/slaves/${idx}/stop`, 'POST');
+  refreshRuns();
+}
+
+async function patchSlaveIp(runId, idx, value) {
+  const v = (value || '').trim();
+  if (!v) return;
+  await api(`/api/runs/${runId}/slaves/${idx}`, 'PATCH', { listen_ip: v });
+  // clear the cached verify result for this slave, since the IP changed
+  delete slaveVerifyStatus[`${runId}/${idx}`];
+}
+
+const slaveVerifyStatus = {};
+async function verifySlaveIp(runId, idx) {
+  const input = el(`slave-${runId}-${idx}-ip`);
+  const statusEl = el(`slave-${runId}-${idx}-verify`);
+  const ip = (input?.value || '').trim();
+  if (!ip) return;
+  // Patch first so the server knows the candidate IP (for consistency).
+  await patchSlaveIp(runId, idx, ip);
+  statusEl.textContent = 'probing…';
+  statusEl.style.color = 'var(--dim)';
+  const res = await api('/api/verify-ip', 'POST', { ip });
+  const key = `${runId}/${idx}`;
+  if (!res.ok) {
+    slaveVerifyStatus[key] = 'error';
+    statusEl.textContent = res.data.error || 'error';
+    statusEl.style.color = 'var(--err)';
+    return;
+  }
+  const d = res.data;
+  if (d.error) {
+    slaveVerifyStatus[key] = 'error';
+    statusEl.textContent = d.error;
+    statusEl.style.color = 'var(--err)';
+  } else if (d.in_use) {
+    const mac = d.mac ? ` (${d.mac})` : '';
+    slaveVerifyStatus[key] = `in use${mac}`;
+    statusEl.textContent = `in use on ${d.iface}${mac}`;
+    statusEl.style.color = 'var(--err)';
+  } else if (ip === '0.0.0.0') {
+    slaveVerifyStatus[key] = 'any';
+    statusEl.textContent = 'any interface';
+    statusEl.style.color = 'var(--ok)';
+  } else if (d.locally_assigned) {
+    slaveVerifyStatus[key] = 'local';
+    statusEl.textContent = `already local on ${d.iface}`;
+    statusEl.style.color = 'var(--ok)';
+  } else {
+    slaveVerifyStatus[key] = 'free-alias';
+    statusEl.textContent = `free on ${d.iface} — will auto-alias on start`;
+    statusEl.style.color = 'var(--ok)';
+  }
+}
+
+// =========================================================================
+//  runs list
+// =========================================================================
+let currentDetailId = null;
+
+async function refreshRuns() {
+  // If the user is actively typing in a text input inside the runs
+  // list, skip this tick — rewriting innerHTML would steal focus
+  // mid-keystroke. We specifically check for INPUT/TEXTAREA; buttons
+  // that happen to hold focus after a click should NOT block re-renders
+  // (otherwise clicking START LISTENING would freeze the UI until blur).
+  const runsNode = el('runs-list');
+  const active = document.activeElement;
+  if (runsNode && active && runsNode.contains(active)) {
+    const tag = active.tagName;
+    const isTextInput =
+      (tag === 'INPUT' && (active.type === 'text' || active.type === 'number' || !active.type)) ||
+      tag === 'TEXTAREA';
+    if (isTextInput) return;
+  }
+  const res = await api('/api/runs');
+  const out = el('runs-list');
+  const meta = el('runs-meta');
+  if (!res.ok) {
+    out.innerHTML = '<div class="err-box">error fetching runs</div>';
+    return;
+  }
+  const runs = res.data || [];
+  const running = runs.filter(r => r.status === 'running').length;
+  meta.textContent = runs.length ? `${runs.length} total · ${running} running` : '—';
+  if (!runs.length) {
+    out.innerHTML = '<div class="lib-empty">no runs recorded</div>';
+    return;
+  }
+  let h = '';
+  for (const r of runs) {
+    const frac = r.planned ? (r.sent / r.planned) : (r.report ? 1 : 0);
+    const pct = Math.round(frac * 100);
+    const cur = r.report ? r.report.total_packets : r.sent;
+    const total = r.planned || (r.report ? r.report.total_packets : 0);
+    const tgt = esc(r.target_ip);
+    const name = `${esc(basename(r.pcap))} <span class="arrow">→</span> ${tgt}`;
+
+    h += `<div class="run ${r.status}">`;
+    h += `  <div class="head">`;
+    h += `    <span class="num">RUN·${r.id.toString().padStart(4,'0')}</span>`;
+    h += `    <span class="title">${name}</span>`;
+    h += `    <span class="status ${r.status}">${r.status}</span>`;
+    h += `  </div>`;
+
+    const modeLabel = r.mode === 'benchmark' ? 'benchmark' : 'raw';
+    h += `  <div class="submeta">`;
+    h += `    <span><span class="k">mode</span> ${modeLabel}</span>`;
+    h += `    <span><span class="k">speed</span> ${r.speed}×${r.top_speed ? ' top' : ''}</span>`;
+    if (r.realtime) h += `    <span><span class="k">sched</span> fifo</span>`;
+    h += `  </div>`;
+
+    // main progress bar
+    h += `  <div class="pbar ${r.status}">`;
+    h += `    <div class="plabel">progress</div>`;
+    h += `    <div class="pcount">${pct}% &middot; ${cur.toLocaleString()} / ${(total || 0).toLocaleString()}</div>`;
+    h += `    <div class="ptrack"><div class="pfill" style="width:${pct}%"></div></div>`;
+    h += `  </div>`;
+
+    // per-source mini bars. Slave-benchmark sessions get a richer row
+    // with state indicator + per-slave start button.
+    if (r.per_source_progress && r.per_source_progress.length) {
+      const isSlave = r.per_source_progress.some(p => p.listen_port > 0);
+      if (isSlave) {
+        h += `<div class="slave-list">`;
+        for (let i = 0; i < r.per_source_progress.length; i++) {
+          h += renderSlaveRow(r, r.per_source_progress[i], i);
+        }
+        h += `</div>`;
+      } else {
+        h += `<div class="per-source-list">`;
+        for (const p of r.per_source_progress) {
+          const sf = p.planned ? (p.sent / p.planned) : 0;
+          const spct = Math.round(sf * 100);
+          const nm = p.src_ip || ('l2 ' + p.src_mac);
+          h += `<div class="per-source-bar ${r.status}">`;
+          h += `  <span class="nm">${esc(nm)}</span>`;
+          h += `  <div class="mini-track"><div class="mini-fill" style="width:${spct}%"></div></div>`;
+          h += `  <span class="cnt">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>`;
+          h += `</div>`;
+        }
+        h += `</div>`;
+      }
+    }
+
+    if (r.throughput_history && r.throughput_history.length > 1) {
+      const latest = r.throughput_history[r.throughput_history.length - 1] || 0;
+      h += `<div class="sparkrow">`;
+      h += `  <span class="lbl">THROUGHPUT</span>`;
+      h += `  <span>${sparklineSvg(r.throughput_history, r.id)}</span>`;
+      h += `  <span class="val">${latest.toLocaleString()} pps</span>`;
+      h += `</div>`;
+    }
+
+    const actions = [];
+    if (r.status === 'running') {
+      actions.push(`<button class="stop" onclick="stopRun(${r.id})">STOP</button>`);
+    }
+    if ((r.report && r.report.capture_path) || (r.benchmark && r.benchmark.capture_path)) {
+      actions.push(`<a href="/api/runs/${r.id}/download" download>DOWNLOAD CAPTURE</a>`);
+    }
+    actions.push(`<button onclick="toggleDetail(${r.id})">${currentDetailId === r.id ? 'HIDE DETAILS' : 'DETAILS'}</button>`);
+    if (r.status !== 'running') {
+      actions.push(`<button class="stop" onclick="deleteRun(${r.id})">DELETE</button>`);
+    }
+    h += `<div class="actions-inline">${actions.join('')}</div>`;
+
+    if (currentDetailId === r.id) {
+      h += renderDetail(r);
+    }
+    h += `</div>`;
+  }
+  out.innerHTML = h;
+
+  // Just toggle the (stable, never-moved) diagram section's display.
+  syncDiagramVisibility();
+}
+
+// The diagram section is now a stable sibling of #runs-list — it is
+// never moved in the DOM, so refreshRuns()'s innerHTML rewrite of
+// the runs list leaves it untouched. JS just toggles its visibility.
+function syncDiagramVisibility() {
+  const section = el('diagram-section');
+  if (!section) return;
+  const hasRunning = !!document.querySelector('#runs-list .run.running');
+  const wantDisplay = hasRunning ? '' : 'none';
+  if (section.style.display !== wantDisplay) {
+    section.style.display = wantDisplay;
+    // When transitioning from hidden → visible, give the canvas one
+    // resize so ECharts picks up the now-real container size.
+    if (hasRunning) {
+      requestAnimationFrame(() => {
+        if (!diagramChart) return;
+        const dom = diagramChart.getDom();
+        if (dom && dom.clientWidth > 0 && dom.clientHeight > 0) {
+          diagramChart.resize();
+        }
+      });
+    }
+  }
+}
+
+function toggleDetail(id) {
+  currentDetailId = currentDetailId === id ? null : id;
+  refreshRuns();
+}
+
+// =========================================================================
+//  detail panel
+// =========================================================================
+function renderDetail(r) {
+  let h = `<div class="detail">`;
+  if (r.error) {
+    h += `<div class="err-box">${esc(r.error)}</div>`;
+  }
+  h += `<div class="kv">`;
+  h += `<div class="k">pcap</div><div class="v">${esc(r.pcap)}</div>`;
+  h += `<div class="k">target</div><div class="v">${esc(r.target_ip)}${r.target_mac ? ' &middot; ' + esc(r.target_mac) : ''}</div>`;
+  h += `<div class="k">speed</div><div class="v">${r.speed}${r.top_speed ? ' (top)' : ''}${r.realtime ? ' · rt' : ''}</div>`;
+  if (r.report) {
+    h += `<div class="k">sent</div><div class="v">${r.report.total_packets.toLocaleString()} pkts &middot; ${fmtBytes(r.report.total_bytes)}</div>`;
+    h += `<div class="k">errors</div><div class="v">${r.report.total_errors}</div>`;
+    if (r.report.capture_path) {
+      h += `<div class="k">capture</div><div class="v">${r.report.captured_packets} frames &middot; ${fmtBytes(r.report.captured_bytes)}</div>`;
+    }
+  }
+  if (r.benchmark) {
+    const b = r.benchmark;
+    h += `<div class="k">sessions</div><div class="v">${b.per_session.length}</div>`;
+    h += `<div class="k">messages</div><div class="v">${b.total_messages_sent} sent &middot; ${b.total_messages_received} recv</div>`;
+    h += `<div class="k">throughput</div><div class="v">${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</div>`;
+    h += `<div class="k">latency (µs)</div><div class="v">min ${b.aggregate_latency_min_us} &middot; p50 ${b.aggregate_latency_p50_us} &middot; p90 ${b.aggregate_latency_p90_us} &middot; p99 ${b.aggregate_latency_p99_us} &middot; max ${b.aggregate_latency_max_us}</div>`;
+  }
+  h += `</div>`;
+
+  // raw per-source table
+  if (r.report && r.report.per_source && r.report.per_source.length) {
+    h += `<h3>per-source timing</h3>`;
+    h += `<table class="t"><tr><th>src ip</th><th>mac</th><th>tap</th><th>kind</th><th class="num">sent</th><th class="num">bytes</th><th class="num">elapsed ms</th><th class="num">mean µs</th><th class="num">p99 µs</th></tr>`;
+    for (const s of r.report.per_source) {
+      h += `<tr>`;
+      h += `<td>${esc(s.src_ip || '—')}</td>`;
+      h += `<td><code>${esc(s.src_mac)}</code></td>`;
+      h += `<td><code>${esc(s.tap)}</code></td>`;
+      h += `<td>${esc(s.kind)}</td>`;
+      h += `<td class="num">${s.sent}</td>`;
+      h += `<td class="num">${fmtBytes(s.bytes)}</td>`;
+      h += `<td class="num">${fmt(s.elapsed_ms)}</td>`;
+      h += `<td class="num">${fmt(s.mean_jitter_us)}</td>`;
+      h += `<td class="num">${fmt(s.p99_jitter_us)}</td>`;
+      h += `</tr>`;
+    }
+    h += `</table>`;
+  }
+
+  // benchmark sessions
+  if (r.benchmark && r.benchmark.per_session && r.benchmark.per_session.length) {
+    h += `<h3>per-session benchmark</h3>`;
+    h += `<table class="t"><tr><th>src ip</th><th class="num">sent</th><th class="num">recv</th><th class="num">p50 µs</th><th class="num">p99 µs</th><th class="num">max µs</th><th class="num">msg/s</th><th class="num">stalls</th><th>status</th></tr>`;
+    for (const s of r.benchmark.per_session) {
+      const status = s.error ? `<span style="color:var(--err)">err</span>` : (s.connected ? '<span style="color:var(--ok)">ok</span>' : 'idle');
+      h += `<tr>`;
+      h += `<td>${esc(s.src_ip)}</td>`;
+      h += `<td class="num">${s.messages_sent}</td>`;
+      h += `<td class="num">${s.messages_received}</td>`;
+      h += `<td class="num">${s.latency_p50_us}</td>`;
+      h += `<td class="num">${s.latency_p99_us}</td>`;
+      h += `<td class="num">${s.latency_max_us}</td>`;
+      h += `<td class="num">${fmt(s.throughput_msgs_per_sec)}</td>`;
+      h += `<td class="num">${s.window_stalls}</td>`;
+      h += `<td>${status}</td>`;
+      h += `</tr>`;
+      if (s.error) {
+        h += `<tr><td colspan="9"><div class="err-box">${esc(s.error)}</div></td></tr>`;
+      }
+    }
+    h += `</table>`;
+
+    h += `<h3>latency distribution</h3>`;
+    h += latencyChart(`lat-agg-${r.id}`, r.benchmark.aggregate_latency_samples_us, r.benchmark.aggregate_latency_p50_us, r.benchmark.aggregate_latency_p99_us);
+  }
+
+  // gap histogram
+  if ((r.report && r.report.capture_path) || (r.benchmark && r.benchmark.capture_path)) {
+    h += `<h3>inter-packet gap distribution</h3>`;
+    const cached = gapCache[r.id];
+    if (cached && cached !== 'loading') {
+      h += gapChart(`gap-${r.id}`, cached);
+    } else {
+      h += `<div class="chart-wrap" id="gap-${r.id}"><div class="muted" style="font-family:var(--mono);font-size:11px">loading…</div></div>`;
+      fetchGapHistogram(r.id);
+    }
+  }
+  h += `</div>`;
+  return h;
+}
+
+// =========================================================================
+//  charts
+// =========================================================================
+
+// sparkline — smooth SVG area chart for throughput history
+function sparklineSvg(samples, uid) {
+  const w = 600, h = 44, pad = 2;
+  if (!samples || samples.length < 2) return '';
+  const max = Math.max(1, ...samples);
+  const step = (w - pad*2) / (samples.length - 1);
+  const pts = samples.map((v, i) => {
+    const x = pad + i * step;
+    const y = h - pad - (v / max) * (h - pad*2);
+    return [x, y];
+  });
+  const path = pts.map((p, i) => (i === 0 ? 'M' : 'L') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ');
+  const area = path + ` L ${w - pad} ${h - pad} L ${pad} ${h - pad} Z`;
+  return `
+    <svg class="chart-svg" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" style="height:44px;width:100%">
+      <path d="${area}" fill="var(--accent-soft)" />
+      <path d="${path}" fill="none" stroke="var(--accent)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+    </svg>
+  `;
+}
+
+// gap histogram — two overlaid series with interactive bars
+function gapChart(uid, data) {
+  const n = 20;
+  const w = 680, h = 220;
+  const padL = 44, padR = 20, padT = 16, padB = 38;
+  const innerW = w - padL - padR;
+  const innerH = h - padT - padB;
+  const max = Math.max(1, ...data.original, ...data.captured);
+  const bw = innerW / n;
+
+  // log bucket boundaries for tooltips (1 µs → 10 s)
+  const logMin = 3, logMax = 10; // 10^3 ns = 1µs, 10^10 ns = 10s
+  const bucketLabel = i => {
+    const lo = Math.pow(10, logMin + (i / n) * (logMax - logMin));
+    const hi = Math.pow(10, logMin + ((i+1) / n) * (logMax - logMin));
+    return nsRange(lo, hi);
+  };
+
+  let svg = `<svg class="chart-svg" viewBox="0 0 ${w} ${h}" style="height:220px">`;
+  // y-axis gridlines (5)
+  for (let g = 0; g <= 5; g++) {
+    const y = padT + (g / 5) * innerH;
+    const v = Math.round(max * (1 - g / 5));
+    svg += `<line x1="${padL}" y1="${y}" x2="${w-padR}" y2="${y}" stroke="var(--rule-soft)" stroke-width="1"/>`;
+    svg += `<text x="${padL-6}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--dim)" font-family="var(--mono)">${v}</text>`;
+  }
+  // bars
+  for (let i = 0; i < n; i++) {
+    const x = padL + i * bw;
+    const origH = (data.original[i] / max) * innerH;
+    const capH = (data.captured[i] / max) * innerH;
+    // background hover zone
+    svg += `<rect class="bucket-bg" x="${x}" y="${padT}" width="${bw}" height="${innerH}" fill="transparent" data-idx="${i}" data-uid="${uid}"/>`;
+    // original (ink) bar
+    svg += `<rect x="${x+2}" y="${padT + innerH - origH}" width="${bw-4}" height="${origH}" fill="var(--ink)" opacity="0.78"/>`;
+    // captured (accent) bar slightly narrower, offset
+    svg += `<rect x="${x+5}" y="${padT + innerH - capH}" width="${bw-10}" height="${capH}" fill="var(--accent)" opacity="0.85"/>`;
+  }
+  // x axis
+  svg += `<line x1="${padL}" y1="${padT + innerH}" x2="${w-padR}" y2="${padT + innerH}" stroke="var(--ink)" stroke-width="1"/>`;
+  const xTicks = [
+    { frac: 0,    label: '1 µs' },
+    { frac: 3/7,  label: '1 ms' },
+    { frac: 4/7,  label: '10 ms' },
+    { frac: 6/7,  label: '1 s' },
+    { frac: 1,    label: '10 s' },
+  ];
+  for (const t of xTicks) {
+    const x = padL + t.frac * innerW;
+    svg += `<line x1="${x}" y1="${padT + innerH}" x2="${x}" y2="${padT + innerH + 4}" stroke="var(--dim)" stroke-width="1"/>`;
+    const anchor = t.frac === 0 ? 'start' : (t.frac === 1 ? 'end' : 'middle');
+    svg += `<text x="${x}" y="${padT + innerH + 16}" font-size="10" fill="var(--dim)" text-anchor="${anchor}" font-family="var(--mono)">${t.label}</text>`;
+  }
+  svg += `</svg>`;
+
+  // legend + data stash
+  const origLabel = basename(data.original_path || 'original');
+  const capLabel = basename(data.captured_path || 'replay');
+  gapDataByUid[uid] = data;
+  return `
+    <div class="chart-wrap">
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--ink);opacity:0.78"></span>original pcap</span>
+        <span><span class="swatch" style="background:var(--accent);opacity:0.85"></span>replayed capture</span>
+        <span class="muted" style="margin-left:auto">${esc(origLabel)} / ${esc(capLabel)}</span>
+      </div>
+      ${svg}
+    </div>
+  `;
+}
+
+// latency histogram — samples µs → 20 log buckets
+function latencyChart(uid, samples, p50, p99) {
+  if (!samples || !samples.length) return '<div class="lib-empty">no samples</div>';
+  const n = 20;
+  const w = 680, h = 200;
+  const padL = 44, padR = 20, padT = 16, padB = 34;
+  const innerW = w - padL - padR;
+  const innerH = h - padT - padB;
+  const logMin = 1;          // 10 µs
+  const logMax = 6;          // 1 s
+  const buckets = new Array(n).fill(0);
+  const bucketOf = v => {
+    if (v <= 0) return 0;
+    const l = Math.log10(v);
+    return Math.max(0, Math.min(n-1, Math.floor(((l - logMin) / (logMax - logMin)) * n)));
+  };
+  for (const v of samples) buckets[bucketOf(v)]++;
+  const max = Math.max(1, ...buckets);
+  const bw = innerW / n;
+
+  let svg = `<svg class="chart-svg" viewBox="0 0 ${w} ${h}" style="height:200px">`;
+  for (let g = 0; g <= 4; g++) {
+    const y = padT + (g / 4) * innerH;
+    const v = Math.round(max * (1 - g / 4));
+    svg += `<line x1="${padL}" y1="${y}" x2="${w-padR}" y2="${y}" stroke="var(--rule-soft)" stroke-width="1"/>`;
+    svg += `<text x="${padL-6}" y="${y+3}" font-size="9" text-anchor="end" fill="var(--dim)" font-family="var(--mono)">${v}</text>`;
+  }
+  for (let i = 0; i < n; i++) {
+    const x = padL + i * bw;
+    const bh = (buckets[i] / max) * innerH;
+    svg += `<rect class="bucket-bg" x="${x}" y="${padT}" width="${bw}" height="${innerH}" fill="transparent" data-idx="${i}" data-uid="${uid}"/>`;
+    svg += `<rect x="${x+2}" y="${padT + innerH - bh}" width="${bw-4}" height="${bh}" fill="var(--blue)" opacity="0.85"/>`;
+  }
+  // p50 / p99 markers
+  const markerAt = (v, color, label) => {
+    if (!v) return '';
+    const frac = Math.max(0, Math.min(1, (Math.log10(Math.max(1, v)) - logMin) / (logMax - logMin)));
+    const x = padL + frac * innerW;
+    return `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT+innerH}" stroke="${color}" stroke-width="1.5" stroke-dasharray="3,3"/>
+            <text x="${x+4}" y="${padT+12}" font-size="10" fill="${color}" font-family="var(--mono)">${label} ${v}µs</text>`;
+  };
+  svg += markerAt(p50, 'var(--ok)', 'p50');
+  svg += markerAt(p99, 'var(--accent)', 'p99');
+
+  svg += `<line x1="${padL}" y1="${padT + innerH}" x2="${w-padR}" y2="${padT + innerH}" stroke="var(--ink)" stroke-width="1"/>`;
+  const xTicks = [
+    { frac: 0, label: '10 µs' },
+    { frac: 0.4, label: '1 ms' },
+    { frac: 0.6, label: '10 ms' },
+    { frac: 0.8, label: '100 ms' },
+    { frac: 1, label: '1 s' },
+  ];
+  for (const t of xTicks) {
+    const x = padL + t.frac * innerW;
+    svg += `<line x1="${x}" y1="${padT + innerH}" x2="${x}" y2="${padT + innerH + 4}" stroke="var(--dim)" stroke-width="1"/>`;
+    const anchor = t.frac === 0 ? 'start' : (t.frac === 1 ? 'end' : 'middle');
+    svg += `<text x="${x}" y="${padT + innerH + 16}" font-size="10" fill="var(--dim)" text-anchor="${anchor}" font-family="var(--mono)">${t.label}</text>`;
+  }
+  svg += `</svg>`;
+
+  latencyDataByUid[uid] = { buckets, logMin, logMax };
+  return `
+    <div class="chart-wrap">
+      <div class="legend">
+        <span><span class="swatch" style="background:var(--blue);opacity:0.85"></span>latency samples</span>
+        <span><span class="swatch" style="background:var(--ok)"></span>p50</span>
+        <span><span class="swatch" style="background:var(--accent)"></span>p99</span>
+        <span class="muted" style="margin-left:auto">${samples.length.toLocaleString()} samples</span>
+      </div>
+      ${svg}
+    </div>
+  `;
+}
+
+// chart data stashes for tooltips
+const gapDataByUid = {};
+const latencyDataByUid = {};
+
+function nsRange(loNs, hiNs) {
+  const fmt1 = ns => {
+    if (ns < 1000) return ns.toFixed(0) + ' ns';
+    if (ns < 1e6)  return (ns/1000).toFixed(0) + ' µs';
+    if (ns < 1e9)  return (ns/1e6).toFixed(0) + ' ms';
+    return (ns/1e9).toFixed(1) + ' s';
+  };
+  return `${fmt1(loNs)} – ${fmt1(hiNs)}`;
+}
+function usRange(lo, hi) {
+  const fmt1 = us => {
+    if (us < 1000) return us.toFixed(0) + ' µs';
+    if (us < 1e6)  return (us/1000).toFixed(1) + ' ms';
+    return (us/1e6).toFixed(2) + ' s';
+  };
+  return `${fmt1(lo)} – ${fmt1(hi)}`;
+}
+
+// chart tooltip delegation
+document.addEventListener('mousemove', e => {
+  const t = e.target;
+  if (!t.classList || !t.classList.contains('bucket-bg')) return;
+  const uid = t.getAttribute('data-uid');
+  const idx = parseInt(t.getAttribute('data-idx'));
+  let html = '';
+  if (gapDataByUid[uid]) {
+    const d = gapDataByUid[uid];
+    const n = 20;
+    const lo = Math.pow(10, 3 + (idx / n) * 7);
+    const hi = Math.pow(10, 3 + ((idx+1) / n) * 7);
+    html = `<b>${nsRange(lo, hi)}</b><br>original: ${d.original[idx]}<br>replay: ${d.captured[idx]}`;
+  } else if (latencyDataByUid[uid]) {
+    const d = latencyDataByUid[uid];
+    const n = 20;
+    const lo = Math.pow(10, d.logMin + (idx / n) * (d.logMax - d.logMin));
+    const hi = Math.pow(10, d.logMin + ((idx+1) / n) * (d.logMax - d.logMin));
+    html = `<b>${usRange(lo, hi)}</b><br>${d.buckets[idx]} samples`;
+  }
+  if (html) showTip(html, e.clientX + window.scrollX, e.clientY + window.scrollY);
+});
+document.addEventListener('mouseout', e => {
+  if (e.target.classList && e.target.classList.contains('bucket-bg')) hideTip();
+});
+
+// =========================================================================
+//  gap histogram loader
+// =========================================================================
+const gapCache = {};
+async function fetchGapHistogram(id) {
+  if (gapCache[id] === 'loading' || gapCache[id]) return;
+  gapCache[id] = 'loading';
+  const res = await api(`/api/runs/${id}/gaps`);
+  if (!res.ok) {
+    gapCache[id] = null;
+    const node = el(`gap-${id}`);
+    if (node) node.innerHTML = `<div class="err-box">${esc(res.data.error || res.data)}</div>`;
+    return;
+  }
+  gapCache[id] = res.data;
+  // The next refreshRuns() tick will render from cache; also re-render now
+  // if the current detail matches.
+  if (currentDetailId === id) refreshRuns();
+}
+
+// =========================================================================
+//  analysis
+// =========================================================================
+let analysisFile = null;
+let analysisReport = null;
+
+const anDz = el('an-dropzone');
+anDz.addEventListener('dragover', e => { e.preventDefault(); anDz.classList.add('drag'); });
+anDz.addEventListener('dragleave', () => anDz.classList.remove('drag'));
+anDz.addEventListener('drop', e => {
+  e.preventDefault();
+  anDz.classList.remove('drag');
+  if (e.dataTransfer.files.length) setAnalysisFile(e.dataTransfer.files[0]);
+});
+el('an-file').addEventListener('change', e => {
+  if (e.target.files.length) setAnalysisFile(e.target.files[0]);
+});
+
+function setAnalysisFile(f) {
+  analysisFile = f;
+  const st = el('an-upload-status');
+  st.style.display = 'block';
+  st.textContent = `${f.name} · ${(f.size/1024).toFixed(1)} kB`;
+  st.style.color = 'var(--ok)';
+  el('an-run-btn').disabled = false;
+}
+
+async function runAnalysis() {
+  if (!analysisFile) return;
+  const mode = document.querySelector('input[name="an-mode"]:checked')?.value || 'generic';
+  const msg = el('an-msg');
+  const btn = el('an-run-btn');
+  btn.disabled = true;
+  msg.textContent = 'analyzing…';
+  msg.style.color = 'var(--dim)';
+
+  const fd = new FormData();
+  fd.append('file', analysisFile);
+  fd.append('mode', mode);
+  try {
+    const r = await fetch('/api/analyze', { method: 'POST', body: fd });
+    const text = await r.text();
+    let data;
+    try { data = JSON.parse(text); } catch { data = { error: text }; }
+    if (!r.ok) {
+      msg.textContent = data.error || 'error';
+      msg.style.color = 'var(--err)';
+      btn.disabled = false;
+      return;
+    }
+    analysisReport = data;
+    renderAnalysis(data);
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = el('an-download-json');
+    a.href = url;
+    a.download = `analysis_run${data.run_id}_${mode}.json`;
+    a.style.display = 'inline';
+    msg.textContent = '';
+    btn.disabled = false;
+  } catch (err) {
+    msg.textContent = err.message || String(err);
+    msg.style.color = 'var(--err)';
+    btn.disabled = false;
+  }
+}
+
+function renderAnalysis(r) {
+  const out = el('an-result');
+  let h = `<div class="an-card">`;
+  // headline
+  h += `<div class="an-summary">`;
+  h += `  <div><span class="an-verdict ${esc(r.verdict)}">${esc(r.verdict.replace(/_/g,' '))}</span>`;
+  h += `    <span class="an-score" style="margin-left:14px">${r.score_pct.toFixed(1)}%</span></div>`;
+  h += `  <div class="reason">${esc(r.verdict_reason)}</div>`;
+  h += `</div>`;
+
+  // run context
+  h += `<div class="an-kv">`;
+  h += `<div class="k">run</div><div class="v">#${r.run_id} · ${esc(r.role)} mode · ${esc(r.mode)} analysis</div>`;
+  h += `<div class="k">source pcap</div><div class="v">${esc(r.original_pcap)}</div>`;
+  h += `<div class="k">captured size</div><div class="v">${fmtBytes(r.captured_size_bytes)} · ${r.captured_total_packets.toLocaleString()} total pkts</div>`;
+  if (r.tcp_flow) {
+    h += `<div class="k">tcp flow</div><div class="v">${esc(r.tcp_flow.client)} → ${esc(r.tcp_flow.server)} · ${r.tcp_flow.packets} pkts · <code>${esc(r.tcp_flow.state || 'no state')}</code></div>`;
+  }
+  h += `</div>`;
+
+  // playback
+  const pb = r.playback;
+  h += `<div class="an-h">PLAYBACK SIDE (${esc(pb.direction)})</div>`;
+  h += `<div class="an-kv">`;
+  h += `<div class="k">expected i-frames</div><div class="v">${pb.expected_iframes}</div>`;
+  const delivOk = pb.delivered_iframes === pb.expected_iframes;
+  h += `<div class="k">delivered</div><div class="v ${delivOk?'ok':'bad'}">${pb.delivered_iframes}</div>`;
+  h += `<div class="k">type-id sequence</div><div class="v ${pb.type_id_sequence_match?'ok':'warn'}">${pb.type_id_sequence_match ? 'match' : 'divergent'} · ${pb.matched_type_ids}/${pb.expected_iframes} matched</div>`;
+  h += `<div class="k">byte-identical</div><div class="v">${pb.byte_identical_count}/${pb.expected_iframes}</div>`;
+  if (pb.missing_indices.length) {
+    h += `<div class="k">missing idx</div><div class="v bad">${pb.missing_indices.slice(0,20).join(', ')}${pb.missing_indices.length>20?'…':''}</div>`;
+  }
+  h += `</div>`;
+  h += `<div class="an-tid-seq">expected: ${pb.expected_type_ids.join(' ')}</div>`;
+  h += `<div class="an-tid-seq">captured: ${pb.delivered_type_ids.join(' ')}</div>`;
+  if (pb.mismatches.length) {
+    h += `<div class="an-h">MISMATCHES (${pb.mismatches.length})</div>`;
+    for (const d of pb.mismatches.slice(0, 20)) {
+      h += `<div class="an-diff-row">`;
+      h += `  <div><span class="lbl">idx</span> ${d.index} · exp tid=${d.expected_type_id} · got tid=${d.actual_type_id}</div>`;
+      h += `  <div><span class="lbl">exp asdu</span> ${esc(d.expected_asdu_hex)}</div>`;
+      h += `  <div><span class="lbl">got asdu</span> ${esc(d.actual_asdu_hex)}</div>`;
+      h += `</div>`;
+    }
+  }
+
+  // target side
+  const tg = r.target;
+  h += `<div class="an-h">TARGET SIDE (${esc(tg.direction)})</div>`;
+  h += `<div class="an-kv">`;
+  h += `<div class="k">u / s / i frames</div><div class="v">${tg.u_frames} · ${tg.s_frames} · ${tg.i_frames}</div>`;
+  h += `<div class="k">u-codes seen</div><div class="v">${tg.u_codes_seen.map(esc).join(', ') || '—'}</div>`;
+  h += `<div class="k">startdt handshake</div><div class="v ${tg.startdt_handshake_ok?'ok':'bad'}">${tg.startdt_handshake_ok ? 'completed' : 'missing'}</div>`;
+  if (tg.target_type_ids.length) {
+    h += `<div class="k">target type ids</div><div class="v"><code>${tg.target_type_ids.join(' ')}</code></div>`;
+  }
+  h += `</div>`;
+
+  if (tg.correctness) {
+    const c = tg.correctness;
+    const kindLabel = {
+      same_script: 'TARGET REPLAYED THE ORIGINAL SCRIPT',
+      subset: 'TARGET REPLAYED A SUBSET OF THE SCRIPT',
+      divergent: 'TARGET RAN ITS OWN SCRIPT',
+      silent: 'TARGET SENT NO I-FRAMES',
+    }[c.target_script_kind] || c.target_script_kind.toUpperCase();
+    const kindColor = {
+      same_script: 'var(--ok)',
+      subset: 'var(--blue)',
+      divergent: 'var(--blue)',
+      silent: 'var(--warn)',
+    }[c.target_script_kind] || 'var(--dim)';
+    const kindHelp = {
+      same_script: "the live target produced the same iec 104 command sequence as the captured master. if the target is a separate piece of software, this is a strong positive signal.",
+      subset: "the live target produced a prefix/subset of the captured script. probably a truncated run or a simpler master that only issues a few commands.",
+      divergent: "the live target is running a different command script than the captured master. this is normal when the live master is a different piece of software — it's not an error, just a different peer. the delivery side of the replay is still judged separately.",
+      silent: "the live target never sent any i-frames of its own. it handshook and ack'd, but it didn't issue any commands. expected for a purely passive master or when the session was cut short.",
+    }[c.target_script_kind] || '';
+
+    h += `<div class="an-h">TARGET SCRIPT COMPARISON (correct mode)</div>`;
+    h += `<div style="padding:10px 12px;background:var(--surface-2);border:1px solid var(--rule);border-left:2px solid ${kindColor};margin:6px 0 10px">`;
+    h += `  <div style="font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:0.1em;color:${kindColor};margin-bottom:6px">${esc(kindLabel)}</div>`;
+    h += `  <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);line-height:1.5">${esc(kindHelp)}</div>`;
+    h += `</div>`;
+    h += `<div class="an-kv">`;
+    h += `<div class="k">original sent</div><div class="v">${c.expected_iframes} i-frames</div>`;
+    h += `<div class="k">target sent</div><div class="v">${c.actual_iframes} i-frames</div>`;
+    h += `<div class="k">type-id overlap</div><div class="v">${c.lcs_type_ids}/${c.expected_iframes} &middot; ${(c.lcs_similarity*100).toFixed(0)}% similarity (lcs)</div>`;
+    h += `<div class="k">byte-identical</div><div class="v">${c.byte_identical_count}</div>`;
+    h += `<div class="k">matched prefix</div><div class="v">${c.matched_type_id_prefix}/${c.expected_iframes} (index-by-index)</div>`;
+    h += `</div>`;
+    // Side-by-side type-id sequences.
+    h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">`;
+    h += `  <div><div class="an-h" style="margin-top:0">ORIGINAL TARGET SENT</div><div class="an-tid-seq">${(c.original_type_ids || []).join(' ') || '—'}</div></div>`;
+    h += `  <div><div class="an-h" style="margin-top:0">LIVE TARGET SENT</div><div class="an-tid-seq">${tg.target_type_ids.join(' ') || '—'}</div></div>`;
+    h += `</div>`;
+  }
+
+  // timing
+  const t = r.timing;
+  h += `<div class="an-h">TIMING</div>`;
+  h += `<div class="an-kv">`;
+  h += `<div class="k">duration (original)</div><div class="v">${(t.original_duration_ms/1000).toFixed(3)} s</div>`;
+  h += `<div class="k">duration (captured)</div><div class="v">${(t.captured_duration_ms/1000).toFixed(3)} s</div>`;
+  if (t.speedup_factor > 0) {
+    const sp = t.speedup_factor;
+    const label = sp > 2 ? `${sp.toFixed(1)}× faster (fast mode)` : sp > 0.5 ? `~matched (original pacing)` : `${(1/sp).toFixed(1)}× slower`;
+    h += `<div class="k">speedup</div><div class="v">${esc(label)}</div>`;
+  }
+  h += `<div class="k">mean gap</div><div class="v">orig ${t.original_mean_gap_ms.toFixed(1)} ms · capt ${t.captured_mean_gap_ms.toFixed(2)} ms</div>`;
+  h += `<div class="k">p50 gap</div><div class="v">orig ${t.original_p50_gap_ms.toFixed(1)} ms · capt ${t.captured_p50_gap_ms.toFixed(2)} ms</div>`;
+  h += `<div class="k">p99 gap</div><div class="v">orig ${t.original_p99_gap_ms.toFixed(1)} ms · capt ${t.captured_p99_gap_ms.toFixed(2)} ms</div>`;
+  h += `</div>`;
+
+  if (r.notes && r.notes.length) {
+    h += `<div class="an-h">NOTES</div>`;
+    for (const n of r.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
+  }
+
+  h += `</div>`;
+  out.innerHTML = h;
+}
+
+// =========================================================================
+//  protocols + status
+// =========================================================================
+async function loadProtocols() {
+  const res = await api('/api/protocols');
+  const out = el('protocols-list');
+  if (!res.ok) { out.innerHTML = '<span class="muted">error</span>'; return; }
+  let h = '';
+  for (const p of res.data) {
+    const cls = p.status === 'ready' ? 'ready' : '';
+    h += `<div class="row"><span class="dot ${cls}"></span><span class="name">${esc(p.name)}</span><span class="ports">${esc(p.status)} &middot; ${p.ports.join(',') || '—'}</span></div>`;
+  }
+  out.innerHTML = h;
+}
+
+// =========================================================================
+//  live network diagram (echarts)
+// =========================================================================
+let diagramChart = null;
+let diagramWs = null;
+let diagramRunId = null;
+let diagramFullscreen = false;
+let diagramFs0Parent = null;  // where the canvas was before fullscreen
+let diagramTargetLabel = '';
+const DIAGRAM_REFRESH_MS = 250;
+
+// Speed buckets for the animated particle streams. Each bucket gets
+// its own ECharts `lines` series so we can vary the effect period
+// (= particle traversal time) per bucket — ECharts doesn't support
+// per-data-item effect overrides.
+//
+// minPps is inclusive. Pps below the lowest bucket → static line.
+// `period` is seconds per particle traversal. Lower = faster.
+const SPEED_BUCKETS = [
+  { minPps: 1,    period: 4.0, symbolSize: 4 },
+  { minPps: 10,   period: 2.0, symbolSize: 5 },
+  { minPps: 100,  period: 1.0, symbolSize: 6 },
+  { minPps: 1000, period: 0.4, symbolSize: 7 },
+];
+// Hard cap on simultaneously animated streams across both directions.
+// Beyond this, sessions still appear as nodes + static lines but
+// don't animate, so the browser doesn't get hammered when there are
+// hundreds of high-pps sessions.
+const MAX_ANIMATED_STREAMS = 200;
+
+function pickSpeedBucket(pps) {
+  if (pps <= 0) return -1;
+  for (let i = SPEED_BUCKETS.length - 1; i >= 0; i--) {
+    if (pps >= SPEED_BUCKETS[i].minPps) return i;
+  }
+  return -1;
+}
+
+function ensureDiagramChart() {
+  if (typeof echarts === 'undefined') return null;
+  const node = document.getElementById('diagram-canvas');
+  if (!node) return null;
+  if (diagramChart && diagramChart.getDom() === node) return diagramChart;
+  if (diagramChart) {
+    diagramChart.dispose();
+  }
+  diagramChart = echarts.init(node, null, { renderer: 'canvas' });
+
+  // Build the series list dynamically:
+  //   - 1 static-spoke line series
+  //   - 1 series per speed bucket × 2 directions (8 total)
+  //   - 1 graph series for the nodes
+  const series = [];
+  // Static spokes (back layer).
+  series.push({
+    type: 'lines',
+    coordinateSystem: 'cartesian2d',
+    polyline: false,
+    zlevel: 1,
+    lineStyle: { color: '#c9c9c4', width: 1, opacity: 0.5 },
+    data: [],
+  });
+  // Up + down series per bucket.
+  // We can't rely on `lineStyle.curveness` to separate the two
+  // directions because ECharts effect particles travel the chord
+  // (not the curved line), so curving the line still leaves the
+  // particles on the same path. Instead `renderDiagramFrame` shifts
+  // the up- and down-line ENDPOINTS perpendicularly by a few pixels
+  // before pushing them in here, so they're truly parallel offset
+  // straight lines that never overlap.
+  for (const dir of ['up', 'down']) {
+    const color = dir === 'up' ? '#c15a2b' : '#1f4a78';
+    for (let bi = 0; bi < SPEED_BUCKETS.length; bi++) {
+      const b = SPEED_BUCKETS[bi];
+      series.push({
+        type: 'lines',
+        coordinateSystem: 'cartesian2d',
+        polyline: false,
+        zlevel: 2 + bi,
+        effect: {
+          show: true,
+          period: b.period,
+          trailLength: 0.35,
+          color,
+          symbolSize: b.symbolSize,
+        },
+        // Faint visible track so the user sees the geometry the
+        // particles follow even between bursts.
+        lineStyle: { color, opacity: 0.22, width: 1 },
+        data: [],
+      });
+    }
+  }
+  // Nodes on top.
+  series.push({
+    type: 'graph',
+    coordinateSystem: 'cartesian2d',
+    zlevel: 10,
+    symbolSize: 16,
+    roam: false,
+    label: { show: false },
+    edgeSymbol: ['none', 'none'],
+    lineStyle: { width: 0, opacity: 0 },
+    emphasis: { focus: 'self' },
+    data: [],
+    links: [],
+  });
+
+  diagramChart.setOption({
+    backgroundColor: 'transparent',
+    // Kill the per-update transition. The particle effect stays
+    // animated (it's driven by the lines.effect series, not by the
+    // setOption transition), but data swaps don't fade-in.
+    animation: false,
+    animationDurationUpdate: 0,
+    grid: { left: 0, right: 0, top: 0, bottom: 0, containLabel: false },
+    xAxis: {
+      type: 'value', show: false, min: 0, max: 1000,
+      axisLine: { show: false }, splitLine: { show: false },
+    },
+    yAxis: {
+      type: 'value', show: false, min: 0, max: 540, inverse: true,
+      axisLine: { show: false }, splitLine: { show: false },
+    },
+    series,
+  });
+  return diagramChart;
+}
+
+// Index helpers: 0=static, 1..1+B=up buckets, 1+B..1+2B=down buckets,
+// 1+2B=nodes.
+function bucketSeriesIndex(direction, bucketIdx) {
+  const B = SPEED_BUCKETS.length;
+  if (direction === 'up') return 1 + bucketIdx;
+  return 1 + B + bucketIdx;
+}
+function nodesSeriesIndex() {
+  return 1 + 2 * SPEED_BUCKETS.length;
+}
+function staticSeriesIndex() {
+  return 0;
+}
+
+/// Hub-and-spoke layout: target at the centre, RTUs distributed on
+/// concentric rings around it. Up to ~60 nodes per ring.
+/// Returns coordinates in the chart's logical 1000×540 space.
+function diagramLayout(perSession) {
+  const W = 1000;
+  const H = 540;
+  const cx = W / 2;
+  const cy = H / 2;
+  const nodes = [{
+    id: 'target',
+    isTarget: true,
+    x: cx, y: cy,
+    name: diagramTargetLabel || 'target',
+  }];
+  const n = perSession.length;
+  if (n === 0) return { nodes, cx, cy, W, H };
+  const baseR = 170;
+  const ringSize = 60;
+  for (let i = 0; i < n; i++) {
+    const ring = Math.floor(i / ringSize);
+    const inRing = Math.min(ringSize, n - ring * ringSize);
+    const idxInRing = i - ring * ringSize;
+    const ringR = baseR + ring * 50;
+    const angle = (idxInRing / inRing) * Math.PI * 2 - Math.PI / 2;
+    const x = cx + Math.cos(angle) * ringR;
+    const y = cy + Math.sin(angle) * ringR;
+    const ps = perSession[i];
+    nodes.push({
+      id: 's' + i,
+      x, y,
+      name: ps.src_ip || ('rtu ' + i),
+      state: ps.state,
+      sent: ps.sent,
+      received: ps.received,
+    });
+  }
+  return { nodes, cx, cy, W, H };
+}
+
+function nodeStyleForState(state, isTarget) {
+  if (isTarget) {
+    return { color: '#0e0e0c', borderColor: '#c15a2b', borderWidth: 3 };
+  }
+  switch (state) {
+    case 'active':
+    case 'connected':
+      return { color: '#c15a2b', borderColor: '#0e0e0c', borderWidth: 1 };
+    case 'listening':
+      return { color: '#1f4a78', borderColor: '#0e0e0c', borderWidth: 1 };
+    case 'completed':
+      return { color: '#5a7a3f', borderColor: '#0e0e0c', borderWidth: 1 };
+    case 'failed':
+      return { color: '#922626', borderColor: '#0e0e0c', borderWidth: 1 };
+    case 'pending':
+    default:
+      return { color: '#cfcfca', borderColor: '#6a6a65', borderWidth: 1 };
+  }
+}
+
+// Per-session activity state. The fix is twofold:
+//   1. Long grace window (30 s). The captured iec104.pcap has multi-
+//      second gaps in the master→slave direction; without a long
+//      grace the diagram would silence those quiet stretches even
+//      though the session is still alive.
+//   2. Sticky bucket (BUCKET_STICKY_MS = 1500 ms). Once a direction
+//      lands in a bucket, it stays there for at least 1.5 s before
+//      switching. This stops the line from flickering between
+//      different `lines` series as instant pps oscillates above and
+//      below bucket thresholds tick-to-tick.
+//   3. Floor: while a session is in `active`/`connected` state we
+//      treat the effective rate as MIN 1 pps (slowest bucket) so the
+//      line is drawn continuously even between bursts.
+const SESSION_GRACE_MS = 30000;
+const BUCKET_STICKY_MS = 1500;
+const sessionGrace = new Map(); // key: session_idx → state object
+
+function ensureGraceEntry(idx) {
+  let entry = sessionGrace.get(idx);
+  if (!entry) {
+    entry = {
+      lastUpAt: 0, lastUpPps: 0,
+      lastDownAt: 0, lastDownPps: 0,
+      upBucket: -1, upBucketAt: 0,
+      downBucket: -1, downBucketAt: 0,
+    };
+    sessionGrace.set(idx, entry);
+  }
+  return entry;
+}
+
+function gracePps(idx, dir, currentPps) {
+  const now = performance.now();
+  const entry = ensureGraceEntry(idx);
+  if (currentPps > 0) {
+    if (dir === 'up') { entry.lastUpAt = now; entry.lastUpPps = currentPps; }
+    else              { entry.lastDownAt = now; entry.lastDownPps = currentPps; }
+    return currentPps;
+  }
+  const lastAt  = dir === 'up' ? entry.lastUpAt  : entry.lastDownAt;
+  const lastPps = dir === 'up' ? entry.lastUpPps : entry.lastDownPps;
+  if (lastAt > 0 && now - lastAt < SESSION_GRACE_MS) {
+    return lastPps;
+  }
+  return 0;
+}
+
+/// Sticky-bucket selector. Picks `pickSpeedBucket(pps)` but won't
+/// change the previous choice within BUCKET_STICKY_MS. This stops
+/// the line from migrating between series on every tick when the
+/// instantaneous pps oscillates around a bucket threshold.
+function stickyBucket(idx, dir, pps) {
+  const now = performance.now();
+  const entry = ensureGraceEntry(idx);
+  const desired = pickSpeedBucket(pps);
+  const lastBucket = dir === 'up' ? entry.upBucket : entry.downBucket;
+  const lastAt     = dir === 'up' ? entry.upBucketAt : entry.downBucketAt;
+  // Allow an immediate move if there was no previous bucket, or if
+  // the sticky window has elapsed, or if we're moving to "off"
+  // (-1 → drop the line, no animation churn to worry about).
+  if (lastBucket < 0 || desired < 0 || now - lastAt >= BUCKET_STICKY_MS) {
+    if (dir === 'up') { entry.upBucket = desired;   entry.upBucketAt = now; }
+    else              { entry.downBucket = desired; entry.downBucketAt = now; }
+    return desired;
+  }
+  return lastBucket;
+}
+
+function clearSessionGrace(idx) {
+  sessionGrace.delete(idx);
+}
+
+function renderDiagramFrame(frame) {
+  const chart = ensureDiagramChart();
+  if (!chart) return;
+  diagramTargetLabel = frame.target || diagramTargetLabel;
+  const sessions = frame.per_session || [];
+  const layout = diagramLayout(sessions);
+
+  // Reset grace state for any session that has reached a terminal
+  // state — we don't want the diagram to keep animating ghost flows
+  // for a completed/failed session.
+  for (let i = 0; i < sessions.length; i++) {
+    const s = sessions[i].state;
+    if (s === 'completed' || s === 'failed' || s === 'pending') {
+      clearSessionGrace(i);
+    }
+  }
+
+  const sessionCount = layout.nodes.length - 1;
+  const nodeBaseSize = sessionCount <= 4 ? 28 : sessionCount <= 30 ? 18 : 12;
+
+  // ---------- nodes ----------
+  const nodeData = layout.nodes.map(n => {
+    const style = nodeStyleForState(n.state, !!n.isTarget);
+    const isTarget = !!n.isTarget;
+    return {
+      id: n.id,
+      name: n.name,
+      value: [n.x, n.y],
+      symbolSize: isTarget ? 38 : nodeBaseSize,
+      itemStyle: {
+        color: style.color,
+        borderColor: style.borderColor,
+        borderWidth: style.borderWidth,
+      },
+      label: {
+        show: true,
+        position: isTarget ? 'inside' : 'right',
+        color: isTarget ? '#faf7f1' : '#0e0e0c',
+        fontFamily: 'ui-monospace, monospace',
+        fontSize: isTarget ? 12 : 10,
+        fontWeight: isTarget ? 600 : 500,
+        formatter: isTarget ? 'TARGET' : '{b}',
+      },
+    };
+  });
+
+  // ---------- static spokes ----------
+  const targetCoord = [layout.cx, layout.cy];
+  const staticLines = [];
+  for (const n of layout.nodes) {
+    if (n.isTarget) continue;
+    staticLines.push({ coords: [[n.x, n.y], targetCoord] });
+  }
+
+  // ---------- animated streams (per-session pps → bucket) ----------
+  // Build empty bucket arrays.
+  const upBuckets = SPEED_BUCKETS.map(() => []);
+  const downBuckets = SPEED_BUCKETS.map(() => []);
+
+  // Helper: compute two parallel sets of endpoints for a node↔target
+  // line, offset perpendicular to the chord so up- and downlinks have
+  // visually distinct tracks the particles can travel without
+  // colliding.
+  const PERP_OFFSET = 12; // logical units in the 1000×540 grid
+  function parallelEndpoints(node) {
+    const dx = targetCoord[0] - node.x;
+    const dy = targetCoord[1] - node.y;
+    const len = Math.max(1, Math.hypot(dx, dy));
+    // Perpendicular unit vector.
+    const px = -dy / len * PERP_OFFSET;
+    const py =  dx / len * PERP_OFFSET;
+    return {
+      up:   [[node.x + px, node.y + py], [targetCoord[0] + px, targetCoord[1] + py]],
+      down: [[targetCoord[0] - px, targetCoord[1] - py], [node.x - px, node.y - py]],
+    };
+  }
+
+  // Sort sessions by combined pps descending so the busiest get
+  // animated first when we hit the cap.
+  const ranked = [];
+  for (let i = 0; i < sessions.length; i++) {
+    const ps = sessions[i];
+    const node = layout.nodes[i + 1]; // +1 because target is index 0
+    if (!node) continue;
+    const totalPps = (ps.pps_sent || 0) + (ps.pps_recv || 0);
+    ranked.push({ idx: i, ps, node, totalPps });
+  }
+  ranked.sort((a, b) => b.totalPps - a.totalPps);
+
+  let animatedCount = 0;
+  let truncatedSessions = 0;
+  for (const r of ranked) {
+    const ps = r.ps;
+    const node = r.node;
+    const isAlive = ps.state === 'active' || ps.state === 'connected';
+    // Effective pps. Grace keeps the last-seen rate alive for 30 s
+    // after activity stops. While the session is still in
+    // active/connected state we apply a floor of 1 pps so the line
+    // never blanks even during multi-second pcap gaps.
+    let upPps = gracePps(r.idx, 'up', ps.pps_sent || 0);
+    let downPps = gracePps(r.idx, 'down', ps.pps_recv || 0);
+    if (isAlive) {
+      if (upPps === 0) upPps = 1;
+      if (downPps === 0) downPps = 1;
+    }
+    // Sticky bucket: once a direction lands in a bucket it stays
+    // there for at least 1.5 s, which kills the every-tick flicker
+    // from instant pps bouncing across thresholds.
+    const upB = stickyBucket(r.idx, 'up', upPps);
+    const downB = stickyBucket(r.idx, 'down', downPps);
+
+    const need = (upB >= 0 ? 1 : 0) + (downB >= 0 ? 1 : 0);
+    if (need === 0) continue;
+    if (animatedCount + need > MAX_ANIMATED_STREAMS) {
+      truncatedSessions++;
+      continue;
+    }
+    const ep = parallelEndpoints(node);
+    if (upB >= 0) {
+      upBuckets[upB].push({ coords: ep.up });
+      animatedCount++;
+    }
+    if (downB >= 0) {
+      downBuckets[downB].push({ coords: ep.down });
+      animatedCount++;
+    }
+  }
+
+  // ---------- assemble setOption series payloads ----------
+  // We must include EVERY series in the same order as ensureDiagramChart
+  // built them, so ECharts maps payloads to the right slots.
+  const series = [];
+  series.push({ data: staticLines });
+  for (let bi = 0; bi < SPEED_BUCKETS.length; bi++) {
+    series.push({ data: upBuckets[bi] });
+  }
+  for (let bi = 0; bi < SPEED_BUCKETS.length; bi++) {
+    series.push({ data: downBuckets[bi] });
+  }
+  series.push({ data: nodeData, links: [] });
+
+  chart.setOption({ series });
+
+  // Stash the truncation count + animation total so renderDiagramStats
+  // can surface them in the meta panel.
+  diagramStatsExtras = {
+    animated: animatedCount,
+    truncated: truncatedSessions,
+    total_sessions: sessions.length,
+  };
+}
+
+let diagramStatsExtras = { animated: 0, truncated: 0, total_sessions: 0 };
+
+function diagramFmtCount(n) {
+  if (n == null) return '—';
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'G';
+  if (n >= 1e6) return (n / 1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return n.toString();
+}
+
+function renderDiagramStats(frame) {
+  const stats = el('diagram-stats');
+  if (!stats) return;
+  const activeCount = (frame.per_session || []).filter(p =>
+    p.state === 'active' || p.state === 'connected').length;
+  const totalSessions = (frame.per_session || []).length;
+  const truncated = diagramStatsExtras.truncated || 0;
+  const animated = diagramStatsExtras.animated || 0;
+  const truncMarkup = truncated > 0
+    ? ` <span class="muted" style="font-size:10px">${truncated} HIDDEN</span>`
+    : '';
+  const streamColor = truncated > 0 ? 'warn' : 'ok';
+  stats.innerHTML = `
+    <div class="stat"><span class="k">RUN</span><span class="v">#${frame.run_id}</span></div>
+    <div class="stat"><span class="k">MODE</span><span class="v">${esc(frame.role || frame.mode || 'raw')}</span></div>
+    <div class="stat"><span class="k">SENT</span><span class="v accent">${diagramFmtCount(frame.sent || 0)}</span></div>
+    <div class="stat"><span class="k">UPLINK pps</span><span class="v accent">${diagramFmtCount(frame.pps_sent || 0)}</span></div>
+    <div class="stat"><span class="k">DOWNLINK pps</span><span class="v blue">${diagramFmtCount(frame.pps_recv || 0)}</span></div>
+    <div class="stat"><span class="k">ACTIVE / STREAMS</span><span class="v ${streamColor}">${activeCount}/${totalSessions} &middot; ${animated}${truncMarkup}</span></div>
+  `;
+  // Progress bar
+  const planned = frame.planned || 0;
+  const sent = frame.sent || 0;
+  const pct = planned > 0 ? Math.min(100, Math.round((sent / planned) * 100)) : 0;
+  el('diagram-pfill').style.width = pct + '%';
+  el('diagram-plabel').textContent = `${pct}% · ${diagramFmtCount(sent)} / ${diagramFmtCount(planned)}`;
+  el('diagram-meta').textContent = frame.status ? `run #${frame.run_id} · ${frame.status}` : '—';
+}
+
+async function pickDiagramRun() {
+  // Subscribe the live diagram to the most recent running run, if any.
+  const res = await api('/api/runs');
+  if (!res.ok) return null;
+  const running = (res.data || []).find(r => r.status === 'running');
+  return running ? running.id : null;
+}
+
+async function maybeStartDiagram() {
+  const id = await pickDiagramRun();
+  if (id == null) {
+    if (diagramWs) {
+      try { diagramWs.close(); } catch {}
+      diagramWs = null;
+      diagramRunId = null;
+    }
+    el('diagram-section').style.display = 'none';
+    return;
+  }
+  if (id === diagramRunId && diagramWs && diagramWs.readyState === WebSocket.OPEN) return;
+  if (diagramWs) { try { diagramWs.close(); } catch {} }
+  diagramRunId = id;
+  el('diagram-section').style.display = '';
+  // Pull the run's target label for the center node.
+  try {
+    const r = await api(`/api/runs/${id}`);
+    if (r.ok) diagramTargetLabel = r.data.target_ip || 'target';
+  } catch {}
+
+  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(`${proto}//${location.host}/api/runs/${id}/live`);
+  diagramWs = ws;
+  // Kick refreshRuns immediately so mountDiagramInRunningRow runs
+  // before the first WS frame arrives, ensuring the canvas is
+  // already mounted in the running row.
+  refreshRuns();
+  ws.onmessage = evt => {
+    try {
+      const frame = JSON.parse(evt.data);
+      frame.target = diagramTargetLabel;
+      renderDiagramFrame(frame);
+      renderDiagramStats(frame);
+      // Update the diagram header so the user can see exactly which
+      // run the live traffic belongs to (matches the connector arrow
+      // pointing at the run row below).
+      const head = document.querySelector('#diagram-section .diagram-head h3');
+      if (head) head.textContent = `LIVE TRAFFIC · RUN #${frame.run_id}`;
+      if (frame.status && frame.status !== 'running') {
+        // Final tick — keep the diagram visible for a moment then hide.
+        setTimeout(() => {
+          if (diagramRunId === frame.run_id) {
+            el('diagram-section').style.display = 'none';
+            diagramRunId = null;
+            try { ws.close(); } catch {}
+          }
+        }, 4000);
+      }
+    } catch {}
+  };
+  ws.onclose = () => {
+    if (diagramWs === ws) diagramWs = null;
+  };
+  ws.onerror = () => {
+    if (diagramWs === ws) diagramWs = null;
+  };
+}
+
+function toggleDiagramFullscreen() {
+  const overlay = el('diagram-overlay');
+  const card = el('diagram-card');
+  const mount = el('diagram-overlay-mount');
+
+  // Dispose the chart BEFORE moving the canvas. ECharts has an
+  // internal requestAnimationFrame loop driving the effect particles
+  // and it crashes if the canvas has 0×0 dims at any point during
+  // the move. Tearing the chart down stops that loop; the next WS
+  // frame re-initialises it on the now-correctly-sized canvas.
+  if (diagramChart) {
+    try { diagramChart.dispose(); } catch {}
+    diagramChart = null;
+  }
+
+  if (!diagramFullscreen) {
+    diagramFs0Parent = card.parentNode;
+    mount.appendChild(card);
+    overlay.style.display = '';
+    diagramFullscreen = true;
+  } else {
+    diagramFs0Parent.appendChild(card);
+    overlay.style.display = 'none';
+    diagramFullscreen = false;
+  }
+
+  // The next renderDiagramFrame from the WS tick will call
+  // ensureDiagramChart which inits a fresh ECharts instance on the
+  // now-correctly-sized canvas. No manual resize needed.
+}
+
+window.addEventListener('resize', () => {
+  if (!diagramChart) return;
+  const dom = diagramChart.getDom();
+  if (!dom || dom.clientWidth <= 0 || dom.clientHeight <= 0) return;
+  diagramChart.resize();
+});
+
+// Periodically check whether a run is running and auto-start the
+// diagram subscription. Polls /api/runs every 2s while the diagram is
+// idle, drops out once a WS is connected.
+setInterval(() => { maybeStartDiagram(); }, 2000);
+
+async function loadNics() {
+  const res = await api('/api/nics');
+  if (!res.ok) return;
+  const nics = res.data.filter(n => !n.loopback && !n.bridge);
+  const fillSelect = (id, placeholder) => {
+    const sel = el(id);
+    if (!sel) return;
+    const current = sel.value;
+    sel.innerHTML = `<option value="">${placeholder}</option>`;
+    for (const n of nics) {
+      const ip = n.ipv4.length ? ` · ${n.ipv4.join(',')}` : '';
+      const status = n.up ? '' : ' · DOWN';
+      const opt = document.createElement('option');
+      opt.value = n.name;
+      opt.textContent = `${n.name}${ip}${status}`;
+      sel.appendChild(opt);
+    }
+    if (current) sel.value = current;
+  };
+  fillSelect('run-nic',          '(none — bridge stays isolated)');
+  fillSelect('run-scada-gw-iface', '(select nic)');
+  fillSelect('run-scada-upstream', '(none — scada has no upstream)');
+}
+
+function toggleScadaGwControls() {
+  const on = el('run-scada-gw-enable').checked;
+  el('run-scada-gw-ip-field').style.display    = on ? '' : 'none';
+  el('run-scada-gw-iface-field').style.display = on ? '' : 'none';
+  el('run-scada-upstream-field').style.display = on ? '' : 'none';
+}
+
+async function arpProbe() {
+  const ip = el('run-target-ip').value.trim();
+  const iface = el('run-nic').value;
+  const status = el('arp-status');
+  if (!ip) {
+    status.innerHTML = '<span style="color:var(--err)">enter target ip first</span>';
+    return;
+  }
+  status.innerHTML = 'probing…';
+  status.style.color = 'var(--dim)';
+  const res = await api('/api/arp', 'POST', { ip, iface: iface || null });
+  if (!res.ok) {
+    status.innerHTML = `<span style="color:var(--err)">${esc(res.data.error || res.data)}</span>`;
+    return;
+  }
+  const d = res.data;
+  if (d.error) {
+    status.innerHTML = `<span style="color:var(--err)">${esc(d.error)}</span>`;
+    return;
+  }
+  if (d.mac) {
+    el('run-target-mac').value = d.mac;
+    status.innerHTML = `<span style="color:var(--ok)">resolved on ${esc(d.iface)}</span>`;
+  } else {
+    status.innerHTML = `<span style="color:var(--err)">no reply</span>`;
+  }
+}
+
+async function loadStatus() {
+  const res = await api('/api/status');
+  if (res.ok) {
+    const v = 'v' + res.data.version;
+    el('version').textContent = v;
+    const foot = el('foot-version');
+    if (foot) foot.textContent = v;
+  }
+  el('host-label').textContent = location.host;
+}
+
+// =========================================================================
+//  polling
+// =========================================================================
+let pollTimer = null;
+function schedulePoll() {
+  if (pollTimer) clearTimeout(pollTimer);
+  const anyRunning = document.querySelectorAll('.run.running').length > 0;
+  const delay = anyRunning ? 800 : 3000;
+  pollTimer = setTimeout(async () => {
+    await refreshRuns();
+    schedulePoll();
+  }, delay);
+}
+
+loadStatus();
+loadProtocols();
+loadNics();
+refreshLibrary();
+refreshRuns().then(schedulePoll);
+</script>
+</body>
+</html>

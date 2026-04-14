@@ -1,0 +1,28 @@
+[package]
+name = "webui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+tracing = { workspace = true }
+rusqlite = { version = "0.32", features = ["bundled"] }
+tokio = { workspace = true }
+axum = { workspace = true, features = ["ws"] }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+pcapload = { path = "../pcapload" }
+sched = { path = "../sched" }
+netctl = { path = "../netctl" }
+protoplay = { path = "../protoplay" }
+proto_iec104 = { path = "../proto_iec104" }
+proto_modbus_tcp = { path = "../proto_modbus_tcp" }
+proto_dnp3_tcp = { path = "../proto_dnp3_tcp" }
+proto_iec61850_mms = { path = "../proto_iec61850_mms" }
+proto_iec60870_6_iccp = { path = "../proto_iec60870_6_iccp" }
