@@ -14,7 +14,10 @@ use sched::{run as run_sched, RunConfig, RunContext};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "outstation", about = "Multi-source pcap replayer")]
+#[command(
+    name = "outstation",
+    about = "Stateful SCADA traffic simulator and multi-source pcap replayer"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

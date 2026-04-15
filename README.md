@@ -4,7 +4,7 @@
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
 [![Linux](https://img.shields.io/badge/platform-linux-informational.svg)](#requirements)
 
-A multi-source pcap replayer for Linux that turns captured network traces into real traffic on the wire. Built for benchmarking and regression-testing SCADA systems with real captured RTU traffic.
+A stateful SCADA traffic simulator for Linux that replays captured IEC 60870-5-104 traces as live TCP sessions on the wire — one session per captured RTU — with per-message latency metrics and post-run fidelity verification. Built for benchmarking and regression-testing SCADA systems with real captured RTU traffic.
 
 Driven entirely from a browser UI — upload a pcap, configure a run, press start, watch live progress and latency charts. No CLI workflow, no scripting. The browser owns the full loop.
 

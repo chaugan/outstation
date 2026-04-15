@@ -91,9 +91,9 @@ Then the following happens automatically:
 1. SCADA tries to send a TCP SYN-ACK to `192.168.10.42`.
 2. Its routing table says: "off-subnet, send via default gateway `10.0.0.1`."
 3. SCADA issues an ARP: *"who has `10.0.0.1`?"*.
-4. On an isolated switch, outstation is the only thing that hears the ARP. Pcapreplay has `10.0.0.1` installed as a local /32 alias on its inner NIC and replies: *"I do."*
+4. On an isolated switch, outstation is the only thing that hears the ARP. Outstation has `10.0.0.1` installed as a local /32 alias on its inner NIC and replies: *"I do."*
 5. SCADA sends the SYN-ACK to outstation's MAC.
-6. Pcapreplay's kernel accepts the frame, and because `192.168.10.42` is also a local alias, the kernel routes the packet up to user space where the benchmark session bound to `192.168.10.42:0` is waiting. The handshake completes.
+6. Outstation's kernel accepts the frame, and because `192.168.10.42` is also a local alias, the kernel routes the packet up to user space where the benchmark session bound to `192.168.10.42:0` is waiting. The handshake completes.
 
 SCADA **has not been reconfigured**. It still thinks it's talking to its default gateway. The whitelist still matches because we never touched the source IP. Everything inside the guest is identical to production — *except* that the physical layer has been shifted to an isolated virtual switch.
 

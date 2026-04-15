@@ -1,4 +1,4 @@
-//! In-place L2/L3/L4 header rewrite for pcap replay.
+//! In-place L2/L3/L4 header rewrite for outstation's raw replay mode.
 //!
 //! Given an Ethernet frame carrying IPv4, overwrite the destination MAC
 //! and destination IP and recompute every affected checksum so the packet

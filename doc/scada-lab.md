@@ -91,9 +91,9 @@ Da skjer følgende, helt automatisk:
 1. SCADA prøver å sende en TCP SYN-ACK til `192.168.10.42`.
 2. Rutetabellen sier: "off-subnet, send til default gateway `10.0.0.1`".
 3. SCADA gjør en ARP: *"Hvem har `10.0.0.1`?"*.
-4. På en isolert switch er outstation den eneste som hører ARP-spørsmålet. Pcapreplay har fått `10.0.0.1` lagt til som et lokalt /32-alias på sitt indre nettgrensesnitt, og svarer: *"Det er meg."*
+4. På en isolert switch er outstation den eneste som hører ARP-spørsmålet. Outstation har fått `10.0.0.1` lagt til som et lokalt /32-alias på sitt indre nettgrensesnitt, og svarer: *"Det er meg."*
 5. SCADA sender SYN-ACK-en til outstation sin MAC-adresse.
-6. Pcapreplay tar imot pakken på kjernenivå, og fordi `192.168.10.42` også er et lokalt alias, ruter kjernen pakken opp til brukerrommet, der benchmark-sesjonen bundet til `192.168.10.42:0` venter på den. Handshaken fullføres.
+6. Outstation tar imot pakken på kjernenivå, og fordi `192.168.10.42` også er et lokalt alias, ruter kjernen pakken opp til brukerrommet, der benchmark-sesjonen bundet til `192.168.10.42:0` venter på den. Handshaken fullføres.
 
 SCADA har **ikke blitt konfigurert om**. Den tror fortsatt den snakker med sin default gateway. Whitelisten stemmer fortsatt fordi vi ikke har rørt kilde-IP-en. Alt er som i produksjon — *bortsett fra* at det fysiske laget har blitt skjøvet til en isolert virtuell switch.
 
@@ -330,7 +330,7 @@ Du glemte å huke på "upstream NAT NIC". SCADA-en står isolert med kun outstat
 
 Benchmark-modus har et valgfritt warmup-intervall (standard 0 sekunder). Hvis du har satt en høy verdi, er det forventet at sesjonene ikke begynner å sende før warmup er ferdig. Warmup-tiden brukes for å la deg attache Wireshark / tcpdump på `eth0` før trafikken starter.
 
-### Pcapreplay krasjer og lar aliasene stå igjen
+### Outstation krasjer og lar aliasene stå igjen
 
 Start outstation på nytt: `sudo systemctl restart outstation` (eller manuell start av binæren). Den rydder opp automatisk ved oppstart og logger `reclaimed N orphaned ip alias(es)`.
 
