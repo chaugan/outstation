@@ -607,7 +607,7 @@ fn wait_for_u(rx: &Receiver<Apdu>, code: u8, timeout: Duration) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Slave-mode session: pcapreplay impersonates the captured server.
+// Slave-mode session: outstation impersonates the captured server.
 //
 // Flow:
 //   1. Bind a TcpListener on 0.0.0.0:cfg.listen_port.

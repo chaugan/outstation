@@ -40,5 +40,5 @@ curl -s -D - -o /tmp/downloaded.pcap "http://127.0.0.1:8080/api/runs/$ID/downloa
 echo "downloaded size: $(stat -c %s /tmp/downloaded.pcap) bytes"
 echo
 echo "=== inspect downloaded pcap ==="
-cd ~/projects/pcapreplay
+cd ~/projects/outstation
 ./target/release/pcapinspect /tmp/downloaded.pcap 2>/dev/null || ./target/debug/pcapinspect /tmp/downloaded.pcap

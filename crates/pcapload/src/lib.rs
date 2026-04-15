@@ -752,7 +752,7 @@ impl LoadedPcap {
 
     /// Mirror of [`LoadedPcap::reassemble_client_payload`] that extracts
     /// the **server-originated** byte stream of a TCP flow. Used by
-    /// slave-mode benchmark replay: pcapreplay accepts the master's
+    /// slave-mode benchmark replay: outstation accepts the master's
     /// connection and plays these bytes back as the server side.
     pub fn reassemble_server_payload(&self, flow_idx: usize) -> anyhow::Result<ReassembledFlow> {
         use anyhow::{anyhow, bail};

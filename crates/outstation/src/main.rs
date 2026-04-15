@@ -1,6 +1,6 @@
-//! Top-level `pcapreplay` binary — the user-facing CLI. For now it
+//! Top-level `outstation` binary — the user-facing CLI. For now it
 //! exposes only the synchronous `run` path; the web UI will eventually
-//! live beside it as `pcapreplay serve`.
+//! live beside it as `outstation serve`.
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use sched::{run as run_sched, RunConfig, RunContext};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "pcapreplay", about = "Multi-source pcap replayer")]
+#[command(name = "outstation", about = "Multi-source pcap replayer")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

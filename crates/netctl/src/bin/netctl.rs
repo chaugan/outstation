@@ -4,7 +4,7 @@ use netctl::{delete_iface, iface_exists, list_with_prefix, parse_mac, set_mac, T
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "netctl", about = "pcapreplay bridge/TAP management")]
+#[command(name = "netctl", about = "outstation bridge/TAP management")]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,

@@ -607,8 +607,8 @@ pub struct BenchmarkConfig {
     /// Free-form JSON/YAML passed through to the ProtoReplayer.
     pub proto_config: Option<String>,
     /// Which side of the captured conversation the tool plays.
-    /// `Master` (default) = pcapreplay connects out as the client of
-    /// `target_ip:target_port`. `Slave` = pcapreplay binds a listener
+    /// `Master` (default) = outstation connects out as the client of
+    /// `target_ip:target_port`. `Slave` = outstation binds a listener
     /// per captured RTU and waits for the target master to connect in.
     /// Each listener binds to its RTU's own IP (auto-aliased onto the
     /// default-route interface) at `listen_port_base`, so 200 RTUs show
@@ -638,7 +638,7 @@ pub struct BenchmarkConfig {
     pub scada_gateway_iface: Option<String>,
     pub upstream_nat_iface: Option<String>,
     /// Path to the alias state file for crash-safe alias reclamation.
-    /// If unset, defaults to `/var/lib/pcapreplay/state-aliases.txt`.
+    /// If unset, defaults to `/var/lib/outstation/state-aliases.txt`.
     pub alias_state_path: Option<PathBuf>,
 }
 
@@ -821,7 +821,7 @@ pub fn run_benchmark(
         let state_path = cfg
             .alias_state_path
             .clone()
-            .unwrap_or_else(|| PathBuf::from("/var/lib/pcapreplay/state-aliases.txt"));
+            .unwrap_or_else(|| PathBuf::from("/var/lib/outstation/state-aliases.txt"));
         Some(netctl::GatewayGuard::install(
             inner,
             gw_ip,
@@ -1228,7 +1228,7 @@ pub fn run_benchmark(
     Ok(report)
 }
 
-/// Slave-mode benchmark: pcapreplay binds a TcpListener per captured
+/// Slave-mode benchmark: outstation binds a TcpListener per captured
 /// RTU on an incrementing port starting at `cfg.listen_port_base` and
 /// waits for the live target master to connect to each. No veth
 /// topology — sessions live in the host's own network namespace.
@@ -1343,7 +1343,7 @@ fn run_benchmark_slave(
         let state_path = cfg
             .alias_state_path
             .clone()
-            .unwrap_or_else(|| PathBuf::from("/var/lib/pcapreplay/state-aliases.txt"));
+            .unwrap_or_else(|| PathBuf::from("/var/lib/outstation/state-aliases.txt"));
         Some(netctl::GatewayGuard::install(
             inner,
             gw_ip,
@@ -1471,7 +1471,7 @@ fn run_benchmark_slave(
                 // file so a server crash mid-run doesn't leak the
                 // alias forever (startup reclaim picks it up).
                 let mut added_alias: Option<(String, Ipv4Addr, u8)> = None;
-                let alias_state = std::path::PathBuf::from("/var/lib/pcapreplay/state-aliases.txt");
+                let alias_state = std::path::PathBuf::from("/var/lib/outstation/state-aliases.txt");
                 if !listen_ip.is_unspecified() {
                     let already_local = netctl::list_local_ipv4()
                         .ok()

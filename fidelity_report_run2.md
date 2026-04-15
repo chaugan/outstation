@@ -1,14 +1,14 @@
-# pcapreplay — playback fidelity report
+# outstation — playback fidelity report
 
 **Run ID:** 2
 **Pcap under test:** `synth_iec104_rtus200_lan10.pcap` (SHA-256 `61c897f8…96938d`, 200 synthetic RTUs)
 **RTU analysed:** `192.168.10.2:2404` (single flow out of 200, selected by the master during the captured session)
-**Mode:** benchmark · slave (pcapreplay listens; external IEC 60870-5-104 master connects in)
+**Mode:** benchmark · slave (outstation listens; external IEC 60870-5-104 master connects in)
 **Live master:** RedisAnt `iec104client`, running on a separate laptop at `192.168.86.223`, reaching the VM over wifi/LAN via OPNsense
 **Duration:** 175.5 seconds of replayed IEC 60870-5-104 telemetry
 **Score:** **100 %** — verdict `good_delivery`
 
-This report is based entirely on `analysis_run2_generic_1.json`, produced by pcapreplay's post-run analyser comparing the source pcap against the pcap captured from the real wire during the run.
+This report is based entirely on `analysis_run2_generic_1.json`, produced by outstation's post-run analyser comparing the source pcap against the pcap captured from the real wire during the run.
 
 ---
 
@@ -39,7 +39,7 @@ For an IDS or a protocol analyser watching the wire, the replayed stream is **in
 | Interrogation commands from master | 2 × I-frames, types `C_IC_NA_1` (100, station interrogation) + `C_CI_NA_1` (101, counter interrogation) |
 | Session close | clean `FIN / RST` after STOPDT |
 
-pcapreplay's slave-side state machine correctly:
+outstation's slave-side state machine correctly:
 
 - bound `192.168.10.2:2404` by auto-aliasing the RTU IP onto the VM's NIC,
 - accepted the master's incoming TCP connection,
@@ -73,7 +73,7 @@ This is the part that distinguishes a "realistic simulator" from a "packet blast
 - **p99 delta: 0.36 ms.** Even the longest inter-frame gaps — the ones that define whether the master starts sending TESTFR probes — are reproduced to sub-millisecond accuracy.
 - **p50 delta: +18 ms.** The median gap drifted ~18 ms longer in replay. That's because the slave-side send loop uses a coarser sleep clock than the pcap's sub-millisecond capture timestamps. At the median of ~737 ms this is a 2.5 % relative shift — invisible to a human and invisible to the protocol.
 
-In other words: pcapreplay does **not** replay at maximum speed and then call it done. It reproduces the original temporal shape of the telemetry feed — including the natural variation where one RTU goes quiet for 6 seconds and then bursts out 4 frames in 20 ms — so that the behaviour on the wire matches what the original capture would have looked like at the master side.
+In other words: outstation does **not** replay at maximum speed and then call it done. It reproduces the original temporal shape of the telemetry feed — including the natural variation where one RTU goes quiet for 6 seconds and then bursts out 4 frames in 20 ms — so that the behaviour on the wire matches what the original capture would have looked like at the master side.
 
 ---
 
@@ -86,7 +86,7 @@ The analysis above is for **one RTU out of 200** that ran concurrently in the sa
 - all started simultaneously via the UI's `START ALL` button,
 - paced independently against their own slice of the source pcap.
 
-The master on the laptop drove its 200-target discovery loop into this listener farm, and the per-RTU fidelity numbers above are representative of the result — the fix for per-flow pairing in the analyser (pcapreplay `crates/webui/src/analysis.rs:330`) ensures that each RTU is compared against its own source pcap flow, so per-RTU scores are independent.
+The master on the laptop drove its 200-target discovery loop into this listener farm, and the per-RTU fidelity numbers above are representative of the result — the fix for per-flow pairing in the analyser (outstation `crates/webui/src/analysis.rs:330`) ensures that each RTU is compared against its own source pcap flow, so per-RTU scores are independent.
 
 ---
 
@@ -102,8 +102,8 @@ The master on the laptop drove its 200-target discovery loop into this listener 
 | **Mean-gap drift** | 0.01 % |
 | **Verdict** | `good_delivery` · **score 100 %** |
 
-pcapreplay in slave mode reproduces the captured IEC 60870-5-104 traffic with byte-level accuracy at the data-frame layer, full protocol correctness at the IEC 101/104 layer, and sub-millisecond temporal accuracy at the wire layer. A live SCADA master interacting with the replayed RTUs sees a feed it cannot distinguish from the original environment.
+outstation in slave mode reproduces the captured IEC 60870-5-104 traffic with byte-level accuracy at the data-frame layer, full protocol correctness at the IEC 101/104 layer, and sub-millisecond temporal accuracy at the wire layer. A live SCADA master interacting with the replayed RTUs sees a feed it cannot distinguish from the original environment.
 
 ---
 
-*Generated from `analysis_run2_generic_1.json` (run 2, slave mode, generic analysis). Source pcap and captured pcap both reside under `/var/lib/pcapreplay/library/` and `/tmp/pcapreplay-captures/` respectively on the pcapreplay VM.*
+*Generated from `analysis_run2_generic_1.json` (run 2, slave mode, generic analysis). Source pcap and captured pcap both reside under `/var/lib/outstation/library/` and `/tmp/outstation-captures/` respectively on the outstation VM.*

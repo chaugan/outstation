@@ -54,16 +54,16 @@ pub struct AppState {
 
 impl AppState {
     pub fn new() -> Self {
-        let library_dir = std::env::var("PCAPREPLAY_LIBRARY_DIR")
+        let library_dir = std::env::var("OUTSTATION_LIBRARY_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("/var/lib/pcapreplay/library"));
+            .unwrap_or_else(|_| PathBuf::from("/var/lib/outstation/library"));
         if let Err(e) = std::fs::create_dir_all(&library_dir) {
             warn!(dir = %library_dir.display(), error = %e, "library dir create failed");
         }
         let db_path = library_dir
             .parent()
             .map(|p| p.to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("/var/lib/pcapreplay"))
+            .unwrap_or_else(|| PathBuf::from("/var/lib/outstation"))
             .join("runs.sqlite");
         let db = Db::open(&db_path).unwrap_or_else(|e| {
             warn!(error = %e, path = %db_path.display(), "failed to open runs db — falling back to in-memory");
@@ -540,7 +540,7 @@ fn refresh_progress(rs: &mut RunState) {
         .collect();
 }
 
-const CAPTURE_DIR: &str = "/tmp/pcapreplay-captures";
+const CAPTURE_DIR: &str = "/tmp/outstation-captures";
 
 async fn serve_index() -> Html<&'static str> {
     Html(EMBEDDED_HTML)
@@ -1654,7 +1654,7 @@ async fn api_analyze(
 
     // Persist the captured pcap to a temp file so pcapload can mmap
     // it the way it wants. Dropped at end of scope.
-    let tmp_dir = std::env::temp_dir().join("pcapreplay-analysis");
+    let tmp_dir = std::env::temp_dir().join("outstation-analysis");
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| AppError::Internal(format!("create tmp: {e}")))?;
     let tmp_path = tmp_dir.join(format!("capt_{}.pcap", rs.id));
@@ -2034,22 +2034,22 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
 
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
-    info!(addr = %bind, "pcapreplay webui listening");
+    info!(addr = %bind, "outstation webui listening");
     axum::serve(listener, app).await?;
     Ok(())
 }
 
 /// Where the IP-alias state file lives. Defaults to a sibling of the
-/// library dir under /var/lib/pcapreplay; honors PCAPREPLAY_LIBRARY_DIR
+/// library dir under /var/lib/outstation; honors OUTSTATION_LIBRARY_DIR
 /// for parity with the library layout.
 fn alias_state_path() -> std::path::PathBuf {
-    let library_dir = std::env::var("PCAPREPLAY_LIBRARY_DIR")
+    let library_dir = std::env::var("OUTSTATION_LIBRARY_DIR")
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/pcapreplay/library"));
+        .unwrap_or_else(|_| std::path::PathBuf::from("/var/lib/outstation/library"));
     let parent = library_dir
         .parent()
         .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/pcapreplay"));
+        .unwrap_or_else(|| std::path::PathBuf::from("/var/lib/outstation"));
     parent.join("state-aliases.txt")
 }
 

@@ -1,4 +1,4 @@
-# pcapreplay — SCADA engineer's guide
+# outstation — SCADA engineer's guide
 
 *How to run a realistic replay of IEC 60870-5-104 traffic against a SCADA server in a virtual test lab, without touching the SCADA server itself.*
 
@@ -20,7 +20,7 @@
 
 ## 1. What the tool is
 
-**pcapreplay** is a tool for replaying captured network traffic — typically IEC 60870-5-104 from real RTUs — against a test target, in a way that lets you:
+**outstation** is a tool for replaying captured network traffic — typically IEC 60870-5-104 from real RTUs — against a test target, in a way that lets you:
 
 - **Benchmark** a SCADA server by unleashing a realistic number of RTU sessions against it simultaneously, measuring latency, throughput, and whether any messages are lost.
 - **Regression-test** a SCADA upgrade by replaying the same traffic before and after, then comparing the response.
@@ -44,7 +44,7 @@ This guide focuses on benchmark mode against a SCADA server, because that's wher
 
 Say you have a pcap captured from production, with traffic from 200 RTUs all talking to a SCADA master over IEC 60870-5-104. The pcap is 3 GB and covers one hour.
 
-You point pcapreplay at a SCADA test system, pick "benchmark" mode, and hit start. Here's what happens:
+You point outstation at a SCADA test system, pick "benchmark" mode, and hit start. Here's what happens:
 
 1. **Pcap analysis.** The tool reads the file, identifies all TCP flows, groups packets per source IP (per RTU), and extracts the IEC 104 messages.
 2. **Session setup.** For each RTU in the pcap, the tool creates a TCP socket bound to that RTU's original source IP (via automatic IP aliases on a local interface) and connects to the SCADA test server on port 2404.
@@ -65,7 +65,7 @@ Your pcap contains traffic from 200 RTUs spread across many different subnets �
 
 The SCADA test server likely has a whitelist: it only accepts connections from source addresses it knows — which are the same RTU addresses it sees in production.
 
-So far, so good: pcapreplay sends packets with the real source IPs, SCADA accepts them because the whitelist matches, the TCP SYN lands.
+So far, so good: outstation sends packets with the real source IPs, SCADA accepts them because the whitelist matches, the TCP SYN lands.
 
 **But** — SCADA has to reply to the SYN. SCADA's kernel looks in its routing table: *"where do I send packets destined for 192.168.10.42?"* If SCADA sits on `10.0.0.0/24`, it has no directly-connected route to `192.168.10.0/24`. It forwards the reply to its default gateway. The default gateway has no route either. The reply is dropped.
 
@@ -73,7 +73,7 @@ The TCP handshake never completes. No IEC 104 session is established. The benchm
 
 ### Why "just configure it on SCADA" doesn't fly
 
-The obvious fix — *"just add static routes on SCADA pointing the RTU subnets back at pcapreplay"* — isn't always acceptable:
+The obvious fix — *"just add static routes on SCADA pointing the RTU subnets back at outstation"* — isn't always acceptable:
 
 - The SCADA server may be a near-production test system that must remain "untouched".
 - You don't have root on SCADA.
@@ -84,15 +84,15 @@ We need a solution where we manipulate **SCADA's network environment**, not SCAD
 
 ### The solution: isolated virtual switch
 
-If both pcapreplay and SCADA run as virtual machines — which they do in this setup — we can put them both on an **isolated virtual switch** where pcapreplay is the only L2 neighbor SCADA can see.
+If both outstation and SCADA run as virtual machines — which they do in this setup — we can put them both on an **isolated virtual switch** where outstation is the only L2 neighbor SCADA can see.
 
 Then the following happens automatically:
 
 1. SCADA tries to send a TCP SYN-ACK to `192.168.10.42`.
 2. Its routing table says: "off-subnet, send via default gateway `10.0.0.1`."
 3. SCADA issues an ARP: *"who has `10.0.0.1`?"*.
-4. On an isolated switch, pcapreplay is the only thing that hears the ARP. Pcapreplay has `10.0.0.1` installed as a local /32 alias on its inner NIC and replies: *"I do."*
-5. SCADA sends the SYN-ACK to pcapreplay's MAC.
+4. On an isolated switch, outstation is the only thing that hears the ARP. Pcapreplay has `10.0.0.1` installed as a local /32 alias on its inner NIC and replies: *"I do."*
+5. SCADA sends the SYN-ACK to outstation's MAC.
 6. Pcapreplay's kernel accepts the frame, and because `192.168.10.42` is also a local alias, the kernel routes the packet up to user space where the benchmark session bound to `192.168.10.42:0` is waiting. The handshake completes.
 
 SCADA **has not been reconfigured**. It still thinks it's talking to its default gateway. The whitelist still matches because we never touched the source IP. Everything inside the guest is identical to production — *except* that the physical layer has been shifted to an isolated virtual switch.
@@ -106,7 +106,7 @@ SCADA **has not been reconfigured**. It still thinks it's talking to its default
 ```
 ┌─────────────────────┐        ┌──────────────────────────┐
 │                     │        │                          │
-│    SCADA (VM)       │        │     pcapreplay (VM)      │
+│    SCADA (VM)       │        │     outstation (VM)      │
 │                     │        │                          │
 │   eth0              │        │  eth0 (inner)            │
 │   10.0.0.50/24      ├────────┤  10.0.0.1/24   (*)       │
@@ -130,13 +130,13 @@ SCADA **has not been reconfigured**. It still thinks it's talking to its default
 ### Components
 
 - **SCADA VM**: your existing SCADA test server. No changes. Just moved onto the new isolated switch.
-- **pcapreplay VM**: a clean Ubuntu / Debian / RHEL install with the `pcapreplay` binary and two vNICs.
+- **outstation VM**: a clean Ubuntu / Debian / RHEL install with the `outstation` binary and two vNICs.
 - **Isolated virtual switch** (called `vswitch_test` here): on VMware ESXi, a port group without an uplink; in vSphere, a "private" vSwitch; in Proxmox, a Linux Bridge with no physical interface; in VirtualBox, an "Internal Network"; in libvirt/KVM, `<forward mode='none'/>`.
 
-### Why two vNICs on pcapreplay?
+### Why two vNICs on outstation?
 
 - **eth0 (inner)**: the only link to SCADA. This is where every RTU alias and the gateway alias live.
-- **eth1 (outer)**: the pcapreplay VM itself needs real-lab access for admin/SSH/updates. Optionally, eth1 is also used as a NAT egress so SCADA can still reach the real world (NTP, updates) via pcapreplay. This is optional — if SCADA should be fully isolated during the test, you can skip eth1.
+- **eth1 (outer)**: the outstation VM itself needs real-lab access for admin/SSH/updates. Optionally, eth1 is also used as a NAT egress so SCADA can still reach the real world (NTP, updates) via outstation. This is optional — if SCADA should be fully isolated during the test, you can skip eth1.
 
 ---
 
@@ -179,9 +179,9 @@ Load with `sudo virsh net-define isolated.xml && sudo virsh net-start isolated-t
 3. Do not change anything inside the SCADA guest. IP address, netmask, default gateway, DNS — all unchanged.
 4. Start SCADA again.
 
-Important: after the move SCADA will have no connectivity until the pcapreplay VM is also attached to the same isolated switch. This is expected.
+Important: after the move SCADA will have no connectivity until the outstation VM is also attached to the same isolated switch. This is expected.
 
-### 5.3 Create the pcapreplay VM
+### 5.3 Create the outstation VM
 
 1. Create a new VM with 4 vCPU, 8 GB RAM (for 200 RTUs), 40 GB disk.
 2. Install Ubuntu Server 22.04 LTS or similar.
@@ -190,13 +190,13 @@ Important: after the move SCADA will have no connectivity until the pcapreplay V
    - `eth1` → your normal lab switch (outer — faces the real world).
 4. Set a static IP on `eth0`. Use **the same IP SCADA already has configured as its default gateway** — e.g. `10.0.0.1/24`. Do not set a gateway on this NIC.
 5. Set an IP on `eth1` that fits the real lab network, and set the default gateway there.
-6. Install pcapreplay and the systemd unit (see `systemd/install.sh` in the repo).
+6. Install outstation and the systemd unit (see `systemd/install.sh` in the repo).
 
-Verify by pinging SCADA from pcapreplay: `ping 10.0.0.50`. If it answers, the physical layer is good.
+Verify by pinging SCADA from outstation: `ping 10.0.0.50`. If it answers, the physical layer is good.
 
 ### 5.4 Open the web UI
 
-From your workstation, open `http://<pcapreplay-eth1-ip>:8080` in a browser. You should see sections for "Pcap Library", "Run Configuration", "Runs", and "Network Diagram".
+From your workstation, open `http://<outstation-eth1-ip>:8080` in a browser. You should see sections for "Pcap Library", "Run Configuration", "Runs", and "Network Diagram".
 
 ---
 
@@ -227,15 +227,15 @@ In the **Run Configuration** section:
 This is the new, critical step:
 
 1. Tick **"act as scada gateway"** at the bottom of the benchmark panel.
-2. **SCADA-side gateway IP**: the IP SCADA has as its default gateway — in our example `10.0.0.1`. This is the IP pcapreplay will install as a /32 alias for the duration of the run.
+2. **SCADA-side gateway IP**: the IP SCADA has as its default gateway — in our example `10.0.0.1`. This is the IP outstation will install as a /32 alias for the duration of the run.
 3. **Inner NIC**: pick `eth0` (same as the egress NIC — the one that faces SCADA).
-4. **Upstream NAT NIC** *(optional)*: pick `eth1` if SCADA should keep its real-world access (updates, NTP, admin) during the test. pcapreplay will then enable IP forwarding and add a MASQUERADE rule on `eth1`. Leave empty if SCADA should be fully isolated during the test.
+4. **Upstream NAT NIC** *(optional)*: pick `eth1` if SCADA should keep its real-world access (updates, NTP, admin) during the test. outstation will then enable IP forwarding and add a MASQUERADE rule on `eth1`. Leave empty if SCADA should be fully isolated during the test.
 
 ### 6.4 Start
 
 Press **START RUN**. What happens under the hood:
 
-1. pcapreplay adds `10.0.0.1/32` as an alias on `eth0`.
+1. outstation adds `10.0.0.1/32` as an alias on `eth0`.
 2. IP forwarding is enabled (if NAT was chosen).
 3. A MASQUERADE rule is inserted: `iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE`.
 4. For each RTU in the pcap, that RTU's IP is added as a /32 alias on `eth0` via the existing auto-alias machinery.
@@ -248,7 +248,7 @@ The UI shows a live network diagram with animated packet streams, per-RTU progre
 
 ### 6.5 When the run finishes
 
-pcapreplay cleans everything up automatically:
+outstation cleans everything up automatically:
 
 - The /32 alias on `eth0` is removed.
 - IP forwarding is restored to its previous value.
@@ -256,7 +256,7 @@ pcapreplay cleans everything up automatically:
 - The veth interfaces and `pcr_br0` bridge are torn down.
 - All changes are reversible.
 
-If the pcapreplay process crashes mid-run, the aliases and MASQUERADE rule are left behind. On the next startup pcapreplay reads the state file at `/var/lib/pcapreplay/state-aliases.txt` and removes orphaned aliases automatically. You'll see a warning in the log: *"reclaimed N orphaned ip alias(es) from a previous run"*.
+If the outstation process crashes mid-run, the aliases and MASQUERADE rule are left behind. On the next startup outstation reads the state file at `/var/lib/outstation/state-aliases.txt` and removes orphaned aliases automatically. You'll see a warning in the log: *"reclaimed N orphaned ip alias(es) from a previous run"*.
 
 ---
 
@@ -283,7 +283,7 @@ One row per RTU, with:
 
 ### Captured pcap
 
-pcapreplay records everything it actually sent on the wire during the run to `/tmp/pcapreplay-captures/run_<id>.pcap`. You can download it via the **DOWNLOAD CAPTURE** button and open it in Wireshark to verify that what went out matches your expectations.
+outstation records everything it actually sent on the wire during the run to `/tmp/outstation-captures/run_<id>.pcap`. You can download it via the **DOWNLOAD CAPTURE** button and open it in Wireshark to verify that what went out matches your expectations.
 
 ### Timing comparison
 
@@ -291,15 +291,15 @@ Under **DETAILS** there's also a histogram comparison of inter-frame gaps in the
 
 ### SQLite persistence
 
-Every run is stored in `/var/lib/pcapreplay/runs.sqlite`. After a server restart all historical runs are still there with their reports intact, and you can delete individual runs via the **DELETE** button on each run card.
+Every run is stored in `/var/lib/outstation/runs.sqlite`. After a server restart all historical runs are still there with their reports intact, and you can delete individual runs via the **DELETE** button on each run card.
 
 ---
 
 ## 8. Troubleshooting
 
-### SCADA can't reach pcapreplay
+### SCADA can't reach outstation
 
-From the pcapreplay VM:
+From the outstation VM:
 
 ```sh
 ping 10.0.0.50                       # SCADA's IP
@@ -318,26 +318,26 @@ In the per-session row, `connected` stays `false` after 10 seconds.
 - **Check that SCADA actually has `10.0.0.1` as its default gateway**: `ip route` on SCADA — even though we don't change anything on SCADA, it's fine to read its config.
 - **Check that the source IP matches SCADA's whitelist**. This is the most common problem: you're using a pcap from a different environment, and the SCADA test server doesn't accept those source IPs.
 
-### pcapreplay's own kernel sends TCP RSTs
+### outstation's own kernel sends TCP RSTs
 
-If in Wireshark (on the pcapreplay side) you see the pcapreplay kernel replying with RST to SYN-ACKs from SCADA, the RTU IP isn't installed as a local alias and the kernel doesn't know it's a "local" address. This only happens if the pre-emptive auto-alias machinery failed. Check `/var/log/syslog` for errors from `netctl::add_ip_alias`.
+If in Wireshark (on the outstation side) you see the outstation kernel replying with RST to SYN-ACKs from SCADA, the RTU IP isn't installed as a local alias and the kernel doesn't know it's a "local" address. This only happens if the pre-emptive auto-alias machinery failed. Check `/var/log/syslog` for errors from `netctl::add_ip_alias`.
 
 ### SCADA loses all internet access
 
-You forgot to tick "upstream NAT NIC". SCADA is stranded with only pcapreplay as its neighbor and can't reach anything beyond it. Either enable NAT mode on the next run, or accept that SCADA is isolated during the test (often the best choice anyway).
+You forgot to tick "upstream NAT NIC". SCADA is stranded with only outstation as its neighbor and can't reach anything beyond it. Either enable NAT mode on the next run, or accept that SCADA is isolated during the test (often the best choice anyway).
 
 ### The run hangs on warmup
 
 Benchmark mode has an optional warmup interval (default 0 seconds). If you set a high value, it's expected that sessions won't start sending until warmup is done. Warmup exists so you can attach Wireshark / tcpdump to `eth0` before the traffic begins.
 
-### pcapreplay crashed and left aliases behind
+### outstation crashed and left aliases behind
 
-Restart pcapreplay: `sudo systemctl restart pcapreplay` (or manually restart the binary). It cleans up on startup and logs `reclaimed N orphaned ip alias(es)`.
+Restart outstation: `sudo systemctl restart outstation` (or manually restart the binary). It cleans up on startup and logs `reclaimed N orphaned ip alias(es)`.
 
 To clean up by hand:
 
 ```sh
-sudo cat /var/lib/pcapreplay/state-aliases.txt
+sudo cat /var/lib/outstation/state-aliases.txt
 sudo ip addr del 10.0.0.1/32 dev eth0
 sudo iptables -t nat -D POSTROUTING -o eth1 -j MASQUERADE
 sudo sysctl net.ipv4.ip_forward=0
@@ -356,10 +356,10 @@ sudo sysctl net.ipv4.ip_forward=0
 | **k-window** | Maximum number of unacked I-frames a sender is allowed to have outstanding. Default k=12. |
 | **w-window** | Receiver must send an S-frame ack at the latest after w received I-frames. Default w=8. |
 | **ASDU** | "Application Service Data Unit" — the content of an I-frame: type ID, COT (cause of transmission), common address, IOA (information object address), values. |
-| **RTU** | "Remote Terminal Unit" — a field station that reports to SCADA. In this lab each RTU is represented by one TCP session from pcapreplay. |
-| **SCADA master** | The system that collects data from RTUs. When we run benchmark in "master" role, pcapreplay is the client and SCADA is the server. |
-| **pcap / pcapng** | Packet capture formats. pcapreplay supports both. |
-| **AF_PACKET** | Linux mechanism for sending/receiving raw Ethernet frames directly, bypassing the TCP/IP stack. Used by pcapreplay for raw replay mode. |
+| **RTU** | "Remote Terminal Unit" — a field station that reports to SCADA. In this lab each RTU is represented by one TCP session from outstation. |
+| **SCADA master** | The system that collects data from RTUs. When we run benchmark in "master" role, outstation is the client and SCADA is the server. |
+| **pcap / pcapng** | Packet capture formats. outstation supports both. |
+| **AF_PACKET** | Linux mechanism for sending/receiving raw Ethernet frames directly, bypassing the TCP/IP stack. Used by outstation for raw replay mode. |
 | **MASQUERADE** | iptables NAT rule that rewrites the source address to the egress NIC's address. Used here to give SCADA upstream access. |
 | **Isolated vSwitch** | A virtual switch with no physical uplink. Only VMs attached to the same switch can talk to each other. |
 | **/32 alias** | An IP address added to a NIC with a /32 netmask, meaning "only this single address, no subnet route". Used to park the gateway IP and RTU IPs on `eth0` without affecting the routing table. |

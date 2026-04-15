@@ -1,4 +1,4 @@
-//! Manage Linux bridges and TAP interfaces for pcapreplay.
+//! Manage Linux bridges and TAP interfaces for outstation.
 //!
 //! v1 shells out to `ip` from iproute2. This keeps the crate tiny and the
 //! error messages transparent. A future revision can swap to rtnetlink for
@@ -294,7 +294,7 @@ pub fn find_iface_prefix(iface: &str) -> Option<u8> {
 // ---------------------------------------------------------------------------
 // Tracked IP-alias management.
 //
-// Because pcapreplay runs as a long-lived service that may crash or get
+// Because outstation runs as a long-lived service that may crash or get
 // killed, a flat-text state file at a caller-supplied path records every
 // IP alias we add. On startup the caller calls `reclaim_recorded_aliases`
 // which reads the file, removes each leftover alias, and truncates the
@@ -687,8 +687,8 @@ fn remove_iptables_drop(bridge: &str) -> Result<()> {
 // ---------------------------------------------------------------------------
 // SCADA-gateway mode:
 //
-// When the pcapreplay box is the only L2 neighbor of a SCADA guest (typical
-// virtual-lab setup — see doc/scada-lab.md), we want pcapreplay to act as the
+// When the outstation box is the only L2 neighbor of a SCADA guest (typical
+// virtual-lab setup — see doc/scada-lab.md), we want outstation to act as the
 // SCADA's default gateway AND to NAT unrelated egress back out to the real
 // lab. This guard owns all the reversible side effects of that setup:
 //

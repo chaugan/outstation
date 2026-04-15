@@ -1,4 +1,4 @@
-# pcapreplay — bruksanvisning for SCADA-ingeniører
+# outstation — bruksanvisning for SCADA-ingeniører
 
 *Hvordan kjøre realistisk replay av IEC 60870-5-104-trafikk mot en SCADA-server i et virtuelt testlab, uten å røre SCADA-en.*
 
@@ -20,7 +20,7 @@
 
 ## 1. Kort om verktøyet
 
-**pcapreplay** er et verktøy for å spille av fanget nettverkstrafikk — typisk IEC 60870-5-104 fra reelle RTU-er — mot et testmål, på en slik måte at du kan:
+**outstation** er et verktøy for å spille av fanget nettverkstrafikk — typisk IEC 60870-5-104 fra reelle RTU-er — mot et testmål, på en slik måte at du kan:
 
 - **Benchmarke** en SCADA-server ved å slippe løs et realistisk antall RTU-sesjoner mot den samtidig, og måle latens, gjennomstrømning og om noen meldinger mistes.
 - **Regresjonsteste** en SCADA-oppgradering ved å spille av den samme trafikken før og etter, og sammenligne responsen.
@@ -44,7 +44,7 @@ Denne veiledningen fokuserer på benchmark-modus mot en SCADA-server, siden det 
 
 La oss si du har en pcap fanget fra produksjon, med trafikk fra 200 RTU-er som alle kommuniserer med en SCADA-master over IEC 60870-5-104. Pcap-en er på 3 GB og dekker en time.
 
-Du peker pcapreplay på et SCADA-testsystem, velger "benchmark"-modus og trykker start. Det som skjer:
+Du peker outstation på et SCADA-testsystem, velger "benchmark"-modus og trykker start. Det som skjer:
 
 1. **Pcap-analyse.** Verktøyet leser filen, identifiserer alle TCP-flows, grupperer pakkene per kilde-IP (per RTU), og plukker ut de meldingene som er relevante for IEC 104.
 2. **Sesjonsoppsett.** For hver RTU i pcap-en opprettes et TCP-socket som binder seg til den RTU-ens originale kilde-IP (via automatiske IP-aliaser på lokalt nettgrensesnitt), og kobler seg til SCADA-testserveren på port 2404.
@@ -65,7 +65,7 @@ Pcap-en inneholder trafikk fra 200 RTU-er som er spredt over mange forskjellige 
 
 SCADA-testserveren har sannsynligvis en whitelist: den godtar bare tilkoblinger fra adresser den kjenner — som er de samme RTU-adressene fra produksjon.
 
-Så langt, alt vel: pcapreplay sender pakker med de ekte kilde-IP-ene, SCADA godtar dem fordi de matcher whitelisten, og TCP-SYN-en kommer fram.
+Så langt, alt vel: outstation sender pakker med de ekte kilde-IP-ene, SCADA godtar dem fordi de matcher whitelisten, og TCP-SYN-en kommer fram.
 
 **Men** — SCADA må svare tilbake på SYN-en. SCADA-ens kjerne slår opp i rutetabellen sin: *"Hvor skal jeg sende pakker til 192.168.10.42?"*. Hvis SCADA-en står på `10.0.0.0/24`, har den ingen direkte rute til `192.168.10.0/24`. Den sender svaret til sin default gateway. Default gateway har heller ingen rute dit. Svaret dør.
 
@@ -73,7 +73,7 @@ TCP-handshaken fullføres aldri. Ingen IEC 104-sesjon opprettes. Benchmarken fei
 
 ### Hvorfor man ikke kan "bare konfigurere det på SCADA-en"
 
-Den åpenbare løsningen — *"bare legg inn statiske ruter på SCADA som peker RTU-subnettene tilbake til pcapreplay"* — er ikke alltid akseptabelt:
+Den åpenbare løsningen — *"bare legg inn statiske ruter på SCADA som peker RTU-subnettene tilbake til outstation"* — er ikke alltid akseptabelt:
 
 - SCADA-serveren kan være en produksjonslignende test som skal være "uten endring".
 - Du har ikke root-tilgang på SCADA.
@@ -84,15 +84,15 @@ Vi trenger en løsning der vi manipulerer **SCADAens nettverksmiljø**, ikke SCA
 
 ### Løsningen: isolert virtuell switch
 
-Hvis både pcapreplay og SCADA kjører som virtuelle maskiner — noe de gjør i dette oppsettet — kan vi sette dem begge på en **isolert virtuell switch** der pcapreplay er den eneste naboen SCADA kan se på lag 2.
+Hvis både outstation og SCADA kjører som virtuelle maskiner — noe de gjør i dette oppsettet — kan vi sette dem begge på en **isolert virtuell switch** der outstation er den eneste naboen SCADA kan se på lag 2.
 
 Da skjer følgende, helt automatisk:
 
 1. SCADA prøver å sende en TCP SYN-ACK til `192.168.10.42`.
 2. Rutetabellen sier: "off-subnet, send til default gateway `10.0.0.1`".
 3. SCADA gjør en ARP: *"Hvem har `10.0.0.1`?"*.
-4. På en isolert switch er pcapreplay den eneste som hører ARP-spørsmålet. Pcapreplay har fått `10.0.0.1` lagt til som et lokalt /32-alias på sitt indre nettgrensesnitt, og svarer: *"Det er meg."*
-5. SCADA sender SYN-ACK-en til pcapreplay sin MAC-adresse.
+4. På en isolert switch er outstation den eneste som hører ARP-spørsmålet. Pcapreplay har fått `10.0.0.1` lagt til som et lokalt /32-alias på sitt indre nettgrensesnitt, og svarer: *"Det er meg."*
+5. SCADA sender SYN-ACK-en til outstation sin MAC-adresse.
 6. Pcapreplay tar imot pakken på kjernenivå, og fordi `192.168.10.42` også er et lokalt alias, ruter kjernen pakken opp til brukerrommet, der benchmark-sesjonen bundet til `192.168.10.42:0` venter på den. Handshaken fullføres.
 
 SCADA har **ikke blitt konfigurert om**. Den tror fortsatt den snakker med sin default gateway. Whitelisten stemmer fortsatt fordi vi ikke har rørt kilde-IP-en. Alt er som i produksjon — *bortsett fra* at det fysiske laget har blitt skjøvet til en isolert virtuell switch.
@@ -106,7 +106,7 @@ SCADA har **ikke blitt konfigurert om**. Den tror fortsatt den snakker med sin d
 ```
 ┌─────────────────────┐        ┌──────────────────────────┐
 │                     │        │                          │
-│    SCADA (VM)       │        │     pcapreplay (VM)      │
+│    SCADA (VM)       │        │     outstation (VM)      │
 │                     │        │                          │
 │   eth0              │        │  eth0 (indre)            │
 │   10.0.0.50/24      ├────────┤  10.0.0.1/24   (*)       │
@@ -130,13 +130,13 @@ SCADA har **ikke blitt konfigurert om**. Den tror fortsatt den snakker med sin d
 ### Komponenter
 
 - **SCADA-VM**: din eksisterende SCADA-testserver. Ingen endringer. Flyttes bare over på den nye isolerte switchen.
-- **pcapreplay-VM**: en ren Ubuntu / Debian / RHEL-installasjon med `pcapreplay`-binæren, to vNIC-er.
+- **outstation-VM**: en ren Ubuntu / Debian / RHEL-installasjon med `outstation`-binæren, to vNIC-er.
 - **Isolert virtuell switch** (kalt `vswitch_test` her): i VMware ESXi: "Port Group" uten uplink; i vSphere: "Private VLAN"; i Proxmox: en Linux Bridge uten fysisk interface; i VirtualBox: "Internal Network"; i libvirt/KVM: `<forward mode='none'/>`.
 
-### Hvorfor to vNIC-er på pcapreplay?
+### Hvorfor to vNIC-er på outstation?
 
 - **eth0 (indre)**: eneste kontakt med SCADA. Her legges alle RTU-aliaser og gateway-aliaset.
-- **eth1 (ytre)**: pcapreplay-VM-en selv trenger tilgang til det ekte lab-nettet for admin/SSH/oppdateringer. I tillegg brukes eth1 som NAT-utgang slik at SCADA fortsatt kan hente NTP, oppdateringer osv. via pcapreplay. Dette er valgfritt — hvis SCADA skal være helt isolert under testen, kan du droppe eth1.
+- **eth1 (ytre)**: outstation-VM-en selv trenger tilgang til det ekte lab-nettet for admin/SSH/oppdateringer. I tillegg brukes eth1 som NAT-utgang slik at SCADA fortsatt kan hente NTP, oppdateringer osv. via outstation. Dette er valgfritt — hvis SCADA skal være helt isolert under testen, kan du droppe eth1.
 
 ---
 
@@ -179,9 +179,9 @@ Last inn med `sudo virsh net-define isolated.xml && sudo virsh net-start isolate
 3. Ikke endre noe inne i SCADA-gjesten. IP-adresse, netmask, default gateway, DNS — alt skal være uendret.
 4. Start SCADA-en igjen.
 
-Viktig: etter flyttingen vil SCADA-en miste all nettverkskontakt inntil pcapreplay-VM-en også er koblet til den samme isolerte switchen. Dette er forventet.
+Viktig: etter flyttingen vil SCADA-en miste all nettverkskontakt inntil outstation-VM-en også er koblet til den samme isolerte switchen. Dette er forventet.
 
-### 5.3 Opprett pcapreplay-VM-en
+### 5.3 Opprett outstation-VM-en
 
 1. Opprett en ny VM med 4 vCPU, 8 GB RAM (for 200 RTU-er), 40 GB disk.
 2. Installer Ubuntu Server 22.04 LTS eller lignende.
@@ -190,13 +190,13 @@ Viktig: etter flyttingen vil SCADA-en miste all nettverkskontakt inntil pcaprepl
    - `eth1` → din vanlige lab-switch (ytre — mot det ekte nettet).
 4. Sett en statisk IP på `eth0`. Bruk **samme IP som SCADA-en har som default gateway** — for eksempel `10.0.0.1/24`. Ikke sett gateway på denne.
 5. Sett en IP på `eth1` som passer det ekte lab-nettet, og sett default gateway på den.
-6. Installer pcapreplay og systemd-tjenesten (følg `systemd/install.sh` i repoet).
+6. Installer outstation og systemd-tjenesten (følg `systemd/install.sh` i repoet).
 
-Du kan verifisere ved å pinge SCADA fra pcapreplay: `ping 10.0.0.50`. Hvis det svarer, er det fysiske laget i orden.
+Du kan verifisere ved å pinge SCADA fra outstation: `ping 10.0.0.50`. Hvis det svarer, er det fysiske laget i orden.
 
 ### 5.4 Åpne nettgrensesnittet
 
-Fra arbeidsstasjonen din, åpne `http://<pcapreplay-eth1-ip>:8080` i nettleser. Du skal se oversikten med seksjoner for "Pcap Library", "Run Configuration", "Runs" og "Network Diagram".
+Fra arbeidsstasjonen din, åpne `http://<outstation-eth1-ip>:8080` i nettleser. Du skal se oversikten med seksjoner for "Pcap Library", "Run Configuration", "Runs" og "Network Diagram".
 
 ---
 
@@ -227,15 +227,15 @@ I **Run Configuration**-seksjonen:
 Dette er det nye, kritiske trinnet. Haken du har ventet på:
 
 1. Huk av **"act as scada gateway"** nederst i benchmark-panelet.
-2. **SCADA-side gateway IP**: den IP-en SCADA har som default gateway — i vårt eksempel `10.0.0.1`. Dette er IP-en pcapreplay vil hekte på som /32-alias under kjøringen.
+2. **SCADA-side gateway IP**: den IP-en SCADA har som default gateway — i vårt eksempel `10.0.0.1`. Dette er IP-en outstation vil hekte på som /32-alias under kjøringen.
 3. **Inner NIC**: velg `eth0` (samme som egress NIC — det er den som peker mot SCADA).
-4. **Upstream NAT NIC** *(valgfritt)*: velg `eth1` hvis SCADA skal ha fortsatt tilgang til det ekte nettet (oppdateringer, NTP, admin) mens testen kjører. pcapreplay vil da slå på IP-forwarding og legge til en MASQUERADE-regel for `eth1`. La være tom hvis SCADA skal være helt isolert under testen.
+4. **Upstream NAT NIC** *(valgfritt)*: velg `eth1` hvis SCADA skal ha fortsatt tilgang til det ekte nettet (oppdateringer, NTP, admin) mens testen kjører. outstation vil da slå på IP-forwarding og legge til en MASQUERADE-regel for `eth1`. La være tom hvis SCADA skal være helt isolert under testen.
 
 ### 6.4 Start
 
 Trykk **START RUN**. Det som skjer bak kulissene:
 
-1. pcapreplay installerer `10.0.0.1/32` som alias på `eth0`.
+1. outstation installerer `10.0.0.1/32` som alias på `eth0`.
 2. IP-forwarding slås på (hvis NAT er valgt).
 3. MASQUERADE-regelen settes inn i `iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE`.
 4. For hver RTU i pcap-en legges RTU-IP-en til som /32-alias på `eth0` via bestående auto-alias-mekanismen.
@@ -248,7 +248,7 @@ Nettgrensesnittet viser live nettverksdiagram med animerte datastrømmer, progre
 
 ### 6.5 Når kjøringen er ferdig
 
-pcapreplay rydder opp alt automatisk:
+outstation rydder opp alt automatisk:
 
 - /32-aliaset på `eth0` fjernes.
 - IP-forwarding tilbakestilles til opprinnelig verdi.
@@ -256,7 +256,7 @@ pcapreplay rydder opp alt automatisk:
 - Veth-interfacene og pcr_br0-broen rives.
 - Alle endringer er reversible.
 
-Hvis pcapreplay-prosessen krasjer midt i en kjøring, blir aliasene og MASQUERADE-regelen liggende. Ved oppstart ser pcapreplay etter dette i statusfilen `/var/lib/pcapreplay/state-aliases.txt` og fjerner spor etter forrige kjøring automatisk. Du får en advarsel i loggen: *"reclaimed N orphaned ip alias(es) from a previous run"*.
+Hvis outstation-prosessen krasjer midt i en kjøring, blir aliasene og MASQUERADE-regelen liggende. Ved oppstart ser outstation etter dette i statusfilen `/var/lib/outstation/state-aliases.txt` og fjerner spor etter forrige kjøring automatisk. Du får en advarsel i loggen: *"reclaimed N orphaned ip alias(es) from a previous run"*.
 
 ---
 
@@ -283,7 +283,7 @@ En rad per RTU, med:
 
 ### Fanget pcap
 
-pcapreplay lagrer alt som faktisk ble sendt på wire under kjøringen til `/tmp/pcapreplay-captures/run_<id>.pcap`. Du kan laste denne ned via **DOWNLOAD CAPTURE**-knappen og åpne den i Wireshark for å verifisere at det som gikk ut matcher forventningen.
+outstation lagrer alt som faktisk ble sendt på wire under kjøringen til `/tmp/outstation-captures/run_<id>.pcap`. Du kan laste denne ned via **DOWNLOAD CAPTURE**-knappen og åpne den i Wireshark for å verifisere at det som gikk ut matcher forventningen.
 
 ### Timing-sammenligning
 
@@ -291,15 +291,15 @@ Under **DETAILS** kan du også se en histogramsammenligning av inter-frame-gaps 
 
 ### SQLite-persistens
 
-Alle kjøringer lagres i `/var/lib/pcapreplay/runs.sqlite`. Etter en server-restart ligger alle historiske kjøringer der fortsatt, med rapporter og alt, og du kan slette dem individuelt via **DELETE**-knappen på hver run card.
+Alle kjøringer lagres i `/var/lib/outstation/runs.sqlite`. Etter en server-restart ligger alle historiske kjøringer der fortsatt, med rapporter og alt, og du kan slette dem individuelt via **DELETE**-knappen på hver run card.
 
 ---
 
 ## 8. Feilsøking
 
-### SCADA får ikke kontakt med pcapreplay
+### SCADA får ikke kontakt med outstation
 
-Sjekk fra pcapreplay-VM-en:
+Sjekk fra outstation-VM-en:
 
 ```sh
 ping 10.0.0.50                       # SCADA-ens IP
@@ -318,13 +318,13 @@ I nettgrensesnittets per-sesjon-rad er `connected` fortsatt `false` etter 10 sek
 - **Sjekk at SCADA-en faktisk har `10.0.0.1` som default gateway**: `ip route` på SCADA — selv om vi ikke skal endre noe på SCADA, kan du fritt lese konfigurasjonen.
 - **Sjekk at kilde-IP-en matcher SCADA-ens whitelist**. Dette er den vanligste feilen: du bruker en pcap fra et annet miljø, og SCADA-testserveren godtar ikke de kilde-IP-ene.
 
-### "TCP RST" fra pcapreplays egen kjerne
+### "TCP RST" fra outstations egen kjerne
 
-Hvis du i Wireshark (på pcapreplay-siden) ser at pcapreplay-kjernen svarer med RST på SYN-ACK-er fra SCADA, betyr det at RTU-IP-en ikke er lagt til som lokalt alias, og kjernen vet ikke at det er en "lokal" adresse. Dette skjer kun hvis den pre-emptive auto-alias-mekanismen har sviktet. Sjekk `/var/log/syslog` for feil fra `netctl::add_ip_alias`.
+Hvis du i Wireshark (på outstation-siden) ser at outstation-kjernen svarer med RST på SYN-ACK-er fra SCADA, betyr det at RTU-IP-en ikke er lagt til som lokalt alias, og kjernen vet ikke at det er en "lokal" adresse. Dette skjer kun hvis den pre-emptive auto-alias-mekanismen har sviktet. Sjekk `/var/log/syslog` for feil fra `netctl::add_ip_alias`.
 
 ### SCADA mister all internett-tilgang
 
-Du glemte å huke på "upstream NAT NIC". SCADA-en står isolert med kun pcapreplay som nabo, og kommer seg ikke videre. Enten aktiver NAT-modus i neste kjøring, eller aksepter at SCADA er isolert under testen (ofte det beste uansett).
+Du glemte å huke på "upstream NAT NIC". SCADA-en står isolert med kun outstation som nabo, og kommer seg ikke videre. Enten aktiver NAT-modus i neste kjøring, eller aksepter at SCADA er isolert under testen (ofte det beste uansett).
 
 ### Kjøringen henger på warmup
 
@@ -332,12 +332,12 @@ Benchmark-modus har et valgfritt warmup-intervall (standard 0 sekunder). Hvis du
 
 ### Pcapreplay krasjer og lar aliasene stå igjen
 
-Start pcapreplay på nytt: `sudo systemctl restart pcapreplay` (eller manuell start av binæren). Den rydder opp automatisk ved oppstart og logger `reclaimed N orphaned ip alias(es)`.
+Start outstation på nytt: `sudo systemctl restart outstation` (eller manuell start av binæren). Den rydder opp automatisk ved oppstart og logger `reclaimed N orphaned ip alias(es)`.
 
 Hvis du vil rydde manuelt:
 
 ```sh
-sudo cat /var/lib/pcapreplay/state-aliases.txt
+sudo cat /var/lib/outstation/state-aliases.txt
 sudo ip addr del 10.0.0.1/32 dev eth0
 sudo iptables -t nat -D POSTROUTING -o eth1 -j MASQUERADE
 sudo sysctl net.ipv4.ip_forward=0
@@ -356,10 +356,10 @@ sudo sysctl net.ipv4.ip_forward=0
 | **k-vindu** | Maksimalt antall u-bekreftede I-rammer en sender kan ha ute. Standard k=12. |
 | **w-vindu** | Mottaker må sende S-frame ack senest etter w mottatte I-rammer. Standard w=8. |
 | **ASDU** | "Application Service Data Unit" — innholdet i en I-frame: type-ID, COT (cause of transmission), common address, IOA (information object address), verdier. |
-| **RTU** | "Remote Terminal Unit" — fjernstasjon som rapporterer til SCADA. I denne labben er hver RTU representert av én TCP-sesjon fra pcapreplay. |
-| **SCADA master** | Systemet som samler inn data fra RTU-er. Når vi kjører benchmark i "master"-rolle, er pcapreplay klienten og SCADA er serveren. |
-| **pcap / pcapng** | Pakkefangstformater. pcapreplay støtter begge. |
-| **AF_PACKET** | Linux-mekanisme for å sende/motta rå Ethernet-rammer direkte, uten å gå via TCP/IP-stakken. Brukt av pcapreplay for raw replay-modus. |
+| **RTU** | "Remote Terminal Unit" — fjernstasjon som rapporterer til SCADA. I denne labben er hver RTU representert av én TCP-sesjon fra outstation. |
+| **SCADA master** | Systemet som samler inn data fra RTU-er. Når vi kjører benchmark i "master"-rolle, er outstation klienten og SCADA er serveren. |
+| **pcap / pcapng** | Pakkefangstformater. outstation støtter begge. |
+| **AF_PACKET** | Linux-mekanisme for å sende/motta rå Ethernet-rammer direkte, uten å gå via TCP/IP-stakken. Brukt av outstation for raw replay-modus. |
 | **MASQUERADE** | NAT-regel i iptables som rewriter kildeadressen til utgangs-NICens adresse. Brukt her for å gi SCADA upstream-tilgang. |
 | **Isolert vSwitch** | Virtuell switch som ikke er tilkoblet noen fysisk NIC. Kun VM-er som er koblet til samme switch kan snakke med hverandre. |
 | **/32-alias** | En IP-adresse lagt til på et nettgrensesnitt med subnet-maske 32, som betyr "bare denne enkle adressen, ingen subnet-rute". Brukt for å hekte gateway-IP-en og RTU-IP-ene på `eth0` uten å rote med rutetabellen. |

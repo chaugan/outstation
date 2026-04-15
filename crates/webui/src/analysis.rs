@@ -3,7 +3,7 @@
 //!
 //! Produces a structured [`AnalysisReport`] with three sections:
 //!
-//! 1. **Playback side** — what pcapreplay was supposed to deliver.
+//! 1. **Playback side** — what outstation was supposed to deliver.
 //!    In master runs, that's the original client-side I-frames;
 //!    in slave runs, the original server-side I-frames. The analyzer
 //!    checks how many of them arrived at the wire in the captured
@@ -29,7 +29,7 @@ use serde::Serialize;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisMode {
     /// Target is a different software than the one in the pcap.
-    /// We only care that pcapreplay's side delivered the expected
+    /// We only care that outstation's side delivered the expected
     /// frames and the target held up basic IEC 104 flow control.
     Generic,
     /// Target is the same device(s) as the original pcap. Expect the
@@ -40,9 +40,9 @@ pub enum AnalysisMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RoleHint {
-    /// pcapreplay acted as the client (master).
+    /// outstation acted as the client (master).
     Master,
-    /// pcapreplay acted as the server (slave).
+    /// outstation acted as the server (slave).
     Slave,
 }
 
@@ -324,7 +324,7 @@ fn find_captured_flow(
     None
 }
 
-/// Pick the flow in the **original** pcap that pcapreplay was
+/// Pick the flow in the **original** pcap that outstation was
 /// replaying. In both roles it's the one whose `server.port` matches
 /// `target_port`. When the captured session lands on a specific RTU
 /// (slave mode, many listeners) or from a specific master
@@ -463,15 +463,15 @@ pub fn analyze(
     let cap_client_rf = captured.reassemble_client_payload(cap_flow_idx).ok();
     let cap_server_rf = captured.reassemble_server_payload(cap_flow_idx).ok();
 
-    // Figure out which side in the captured flow is pcapreplay's
+    // Figure out which side in the captured flow is outstation's
     // playback and which is the target.
     let (playback_rf, target_rf) = match role {
         RoleHint::Master => {
-            // pcapreplay was the client side
+            // outstation was the client side
             (cap_client_rf.as_ref(), cap_server_rf.as_ref())
         }
         RoleHint::Slave => {
-            // pcapreplay was the server side
+            // outstation was the server side
             (cap_server_rf.as_ref(), cap_client_rf.as_ref())
         }
     };
@@ -761,7 +761,7 @@ fn decide_verdict(
     if pb.delivered_iframes == 0 {
         return (
             "no_delivery",
-            "pcapreplay's side produced zero I-frames in the captured pcap".into(),
+            "outstation's side produced zero I-frames in the captured pcap".into(),
             0.0,
         );
     }

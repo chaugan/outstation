@@ -6,7 +6,7 @@ members = [
     "crates/pcapload",
     "crates/raw_replay",
     "crates/sched",
-    "crates/pcapreplay",
+    "crates/outstation",
     "crates/tcp_session",
     "crates/protoplay",
     "crates/proto_iec104",

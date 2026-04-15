@@ -1,7 +1,7 @@
 //! Plugin interface for protocol-aware client-session replayers.
 //!
 //! Each protocol implementation lives in its own `proto_*` crate and
-//! exposes a type implementing [`ProtoReplayer`]. The main `pcapreplay`
+//! exposes a type implementing [`ProtoReplayer`]. The main `outstation`
 //! binary builds a registry of available modules at startup and routes
 //! TCP flows to the right module based on user configuration.
 //!

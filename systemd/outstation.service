@@ -1,5 +1,5 @@
 [Unit]
-Description=pcapreplay web UI and replay engine
+Description=outstation web UI and replay engine
 After=network-online.target
 Wants=network-online.target
 
@@ -10,15 +10,15 @@ Type=simple
 # ethtool offload, and installs/removes iptables rules around runs.
 # It needs CAP_NET_ADMIN, CAP_NET_RAW, CAP_NET_BIND_SERVICE, and
 # CAP_SYS_NICE for SCHED_FIFO timing.
-ExecStart=/usr/local/bin/pcapreplay serve --bind 0.0.0.0:8080
+ExecStart=/usr/local/bin/outstation serve --bind 0.0.0.0:8080
 Restart=on-failure
 RestartSec=2
 
 # Drop root but keep the capabilities we actually need via ambient caps.
 # If you prefer running as root, comment out User/Group and the two
 # Capability lines below.
-User=pcapreplay
-Group=pcapreplay
+User=outstation
+Group=outstation
 AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE
 CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE
 
@@ -33,9 +33,9 @@ ProtectKernelTunables=no
 ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictRealtime=no
-# Library uploads + replay capture pcaps live under /var/lib/pcapreplay.
-StateDirectory=pcapreplay
-ReadWritePaths=/var/lib/pcapreplay
+# Library uploads + replay capture pcaps live under /var/lib/outstation.
+StateDirectory=outstation
+ReadWritePaths=/var/lib/outstation
 
 # UI binds on 0.0.0.0 so it's reachable from the LAN. There's no
 # authentication on the backend — restrict at the network layer or

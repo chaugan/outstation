@@ -1,11 +1,11 @@
 [package]
-name = "pcapreplay"
+name = "outstation"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [[bin]]
-name = "pcapreplay"
+name = "outstation"
 path = "src/main.rs"
 
 [dependencies]

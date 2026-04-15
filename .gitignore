@@ -18,8 +18,8 @@ Cargo.lock.bak
 /captured_iec104.pcapng
 
 # Runtime state (systemd)
-/var/lib/pcapreplay/
-/tmp/pcapreplay-captures/
+/var/lib/outstation/
+/tmp/outstation-captures/
 
 # Internal handover / design notes — not for publication
 /HANDOVER/

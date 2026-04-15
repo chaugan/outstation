@@ -1,4 +1,4 @@
-# pcapreplay
+# outstation
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
 [![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
@@ -32,24 +32,24 @@ Driven entirely from a browser UI — upload a pcap, configure a run, press star
 
 Running realistic traffic against a SCADA server is harder than it sounds. You can capture a pcap from production with traffic from 200 RTUs, but you can't just `tcpreplay` it — the target SCADA has a whitelist of real RTU IPs, it expects real TCP sessions, the captured flows need to be reassembled per-RTU and driven through the IEC 60870-5-104 state machine (STARTDT, k-window, I-frames, S-frame acks, TESTFR), and you need per-message latency measurements out the other end so you can tell whether the SCADA is handling the load.
 
-pcapreplay does all of this from a single binary with a browser UI. It scales to ~200 RTUs / ~10 k messages per second on a single modest VM, and the whole thing is designed around letting you run it against a real SCADA test server **without changing anything inside the SCADA guest** (see [`doc/scada-lab.en.md`](doc/scada-lab.en.md)).
+outstation does all of this from a single binary with a browser UI. It scales to ~200 RTUs / ~10 k messages per second on a single modest VM, and the whole thing is designed around letting you run it against a real SCADA test server **without changing anything inside the SCADA guest** (see [`doc/scada-lab.en.md`](doc/scada-lab.en.md)).
 
 ## What makes it different
 
-Most pcap replay tools treat a capture as bytes to retransmit. pcapreplay treats a capture as *behaviour to impersonate*. `tcpreplay` streams L2 packets at an interface with optional address rewrite; `tcpliveplay` drives exactly one live TCP flow but has no application-layer knowledge; Scapy scripts and `bittwist` work one flow at a time and leave everything else to you. None of them can stand in for 200 RTUs, measure per-message latency under real load, or tell you after the fact whether the replay was faithful. This is the shape of the gap:
+Most pcap replay tools treat a capture as bytes to retransmit. outstation treats a capture as *behaviour to impersonate*. `tcpreplay` streams L2 packets at an interface with optional address rewrite; `tcpliveplay` drives exactly one live TCP flow but has no application-layer knowledge; Scapy scripts and `bittwist` work one flow at a time and leave everything else to you. None of them can stand in for 200 RTUs, measure per-message latency under real load, or tell you after the fact whether the replay was faithful. This is the shape of the gap:
 
-- **Protocol participant, not a packet blaster.** In benchmark mode pcapreplay opens a real TCP socket and runs a full IEC 60870-5-104 state machine — APCI framing, I/S/U frames, live N(S)/N(R) sequencing, k-window flow control, t1/t2/t3 timers, STARTDT/STOPDT, TESTFR keepalives, per-frame ACK tracking (`crates/proto_iec104/src/session.rs`). A live SCADA master or slave on the other end gets a real counterpart it can actually talk to, not a stream of stale packets with fresh checksums.
+- **Protocol participant, not a packet blaster.** In benchmark mode outstation opens a real TCP socket and runs a full IEC 60870-5-104 state machine — APCI framing, I/S/U frames, live N(S)/N(R) sequencing, k-window flow control, t1/t2/t3 timers, STARTDT/STOPDT, TESTFR keepalives, per-frame ACK tracking (`crates/proto_iec104/src/session.rs`). A live SCADA master or slave on the other end gets a real counterpart it can actually talk to, not a stream of stale packets with fresh checksums.
 - **Many-to-one and one-to-many SCADA fan-out on a single host.** One run impersonates **200 RTUs to one master** (slave mode) or **200 masters to one SCADA server** (master mode), all on one host, all on standard port 2404, differentiated purely by IP. Slave mode auto-installs and auto-removes /32 IP aliases per listener; master mode builds per-session veth ports on a private bridge so 200 outgoing TCP clients cleanly bind to 200 distinct source addresses. Neither of these requires hand-rolled shell scripting to operate.
 - **Built-in fidelity analysis.** After a run the analyser reopens the mirrored capture pcap from the wire and compares it flow-by-flow against the source pcap: how many I-frames were delivered, whether the type-ID sequence matches, how many frames are byte-identical, the drift in inter-frame timing, and a verdict / score (`crates/webui/src/analysis.rs`). No other replay tool I know of ships verification as a first-class feature — with `tcpreplay` you capture on the wire yourself and diff by hand if you care at all.
 - **Timing-preserving pacing.** `Pacing::OriginalTiming { speed }` replays each I-frame at its original pcap-relative timestamp so the temporal shape of the telemetry feed is preserved — the natural pauses, the bursts, the outliers. A real 175-second IEC 104 session replays with ~20 ms total wall-clock drift and <1 ms mean inter-frame delta (see [`fidelity_report_run2.md`](fidelity_report_run2.md)). `AsFastAsPossible` is available when you want raw throughput instead. `tcpreplay`'s `--mbps` / `--multiplier` are packet-rate knobs, not protocol-frame-aware pacing — they can't keep a "pause 6 seconds, then burst 4 frames" shape.
-- **Two-way: master *and* slave.** pcapreplay can impersonate either side of the conversation — test your substation RTUs, then swap and test the control centre's master — from the same UI, without changing tools. Most replay tools do one direction at best.
+- **Two-way: master *and* slave.** outstation can impersonate either side of the conversation — test your substation RTUs, then swap and test the control centre's master — from the same UI, without changing tools. Most replay tools do one direction at best.
 - **Per-session live observability.** Every RTU is a row in the UI with its own state (`pending` / `listening` / `connected` / `active` / `completed` / `failed` / `cancelled`), live send/receive counters, byte counts, and per-session stop. An ECharts hub-and-spoke diagram renders the active topology in real time with animated streams per direction and per-rate bucket. `START ALL` / `STOP` fan out across the whole run with one click.
 - **Benchmark metrics, not "did it finish".** Per-session send→ack latency sampled into a bounded reservoir, rolled up to p50/p90/p99 histograms across the whole run; window-stall counts, unacked-at-end tallies, throughput in msg/s, per-session byte accounting. If you're load-testing a real SCADA server, the latency distribution is the thing that actually matters — and you get it without additional tooling.
 - **Synthetic SCADA traffic generation.** `gen_iec104_traffic.py` produces standards-conformant IEC 104 pcaps at arbitrary scale — configurable RTU count, IP subnet, ASDU address space, points per RTU, inter-event cadence, sequential or random IP allocation. Useful when you want to stress-test against scenarios you don't have real captures for.
 - **Safe for the host it runs on.** Every topology change is wrapped in RAII guards that restore on drop: bridge lifecycle, veth pairs, IP aliases, sysctls, iptables rules, NIC tx-checksum offload. A state file on disk lets aliases be reclaimed after a crash. A killed or panicked run does not leave your network in a weird state next boot.
-- **Browser, not CLI.** Upload, configure, run, monitor, stop, abort, download the replay capture, read the fidelity report — all in one UI. No shell scripting, no per-RTU `ip addr add`, no bespoke glue. A pcap library, SQLite-backed run history, per-run delete, per-pcap viability analysis at upload time. Single binary `pcapreplay serve`, single systemd unit.
+- **Browser, not CLI.** Upload, configure, run, monitor, stop, abort, download the replay capture, read the fidelity report — all in one UI. No shell scripting, no per-RTU `ip addr add`, no bespoke glue. A pcap library, SQLite-backed run history, per-run delete, per-pcap viability analysis at upload time. Single binary `outstation serve`, single systemd unit.
 
-The one-line version: *every other pcap replay tool treats a capture as traffic to retransmit; pcapreplay treats a capture as behaviour to impersonate*, and ships the protocol stack, the per-flow fan-out, the live UI, and the post-run fidelity verification needed to back that up.
+The one-line version: *every other pcap replay tool treats a capture as traffic to retransmit; outstation treats a capture as behaviour to impersonate*, and ships the protocol stack, the per-flow fan-out, the live UI, and the post-run fidelity verification needed to back that up.
 
 ## How it works
 
@@ -101,12 +101,12 @@ Every run is reversible: the bridge, veth pairs, IP aliases, sysctl state, iptab
 
 - **Raw replay** — per-source veth ports on an auto-managed Linux bridge, per-frame L2/L3 rewrite with checksum recompute, AF_PACKET injection at microsecond accuracy. For feeding IDS / logger / historian systems.
 - **Stateful session replay (benchmark mode)**, with two roles:
-  - **Master** — pcapreplay connects out as a TCP client of `target_ip:target_port`, one real session per captured RTU, driven by a protocol-aware replayer. Pipelined to the protocol's native k-window; per-message send→ack latency recorded via reservoir sampling and rendered as p50/p90/p99 histograms.
-  - **Slave** — pcapreplay binds one listener per captured RTU on the RTU's own IP at `listen_port_base` (default 2404), auto-aliases the RTU IP onto the default-route interface, and waits for a live master to connect in. Works with external master tools like RedisAnt's `iec104client`.
+  - **Master** — outstation connects out as a TCP client of `target_ip:target_port`, one real session per captured RTU, driven by a protocol-aware replayer. Pipelined to the protocol's native k-window; per-message send→ack latency recorded via reservoir sampling and rendered as p50/p90/p99 histograms.
+  - **Slave** — outstation binds one listener per captured RTU on the RTU's own IP at `listen_port_base` (default 2404), auto-aliases the RTU IP onto the default-route interface, and waits for a live master to connect in. Works with external master tools like RedisAnt's `iec104client`.
 
 ### Slave-mode ergonomics
 
-- Each listener is pre-populated with the RTU's captured IP as its `listen_ip`, so 200 sessions come up as 200 distinct `rtu_ip:2404` endpoints on one NIC without any manual config. Aliases are added before bind and removed on session end; a state file at `/var/lib/pcapreplay/state-aliases.txt` lets startup reclaim them after a crash.
+- Each listener is pre-populated with the RTU's captured IP as its `listen_ip`, so 200 sessions come up as 200 distinct `rtu_ip:2404` endpoints on one NIC without any manual config. Aliases are added before bind and removed on session end; a state file at `/var/lib/outstation/state-aliases.txt` lets startup reclaim them after a crash.
 - All listeners share the same port (no port shifting) — only the IP discriminates sessions. A real SCADA master can walk the RTU IP list with `:2404` everywhere instead of chasing 200 different ports.
 - **START ALL** button in the run detail panel fans out the ready flag to every pending listener in one click. **STOP** on the run card fans out cancellation to all sessions in one click and flips them to `CANCELLED` so the UI doesn't keep showing stale `PENDING` rows.
 - Each session reports its own state (`PENDING → LISTENING → CONNECTED → ACTIVE → COMPLETED / CANCELLED / FAILED`) with live send/receive counts, byte counts, and per-session abort.
@@ -121,12 +121,12 @@ Every run is reversible: the bridge, veth pairs, IP aliases, sysctl state, iptab
 
 - Multi-RTU pcaps are dispatched one worker per source IP, each with its own veth port on a private Linux bridge. Source IPs and source MACs are preserved byte-identical to the capture; only the destination is rewritten.
 - Automatic /32 alias management on a chosen egress NIC, with state-file-backed reclaim so a crashed process doesn't leak aliases across restarts.
-- **SCADA-gateway mode** — pcapreplay can claim the SCADA test server's default-gateway IP on an isolated vSwitch, so off-subnet return traffic routes back to pcapreplay without changing anything inside the SCADA guest. Optional upstream NAT keeps SCADA's non-capture egress flowing out a second NIC. Walkthrough in [`doc/scada-lab.en.md`](doc/scada-lab.en.md).
+- **SCADA-gateway mode** — outstation can claim the SCADA test server's default-gateway IP on an isolated vSwitch, so off-subnet return traffic routes back to outstation without changing anything inside the SCADA guest. Optional upstream NAT keeps SCADA's non-capture egress flowing out a second NIC. Walkthrough in [`doc/scada-lab.en.md`](doc/scada-lab.en.md).
 - Egress safety guard disables `bridge-nf-call-iptables` and NIC TX checksum offload for the duration of a run, installs an `iptables raw PREROUTING DROP` rule so injected bytes never leak into the host's own stack, and reverts everything on run teardown.
 
 ### Runtime
 
-- Single-binary `pcapreplay serve` that hosts the browser UI over axum.
+- Single-binary `outstation serve` that hosts the browser UI over axum.
 - Live network diagram rendered with ECharts (vendored locally, no CDN) — animated streams with real rate, separate send/receive lanes, per-session bucketing, 200-stream cap.
 - Live per-RTU progress bars, throughput sparkline, cooperative stop button.
 - Post-run artifacts: downloadable replay pcap (the bytes that actually hit the wire), inter-frame gap histogram (original vs captured overlay), per-session latency histogram.
@@ -153,13 +153,13 @@ New protocols plug in by implementing the `ProtoReplayer` trait in `crates/proto
 cargo build --release
 
 # Run (needs CAP_NET_ADMIN + CAP_NET_RAW — use sudo or the systemd unit)
-sudo ./target/release/pcapreplay serve --bind 0.0.0.0:8080
+sudo ./target/release/outstation serve --bind 0.0.0.0:8080
 
 # Open the UI in a browser
 xdg-open http://localhost:8080
 ```
 
-For a production install, see [`systemd/install.sh`](systemd/install.sh) which sets up the unit, ambient capabilities, and directory layout (library at `/var/lib/pcapreplay/library`, captures at `/tmp/pcapreplay-captures`, SQLite history at `/var/lib/pcapreplay/runs.sqlite`).
+For a production install, see [`systemd/install.sh`](systemd/install.sh) which sets up the unit, ambient capabilities, and directory layout (library at `/var/lib/outstation/library`, captures at `/tmp/outstation-captures`, SQLite history at `/var/lib/outstation/runs.sqlite`).
 
 ### First run in 60 seconds
 
@@ -214,7 +214,7 @@ RTU IPs are allocated **sequentially** starting at `--rtu-start-offset`, skippin
 ### Typical workflow end-to-end
 
 1. `python3 examples/gen_iec104_traffic.py -n 200 -d 180 --subnet 192.168.10.0/24 -o my_rtus.pcap`
-2. Upload `my_rtus.pcap` to the pcapreplay library via the browser UI.
+2. Upload `my_rtus.pcap` to the outstation library via the browser UI.
 3. New run → `slave` role → `listen_port_base = 2404` → `protocol = iec104` → **START RUN**.
 4. Click **START ALL** in the run detail panel to arm every listener.
 5. Point your master tool at any RTU IP in `192.168.10.2..` on port 2404 (all 200 listen on the same port).
@@ -239,7 +239,7 @@ Upload the pcap directly in the browser UI to skip the generator step.
 ## Crate layout
 
 ```
-pcapreplay/
+outstation/
 ├── Cargo.toml                     workspace root, resolver = 2
 ├── crates/
 │   ├── netctl/                    bridge + veth lifecycle, IP aliases,
@@ -256,11 +256,11 @@ pcapreplay/
 │   ├── proto_dnp3_tcp/             stub
 │   ├── proto_iec61850_mms/        stub
 │   ├── proto_iec60870_6_iccp/     stub
-│   ├── pcapreplay/                thin binary shell for `serve`
+│   ├── outstation/                thin binary shell for `serve`
 │   └── webui/                     axum server, embedded SPA, SQLite history
 ├── doc/                           end-user guides (EN + NO)
 ├── examples/                      synthetic traffic generator + sample pcap
-└── systemd/                       pcapreplay.service + install.sh
+└── systemd/                       outstation.service + install.sh
 ```
 
 ## Requirements
