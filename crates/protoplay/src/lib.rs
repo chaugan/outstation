@@ -37,6 +37,10 @@ pub mod session_state {
     pub const ACTIVE: u8 = 3;
     pub const COMPLETED: u8 = 4;
     pub const FAILED: u8 = 5;
+    /// Session exited because the user stopped the run or aborted this
+    /// specific slot. Distinct from FAILED so the UI can show a neutral
+    /// "cancelled" badge instead of a red error.
+    pub const CANCELLED: u8 = 6;
 }
 
 /// A single client-side TCP payload segment.

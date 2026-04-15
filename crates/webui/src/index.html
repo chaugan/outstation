@@ -796,6 +796,22 @@
     border-radius: 0;
   }
   .slave-btn:hover { background: var(--accent); border-color: var(--accent); }
+  .slave-bulk-actions {
+    display: flex;
+    justify-content: flex-end;
+    padding: 8px 0 10px 0;
+    gap: 8px;
+    border-bottom: 1px solid var(--rule-soft);
+    margin-bottom: 6px;
+  }
+  .slave-btn.start-all {
+    padding: 8px 18px;
+    font-size: 11px;
+    background: var(--accent);
+    color: var(--bg);
+    border-color: var(--accent);
+  }
+  .slave-btn.start-all:hover { filter: brightness(1.1); }
   .slave-wait {
     font-family: var(--mono);
     font-size: 11px;
@@ -2074,6 +2090,14 @@ async function stopSlave(runId, idx) {
   refreshRuns();
 }
 
+async function startAllSlaves(runId) {
+  const res = await api(`/api/runs/${runId}/slaves/start_all`, 'POST');
+  if (res.ok && res.data && typeof res.data.started === 'number') {
+    // Optimistic refresh so the user sees the rows flip immediately.
+  }
+  refreshRuns();
+}
+
 async function patchSlaveIp(runId, idx, value) {
   const v = (value || '').trim();
   if (!v) return;
@@ -2194,6 +2218,19 @@ async function refreshRuns() {
     if (r.per_source_progress && r.per_source_progress.length) {
       const isSlave = r.per_source_progress.some(p => p.listen_port > 0);
       if (isSlave) {
+        // Fan-out controls for slave-mode. Only meaningful while the
+        // run is still running and there are pending (uncancelled)
+        // slots left to arm.
+        if (r.status === 'running') {
+          const pendingLeft = r.per_source_progress.filter(
+            p => p.state === 'pending' && !p.cancelled
+          ).length;
+          if (pendingLeft > 0) {
+            h += `<div class="slave-bulk-actions">`;
+            h += `  <button class="slave-btn start-all" onclick="startAllSlaves(${r.id})">START ALL (${pendingLeft})</button>`;
+            h += `</div>`;
+          }
+        }
         h += `<div class="slave-list">`;
         for (let i = 0; i < r.per_source_progress.length; i++) {
           h += renderSlaveRow(r, r.per_source_progress[i], i);

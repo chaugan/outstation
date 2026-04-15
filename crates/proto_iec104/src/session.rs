@@ -335,10 +335,11 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         report.elapsed_ms = t_start.elapsed().as_millis() as u64;
         return report;
     }
-    report.messages_sent += 1;
+    // STARTDT is protocol plumbing, not a data frame — don't count it
+    // in messages_sent (that field must match `planned`, which only
+    // tracks I-frames). Bandwidth is still tallied via bytes_written.
     report.bytes_written += 6;
     bump(&progress, |p| {
-        p.sent.fetch_add(1, Ordering::Relaxed);
         p.bytes_written.fetch_add(6, Ordering::Relaxed);
     });
     if !wait_for_u(&rx, U_STARTDT_CON, HANDSHAKE_TIMEOUT) {
@@ -498,7 +499,8 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
     let send_elapsed_ms = (now_ns().saturating_sub(send_start_ns)) / 1_000_000;
     report.elapsed_ms = send_elapsed_ms;
 
-    // 5. STOPDT close (best effort).
+    // 5. STOPDT close (best effort). Plumbing frame — bytes only, no
+    //    messages_sent bump.
     if let Err(e) = write_apdu(
         &mut write_stream,
         &Apdu::U {
@@ -507,10 +509,8 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
     ) {
         debug!(error = %e, "STOPDT act failed");
     } else {
-        report.messages_sent += 1;
         report.bytes_written += 6;
         bump(&progress, |p| {
-            p.sent.fetch_add(1, Ordering::Relaxed);
             p.bytes_written.fetch_add(6, Ordering::Relaxed);
         });
         // Short wait for STOPDT con.
@@ -566,11 +566,10 @@ fn handle_incoming(
                     code: U_TESTFR_CON,
                 },
             );
-            report.messages_sent += 1;
+            // TESTFR con is plumbing — bandwidth only, no data counter.
             report.bytes_written += 6;
             report.bytes_read += 6;
             bump(progress, |p| {
-                p.sent.fetch_add(1, Ordering::Relaxed);
                 p.bytes_written.fetch_add(6, Ordering::Relaxed);
                 p.bytes_read.fetch_add(6, Ordering::Relaxed);
             });
@@ -583,12 +582,11 @@ fn handle_incoming(
         }
     }
     if *unacked_received >= w {
+        // Automatic S-frame ack — plumbing, not a data frame.
         let _ = write_apdu(writer, &Apdu::S { nr: *my_nr });
-        report.messages_sent += 1;
         report.bytes_written += 6;
         *unacked_received = 0;
         bump(progress, |p| {
-            p.sent.fetch_add(1, Ordering::Relaxed);
             p.bytes_written.fetch_add(6, Ordering::Relaxed);
         });
     }
@@ -801,10 +799,9 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         set_state(&progress, session_state::FAILED);
         return report;
     }
-    report.messages_sent += 1;
+    // STARTDT con is plumbing, not a data frame.
     report.bytes_written += 6;
     bump(&progress, |p| {
-        p.sent.fetch_add(1, Ordering::Relaxed);
         p.bytes_written.fetch_add(6, Ordering::Relaxed);
     });
     set_state(&progress, session_state::ACTIVE);
@@ -948,10 +945,9 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         )
         .is_ok()
         {
-            report.messages_sent += 1;
+            // STOPDT con is plumbing.
             report.bytes_written += 6;
             bump(&progress, |p| {
-                p.sent.fetch_add(1, Ordering::Relaxed);
                 p.bytes_written.fetch_add(6, Ordering::Relaxed);
             });
         }
@@ -1096,11 +1092,11 @@ mod tests {
             "unexpected error: {:?}",
             report.error
         );
-        // 15 I-frames sent plus STARTDT + STOPDT + at least one S-frame
-        // the client emits after receiving w (8) I-frames (here we
-        // don't receive any so that S-frame path doesn't fire).
+        // messages_sent now tracks data I-frames only (STARTDT / STOPDT
+        // / S-frame acks are plumbing and excluded). The test sends 15
+        // client I-frames.
         assert!(
-            report.messages_sent >= 17,
+            report.messages_sent >= 15,
             "messages_sent = {}",
             report.messages_sent
         );
@@ -1198,9 +1194,10 @@ mod tests {
         let report = run_session(cfg);
         assert!(report.connected, "not connected: {:?}", report.error);
         assert!(report.error.is_none(), "error: {:?}", report.error);
-        // At minimum: STARTDT act, I-frame, STOPDT act.
-        assert!(
-            report.messages_sent >= 3,
+        // Data-frame semantics: exactly one I-frame is sent. STARTDT /
+        // STOPDT are plumbing and no longer counted.
+        assert_eq!(
+            report.messages_sent, 1,
             "messages_sent = {}",
             report.messages_sent
         );

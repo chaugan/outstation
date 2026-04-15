@@ -326,8 +326,24 @@ fn find_captured_flow(
 
 /// Pick the flow in the **original** pcap that pcapreplay was
 /// replaying. In both roles it's the one whose `server.port` matches
-/// `target_port`.
-fn find_original_flow(original: &LoadedPcap, target_port: u16) -> Option<usize> {
+/// `target_port`. When the captured session lands on a specific RTU
+/// (slave mode, many listeners) or from a specific master
+/// (master mode, many initiators), the caller passes that endpoint IP
+/// as `server_ip_hint` so we pin on the right flow instead of
+/// returning "whichever happened to land first in the flow index".
+fn find_original_flow(
+    original: &LoadedPcap,
+    target_port: u16,
+    server_ip_hint: Option<std::net::Ipv4Addr>,
+) -> Option<usize> {
+    if let Some(want) = server_ip_hint {
+        for (idx, flow) in original.flows.iter().enumerate() {
+            let Some((ip, sp)) = flow.server else { continue };
+            if sp == target_port && ip == want {
+                return Some(idx);
+            }
+        }
+    }
     for (idx, flow) in original.flows.iter().enumerate() {
         let Some((_, sp)) = flow.server else { continue };
         if sp == target_port {
@@ -357,12 +373,23 @@ pub fn analyze(
 
     let mut notes: Vec<String> = Vec::new();
 
-    // --- Original pcap's relevant flow ---
-    let orig_flow_idx = find_original_flow(&original, target_port).ok_or_else(|| {
-        anyhow::anyhow!(
-            "no flow in source pcap with server_port={target_port}; nothing to compare against"
-        )
-    })?;
+    // --- Captured pcap's relevant flow (picked FIRST so we can use
+    //     its server IP to pin the original flow when the source pcap
+    //     holds more than one RTU). ---
+    let cap_flow_idx_opt = find_captured_flow(&captured, target_port, role);
+    let cap_server_ip_hint = cap_flow_idx_opt
+        .and_then(|idx| captured.flows.get(idx))
+        .and_then(|f| f.server)
+        .map(|(ip, _)| ip);
+
+    // --- Original pcap's relevant flow, pinned to the captured
+    //     session's server IP when one was observed. ---
+    let orig_flow_idx = find_original_flow(&original, target_port, cap_server_ip_hint)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no flow in source pcap with server_port={target_port}; nothing to compare against"
+            )
+        })?;
     let orig_client = original
         .reassemble_client_payload(orig_flow_idx)
         .context("reassemble original client side")?;
@@ -371,9 +398,18 @@ pub fn analyze(
         .context("reassemble original server side")?;
     let orig_client_iframes = extract_iframes(&orig_client.payload);
     let orig_server_iframes = extract_iframes(&orig_server.payload);
+    if let Some(hint) = cap_server_ip_hint {
+        let picked = original.flows[orig_flow_idx].server.map(|(ip, _)| ip);
+        if picked != Some(hint) {
+            notes.push(format!(
+                "source pcap has no flow for captured server {hint}; compared against \
+                 first available flow with port {target_port} instead"
+            ));
+        }
+    }
 
-    // --- Captured pcap's relevant flow ---
-    let cap_flow_idx = match find_captured_flow(&captured, target_port, role) {
+    // --- Captured pcap flow ---
+    let cap_flow_idx = match cap_flow_idx_opt {
         Some(i) => i,
         None => {
             notes.push(format!(

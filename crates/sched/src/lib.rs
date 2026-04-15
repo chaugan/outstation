@@ -609,11 +609,13 @@ pub struct BenchmarkConfig {
     /// Which side of the captured conversation the tool plays.
     /// `Master` (default) = pcapreplay connects out as the client of
     /// `target_ip:target_port`. `Slave` = pcapreplay binds a listener
-    /// on `0.0.0.0:(listen_port_base + idx)` per captured RTU and
-    /// waits for the target master to connect in.
+    /// per captured RTU and waits for the target master to connect in.
+    /// Each listener binds to its RTU's own IP (auto-aliased onto the
+    /// default-route interface) at `listen_port_base`, so 200 RTUs show
+    /// up as 200 distinct `rtu_ip:2404` endpoints — no port shifting.
     pub role: protoplay::Role,
-    /// Slave-only: base TCP port for listeners. Session `i` listens on
-    /// `listen_port_base + i`. Default 2404.
+    /// Slave-only: TCP port every listener binds on top of its
+    /// per-session `listen_ip`. Default 2404.
     pub listen_port_base: u16,
     /// How the replayer should pace its own I-frame sends. Default
     /// [`protoplay::Pacing::AsFastAsPossible`].
@@ -1056,6 +1058,15 @@ pub fn run_benchmark(
                     sleep_interruptible(wait, &ctx_worker.cancel);
                 }
                 if ctx_worker.is_cancelled() {
+                    {
+                        let sp = ctx_worker.per_source.lock().unwrap();
+                        if let Some(p) = sp.get(worker_idx) {
+                            p.state.store(
+                                protoplay::session_state::CANCELLED,
+                                Ordering::Relaxed,
+                            );
+                        }
+                    }
                     return SessionReport {
                         src_ip,
                         src_mac,
@@ -1081,12 +1092,14 @@ pub fn run_benchmark(
                 let session_progress_arc = std::sync::Arc::new(session_progress);
                 let payload_arc = std::sync::Arc::new(payload);
                 let frame_times_arc = std::sync::Arc::new(frame_times_ns);
+                let mut cancelled_mid_run = false;
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
                         sp.get(worker_idx).map(|p| p.is_cancelled()).unwrap_or(false)
                     };
                     if ctx_worker.is_cancelled() || session_cancelled {
+                        cancelled_mid_run = true;
                         break;
                     }
                     let run_cfg = ProtoRunCfg {
@@ -1119,13 +1132,22 @@ pub fn run_benchmark(
                 // Final reconciliation: the replayer's live-updated
                 // atomics should already match pr.messages_sent, but
                 // snap them to the authoritative totals to close any
-                // ordering gap on the last few frames.
+                // ordering gap on the last few frames. Also pin the
+                // session state so the UI stops showing it as ACTIVE.
                 let sp = ctx_worker.per_source.lock().unwrap();
                 if let Some(p) = sp.get(worker_idx) {
                     p.sent.store(pr.messages_sent, Ordering::Relaxed);
                     p.bytes.store(pr.bytes_written, Ordering::Relaxed);
                     p.received.store(pr.messages_received, Ordering::Relaxed);
                     p.unacked.store(pr.unacked_at_end, Ordering::Relaxed);
+                    let final_state = if cancelled_mid_run {
+                        protoplay::session_state::CANCELLED
+                    } else if pr.error.is_some() {
+                        protoplay::session_state::FAILED
+                    } else {
+                        protoplay::session_state::COMPLETED
+                    };
+                    p.state.store(final_state, Ordering::Relaxed);
                 }
                 drop(sp);
                 ctx_worker.sent.fetch_add(1, Ordering::Relaxed);
@@ -1136,6 +1158,7 @@ pub fn run_benchmark(
                     messages_received = pr.messages_received,
                     p50_us = pr.latency_p50_us,
                     p99_us = pr.latency_p99_us,
+                    cancelled = cancelled_mid_run,
                     error = ?pr.error,
                     "benchmark session complete"
                 );
@@ -1278,12 +1301,18 @@ fn run_benchmark_slave(
 
     // 2. Pre-populate RunContext per-source progress, one entry per
     //    RTU/listener so the web UI can draw a live per-session bar.
+    //    Default listen_ip to the RTU's own address from the pcap;
+    //    that way the per-listener auto-alias in the worker kicks in
+    //    without the user having to edit every row by hand.
     {
         let mut sp = ctx.per_source.lock().unwrap();
         sp.clear();
-        for (i, p) in picks.iter().enumerate() {
-            let listen_port = cfg.listen_port_base + i as u16;
-            let tap = format!("0.0.0.0:{listen_port}");
+        for (_i, p) in picks.iter().enumerate() {
+            // All listeners share the same port; the RTU IP is the
+            // discriminator. Binds don't collide because listen_ip is
+            // unique per session.
+            let listen_port = cfg.listen_port_base;
+            let tap = format!("{}:{listen_port}", p.server_ip);
             sp.push(SourceProgress {
                 src_ip: Some(p.server_ip),
                 src_mac: p.server_mac,
@@ -1297,7 +1326,7 @@ fn run_benchmark_slave(
                 state: Arc::new(AtomicU8::new(protoplay::session_state::PENDING)),
                 cancel: Arc::new(AtomicBool::new(false)),
                 listen_port,
-                listen_ip: Arc::new(Mutex::new(Ipv4Addr::UNSPECIFIED)),
+                listen_ip: Arc::new(Mutex::new(p.server_ip)),
             });
         }
     }
@@ -1357,8 +1386,8 @@ fn run_benchmark_slave(
         let cfg_cloned = cfg.clone();
         let src_ip = pick.server_ip;
         let src_mac = pick.server_mac;
-        let listen_port = cfg.listen_port_base + idx as u16;
-        let tap_label = format!("listen:{listen_port}");
+        let listen_port = cfg.listen_port_base;
+        let tap_label = format!("{}:{}", src_ip, listen_port);
         let ctx_worker = ctx.clone();
         let worker_idx = idx;
 
@@ -1382,36 +1411,33 @@ fn run_benchmark_slave(
         };
 
         let handle = thread::Builder::new()
-            .name(format!("bench-slave-{listen_port}"))
+            .name(format!("bench-slave-{src_ip}"))
             .spawn(move || {
                 // Wait for the user to flip `ready` for this slave.
-                // Also bail on run-level or per-session cancel.
+                // Also bail on run-level or per-session cancel. Both
+                // cancel paths write state=CANCELLED so the UI stops
+                // showing the slot as "pending" after a STOP click.
                 loop {
-                    if ctx_worker.is_cancelled() {
-                        return SessionReport {
-                            src_ip,
-                            src_mac,
-                            tap: tap_label,
-                            flow_idx,
-                            started_at_ns: now_ns(),
-                            proto_report: protoplay::ProtoReport {
-                                error: Some("cancelled before start".into()),
-                                ..Default::default()
-                            },
-                        };
-                    }
+                    let run_cancelled = ctx_worker.is_cancelled();
                     let (is_ready, is_cancelled) = {
                         let sp = ctx_worker.per_source.lock().unwrap();
                         let e = &sp[worker_idx];
                         (e.is_ready(), e.is_cancelled())
                     };
-                    if is_cancelled {
+                    if run_cancelled || is_cancelled {
+                        let msg = if run_cancelled {
+                            "cancelled before start"
+                        } else {
+                            "slave cancelled before start"
+                        };
                         let mut pr = protoplay::ProtoReport::default();
-                        pr.error = Some("slave cancelled before start".into());
+                        pr.error = Some(msg.into());
                         let sp = ctx_worker.per_source.lock().unwrap();
                         if let Some(p) = sp.get(worker_idx) {
-                            p.state
-                                .store(protoplay::session_state::FAILED, Ordering::Relaxed);
+                            p.state.store(
+                                protoplay::session_state::CANCELLED,
+                                Ordering::Relaxed,
+                            );
                         }
                         drop(sp);
                         return SessionReport {
@@ -1503,12 +1529,14 @@ fn run_benchmark_slave(
                 let session_progress_arc = std::sync::Arc::new(session_progress);
                 let payload_arc = std::sync::Arc::new(payload);
                 let frame_times_arc = std::sync::Arc::new(frame_times_ns);
+                let mut cancelled_mid_run = false;
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
                         sp.get(worker_idx).map(|p| p.is_cancelled()).unwrap_or(false)
                     };
                     if ctx_worker.is_cancelled() || session_cancelled {
+                        cancelled_mid_run = true;
                         break;
                     }
                     let run_cfg = ProtoRunCfg {
@@ -1553,6 +1581,14 @@ fn run_benchmark_slave(
                     p.bytes.store(pr.bytes_written, Ordering::Relaxed);
                     p.received.store(pr.messages_received, Ordering::Relaxed);
                     p.unacked.store(pr.unacked_at_end, Ordering::Relaxed);
+                    let final_state = if cancelled_mid_run {
+                        protoplay::session_state::CANCELLED
+                    } else if pr.error.is_some() {
+                        protoplay::session_state::FAILED
+                    } else {
+                        protoplay::session_state::COMPLETED
+                    };
+                    p.state.store(final_state, Ordering::Relaxed);
                 }
                 drop(sp);
                 ctx_worker.sent.fetch_add(1, Ordering::Relaxed);
@@ -1564,6 +1600,7 @@ fn run_benchmark_slave(
                     messages_received = pr.messages_received,
                     p50_us = pr.latency_p50_us,
                     p99_us = pr.latency_p99_us,
+                    cancelled = cancelled_mid_run,
                     error = ?pr.error,
                     "slave session complete"
                 );

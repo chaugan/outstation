@@ -237,6 +237,7 @@ fn state_to_str(s: u8) -> &'static str {
         ss::ACTIVE => "active",
         ss::COMPLETED => "completed",
         ss::FAILED => "failed",
+        ss::CANCELLED => "cancelled",
         _ => "unknown",
     }
 }
@@ -461,6 +462,7 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/:id/slaves/:idx/start", post(api_run_start_slave))
         .route("/api/runs/:id/slaves/:idx/stop", post(api_run_stop_slave))
         .route("/api/runs/:id/slaves/:idx", patch(api_run_patch_slave))
+        .route("/api/runs/:id/slaves/start_all", post(api_run_start_all_slaves))
         .route("/api/verify-ip", post(api_verify_ip))
         .route("/api/nics", get(api_nics))
         .route("/api/arp", post(api_arp))
@@ -1378,6 +1380,38 @@ async fn api_run_start_slave(
     entry.ready.store(true, Ordering::Relaxed);
     info!(id, idx, "slave start requested");
     Ok(StatusCode::ACCEPTED)
+}
+
+/// Fan-out "start all slaves" for a running slave-mode benchmark. Flips
+/// `ready=true` on every per-source entry that is still PENDING and
+/// hasn't already been cancelled. Idempotent — re-posting after some
+/// rows have already been started is a no-op for those rows.
+async fn api_run_start_all_slaves(
+    State(state): State<AppState>,
+    Path(id): Path<u64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    use protoplay::session_state as ss;
+    let map = state.runs.lock().unwrap();
+    let rs = map
+        .get(&id)
+        .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
+    let sp = rs.ctx.per_source.lock().unwrap();
+    let mut started = 0u64;
+    for entry in sp.iter() {
+        if entry.is_cancelled() {
+            continue;
+        }
+        let state_now = entry.snapshot_state();
+        if state_now != ss::PENDING {
+            continue;
+        }
+        entry.ready.store(true, Ordering::Relaxed);
+        started += 1;
+    }
+    let total = sp.len() as u64;
+    drop(sp);
+    info!(id, started, total, "slave start-all requested");
+    Ok(Json(serde_json::json!({ "started": started, "total": total })))
 }
 
 async fn api_run_stop_slave(
