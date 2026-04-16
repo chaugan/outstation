@@ -2935,7 +2935,15 @@ function renderDriftScatter(containerId, drift) {
   c.setOption({
     backgroundColor: 'transparent',
     animation: false,
-    grid: { left: 50, right: 14, top: 14, bottom: 38 },
+    grid: { left: 56, right: 14, top: 28, bottom: 56 },
+    toolbox: {
+      right: 14, top: 2,
+      feature: {
+        dataZoom: { yAxisIndex: 'none', title: { zoom: 'zoom (drag a rectangle)', back: 'reset zoom' } },
+        restore: { title: 'reset' },
+      },
+      iconStyle: { borderColor: dimColor },
+    },
     tooltip: {
       trigger: 'item',
       formatter: (p) => {
@@ -2943,15 +2951,15 @@ function renderDriftScatter(containerId, drift) {
         return `frame #${p.value[0]}<br>${tidName(tid)} [${tid}]<br>drift: ${p.value[1].toFixed(2)} ms`;
       },
     },
-    xAxis: { type: 'value', name: 'frame index', nameLocation: 'middle', nameGap: 22,
+    xAxis: { type: 'value',
              axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
              splitLine: { show: false } },
-    yAxis: { type: 'value', name: 'drift (ms)', nameLocation: 'middle', nameGap: 36,
-             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+    yAxis: { type: 'value',
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
              splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
     dataZoom: [
       { type: 'inside', xAxisIndex: 0 },
-      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 4, borderColor: 'transparent',
+      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
         textStyle: { color: dimColor, fontSize: 9 } },
     ],
     series: [
@@ -2985,8 +2993,16 @@ function renderGapComparison(containerId, timing) {
   c.setOption({
     backgroundColor: 'transparent',
     animation: false,
-    grid: { left: 56, right: 14, top: 24, bottom: 38 },
-    legend: { data: ['original', 'captured'], textStyle: { color: dimColor, fontSize: 10 }, top: 2, right: 12 },
+    grid: { left: 64, right: 14, top: 32, bottom: 56 },
+    toolbox: {
+      right: 110, top: 2,
+      feature: {
+        dataZoom: { yAxisIndex: 'none', title: { zoom: 'zoom (drag a rectangle)', back: 'reset zoom' } },
+        restore: { title: 'reset' },
+      },
+      iconStyle: { borderColor: dimColor },
+    },
+    legend: { data: ['original', 'captured'], textStyle: { color: dimColor, fontSize: 10 }, top: 4, right: 12 },
     tooltip: {
       trigger: 'axis',
       formatter: (params) => {
@@ -2997,15 +3013,15 @@ function renderGapComparison(containerId, timing) {
         return s;
       },
     },
-    xAxis: { type: 'category', name: 'inter-frame gap index', nameLocation: 'middle', nameGap: 22,
+    xAxis: { type: 'category',
              data: Array.from({ length: Math.max(orig.length, cap.length) }, (_, i) => String(i + 1)),
              axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 } },
-    yAxis: { type: 'value', name: 'gap (ms)', nameLocation: 'middle', nameGap: 42,
-             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+    yAxis: { type: 'value',
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
              splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
     dataZoom: [
       { type: 'inside', xAxisIndex: 0 },
-      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 4, borderColor: 'transparent',
+      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
         textStyle: { color: dimColor, fontSize: 9 } },
     ],
     series: [
@@ -3051,16 +3067,18 @@ function renderDriftHistogram(containerId, drift) {
     return { value: ct, itemStyle: { color: lo + step <= tol ? okColor : errColor } };
   });
   const c = echarts.init(node, null, { renderer: 'canvas' });
+  const rotate = labels.length > 8;
   c.setOption({
     backgroundColor: 'transparent',
     animation: false,
-    grid: { left: 50, right: 14, top: 14, bottom: 38 },
+    grid: { left: 52, right: 14, top: 14, bottom: rotate ? 48 : 28 },
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
-      formatter: (p) => `${labels[p[0].dataIndex]} ms<br>${p[0].value} samples` },
-    xAxis: { type: 'category', name: '|drift| bucket (ms)', nameLocation: 'middle', nameGap: 22,
+      formatter: (p) => `|drift| ${labels[p[0].dataIndex]} ms<br>${p[0].value} samples` },
+    xAxis: { type: 'category',
              data: labels, axisLine: { lineStyle: { color: dimColor } },
-             axisLabel: { color: dimColor, fontSize: 9, rotate: labels.length > 12 ? 45 : 0 } },
-    yAxis: { type: 'value', name: 'samples', nameLocation: 'middle', nameGap: 36,
+             axisTick: { alignWithLabel: true },
+             axisLabel: { color: dimColor, fontSize: 9, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
+    yAxis: { type: 'value',
              axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
              splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
     series: [{
@@ -3278,7 +3296,7 @@ function renderAnalysis(r) {
                    || (r.timing && (r.timing.captured_gaps_ms || []).length > 0);
   if (haveDriftSamples || haveGapData) {
     h += `<div class="an-h">ANOMALY DETECTION</div>`;
-    h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">click-and-drag inside any chart to zoom; double-click to reset</div>`;
+    h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">scroll inside a chart to zoom &middot; drag to pan &middot; use the toolbox icons (top-right) for rectangular zoom or reset</div>`;
     if (haveDriftSamples) {
       h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
       h += `<div id="an-chart-drift" class="an-chart"></div>`;
