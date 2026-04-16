@@ -1120,6 +1120,47 @@
     padding: 4px 0;
   }
   details.an-seq[open] summary { color: var(--ink); }
+
+  .an-chart {
+    background: var(--surface-2);
+    border: 1px solid var(--rule);
+    margin: 6px 0 14px;
+    height: 220px;
+    width: 100%;
+  }
+  .an-anomaly-list {
+    font-family: var(--mono);
+    font-size: 11px;
+    background: var(--surface-2);
+    padding: 8px 10px;
+    margin-top: 4px;
+  }
+  .an-anomaly-list .row {
+    display: grid;
+    grid-template-columns: 70px 150px 90px 1fr;
+    gap: 10px;
+    padding: 2px 0;
+    align-items: baseline;
+  }
+  .an-anomaly-list .row .idx { color: var(--dim); text-align: right; font-variant-numeric: tabular-nums; }
+  .an-anomaly-list .row .name { color: var(--ink); }
+  .an-anomaly-list .row .drift { color: var(--err); font-variant-numeric: tabular-nums; text-align: right; }
+  .an-anomaly-list .row .drift.ok { color: var(--ok); }
+  .an-anomaly-list .row .ctx { color: var(--ink-2); font-size: 10px; }
+  .an-anomaly-list .empty {
+    color: var(--ok);
+    font-family: var(--sans);
+    font-size: 11px;
+    padding: 4px 0;
+  }
+  .an-chart-caption {
+    font-family: var(--sans);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+    margin: 10px 0 0;
+  }
   .an-diff-row {
     font-family: var(--mono);
     font-size: 10px;
@@ -2854,7 +2895,227 @@ function renderTidSequenceCollapsible(label, ids) {
   return `<details class="an-seq"><summary>show full ${esc(label)} sequence (${ids.length})</summary><div class="an-tid-seq">${head}</div></details>`;
 }
 
+// Track ECharts instances rendered into the analysis card so we can
+// dispose them on the next render and resize them on window resize.
+let _anCharts = [];
+function _resetAnalysisCharts() {
+  for (const c of _anCharts) { try { c.dispose(); } catch (_) {} }
+  _anCharts = [];
+}
+window.addEventListener('resize', () => {
+  if (_anCharts.length === 0) return;
+  if (window._anResizeT) clearTimeout(window._anResizeT);
+  window._anResizeT = setTimeout(() => {
+    for (const c of _anCharts) { try { c.resize(); } catch (_) {} }
+  }, 150);
+});
+
+// CP56-drift scatter: every per-frame signed drift, with the
+// ±tolerance corridor as a faint band so outliers stand out.
+function renderDriftScatter(containerId, drift) {
+  const node = el(containerId);
+  if (!node || !drift || !drift.drift_samples_ms || !drift.drift_samples_ms.length) return;
+  const tol = drift.tolerance_ms || 50;
+  const okColor  = getCssVar('--ok')  || '#3f6430';
+  const errColor = getCssVar('--err') || '#922626';
+  const dimColor = getCssVar('--dim') || '#857f70';
+  // Build [x, y] pairs split into in-tolerance and out-of-tolerance
+  // series so they get distinct colours without per-point overrides.
+  const inP  = [];
+  const outP = [];
+  const idxs = drift.sample_frame_indices || [];
+  const tids = drift.sample_type_ids || [];
+  for (let i = 0; i < drift.drift_samples_ms.length; i++) {
+    const x = idxs[i] != null ? idxs[i] : i;
+    const y = drift.drift_samples_ms[i];
+    const ent = [x, y, tids[i] || 0];
+    if (Math.abs(y) <= tol) inP.push(ent); else outP.push(ent);
+  }
+  const c = echarts.init(node, null, { renderer: 'canvas' });
+  c.setOption({
+    backgroundColor: 'transparent',
+    animation: false,
+    grid: { left: 50, right: 14, top: 14, bottom: 38 },
+    tooltip: {
+      trigger: 'item',
+      formatter: (p) => {
+        const tid = (p.value && p.value[2]) || 0;
+        return `frame #${p.value[0]}<br>${tidName(tid)} [${tid}]<br>drift: ${p.value[1].toFixed(2)} ms`;
+      },
+    },
+    xAxis: { type: 'value', name: 'frame index', nameLocation: 'middle', nameGap: 22,
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+             splitLine: { show: false } },
+    yAxis: { type: 'value', name: 'drift (ms)', nameLocation: 'middle', nameGap: 36,
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+             splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+    dataZoom: [
+      { type: 'inside', xAxisIndex: 0 },
+      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 4, borderColor: 'transparent',
+        textStyle: { color: dimColor, fontSize: 9 } },
+    ],
+    series: [
+      { name: 'in tolerance', type: 'scatter', data: inP, symbolSize: 4,
+        large: true, largeThreshold: 1500, itemStyle: { color: okColor },
+        markArea: {
+          silent: true,
+          itemStyle: { color: 'rgba(63,100,48,0.07)' },
+          data: [[{ yAxis: -tol }, { yAxis: tol }]],
+        },
+      },
+      { name: 'out of tolerance', type: 'scatter', data: outP, symbolSize: 6,
+        large: true, largeThreshold: 1500, itemStyle: { color: errColor } },
+    ],
+  });
+  _anCharts.push(c);
+}
+
+// Inter-frame gap timing: original (muted) vs captured (accent).
+// When pacing is faithful the two lines overlap; divergence pops out.
+function renderGapComparison(containerId, timing) {
+  const node = el(containerId);
+  if (!node || !timing) return;
+  const orig = timing.original_gaps_ms || [];
+  const cap  = timing.captured_gaps_ms || [];
+  if (!orig.length && !cap.length) return;
+  const accColor = getCssVar('--accent') || '#b8441a';
+  const dimColor = getCssVar('--dim')    || '#857f70';
+  const inkColor = getCssVar('--ink-2')  || '#5a5750';
+  const c = echarts.init(node, null, { renderer: 'canvas' });
+  c.setOption({
+    backgroundColor: 'transparent',
+    animation: false,
+    grid: { left: 56, right: 14, top: 24, bottom: 38 },
+    legend: { data: ['original', 'captured'], textStyle: { color: dimColor, fontSize: 10 }, top: 2, right: 12 },
+    tooltip: {
+      trigger: 'axis',
+      formatter: (params) => {
+        if (!params || !params.length) return '';
+        const idx = params[0].axisValue;
+        let s = `gap #${idx}<br>`;
+        for (const p of params) s += `${p.marker} ${p.seriesName}: ${Number(p.value).toFixed(2)} ms<br>`;
+        return s;
+      },
+    },
+    xAxis: { type: 'category', name: 'inter-frame gap index', nameLocation: 'middle', nameGap: 22,
+             data: Array.from({ length: Math.max(orig.length, cap.length) }, (_, i) => String(i + 1)),
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 } },
+    yAxis: { type: 'value', name: 'gap (ms)', nameLocation: 'middle', nameGap: 42,
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+             splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+    dataZoom: [
+      { type: 'inside', xAxisIndex: 0 },
+      { type: 'slider', xAxisIndex: 0, height: 16, bottom: 4, borderColor: 'transparent',
+        textStyle: { color: dimColor, fontSize: 9 } },
+    ],
+    series: [
+      { name: 'original', type: 'line', data: orig, showSymbol: false, smooth: false,
+        lineStyle: { color: inkColor, width: 1, type: 'dashed' },
+        areaStyle: { color: 'rgba(90,87,80,0.08)' }, sampling: 'lttb' },
+      { name: 'captured', type: 'line', data: cap, showSymbol: false, smooth: false,
+        lineStyle: { color: accColor, width: 1.4 }, sampling: 'lttb' },
+    ],
+  });
+  _anCharts.push(c);
+}
+
+// Drift histogram (|drift| bucketed). Bars under the tolerance threshold
+// are green; bars above are red — visual cliff at the threshold.
+function renderDriftHistogram(containerId, drift) {
+  const node = el(containerId);
+  if (!node || !drift || !drift.drift_samples_ms || !drift.drift_samples_ms.length) return;
+  const tol = drift.tolerance_ms || 50;
+  const okColor  = getCssVar('--ok')  || '#3f6430';
+  const errColor = getCssVar('--err') || '#922626';
+  const dimColor = getCssVar('--dim') || '#857f70';
+  // Bin |drift|. Use a step that's a tenth of (max(|d|), tol), at
+  // minimum 5 ms and at maximum 50 ms, so bars are visually meaningful
+  // at both small and large scales.
+  const abs = drift.drift_samples_ms.map(Math.abs);
+  const max = Math.max(...abs, tol * 1.5);
+  const targetBins = 30;
+  let step = Math.max(1, Math.ceil(max / targetBins));
+  // Round step up to a "nice" 1/2/5 multiple of its order of magnitude.
+  const mag = Math.pow(10, Math.floor(Math.log10(step)));
+  const norm = step / mag;
+  step = (norm <= 1 ? 1 : norm <= 2 ? 2 : norm <= 5 ? 5 : 10) * mag;
+  const binCount = Math.ceil(max / step) + 1;
+  const counts = new Array(binCount).fill(0);
+  for (const v of abs) {
+    const b = Math.min(binCount - 1, Math.floor(v / step));
+    counts[b] += 1;
+  }
+  const labels = counts.map((_, i) => `${(i * step).toFixed(0)}–${((i + 1) * step).toFixed(0)}`);
+  const bars = counts.map((ct, i) => {
+    const lo = i * step;
+    return { value: ct, itemStyle: { color: lo + step <= tol ? okColor : errColor } };
+  });
+  const c = echarts.init(node, null, { renderer: 'canvas' });
+  c.setOption({
+    backgroundColor: 'transparent',
+    animation: false,
+    grid: { left: 50, right: 14, top: 14, bottom: 38 },
+    tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' },
+      formatter: (p) => `${labels[p[0].dataIndex]} ms<br>${p[0].value} samples` },
+    xAxis: { type: 'category', name: '|drift| bucket (ms)', nameLocation: 'middle', nameGap: 22,
+             data: labels, axisLine: { lineStyle: { color: dimColor } },
+             axisLabel: { color: dimColor, fontSize: 9, rotate: labels.length > 12 ? 45 : 0 } },
+    yAxis: { type: 'value', name: 'samples', nameLocation: 'middle', nameGap: 36,
+             axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+             splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+    series: [{
+      type: 'bar', data: bars, barCategoryGap: '20%',
+      markLine: { silent: true, symbol: 'none',
+        data: [{ xAxis: Math.floor(tol / step) - 0.5, label: { formatter: `${tol} ms tolerance`, color: dimColor, fontSize: 9 },
+                 lineStyle: { color: dimColor, type: 'dashed' } }] },
+    }],
+  });
+  _anCharts.push(c);
+}
+
+// Top-N anomaly callout list. Plain HTML — no chart.
+function renderTopAnomalies(containerId, drift, topN) {
+  const node = el(containerId);
+  if (!node || !drift || !drift.drift_samples_ms) return;
+  topN = topN || 10;
+  const tol = drift.tolerance_ms || 50;
+  const idxs = drift.sample_frame_indices || [];
+  const tids = drift.sample_type_ids || [];
+  // Sort by |drift| desc, take topN.
+  const ranked = drift.drift_samples_ms
+    .map((d, i) => ({ d, i, idx: idxs[i] != null ? idxs[i] : i, tid: tids[i] || 0 }))
+    .sort((a, b) => Math.abs(b.d) - Math.abs(a.d))
+    .slice(0, topN);
+  let h = '';
+  if (drift.out_of_tolerance === 0) {
+    h += `<div class="empty">no CP56 stamps outside ±${tol.toFixed(0)} ms — every event landed within tolerance</div>`;
+  }
+  for (const r of ranked) {
+    const sign = r.d >= 0 ? '+' : '';
+    const driftCls = Math.abs(r.d) <= tol ? 'drift ok' : 'drift';
+    const ctx = Math.abs(r.d) <= tol ? `within tolerance` : `exceeds ${tol.toFixed(0)} ms`;
+    h += `<div class="row">`;
+    h += `  <div class="idx">#${r.idx}</div>`;
+    h += `  <div class="name">${esc(tidName(r.tid))} <span style="color:var(--dim);font-size:10px">[${r.tid}]</span></div>`;
+    h += `  <div class="${driftCls}">${sign}${r.d.toFixed(1)} ms</div>`;
+    h += `  <div class="ctx">${esc(ctx)}</div>`;
+    h += `</div>`;
+  }
+  if (drift.samples_truncated) {
+    h += `<div class="ctx" style="margin-top:6px">note: per-frame samples were capped at the analyzer's safety limit; aggregate stats above remain accurate.</div>`;
+  }
+  node.innerHTML = h;
+}
+
+// Read a CSS custom property from :root; safe fallback on older browsers.
+function getCssVar(name) {
+  try {
+    return getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+  } catch (_) { return ''; }
+}
+
 function renderAnalysis(r) {
+  _resetAnalysisCharts();
   const out = el('an-result');
   let h = `<div class="an-card">`;
   // headline
@@ -3006,6 +3267,34 @@ function renderAnalysis(r) {
   h += `<div class="k">p99 gap</div><div class="v">orig ${t.original_p99_gap_ms.toFixed(1)} ms · capt ${t.captured_p99_gap_ms.toFixed(2)} ms</div>`;
   h += `</div>`;
 
+  // ── ANOMALY DETECTION ──
+  // Charts that surface per-frame timing fidelity and CP56 drift,
+  // built so a single bad frame in a 50k-frame run is visually
+  // unmissable. Drift charts conditional on fresh-timestamps mode
+  // having raw samples; the gap-comparison chart renders any time we
+  // have inter-frame gap arrays to plot.
+  const haveDriftSamples = r.cp56_drift && (r.cp56_drift.drift_samples_ms || []).length > 0;
+  const haveGapData = (r.timing && (r.timing.original_gaps_ms || []).length > 0)
+                   || (r.timing && (r.timing.captured_gaps_ms || []).length > 0);
+  if (haveDriftSamples || haveGapData) {
+    h += `<div class="an-h">ANOMALY DETECTION</div>`;
+    h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">click-and-drag inside any chart to zoom; double-click to reset</div>`;
+    if (haveDriftSamples) {
+      h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
+      h += `<div id="an-chart-drift" class="an-chart"></div>`;
+    }
+    if (haveGapData) {
+      h += `<div class="an-chart-caption">inter-frame gap timing &middot; original (dashed) vs. captured (solid)</div>`;
+      h += `<div id="an-chart-gap" class="an-chart"></div>`;
+    }
+    if (haveDriftSamples) {
+      h += `<div class="an-chart-caption">drift distribution &middot; bars beyond the dashed line are out-of-tolerance</div>`;
+      h += `<div id="an-chart-hist" class="an-chart"></div>`;
+      h += `<div class="an-chart-caption">worst CP56 drifts (top 10)</div>`;
+      h += `<div id="an-anomalies" class="an-anomaly-list"></div>`;
+    }
+  }
+
   // CP56Time2a drift — only present when the run used fresh-timestamps mode.
   if (r.cp56_drift) {
     const d = r.cp56_drift;
@@ -3036,6 +3325,20 @@ function renderAnalysis(r) {
 
   h += `</div>`;
   out.innerHTML = h;
+
+  // Init ECharts containers AFTER the DOM has accepted the new HTML.
+  // Defer to the next tick so getElementById finds the new nodes.
+  setTimeout(() => {
+    if (r.cp56_drift && (r.cp56_drift.drift_samples_ms || []).length > 0) {
+      renderDriftScatter('an-chart-drift', r.cp56_drift);
+      renderDriftHistogram('an-chart-hist', r.cp56_drift);
+      renderTopAnomalies('an-anomalies', r.cp56_drift, 10);
+    }
+    if (r.timing && ((r.timing.original_gaps_ms || []).length > 0
+                  || (r.timing.captured_gaps_ms || []).length > 0)) {
+      renderGapComparison('an-chart-gap', r.timing);
+    }
+  }, 0);
 }
 
 // =========================================================================

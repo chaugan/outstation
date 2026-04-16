@@ -207,7 +207,32 @@ pub struct Cp56DriftReport {
     /// IV (invalid) flag counts seen on captured stamps.
     pub invalid_flag_count: usize,
     pub summer_flag_count: usize,
+    /// Per-CP56-field signed drift in milliseconds (capture wire ts
+    /// minus decoded stamp). One entry per `samples`. Lets the UI plot
+    /// every needle directly without re-walking the pcap. Capped at
+    /// `MAX_DRIFT_SAMPLES` to keep response sizes sane on huge runs;
+    /// when capped, the array contains the first `MAX_DRIFT_SAMPLES`
+    /// samples and `samples_truncated` is set true.
+    #[serde(default)]
+    pub drift_samples_ms: Vec<f64>,
+    /// Index of the I-frame the corresponding sample came from
+    /// (relative to delivered I-frames). Same length as
+    /// `drift_samples_ms`.
+    #[serde(default)]
+    pub sample_frame_indices: Vec<u32>,
+    /// ASDU type ID for the same frame. Same length again.
+    #[serde(default)]
+    pub sample_type_ids: Vec<u8>,
+    /// True when the per-sample arrays were capped because the run
+    /// produced more CP56 fields than `MAX_DRIFT_SAMPLES`.
+    #[serde(default)]
+    pub samples_truncated: bool,
 }
+
+/// Cap on the per-frame drift sample arrays. A 50k-frame run × 8 B
+/// per f64 + 4 B index + 1 B type ≈ 650 KB raw, ~250 KB after JSON.
+/// That's the upper bound; aggregates stay accurate beyond this.
+pub const MAX_DRIFT_SAMPLES: usize = 50_000;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct TimingReport {
@@ -324,6 +349,14 @@ fn compute_cp56_drift(
     let mut iframes_with_cp56: usize = 0;
     let mut invalid_flag_count: usize = 0;
     let mut summer_flag_count: usize = 0;
+    let mut drift_samples_ms: Vec<f64> = Vec::new();
+    let mut sample_frame_indices: Vec<u32> = Vec::new();
+    let mut sample_type_ids: Vec<u8> = Vec::new();
+    let mut samples_truncated = false;
+    // Local I-frame index, incremented for every I-frame walked
+    // regardless of CP56 presence — matches what the UI sees as "the
+    // i'th frame in the captured playback".
+    let mut iframe_index: u32 = 0;
 
     let mut i = 0usize;
     while i + 6 <= payload.len() {
@@ -340,6 +373,8 @@ fn compute_cp56_drift(
         let body_start = i + 2; // APCI: 4 control bytes start at +2 of 0x68
         // I-frame test: LSB of CF1 is 0.
         if cf1 & 0x01 == 0 {
+            let this_iframe_idx = iframe_index;
+            iframe_index = iframe_index.saturating_add(1);
             // ASDU begins after 4-byte control field.
             let asdu_start = body_start + 4;
             let asdu_end = i + 2 + ln;
@@ -347,6 +382,7 @@ fn compute_cp56_drift(
                 break;
             }
             let asdu = &payload[asdu_start..asdu_end];
+            let type_id = asdu.first().copied().unwrap_or(0);
             // Extract every CP56Time2a in this ASDU (same SQ=0/SQ=1
             // walk as rewrite, reusing asdu.rs offset helpers).
             let stamps = extract_cp56_from_asdu(asdu);
@@ -382,6 +418,13 @@ fn compute_cp56_drift(
                     let diff_ms = diff_ns as f64 / 1e6;
                     signed_ms_sum += diff_ms;
                     abs_ms.push(diff_ms.abs());
+                    if drift_samples_ms.len() < MAX_DRIFT_SAMPLES {
+                        drift_samples_ms.push(diff_ms);
+                        sample_frame_indices.push(this_iframe_idx);
+                        sample_type_ids.push(type_id);
+                    } else {
+                        samples_truncated = true;
+                    }
                 }
             }
         }
@@ -413,6 +456,10 @@ fn compute_cp56_drift(
         mean_signed_ms: mean_signed,
         invalid_flag_count,
         summer_flag_count,
+        drift_samples_ms,
+        sample_frame_indices,
+        sample_type_ids,
+        samples_truncated,
     })
 }
 
@@ -1394,6 +1441,14 @@ mod tests {
         assert_eq!(drift.iframes_with_cp56, 1);
         assert!(drift.max_ms < 1.0, "drift.max_ms = {}", drift.max_ms);
         assert_eq!(drift.out_of_tolerance, 0);
+        // Per-frame arrays must be populated and length-consistent.
+        assert_eq!(drift.drift_samples_ms.len(), drift.samples);
+        assert_eq!(drift.sample_frame_indices.len(), drift.samples);
+        assert_eq!(drift.sample_type_ids.len(), drift.samples);
+        assert!(!drift.samples_truncated);
+        // Single sample at frame index 0, type 36.
+        assert_eq!(drift.sample_frame_indices[0], 0);
+        assert_eq!(drift.sample_type_ids[0], 36);
     }
 
     #[test]
@@ -1412,6 +1467,10 @@ mod tests {
         // abs(100ms) and signed should be +100ms (stamp trailed wire by 100ms).
         assert!((drift.mean_ms - 100.0).abs() < 2.0, "{}", drift.mean_ms);
         assert!(drift.mean_signed_ms > 80.0);
+        // The single per-frame sample must reflect the +100 ms drift
+        // (signed positive: stamp landed in the past relative to wire).
+        assert_eq!(drift.drift_samples_ms.len(), 1);
+        assert!((drift.drift_samples_ms[0] - 100.0).abs() < 2.0);
     }
 
     #[test]
