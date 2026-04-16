@@ -581,10 +581,19 @@ fn classify(
             if flags & TCP_RST != 0 {
                 flow.saw_rst = true;
             }
-            // First packet we see also seeds client if SYN never observed.
+            // Mid-flow capture: no SYN or SYN-ACK observed for this flow.
+            // Seed roles using the well-known-port heuristic (lower port = server).
+            // Falls back to first-packet direction only when ports tie.
             if flow.client.is_none() {
-                flow.client = Some((src_ip, src_port));
-                flow.server = Some((dst_ip, dst_port));
+                let (client_side, server_side) = if dst_port < src_port {
+                    ((src_ip, src_port), (dst_ip, dst_port))
+                } else if src_port < dst_port {
+                    ((dst_ip, dst_port), (src_ip, src_port))
+                } else {
+                    ((src_ip, src_port), (dst_ip, dst_port))
+                };
+                flow.client = Some(client_side);
+                flow.server = Some(server_side);
             }
             let role = match flow.client {
                 Some((c_ip, c_port)) if c_ip == src_ip && c_port == src_port => FlowRole::Client,

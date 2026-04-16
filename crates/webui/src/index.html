@@ -1025,7 +1025,76 @@
   .an-verdict.subset_script { color: var(--blue); }
   .an-verdict.divergent_script { color: var(--blue); }
   .an-verdict.target_silent { color: var(--warn); }
-  .an-verdict.handshake_incomplete, .an-verdict.no_delivery, .an-verdict.no_session, .an-verdict.unknown { color: var(--err); }
+  .an-verdict.handshake_incomplete, .an-verdict.no_delivery, .an-verdict.no_session, .an-verdict.unknown, .an-verdict.failed { color: var(--err); }
+  .an-verdict.all_correct { color: var(--ok); }
+  .an-verdict.not_attempted { color: var(--dim); }
+  /* fleet header */
+  .an-fleet-strip {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    margin: 4px 0 10px;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .an-bucket {
+    padding: 3px 8px;
+    border: 1px solid var(--rule);
+    background: var(--surface-2);
+  }
+  .an-bucket b { color: var(--ink); margin-right: 4px; }
+  .an-bucket.ok    { border-left: 2px solid var(--ok); }
+  .an-bucket.warn  { border-left: 2px solid var(--warn); }
+  .an-bucket.bad   { border-left: 2px solid var(--err); }
+  .an-bucket.muted { border-left: 2px solid var(--dim); color: var(--dim); }
+  .an-fleet-extremes {
+    display: flex;
+    gap: 18px;
+    flex-wrap: wrap;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    margin-bottom: 6px;
+  }
+  /* slave table */
+  .an-slave-table {
+    border: 1px solid var(--rule);
+    margin-top: 4px;
+    background: var(--surface);
+  }
+  .an-slave-row {
+    border-bottom: 1px solid var(--rule);
+  }
+  .an-slave-row:last-child { border-bottom: none; }
+  .an-slave-row > summary { cursor: pointer; user-select: none; }
+  .an-slave-row > summary::-webkit-details-marker { display: none; }
+  .an-slave-row > summary::marker { content: ''; }
+  .an-slave-sum, .an-slave-head {
+    display: grid;
+    grid-template-columns: 18px minmax(120px,1.4fr) minmax(60px,1fr) minmax(90px,1fr) 70px minmax(60px,1fr) minmax(120px,1.6fr);
+    gap: 8px;
+    align-items: center;
+    padding: 6px 8px;
+    font-family: var(--mono);
+    font-size: 11px;
+  }
+  .an-slave-head {
+    background: var(--surface-2);
+    color: var(--dim);
+    text-transform: uppercase;
+    font-size: 10px;
+    letter-spacing: 0.06em;
+    border-bottom: 1px solid var(--rule);
+  }
+  .an-slave-row > summary:hover { background: var(--surface-2); }
+  .an-slave-row[open] > summary { background: var(--surface-2); border-bottom: 1px solid var(--rule); }
+  .an-slave-row[open] > summary .an-tri { transform: rotate(90deg); }
+  .an-tri { display: inline-block; transition: transform 80ms; color: var(--dim); }
+  .an-slave-detail { padding: 10px 12px; }
+  .an-slave-sum .ok    { color: var(--ok); }
+  .an-slave-sum .warn  { color: var(--warn); }
+  .an-slave-sum .bad   { color: var(--err); }
+  .an-slave-sum .muted { color: var(--dim); }
   .an-summary {
     display: flex;
     flex-direction: column;
@@ -1458,6 +1527,10 @@
       <div class="field">
         <label>target ip</label>
         <input id="run-target-ip" type="text" placeholder="10.0.0.50" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>master bind ip <span class="opt">(master mode, optional)</span></label>
+        <input id="run-master-bind-ip" type="text" placeholder="(use captured master ip)" spellcheck="false" title="Override the source IP every master session binds from. Default uses each captured master's IP — set this when the captured master IP doesn't exist locally and you want all sessions to originate from a single local address (e.g. the host's primary IP, or a pre-aliased address).">
       </div>
       <div class="field">
         <label>target mac <span class="opt">(raw only)</span></label>
@@ -2089,6 +2162,7 @@ async function startRun() {
     pacing,
     rewrite_cp56_to_now: el('run-fresh-timestamps')?.checked || false,
     cp56_zone: document.querySelector('input[name="run-cp56-zone"]:checked')?.value || 'local',
+    master_bind_ip: (el('run-master-bind-ip').value.trim() || null),
   };
   if (isBench && el('run-scada-gw-enable').checked) {
     const gw = el('run-scada-gw-ip').value.trim();
@@ -3138,29 +3212,149 @@ function getCssVar(name) {
   } catch (_) { return ''; }
 }
 
-function renderAnalysis(r) {
-  _resetAnalysisCharts();
-  const out = el('an-result');
-  let h = `<div class="an-card">`;
-  // headline
-  h += `<div class="an-summary">`;
+function slaveSlug(ip) {
+  return String(ip).replace(/[^A-Za-z0-9]/g, '-');
+}
+
+function renderFleetHeader(r) {
+  const f = r.fleet || {};
+  let h = `<div class="an-summary">`;
   h += `  <div><span class="an-verdict ${esc(r.verdict)}">${esc(r.verdict.replace(/_/g,' '))}</span>`;
   h += `    <span class="an-score" style="margin-left:14px">${r.score_pct.toFixed(1)}%</span></div>`;
   h += `  <div class="reason">${esc(r.verdict_reason)}</div>`;
   h += `</div>`;
+  h += `<div class="an-fleet-strip">`;
+  h += `<span class="an-bucket"><b>${f.slave_count||0}</b> total</span>`;
+  h += `<span class="an-bucket ok"><b>${f.fully_correct||0}</b> all-correct</span>`;
+  h += `<span class="an-bucket warn"><b>${f.partial||0}</b> partial</span>`;
+  h += `<span class="an-bucket bad"><b>${f.failed||0}</b> failed</span>`;
+  h += `<span class="an-bucket muted"><b>${f.not_attempted||0}</b> silent</span>`;
+  h += `</div>`;
+  if (f.best || f.worst) {
+    h += `<div class="an-fleet-extremes">`;
+    if (f.worst) h += `<span>worst: <code>${esc(f.worst.slave_ip)}</code> @ <b>${f.worst.score_pct.toFixed(1)}%</b></span>`;
+    if (f.best)  h += `<span>best: <code>${esc(f.best.slave_ip)}</code> @ <b>${f.best.score_pct.toFixed(1)}%</b></span>`;
+    h += `</div>`;
+  }
+  return h;
+}
 
-  // run context
-  h += `<div class="an-kv">`;
+function renderRunContext(r) {
+  let h = `<div class="an-kv">`;
   h += `<div class="k">run</div><div class="v">#${r.run_id} · ${esc(r.role)} mode · ${esc(r.mode)} analysis</div>`;
   h += `<div class="k">source pcap</div><div class="v">${esc(r.original_pcap)}</div>`;
   h += `<div class="k">captured size</div><div class="v">${fmtBytes(r.captured_size_bytes)} · ${r.captured_total_packets.toLocaleString()} total pkts</div>`;
-  if (r.tcp_flow) {
-    h += `<div class="k">tcp flow</div><div class="v">${esc(r.tcp_flow.client)} → ${esc(r.tcp_flow.server)} · ${r.tcp_flow.packets} pkts · <code>${esc(r.tcp_flow.state || 'no state')}</code></div>`;
+  if (r.master_ip_mapping) {
+    const m = r.master_ip_mapping;
+    let v = '';
+    if (m.captured) v += `captured: <code>${esc(m.captured)}</code>`;
+    if (m.live) v += (v ? ' · ' : '') + `live: <code>${esc(m.live)}</code>`;
+    if (m.renamed) v += ` <span class="warn" title="The master IP differs between source and live capture. Per-slave matching anchors on slave IP, so this is informational unless replay-time rewriting is needed.">(renamed)</span>`;
+    h += `<div class="k">master ip</div><div class="v">${v || '—'}</div>`;
   }
   h += `</div>`;
+  return h;
+}
 
+function renderSlaveTable(r) {
+  const slaves = r.slaves || [];
+  if (slaves.length === 0) {
+    return `<div class="muted" style="padding:8px 0">no slaves to report</div>`;
+  }
+  let h = `<div class="an-h">SLAVES (${slaves.length}) · click a row to expand</div>`;
+  h += `<div class="an-slave-table">`;
+  h += `<div class="an-slave-row an-slave-head">`;
+  h += `<span></span><span>slave</span><span>packets</span><span>delivered</span><span>handshake</span><span>score</span><span>verdict</span>`;
+  h += `</div>`;
+  for (const s of slaves) {
+    const slug = slaveSlug(s.slave_ip);
+    const scoreCls = s.score_pct >= 99.999 ? 'ok' : (s.score_pct === 0 ? 'bad' : 'warn');
+    const handshakeCls = s.startdt_handshake_ok ? 'ok' : (s.packets > 0 ? 'bad' : 'muted');
+    const handshakeText = s.startdt_handshake_ok ? '✓' : (s.packets > 0 ? '✗' : '—');
+    const delivOk = s.delivered_iframes === s.expected_iframes && s.expected_iframes > 0;
+    const delivCls = delivOk ? 'ok' : (s.delivered_iframes === 0 ? 'bad' : 'warn');
+    h += `<details class="an-slave-row" data-slave-ip="${esc(s.slave_ip)}" data-slug="${slug}">`;
+    h += `<summary class="an-slave-sum">`;
+    h += `<span class="an-tri">▸</span>`;
+    h += `<span><code>${esc(s.slave_ip)}</code></span>`;
+    h += `<span>${s.packets.toLocaleString()}</span>`;
+    h += `<span class="${delivCls}">${s.delivered_iframes}/${s.expected_iframes}</span>`;
+    h += `<span class="${handshakeCls}" style="text-align:center">${handshakeText}</span>`;
+    h += `<span class="${scoreCls}"><b>${s.score_pct.toFixed(1)}%</b></span>`;
+    h += `<span class="an-verdict ${esc(s.verdict)}">${esc(s.verdict.replace(/_/g,' '))}</span>`;
+    h += `</summary>`;
+    h += `<div class="an-slave-detail">`;
+    const d = (r.details_by_ip || {})[s.slave_ip];
+    if (d) {
+      h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin-bottom:8px">${esc(s.verdict_reason || '')}</div>`;
+      h += renderSlaveDetail(s.slave_ip, d);
+    } else {
+      h += `<div class="muted">no detail available for ${esc(s.slave_ip)}</div>`;
+    }
+    h += `</div>`;
+    h += `</details>`;
+  }
+  h += `</div>`;
+  return h;
+}
+
+function setupSlaveDetailExpand(r) {
+  const out = el('an-result');
+  out.querySelectorAll('details.an-slave-row').forEach(node => {
+    node.addEventListener('toggle', () => {
+      if (!node.open || node.dataset.chartsInit === '1') return;
+      node.dataset.chartsInit = '1';
+      const ip = node.dataset.slaveIp;
+      const detail = (r.details_by_ip || {})[ip];
+      if (!detail) return;
+      initSlaveCharts(node.dataset.slug, detail);
+    });
+  });
+}
+
+function initSlaveCharts(slug, d) {
+  if (d.cp56_drift && (d.cp56_drift.drift_samples_ms || []).length > 0) {
+    renderDriftScatter('an-chart-drift-' + slug, d.cp56_drift);
+    renderDriftHistogram('an-chart-hist-' + slug, d.cp56_drift);
+    renderTopAnomalies('an-anomalies-' + slug, d.cp56_drift, 10);
+  }
+  if (d.timing && ((d.timing.original_gaps_ms || []).length > 0
+                || (d.timing.captured_gaps_ms || []).length > 0)) {
+    renderGapComparison('an-chart-gap-' + slug, d.timing);
+  }
+}
+
+function renderAnalysis(r) {
+  _resetAnalysisCharts();
+  const out = el('an-result');
+  let h = `<div class="an-card">`;
+  h += renderFleetHeader(r);
+  h += renderRunContext(r);
+  if (r.notes && r.notes.length) {
+    h += `<div class="an-h">FLEET NOTES</div>`;
+    for (const n of r.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
+  }
+  h += renderSlaveTable(r);
+  h += `</div>`;
+  out.innerHTML = h;
+  setupSlaveDetailExpand(r);
+}
+
+// Render the per-slave drill-down. The HTML structure mirrors the
+// pre-fleet single-flow report so existing CSS classes (.an-kv,
+// .an-h, .an-tid-hist, .an-diff-row, .an-chart, .an-note) just work.
+// Chart container IDs are scoped by slave-IP slug so multiple
+// expanded slaves don't clash.
+function renderSlaveDetail(slaveIp, d) {
+  const slug = slaveSlug(slaveIp);
+  let h = ``;
+  if (d.tcp_flow) {
+    h += `<div class="an-kv">`;
+    h += `<div class="k">tcp flow</div><div class="v">${esc(d.tcp_flow.client)} → ${esc(d.tcp_flow.server)} · ${d.tcp_flow.packets} pkts · <code>${esc(d.tcp_flow.state || 'no state')}</code></div>`;
+    h += `</div>`;
+  }
   // playback
-  const pb = r.playback;
+  const pb = d.playback;
   h += `<div class="an-h">PLAYBACK SIDE (${esc(pb.direction)})</div>`;
   h += `<div class="an-kv">`;
   h += `<div class="k">expected i-frames</div><div class="v">${pb.expected_iframes}</div>`;
@@ -3206,7 +3400,7 @@ function renderAnalysis(r) {
   }
 
   // target side
-  const tg = r.target;
+  const tg = d.target;
   h += `<div class="an-h">TARGET SIDE (${esc(tg.direction)})</div>`;
   h += `<div class="an-kv">`;
   h += `<div class="k">u / s / i frames</div><div class="v">${tg.u_frames} · ${tg.s_frames} · ${tg.i_frames}</div>`;
@@ -3276,7 +3470,7 @@ function renderAnalysis(r) {
   }
 
   // timing
-  const t = r.timing;
+  const t = d.timing;
   h += `<div class="an-h">TIMING</div>`;
   h += `<div class="an-kv">`;
   h += `<div class="k">duration (original)</div><div class="v">${(t.original_duration_ms/1000).toFixed(3)} s</div>`;
@@ -3297,75 +3491,60 @@ function renderAnalysis(r) {
   // unmissable. Drift charts conditional on fresh-timestamps mode
   // having raw samples; the gap-comparison chart renders any time we
   // have inter-frame gap arrays to plot.
-  const haveDriftSamples = r.cp56_drift && (r.cp56_drift.drift_samples_ms || []).length > 0;
-  const haveGapData = (r.timing && (r.timing.original_gaps_ms || []).length > 0)
-                   || (r.timing && (r.timing.captured_gaps_ms || []).length > 0);
+  const haveDriftSamples = d.cp56_drift && (d.cp56_drift.drift_samples_ms || []).length > 0;
+  const haveGapData = (d.timing && (d.timing.original_gaps_ms || []).length > 0)
+                   || (d.timing && (d.timing.captured_gaps_ms || []).length > 0);
   if (haveDriftSamples || haveGapData) {
     h += `<div class="an-h">ANOMALY DETECTION</div>`;
     h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">scroll inside a chart to zoom &middot; drag to pan &middot; use the toolbox icons (top-right) for rectangular zoom or reset</div>`;
     if (haveDriftSamples) {
       h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
       h += `<div class="an-chart-axes">X: frame index &middot; Y: drift (ms, signed)</div>`;
-      h += `<div id="an-chart-drift" class="an-chart"></div>`;
+      h += `<div id="an-chart-drift-${slug}" class="an-chart"></div>`;
     }
     if (haveGapData) {
       h += `<div class="an-chart-caption">inter-frame gap timing &middot; original (dashed) vs. captured (solid)</div>`;
       h += `<div class="an-chart-axes">X: inter-frame gap index &middot; Y: gap duration (ms)</div>`;
-      h += `<div id="an-chart-gap" class="an-chart"></div>`;
+      h += `<div id="an-chart-gap-${slug}" class="an-chart"></div>`;
     }
     if (haveDriftSamples) {
       h += `<div class="an-chart-caption">drift distribution &middot; bars beyond the dashed line are out-of-tolerance</div>`;
       h += `<div class="an-chart-axes">X: |drift| bucket (ms) &middot; Y: sample count</div>`;
-      h += `<div id="an-chart-hist" class="an-chart"></div>`;
+      h += `<div id="an-chart-hist-${slug}" class="an-chart"></div>`;
       h += `<div class="an-chart-caption">worst CP56 drifts (top 10)</div>`;
-      h += `<div id="an-anomalies" class="an-anomaly-list"></div>`;
+      h += `<div id="an-anomalies-${slug}" class="an-anomaly-list"></div>`;
     }
   }
 
   // CP56Time2a drift — only present when the run used fresh-timestamps mode.
-  if (r.cp56_drift) {
-    const d = r.cp56_drift;
-    const passed = d.out_of_tolerance === 0;
-    const withinPct = d.samples > 0
-      ? (100 * (d.samples - d.out_of_tolerance) / d.samples).toFixed(2)
+  if (d.cp56_drift) {
+    const dr = d.cp56_drift;
+    const passed = dr.out_of_tolerance === 0;
+    const withinPct = dr.samples > 0
+      ? (100 * (dr.samples - dr.out_of_tolerance) / dr.samples).toFixed(2)
       : '0.00';
     h += `<div class="an-h">EMBEDDED TIMESTAMP ACCURACY <span class="opt">(fresh-timestamps mode)</span></div>`;
     h += `<div class="an-kv">`;
     h += `<div class="k">verdict</div><div class="v" style="color:${passed ? 'var(--ok,#6a0)' : 'var(--err,#c33)'}">` +
-         `${withinPct}% of ${d.samples} CP56Time2a fields within ±${d.tolerance_ms.toFixed(0)} ms of wire time</div>`;
-    h += `<div class="k">frames with CP56</div><div class="v">${d.iframes_with_cp56}</div>`;
-    h += `<div class="k">mean drift</div><div class="v">${d.mean_ms.toFixed(2)} ms (signed ${d.mean_signed_ms.toFixed(2)})</div>`;
-    h += `<div class="k">p50 / p99 / max</div><div class="v">${d.p50_ms.toFixed(2)} / ${d.p99_ms.toFixed(2)} / ${d.max_ms.toFixed(2)} ms</div>`;
-    if (d.out_of_tolerance > 0) {
-      h += `<div class="k">out of tolerance</div><div class="v" style="color:var(--err,#c33)">${d.out_of_tolerance} / ${d.samples}</div>`;
+         `${withinPct}% of ${dr.samples} CP56Time2a fields within ±${dr.tolerance_ms.toFixed(0)} ms of wire time</div>`;
+    h += `<div class="k">frames with CP56</div><div class="v">${dr.iframes_with_cp56}</div>`;
+    h += `<div class="k">mean drift</div><div class="v">${dr.mean_ms.toFixed(2)} ms (signed ${dr.mean_signed_ms.toFixed(2)})</div>`;
+    h += `<div class="k">p50 / p99 / max</div><div class="v">${dr.p50_ms.toFixed(2)} / ${dr.p99_ms.toFixed(2)} / ${dr.max_ms.toFixed(2)} ms</div>`;
+    if (dr.out_of_tolerance > 0) {
+      h += `<div class="k">out of tolerance</div><div class="v" style="color:var(--err,#c33)">${dr.out_of_tolerance} / ${dr.samples}</div>`;
     }
-    if (d.invalid_flag_count > 0 || d.summer_flag_count > 0) {
-      h += `<div class="k">flags observed</div><div class="v">IV=${d.invalid_flag_count} · SU=${d.summer_flag_count}</div>`;
+    if (dr.invalid_flag_count > 0 || dr.summer_flag_count > 0) {
+      h += `<div class="k">flags observed</div><div class="v">IV=${dr.invalid_flag_count} · SU=${dr.summer_flag_count}</div>`;
     }
     h += `</div>`;
   }
 
-  if (r.notes && r.notes.length) {
+  if (d.notes && d.notes.length) {
     h += `<div class="an-h">NOTES</div>`;
-    for (const n of r.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
+    for (const n of d.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
   }
 
-  h += `</div>`;
-  out.innerHTML = h;
-
-  // Init ECharts containers AFTER the DOM has accepted the new HTML.
-  // Defer to the next tick so getElementById finds the new nodes.
-  setTimeout(() => {
-    if (r.cp56_drift && (r.cp56_drift.drift_samples_ms || []).length > 0) {
-      renderDriftScatter('an-chart-drift', r.cp56_drift);
-      renderDriftHistogram('an-chart-hist', r.cp56_drift);
-      renderTopAnomalies('an-anomalies', r.cp56_drift, 10);
-    }
-    if (r.timing && ((r.timing.original_gaps_ms || []).length > 0
-                  || (r.timing.captured_gaps_ms || []).length > 0)) {
-      renderGapComparison('an-chart-gap', r.timing);
-    }
-  }, 0);
+  return h;
 }
 
 // =========================================================================

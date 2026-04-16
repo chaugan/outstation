@@ -661,6 +661,14 @@ pub struct BenchmarkConfig {
     /// Default `"local"` — matches what most plant SCADA systems
     /// expect on the HMI, with SU bit following server DST state.
     pub cp56_zone: String,
+    /// Master-mode only: override the per-session bind IP. By
+    /// default each master session binds from the captured client
+    /// (master) IP — useful for fidelity replay on a host that owns
+    /// that IP, fatal otherwise. Set this to a local IP (or one we
+    /// can auto-alias onto the egress interface) to make every master
+    /// session originate from a specific local address regardless of
+    /// what the pcap recorded. Ignored in slave mode.
+    pub master_bind_ip: Option<Ipv4Addr>,
 }
 
 impl Default for BenchmarkConfig {
@@ -687,6 +695,7 @@ impl Default for BenchmarkConfig {
             alias_state_path: None,
             rewrite_cp56_to_now: false,
             cp56_zone: "local".into(),
+            master_bind_ip: None,
         }
     }
 }
@@ -935,13 +944,23 @@ pub fn run_benchmark(
         bridge_side: String,
         inject_side: String,
     }
+    // Master IP rewrite: if the user supplied `master_bind_ip`, every
+    // master session binds and originates from that IP, regardless of
+    // what the captured pcap recorded. The veth port for each session
+    // gets the override IP assigned (so bind() succeeds), the captured
+    // IP is preserved only as the `pick.client_ip` for analysis/logging.
+    let master_override = cfg.master_bind_ip;
+    if let Some(ip) = master_override {
+        info!(%ip, "master_bind_ip override active — sessions will originate from this address");
+    }
     let mut bindings: Vec<SessionBinding> = Vec::with_capacity(picks.len());
     for (i, p) in picks.iter().enumerate() {
+        let effective_src_ip = master_override.unwrap_or(p.client_ip);
         let bridge_side = format!("{}b{}", cfg.tap_prefix, i);
         let inject_side = match topo.add_port_with_ip(
             &bridge_side,
             Some(p.client_mac),
-            Some(p.client_ip),
+            Some(effective_src_ip),
         ) {
             Ok(inj) => inj,
             Err(e) => {
@@ -952,7 +971,7 @@ pub fn run_benchmark(
         };
         bindings.push(SessionBinding {
             pick_idx: i,
-            src_ip: p.client_ip,
+            src_ip: effective_src_ip,
             src_mac: p.client_mac,
             bridge_side,
             inject_side,

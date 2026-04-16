@@ -24,8 +24,8 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
 use crate::apdu::{
-    write_apdu, Apdu, ApduReader, U_STARTDT_ACT, U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON,
-    U_TESTFR_ACT, U_TESTFR_CON,
+    write_apdu, Apdu, ApduReader, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT,
+    U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
     load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone, RewriteMap,
@@ -41,12 +41,12 @@ fn wall_clock_unix_ns() -> u64 {
 
 const DEFAULT_W: u16 = 8;
 const DEFAULT_K: u16 = 12;
-const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
 const IDLE_POLL: Duration = Duration::from_millis(50);
 /// `t1` from the IEC 104 spec: max time the client will wait for the
 /// server to acknowledge an outstanding I-frame before declaring the
 /// session broken.
-const T1_TIMEOUT: Duration = Duration::from_secs(15);
+const T1_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[inline]
 fn now_ns() -> u64 {
@@ -208,7 +208,20 @@ fn extract_iframes(cfg: &ProtoRunCfg, side_label: &str) -> Vec<Vec<u8>> {
     for seg in &cfg.client_segments {
         stream.extend_from_slice(&seg.bytes);
     }
-    let mut reader = ApduReader::new(&stream[..]);
+    // Mid-flow capture: the byte stream may begin partway through an
+    // APCI frame. Scan forward for the first self-consistent boundary
+    // (0x68 LEN ... where the next frame also starts on 0x68) and
+    // discard the leading partial-frame bytes.
+    let resync = find_apci_resync(&stream);
+    if resync > 0 {
+        info!(
+            side = side_label,
+            dropped_bytes = resync,
+            total_bytes = stream.len(),
+            "skipped leading mid-frame bytes for APCI resync"
+        );
+    }
+    let mut reader = ApduReader::new(&stream[resync..]);
     let mut out = Vec::new();
     loop {
         match reader.next_apdu() {
@@ -222,6 +235,30 @@ fn extract_iframes(cfg: &ProtoRunCfg, side_label: &str) -> Vec<Vec<u8>> {
         }
     }
     out
+}
+
+/// Find the first byte offset where an APCI frame both parses cleanly
+/// and is followed by another frame boundary (or clean EOF). The
+/// two-frame self-consistency check rejects coincidental 0x68 bytes
+/// that appear inside ASDU payload. Returns 0 if the stream already
+/// begins on a frame; returns `stream.len()` if no boundary is found.
+pub(crate) fn find_apci_resync(stream: &[u8]) -> usize {
+    let mut i = 0usize;
+    while i + 2 + APCI_LEN <= stream.len() {
+        if stream[i] == START_BYTE {
+            let len = stream[i + 1] as usize;
+            if len >= APCI_LEN && len <= MAX_APDU_LEN {
+                let next = i + 2 + len;
+                let boundary_ok = next == stream.len()
+                    || (next < stream.len() && stream[next] == START_BYTE);
+                if boundary_ok && Apdu::parse(&stream[i + 2..i + 2 + APCI_LEN]).is_ok() {
+                    return i;
+                }
+            }
+        }
+        i += 1;
+    }
+    stream.len()
 }
 
 pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
@@ -838,10 +875,42 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             break 'outer;
         }
         if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
-            pace_sleep_until(send_start_ns, target, &progress);
-            if check_cancel(&progress) {
-                report.error = Some(format!("cancelled during pace at idx {idx}"));
-                break 'outer;
+            // Pace until the next captured send time, but stay
+            // responsive to incoming master traffic during the wait —
+            // critical for long inter-frame gaps where TESTFR_act
+            // would otherwise miss its t1 reply window.
+            let target_abs_ns = send_start_ns.saturating_add(target);
+            'pace: loop {
+                let now = now_ns();
+                if now >= target_abs_ns {
+                    break 'pace;
+                }
+                if check_cancel(&progress) {
+                    report.error = Some(format!("cancelled during pace at idx {idx}"));
+                    break 'outer;
+                }
+                let remaining_ns = target_abs_ns.saturating_sub(now);
+                let slice = Duration::from_nanos(remaining_ns.min(IDLE_POLL.as_nanos() as u64));
+                match rx.recv_timeout(slice) {
+                    Ok(apdu) => handle_incoming(
+                        apdu,
+                        &mut write_stream,
+                        &mut my_nr,
+                        &mut unacked_received,
+                        w,
+                        &mut pending,
+                        &mut report,
+                        &progress,
+                        &mut latency,
+                    ),
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        // Master tore down during the gap; let the
+                        // next write fail naturally so the existing
+                        // error path runs.
+                        break 'pace;
+                    }
+                }
             }
         }
         while pending.len() as u16 >= k {
@@ -1232,6 +1301,60 @@ mod tests {
             received.windows(3).any(|w| w[0] == 0x68 && w[2] & 0x01 == 0),
             "did not see an I-frame in server receive buffer"
         );
+    }
+
+    #[test]
+    fn resync_skips_leading_partial_frame_bytes() {
+        // Build a stream of three valid I-frames, then prepend bytes
+        // that look like the tail of a partial frame — including a
+        // coincidental 0x68 byte that does NOT begin a valid frame.
+        let mut clean = Vec::new();
+        for ns in 0..3u16 {
+            clean.extend_from_slice(
+                &Apdu::I {
+                    ns,
+                    nr: 0,
+                    asdu: vec![0x65, 0x01, 0x06, 0x00, 0x01, 0x00, ns as u8, 0x00, 0x00, 0x00],
+                }
+                .serialize(),
+            );
+        }
+        // Junk prefix: arbitrary mid-frame ASDU bytes including one
+        // 0x68 to confirm two-frame self-consistency rejects it.
+        let mut junk = vec![0x42, 0x68, 0xff, 0x00, 0x07, 0x99, 0xaa];
+        junk.extend_from_slice(&clean);
+        let offset = super::find_apci_resync(&junk);
+        assert_eq!(offset, 7, "should skip 7 junk bytes");
+        // Decode from resync point and confirm we recover all 3 I-frames.
+        let mut reader = crate::apdu::ApduReader::new(&junk[offset..]);
+        let mut count = 0;
+        while let Ok(Some(apdu)) = reader.next_apdu() {
+            if matches!(apdu, Apdu::I { .. }) {
+                count += 1;
+            }
+        }
+        assert_eq!(count, 3, "expected 3 I-frames after resync");
+    }
+
+    #[test]
+    fn resync_no_op_on_clean_stream() {
+        let mut clean = Vec::new();
+        clean.extend_from_slice(&Apdu::U { code: 0x07 }.serialize());
+        clean.extend_from_slice(
+            &Apdu::I {
+                ns: 1,
+                nr: 0,
+                asdu: vec![0xde, 0xad, 0xbe, 0xef],
+            }
+            .serialize(),
+        );
+        assert_eq!(super::find_apci_resync(&clean), 0);
+    }
+
+    #[test]
+    fn resync_returns_len_when_no_boundary_found() {
+        let garbage = vec![0xff; 32];
+        assert_eq!(super::find_apci_resync(&garbage), garbage.len());
     }
 }
 

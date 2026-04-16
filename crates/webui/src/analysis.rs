@@ -19,7 +19,8 @@
 //!    inter-frame gap statistics on the playback side, so the user
 //!    can see if pacing mode worked as expected.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::net::Ipv4Addr;
 use std::path::Path;
 
 use pcapload::{LoadedPcap, ReassembledFlow};
@@ -62,20 +63,94 @@ pub struct AnalysisReport {
     pub original_pcap: String,
     pub captured_size_bytes: u64,
     pub captured_total_packets: usize,
+    /// Top-level rollup across the whole fleet of replayed slaves.
+    pub verdict: &'static str,
+    pub verdict_reason: String,
+    pub score_pct: f64,
+    /// Fleet-level notes only. Per-slave notes live inside
+    /// `details_by_ip[ip].notes`.
+    pub notes: Vec<String>,
+    pub fleet: FleetSummary,
+    /// One light-weight row per slave, intended for the table view.
+    /// Sorted worst-score-first so the UI can render as-is.
+    pub slaves: Vec<SlaveSummary>,
+    /// Full drill-down detail per slave IP. UI renders only the entry
+    /// for the row the user expanded.
+    pub details_by_ip: BTreeMap<String, SlaveDetail>,
+    /// Captured-master-IP → live-master-IP mapping. `captured` is
+    /// auto-detected from the original pcap (the unique client across
+    /// 2404 flows). `live` is auto-detected from the captured pcap
+    /// the same way. Surfaced so the UI can show "rewrote .10.10 →
+    /// .86.223 across N sessions".
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_ip_mapping: Option<MasterIpMapping>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct FleetSummary {
+    pub slave_count: usize,
+    /// Slaves where the captured pcap saw at least one TCP packet.
+    pub attempted: usize,
+    /// Slaves expected from the original pcap that never showed up
+    /// in the captured pcap.
+    pub not_attempted: usize,
+    /// score_pct >= 99.999.
+    pub fully_correct: usize,
+    /// 0 < score_pct < 99.999.
+    pub partial: usize,
+    /// score_pct == 0 among attempted slaves.
+    pub failed: usize,
+    /// Mean score_pct across attempted slaves only. Not_attempted
+    /// slaves are excluded so the number reflects "how well did the
+    /// stuff that ran do" rather than blending in zeros for IPs
+    /// nobody ever connected to.
+    pub aggregate_score_pct: f64,
+    pub best: Option<BestWorst>,
+    pub worst: Option<BestWorst>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct BestWorst {
+    pub slave_ip: String,
+    pub score_pct: f64,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct SlaveSummary {
+    pub slave_ip: String,
+    pub score_pct: f64,
+    pub verdict: &'static str,
+    pub verdict_reason: String,
+    pub expected_iframes: usize,
+    pub delivered_iframes: usize,
+    pub packets: usize,
+    pub startdt_handshake_ok: bool,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct SlaveDetail {
     pub tcp_flow: Option<FlowInfo>,
     pub playback: PlaybackReport,
     pub target: TargetReport,
     pub timing: TimingReport,
-    /// CP56Time2a drift statistics. Populated only when the run used
-    /// the fresh-timestamps feature (else `None` — stamps were the
-    /// pcap's originals, so comparing them to wire send times isn't
-    /// meaningful).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cp56_drift: Option<Cp56DriftReport>,
     pub verdict: &'static str,
     pub verdict_reason: String,
     pub score_pct: f64,
     pub notes: Vec<String>,
+}
+
+#[derive(Serialize, Debug, Clone)]
+pub struct MasterIpMapping {
+    /// Master IP observed in the original pcap (None if the pcap had
+    /// no IEC 104 client, or if multiple clients were ambiguous).
+    pub captured: Option<String>,
+    /// Master IP observed in the captured live pcap.
+    pub live: Option<String>,
+    /// True iff both sides resolved to a single, distinct address —
+    /// i.e. there's a meaningful captured→live rename to surface.
+    pub renamed: bool,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -621,75 +696,87 @@ fn flow_state_label(flow: &pcapload::Flow) -> String {
     s.trim().to_string()
 }
 
-/// Locate the captured flow that corresponds to the run's expected
-/// target port (raw path), or any TCP flow on 2404 / `target_port`
-/// whose server address matches the run's target. Returns the flow
-/// index in `captured.flows` plus a `role` hint.
-fn find_captured_flow(
+/// Pick the **busiest** captured flow for a given (server_ip, port).
+/// "Busiest" = most TCP packets. Ranking by packets fixes the case
+/// where a stale 10-packet FIN-only flow shadows the real working
+/// session that carries thousands of packets.
+fn find_busiest_captured_flow(
     captured: &LoadedPcap,
+    server_ip: Ipv4Addr,
     target_port: u16,
-    role: RoleHint,
 ) -> Option<usize> {
-    // Prefer an exact match on server_port == target_port. Multiple
-    // flows may match (e.g., one per simulated RTU in slave mode);
-    // return the first so the caller can compare against the most
-    // interesting one.
+    let mut best: Option<(usize, usize)> = None;
     for (idx, flow) in captured.flows.iter().enumerate() {
-        let Some((_, sp)) = flow.server else { continue };
-        if sp == target_port {
-            // Slave: we're the server side, so the flow's server
-            // should be our listen address. Master: we're the client.
-            let _ = role; // not used to narrow further for now.
-            return Some(idx);
+        let Some((ip, sp)) = flow.server else { continue };
+        if sp != target_port || ip != server_ip {
+            continue;
+        }
+        let pkts = flow.packet_indices.len();
+        if best.map_or(true, |(_, p)| pkts > p) {
+            best = Some((idx, pkts));
         }
     }
-    // Fallback: a flow where any side port matches.
-    for (idx, flow) in captured.flows.iter().enumerate() {
-        if let Some((_, cp)) = flow.client {
-            if cp == target_port {
-                return Some(idx);
-            }
+    best.map(|(idx, _)| idx)
+}
+
+/// Detect the master IP for an IEC 104 pcap: the unique client IP
+/// across all flows whose server port matches `target_port`. When
+/// multiple distinct clients exist, returns the busiest one (most
+/// flows). Returns None if no client speaks 2404 at all.
+fn detect_master_ip(p: &LoadedPcap, target_port: u16) -> Option<Ipv4Addr> {
+    let mut counts: HashMap<Ipv4Addr, usize> = HashMap::new();
+    for flow in &p.flows {
+        let Some((_, sp)) = flow.server else { continue };
+        if sp != target_port {
+            continue;
         }
-        if let Some((_, sp)) = flow.server {
+        if let Some((cip, _)) = flow.client {
+            *counts.entry(cip).or_insert(0) += 1;
+        }
+    }
+    counts.into_iter().max_by_key(|(_, c)| *c).map(|(ip, _)| ip)
+}
+
+/// Enumerate distinct slave IPs in a pcap (server_port == target_port).
+fn list_slave_ips(p: &LoadedPcap, target_port: u16) -> BTreeSet<Ipv4Addr> {
+    let mut ips: BTreeSet<Ipv4Addr> = BTreeSet::new();
+    for flow in &p.flows {
+        if let Some((ip, sp)) = flow.server {
             if sp == target_port {
-                return Some(idx);
+                ips.insert(ip);
             }
         }
     }
-    None
+    ips
 }
 
-/// Pick the flow in the **original** pcap that outstation was
-/// replaying. In both roles it's the one whose `server.port` matches
-/// `target_port`. When the captured session lands on a specific RTU
-/// (slave mode, many listeners) or from a specific master
-/// (master mode, many initiators), the caller passes that endpoint IP
-/// as `server_ip_hint` so we pin on the right flow instead of
-/// returning "whichever happened to land first in the flow index".
-fn find_original_flow(
+/// Pick the flow in the **original** pcap whose server matches the
+/// given slave IP and port. In a multi-RTU pcap there's typically one
+/// flow per slave IP; if multiple flows match (the slave reconnected
+/// during capture), pick the busiest.
+fn find_original_flow_for_slave(
     original: &LoadedPcap,
+    slave_ip: Ipv4Addr,
     target_port: u16,
-    server_ip_hint: Option<std::net::Ipv4Addr>,
 ) -> Option<usize> {
-    if let Some(want) = server_ip_hint {
-        for (idx, flow) in original.flows.iter().enumerate() {
-            let Some((ip, sp)) = flow.server else { continue };
-            if sp == target_port && ip == want {
-                return Some(idx);
-            }
-        }
-    }
+    let mut best: Option<(usize, usize)> = None;
     for (idx, flow) in original.flows.iter().enumerate() {
-        let Some((_, sp)) = flow.server else { continue };
-        if sp == target_port {
-            return Some(idx);
+        let Some((ip, sp)) = flow.server else { continue };
+        if sp != target_port || ip != slave_ip {
+            continue;
+        }
+        let pkts = flow.packet_indices.len();
+        if best.map_or(true, |(_, p)| pkts > p) {
+            best = Some((idx, pkts));
         }
     }
-    None
+    best.map(|(idx, _)| idx)
 }
 
-/// Core entry point. Loads both pcaps, picks the relevant flow, and
-/// runs the comparison.
+/// Core entry point. Loads both pcaps, enumerates every slave
+/// (server-port == target_port) in the original pcap, runs a per-slave
+/// comparison, and rolls the per-slave outcomes up into a fleet
+/// report.
 pub fn analyze(
     original_pcap_path: &Path,
     captured_pcap_path: &Path,
@@ -709,61 +796,160 @@ pub fn analyze(
         .map(|m| m.len())
         .unwrap_or(0);
 
-    let mut notes: Vec<String> = Vec::new();
+    let mut fleet_notes: Vec<String> = Vec::new();
 
-    // --- Captured pcap's relevant flow (picked FIRST so we can use
-    //     its server IP to pin the original flow when the source pcap
-    //     holds more than one RTU). ---
-    let cap_flow_idx_opt = find_captured_flow(&captured, target_port, role);
-    let cap_server_ip_hint = cap_flow_idx_opt
-        .and_then(|idx| captured.flows.get(idx))
-        .and_then(|f| f.server)
-        .map(|(ip, _)| ip);
+    // Auto-detect master IPs on each side and surface as a mapping
+    // for the UI. A "rename" is meaningful only when both sides
+    // resolved to a single, distinct address.
+    let captured_master_ip = detect_master_ip(&original, target_port);
+    let live_master_ip = detect_master_ip(&captured, target_port);
+    let renamed = match (captured_master_ip, live_master_ip) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    };
+    let master_ip_mapping = if captured_master_ip.is_some() || live_master_ip.is_some() {
+        Some(MasterIpMapping {
+            captured: captured_master_ip.map(|ip| ip.to_string()),
+            live: live_master_ip.map(|ip| ip.to_string()),
+            renamed,
+        })
+    } else {
+        None
+    };
+    if renamed {
+        fleet_notes.push(format!(
+            "master IP renamed: captured={} live={}",
+            captured_master_ip.unwrap(),
+            live_master_ip.unwrap()
+        ));
+    }
 
-    // --- Original pcap's relevant flow, pinned to the captured
-    //     session's server IP when one was observed. ---
-    let orig_flow_idx = find_original_flow(&original, target_port, cap_server_ip_hint)
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no flow in source pcap with server_port={target_port}; nothing to compare against"
-            )
-        })?;
-    let orig_client = original
-        .reassemble_client_payload(orig_flow_idx)
-        .context("reassemble original client side")?;
-    let orig_server = original
-        .reassemble_server_payload(orig_flow_idx)
-        .context("reassemble original server side")?;
-    let orig_client_iframes = extract_iframes(&orig_client.payload);
-    let orig_server_iframes = extract_iframes(&orig_server.payload);
-    if let Some(hint) = cap_server_ip_hint {
-        let picked = original.flows[orig_flow_idx].server.map(|(ip, _)| ip);
-        if picked != Some(hint) {
-            notes.push(format!(
-                "source pcap has no flow for captured server {hint}; compared against \
-                 first available flow with port {target_port} instead"
-            ));
+    // Slave universe: union of slaves seen in either pcap. We iterate
+    // the union so the report covers BOTH slaves the replayer was
+    // supposed to drive AND any unexpected slave traffic the live
+    // capture contained.
+    let mut slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&original, target_port);
+    let captured_slave_ips = list_slave_ips(&captured, target_port);
+    for ip in &captured_slave_ips {
+        slave_ips.insert(*ip);
+    }
+    if slave_ips.is_empty() {
+        return Err(anyhow::anyhow!(
+            "no flow in source pcap with server_port={target_port}; nothing to compare against"
+        ));
+    }
+
+    // Per-slave analysis.
+    let mut summaries: Vec<SlaveSummary> = Vec::new();
+    let mut details: BTreeMap<String, SlaveDetail> = BTreeMap::new();
+    for ip in &slave_ips {
+        match analyze_one_slave(
+            &original,
+            &captured,
+            *ip,
+            target_port,
+            role,
+            mode,
+            rewrite_cp56_was_on,
+            cp56_zone,
+            cp56_tolerance_ms,
+        ) {
+            Ok((summary, detail)) => {
+                summaries.push(summary);
+                details.insert(ip.to_string(), detail);
+            }
+            Err(e) => {
+                fleet_notes.push(format!("slave {ip}: skipped ({e})"));
+            }
         }
     }
 
-    // --- Captured pcap flow ---
+    // Sort worst-first so the UI table is meaningful at a glance.
+    summaries.sort_by(|a, b| {
+        a.score_pct
+            .partial_cmp(&b.score_pct)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a.slave_ip.cmp(&b.slave_ip))
+    });
+
+    let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
+
+    Ok(AnalysisReport {
+        run_id,
+        mode: mode_str(mode),
+        role: role_str(role),
+        original_pcap: original_pcap_path.display().to_string(),
+        captured_size_bytes,
+        captured_total_packets: captured.packets.len(),
+        verdict,
+        verdict_reason,
+        score_pct,
+        notes: fleet_notes,
+        fleet,
+        slaves: summaries,
+        details_by_ip: details,
+        master_ip_mapping,
+    })
+}
+
+/// Run the single-slave comparison: pick the original flow for this
+/// slave IP, pick the busiest captured flow for the same IP, and
+/// produce a SlaveSummary + SlaveDetail.
+fn analyze_one_slave(
+    original: &LoadedPcap,
+    captured: &LoadedPcap,
+    slave_ip: Ipv4Addr,
+    target_port: u16,
+    role: RoleHint,
+    mode: AnalysisMode,
+    rewrite_cp56_was_on: bool,
+    cp56_zone: Cp56Zone,
+    cp56_tolerance_ms: f64,
+) -> anyhow::Result<(SlaveSummary, SlaveDetail)> {
+    use anyhow::Context;
+
+    let mut notes: Vec<String> = Vec::new();
+    let slave_ip_str = slave_ip.to_string();
+
+    // Original-side reassembly. Skip if the original pcap has no flow
+    // for this slave (orphan: slave seen in captured but not original).
+    let orig_flow_idx_opt = find_original_flow_for_slave(original, slave_ip, target_port);
+    let (orig_client_iframes, orig_server_iframes, orig_client, orig_server) =
+        if let Some(orig_idx) = orig_flow_idx_opt {
+            let oc = original
+                .reassemble_client_payload(orig_idx)
+                .context("reassemble original client side")?;
+            let os = original
+                .reassemble_server_payload(orig_idx)
+                .context("reassemble original server side")?;
+            let oci = extract_iframes(&oc.payload);
+            let osi = extract_iframes(&os.payload);
+            (oci, osi, Some(oc), Some(os))
+        } else {
+            notes.push(format!(
+                "slave {slave_ip} appears in captured pcap but not in source — \
+                 nothing to compare against"
+            ));
+            (Vec::new(), Vec::new(), None, None)
+        };
+
+    // Captured-side flow (busiest match). Bug 1 fix lives here.
+    let cap_flow_idx_opt = find_busiest_captured_flow(captured, slave_ip, target_port);
     let cap_flow_idx = match cap_flow_idx_opt {
         Some(i) => i,
         None => {
+            // Slave was expected but never reached the wire.
+            let expected = match role {
+                RoleHint::Master => &orig_client_iframes,
+                RoleHint::Slave => &orig_server_iframes,
+            };
             notes.push(format!(
-                "no TCP flow in captured pcap with a port {target_port} endpoint \
-                 — the session never reached the wire"
+                "slave {slave_ip}: no TCP flow in captured pcap on port {target_port}"
             ));
-            // Return an early verdict with what we can.
-            return Ok(AnalysisReport {
-                run_id,
-                mode: mode_str(mode),
-                role: role_str(role),
-                original_pcap: original_pcap_path.display().to_string(),
-                captured_size_bytes,
-                captured_total_packets: captured.packets.len(),
+            let pb = empty_playback(role, &orig_client_iframes, &orig_server_iframes);
+            let detail = SlaveDetail {
                 tcp_flow: None,
-                playback: empty_playback(role, &orig_client_iframes, &orig_server_iframes),
+                playback: pb,
                 target: TargetReport {
                     direction: target_direction(role),
                     u_frames: 0,
@@ -776,13 +962,25 @@ pub fn analyze(
                 },
                 timing: TimingReport::default(),
                 cp56_drift: None,
-                verdict: "no_session",
+                verdict: "not_attempted",
                 verdict_reason: format!(
-                    "captured pcap has no TCP flow on port {target_port}"
+                    "no TCP flow on port {target_port} for slave {slave_ip} \
+                     in captured pcap"
                 ),
                 score_pct: 0.0,
                 notes,
-            });
+            };
+            let summary = SlaveSummary {
+                slave_ip: slave_ip_str,
+                score_pct: 0.0,
+                verdict: "not_attempted",
+                verdict_reason: detail.verdict_reason.clone(),
+                expected_iframes: expected.len(),
+                delivered_iframes: 0,
+                packets: 0,
+                startdt_handshake_ok: false,
+            };
+            return Ok((summary, detail));
         }
     };
     let cap_flow = &captured.flows[cap_flow_idx];
@@ -1002,11 +1200,13 @@ pub fn analyze(
     };
 
     // --- Timing analysis ---
-    let orig_playback_flow = match role {
-        RoleHint::Master => &orig_client,
-        RoleHint::Slave => &orig_server,
+    let orig_playback_flow_opt = match role {
+        RoleHint::Master => orig_client.as_ref(),
+        RoleHint::Slave => orig_server.as_ref(),
     };
-    let orig_gaps = iframe_gap_timings(orig_playback_flow);
+    let orig_gaps = orig_playback_flow_opt
+        .map(|f| iframe_gap_timings(f))
+        .unwrap_or_default();
     let cap_gaps = playback_rf
         .map(|rf| iframe_gap_timings(rf))
         .unwrap_or_default();
@@ -1052,13 +1252,17 @@ pub fn analyze(
     // --- Verdict ---
     let (verdict, reason, score) = decide_verdict(&playback, &target, mode, &notes);
 
-    Ok(AnalysisReport {
-        run_id,
-        mode: mode_str(mode),
-        role: role_str(role),
-        original_pcap: original_pcap_path.display().to_string(),
-        captured_size_bytes,
-        captured_total_packets: captured.packets.len(),
+    let summary = SlaveSummary {
+        slave_ip: slave_ip_str,
+        score_pct: score,
+        verdict,
+        verdict_reason: reason.clone(),
+        expected_iframes: playback.expected_iframes,
+        delivered_iframes: playback.delivered_iframes,
+        packets: flow_info.packets,
+        startdt_handshake_ok: target.startdt_handshake_ok,
+    };
+    let detail = SlaveDetail {
         tcp_flow: Some(flow_info),
         playback,
         target,
@@ -1068,7 +1272,115 @@ pub fn analyze(
         verdict_reason: reason,
         score_pct: score,
         notes,
-    })
+    };
+    Ok((summary, detail))
+}
+
+/// Fold the per-slave summaries into a fleet rollup. Returns the
+/// FleetSummary plus the top-level (verdict, reason, score) tuple
+/// suitable for the report header.
+fn roll_up_fleet(
+    slaves: &[SlaveSummary],
+) -> (FleetSummary, &'static str, String, f64) {
+    let slave_count = slaves.len();
+    let attempted = slaves.iter().filter(|s| s.packets > 0).count();
+    let not_attempted = slave_count.saturating_sub(attempted);
+    let fully_correct = slaves
+        .iter()
+        .filter(|s| s.packets > 0 && s.score_pct >= 99.999)
+        .count();
+    let failed = slaves
+        .iter()
+        .filter(|s| s.packets > 0 && s.score_pct == 0.0)
+        .count();
+    let partial = attempted
+        .saturating_sub(fully_correct)
+        .saturating_sub(failed);
+
+    let attempted_scores: Vec<f64> = slaves
+        .iter()
+        .filter(|s| s.packets > 0)
+        .map(|s| s.score_pct)
+        .collect();
+    let aggregate_score_pct = if attempted_scores.is_empty() {
+        0.0
+    } else {
+        attempted_scores.iter().sum::<f64>() / attempted_scores.len() as f64
+    };
+
+    let best = slaves
+        .iter()
+        .filter(|s| s.packets > 0)
+        .max_by(|a, b| {
+            a.score_pct
+                .partial_cmp(&b.score_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| BestWorst {
+            slave_ip: s.slave_ip.clone(),
+            score_pct: s.score_pct,
+        });
+    let worst = slaves
+        .iter()
+        .filter(|s| s.packets > 0)
+        .min_by(|a, b| {
+            a.score_pct
+                .partial_cmp(&b.score_pct)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .map(|s| BestWorst {
+            slave_ip: s.slave_ip.clone(),
+            score_pct: s.score_pct,
+        });
+
+    let summary = FleetSummary {
+        slave_count,
+        attempted,
+        not_attempted,
+        fully_correct,
+        partial,
+        failed,
+        aggregate_score_pct,
+        best,
+        worst,
+    };
+
+    let (verdict, reason): (&'static str, String) = if slave_count == 0 {
+        ("no_session", "no IEC 104 slaves in source pcap".into())
+    } else if attempted == 0 {
+        (
+            "no_delivery",
+            format!("none of {} slaves reached the wire", slave_count),
+        )
+    } else if failed == 0 && partial == 0 && fully_correct == attempted && not_attempted == 0 {
+        (
+            "all_correct",
+            format!("all {} slaves replayed correctly", attempted),
+        )
+    } else if failed == attempted {
+        (
+            "failed",
+            format!(
+                "all {} attempted slaves produced 0 I-frames",
+                attempted
+            ),
+        )
+    } else {
+        let na_tail = if not_attempted > 0 {
+            format!(", {} not attempted", not_attempted)
+        } else {
+            String::new()
+        };
+        (
+            "partial",
+            format!(
+                "{}/{} slaves replayed correctly; {} partial, {} failed{}",
+                fully_correct, attempted, partial, failed, na_tail
+            ),
+        )
+    };
+
+    (summary, verdict, reason, aggregate_score_pct)
 }
 
 fn target_direction(role: RoleHint) -> &'static str {
@@ -1125,6 +1437,23 @@ fn decide_verdict(
     mode: AnalysisMode,
     _notes: &[String],
 ) -> (&'static str, String, f64) {
+    if pb.expected_iframes == 0 && pb.delivered_iframes == 0 {
+        // No I-frame traffic in either direction. If the target at
+        // least completed the IEC 104 handshake, the session is
+        // healthy — there was just nothing to replay.
+        if tg.startdt_handshake_ok {
+            return (
+                "no_iframes_expected",
+                "no I-frames in source pcap; target completed STARTDT handshake".into(),
+                100.0,
+            );
+        }
+        return (
+            "no_iframes_expected",
+            "no I-frames in source pcap; nothing to deliver".into(),
+            100.0,
+        );
+    }
     if pb.delivered_iframes == 0 {
         return (
             "no_delivery",

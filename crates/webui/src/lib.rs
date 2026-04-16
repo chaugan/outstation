@@ -821,6 +821,15 @@ struct RunReq {
     /// `"utc"`. Ignored unless `rewrite_cp56_to_now` is true.
     #[serde(default = "default_cp56_zone")]
     cp56_zone: String,
+    /// Master-mode only: override the per-session bind IP. Default
+    /// (None) keeps the captured client IPs as the source addresses
+    /// of the replayed master sessions. Set to a local IP (or one we
+    /// can alias onto the bridge) to make all master sessions
+    /// originate from a specific local address regardless of what
+    /// the pcap recorded. Useful when the captured master IP
+    /// (e.g. 192.168.10.10) doesn't exist on the replay host.
+    #[serde(default)]
+    master_bind_ip: Option<Ipv4Addr>,
 }
 
 fn default_cp56_zone() -> String {
@@ -995,6 +1004,7 @@ async fn api_run(
             alias_state_path: Some(alias_state_path()),
             rewrite_cp56_to_now: req.rewrite_cp56_to_now,
             cp56_zone: req.cp56_zone.clone(),
+            master_bind_ip: req.master_bind_ip,
         };
         let db_bench = state.db.clone();
         thread::Builder::new()
@@ -2267,6 +2277,8 @@ fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
     let mut server_ips: HashSet<Ipv4Addr> = HashSet::new();
     let mut client_payload_bytes: u64 = 0;
     let mut server_payload_bytes: u64 = 0;
+    let mut midflow_flows: u64 = 0;
+    let mut clean_handshake_flows: u64 = 0;
 
     for (idx, flow) in p.flows.iter().enumerate() {
         let Some((server_ip, server_port)) = flow.server else {
@@ -2280,6 +2292,11 @@ fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
         };
         client_ips.insert(client_ip);
         server_ips.insert(server_ip);
+        if flow.saw_syn {
+            clean_handshake_flows += 1;
+        } else {
+            midflow_flows += 1;
+        }
 
         if let Ok(rf) = p.reassemble_client_payload(idx) {
             client_payload_bytes += rf.payload.len() as u64;
@@ -2376,6 +2393,14 @@ fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
             client_payload_bytes / (1024 * 1024),
             server_payload_bytes / (1024 * 1024),
         ));
+        if midflow_flows > 0 {
+            notes.push(format!(
+                "{} of {} flows are mid-flow (no SYN observed) — the replayer will synthesize a fresh TCP+STARTDT prelude and resync to the first clean APCI boundary; {} flows had a clean handshake in the capture",
+                midflow_flows,
+                midflow_flows + clean_handshake_flows,
+                clean_handshake_flows,
+            ));
+        }
     }
     if file_size > 1024 * 1024 * 1024 {
         notes.push(
