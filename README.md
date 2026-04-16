@@ -236,6 +236,7 @@ Upload the pcap directly in the browser UI to skip the generator step.
 
 - [`doc/scada-lab.en.md`](doc/scada-lab.en.md) — SCADA engineer's guide (English). Lab topology, step-by-step VMware/Proxmox/libvirt setup, SCADA-gateway mode walkthrough, result reading, troubleshooting.
 - [`doc/scada-lab.md`](doc/scada-lab.md) — same guide in Norwegian.
+- [`reports/`](reports/) — real-world benchmark results from production-shaped runs. Latest: [165-RTU IEC 104 fleet replay, 151 068 I-frames delivered with zero protocol mismatches](reports/2026-04-17-fleet-replay-showcase.md).
 
 ## Crate layout
 
