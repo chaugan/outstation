@@ -1082,6 +1082,44 @@
     padding: 6px 8px;
     margin-top: 4px;
   }
+  .an-tid-hist {
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    background: var(--surface-2);
+    padding: 8px 10px;
+    margin-top: 4px;
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    column-gap: 18px;
+    row-gap: 2px;
+  }
+  .an-tid-hist .hd {
+    font-family: var(--sans);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+    border-bottom: 1px solid var(--rule);
+    padding-bottom: 3px;
+    margin-bottom: 3px;
+  }
+  .an-tid-hist .row { display: flex; gap: 8px; align-items: baseline; }
+  .an-tid-hist .row .nm { color: var(--ink); flex: 1; }
+  .an-tid-hist .row .ct { color: var(--accent); font-variant-numeric: tabular-nums; }
+  .an-tid-hist .row .delta { color: var(--err); font-variant-numeric: tabular-nums; font-size: 10px; margin-left: 4px; }
+  .an-tid-hist .row .delta.ok { color: var(--ok); }
+  details.an-seq summary {
+    cursor: pointer;
+    font-family: var(--sans);
+    font-size: 10px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--dim);
+    padding: 4px 0;
+  }
+  details.an-seq[open] summary { color: var(--ink); }
   .an-diff-row {
     font-family: var(--mono);
     font-size: 10px;
@@ -2755,6 +2793,67 @@ async function runAnalysis() {
   }
 }
 
+// IEC 60870-5-104 ASDU type-ID short names for display. Keep in sync
+// with crates/proto_iec104/src/asdu.rs ELEMENT_LEN. Only the common
+// types are listed; unknown IDs render as the raw number.
+const IEC104_TYPE_NAMES = {
+  1:'M_SP_NA_1', 2:'M_SP_TA_1', 3:'M_DP_NA_1', 4:'M_DP_TA_1',
+  5:'M_ST_NA_1', 6:'M_ST_TA_1', 7:'M_BO_NA_1', 8:'M_BO_TA_1',
+  9:'M_ME_NA_1', 10:'M_ME_TA_1', 11:'M_ME_NB_1', 12:'M_ME_TB_1',
+  13:'M_ME_NC_1', 14:'M_ME_TC_1', 15:'M_IT_NA_1', 16:'M_IT_TA_1',
+  30:'M_SP_TB_1', 31:'M_DP_TB_1', 32:'M_ST_TB_1', 33:'M_BO_TB_1',
+  34:'M_ME_TD_1', 35:'M_ME_TE_1', 36:'M_ME_TF_1', 37:'M_IT_TB_1',
+  45:'C_SC_NA_1', 46:'C_DC_NA_1', 47:'C_RC_NA_1', 48:'C_SE_NA_1',
+  49:'C_SE_NB_1', 50:'C_SE_NC_1', 51:'C_BO_NA_1',
+  58:'C_SC_TA_1', 59:'C_DC_TA_1', 60:'C_RC_TA_1', 61:'C_SE_TA_1',
+  62:'C_SE_TB_1', 63:'C_SE_TC_1', 64:'C_BO_TA_1',
+  70:'M_EI_NA_1', 100:'C_IC_NA_1', 101:'C_CI_NA_1', 102:'C_RD_NA_1',
+  103:'C_CS_NA_1', 104:'C_TS_NA_1', 105:'C_RP_NA_1', 106:'C_CD_NA_1',
+  107:'C_TS_TA_1',
+};
+function tidName(t) {
+  return IEC104_TYPE_NAMES[t] || `type ${t}`;
+}
+function tidHist(ids) {
+  // {tid: count}, returned as sorted array of [tid, count] desc by count.
+  const m = new Map();
+  for (const t of ids) m.set(t, (m.get(t) || 0) + 1);
+  return [...m.entries()].sort((a, b) => b[1] - a[1] || a[0] - b[0]);
+}
+// Render a side-by-side ASDU type histogram. Counts and per-type
+// deltas (captured - expected) are shown so divergence is obvious at
+// a glance even for thousand-frame pcaps.
+function renderTidHistogram(expected, captured) {
+  const e = new Map(tidHist(expected));
+  const c = new Map(tidHist(captured));
+  const allTids = new Set([...e.keys(), ...c.keys()]);
+  const rows = [...allTids].sort((a, b) => (c.get(b) || e.get(b) || 0) - (c.get(a) || e.get(a) || 0) || a - b);
+  let h = `<div class="an-tid-hist">`;
+  h += `<div class="hd">EXPECTED (${expected.length} frames)</div>`;
+  h += `<div class="hd">CAPTURED (${captured.length} frames)</div>`;
+  for (const t of rows) {
+    const ec = e.get(t) || 0;
+    const cc = c.get(t) || 0;
+    const d  = cc - ec;
+    const dStr = d === 0 ? '' : `<span class="delta ${d>0?'ok':''}">${d>0?'+':''}${d}</span>`;
+    h += `<div class="row"><span class="nm">${esc(tidName(t))} <span class="ct">[${t}]</span></span><span class="ct">${ec}</span></div>`;
+    h += `<div class="row"><span class="nm">${esc(tidName(t))} <span class="ct">[${t}]</span></span><span class="ct">${cc}</span>${dStr}</div>`;
+  }
+  h += `</div>`;
+  return h;
+}
+// Collapsible full-sequence dump for users who want byte-for-byte
+// inspection. Default closed; only renders the inner text on demand
+// via `details/summary`. Truncated past 2000 IDs to keep DOM lean.
+function renderTidSequenceCollapsible(label, ids) {
+  if (!ids.length) return '';
+  const MAX_DUMP = 2000;
+  const head = ids.length <= MAX_DUMP
+    ? ids.join(' ')
+    : ids.slice(0, MAX_DUMP).join(' ') + ` … (truncated, ${ids.length - MAX_DUMP} more)`;
+  return `<details class="an-seq"><summary>show full ${esc(label)} sequence (${ids.length})</summary><div class="an-tid-seq">${head}</div></details>`;
+}
+
 function renderAnalysis(r) {
   const out = el('an-result');
   let h = `<div class="an-card">`;
@@ -2806,8 +2905,9 @@ function renderAnalysis(r) {
     h += `<div class="k">missing idx</div><div class="v bad">${pb.missing_indices.slice(0,20).join(', ')}${pb.missing_indices.length>20?'…':''}</div>`;
   }
   h += `</div>`;
-  h += `<div class="an-tid-seq">expected: ${pb.expected_type_ids.join(' ')}</div>`;
-  h += `<div class="an-tid-seq">captured: ${pb.delivered_type_ids.join(' ')}</div>`;
+  h += renderTidHistogram(pb.expected_type_ids, pb.delivered_type_ids);
+  h += renderTidSequenceCollapsible('expected', pb.expected_type_ids);
+  h += renderTidSequenceCollapsible('captured', pb.delivered_type_ids);
   if (pb.mismatches.length) {
     h += `<div class="an-h">REAL MISMATCHES (${pb.mismatches.length})</div>`;
     h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">CP56-only diffs (timestamps we deliberately rewrote) are excluded — they're tallied above.</div>`;
@@ -2827,10 +2927,19 @@ function renderAnalysis(r) {
   h += `<div class="k">u / s / i frames</div><div class="v">${tg.u_frames} · ${tg.s_frames} · ${tg.i_frames}</div>`;
   h += `<div class="k">u-codes seen</div><div class="v">${tg.u_codes_seen.map(esc).join(', ') || '—'}</div>`;
   h += `<div class="k">startdt handshake</div><div class="v ${tg.startdt_handshake_ok?'ok':'bad'}">${tg.startdt_handshake_ok ? 'completed' : 'missing'}</div>`;
-  if (tg.target_type_ids.length) {
-    h += `<div class="k">target type ids</div><div class="v"><code>${tg.target_type_ids.join(' ')}</code></div>`;
-  }
   h += `</div>`;
+  if (tg.target_type_ids.length) {
+    h += `<div class="muted" style="font-family:var(--sans);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--dim);margin-top:8px">target's I-frame types</div>`;
+    // Single-side histogram (no expected-side comparator outside correct mode).
+    const hist = tidHist(tg.target_type_ids);
+    h += `<div class="an-tid-hist" style="grid-template-columns:1fr">`;
+    h += `<div class="hd">${tg.target_type_ids.length} frames sent by target</div>`;
+    for (const [t, ct] of hist) {
+      h += `<div class="row"><span class="nm">${esc(tidName(t))} <span class="ct">[${t}]</span></span><span class="ct">${ct}</span></div>`;
+    }
+    h += `</div>`;
+    h += renderTidSequenceCollapsible('target', tg.target_type_ids);
+  }
 
   if (tg.correctness) {
     const c = tg.correctness;
@@ -2875,11 +2984,10 @@ function renderAnalysis(r) {
     h += `<div class="k">body diff</div><div class="v">${c.expected_iframes} frames &middot; ${cParts.join(' &middot; ')}</div>`;
     h += `<div class="k">matched prefix</div><div class="v">${c.matched_type_id_prefix}/${c.expected_iframes} (index-by-index)</div>`;
     h += `</div>`;
-    // Side-by-side type-id sequences.
-    h += `<div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:8px">`;
-    h += `  <div><div class="an-h" style="margin-top:0">ORIGINAL TARGET SENT</div><div class="an-tid-seq">${(c.original_type_ids || []).join(' ') || '—'}</div></div>`;
-    h += `  <div><div class="an-h" style="margin-top:0">LIVE TARGET SENT</div><div class="an-tid-seq">${tg.target_type_ids.join(' ') || '—'}</div></div>`;
-    h += `</div>`;
+    // Side-by-side type-id histogram of original vs live target.
+    h += renderTidHistogram(c.original_type_ids || [], tg.target_type_ids);
+    h += renderTidSequenceCollapsible('original target', c.original_type_ids || []);
+    h += renderTidSequenceCollapsible('live target', tg.target_type_ids);
   }
 
   // timing
