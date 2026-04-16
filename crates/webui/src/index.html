@@ -1161,6 +1161,12 @@
     color: var(--dim);
     margin: 10px 0 0;
   }
+  .an-chart-axes {
+    font-family: var(--mono);
+    font-size: 10px;
+    color: var(--ink-2);
+    margin: 0 0 2px;
+  }
   .an-diff-row {
     font-family: var(--mono);
     font-size: 10px;
@@ -3299,14 +3305,17 @@ function renderAnalysis(r) {
     h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">scroll inside a chart to zoom &middot; drag to pan &middot; use the toolbox icons (top-right) for rectangular zoom or reset</div>`;
     if (haveDriftSamples) {
       h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
+      h += `<div class="an-chart-axes">X: frame index &middot; Y: drift (ms, signed)</div>`;
       h += `<div id="an-chart-drift" class="an-chart"></div>`;
     }
     if (haveGapData) {
       h += `<div class="an-chart-caption">inter-frame gap timing &middot; original (dashed) vs. captured (solid)</div>`;
+      h += `<div class="an-chart-axes">X: inter-frame gap index &middot; Y: gap duration (ms)</div>`;
       h += `<div id="an-chart-gap" class="an-chart"></div>`;
     }
     if (haveDriftSamples) {
       h += `<div class="an-chart-caption">drift distribution &middot; bars beyond the dashed line are out-of-tolerance</div>`;
+      h += `<div class="an-chart-axes">X: |drift| bucket (ms) &middot; Y: sample count</div>`;
       h += `<div id="an-chart-hist" class="an-chart"></div>`;
       h += `<div class="an-chart-caption">worst CP56 drifts (top 10)</div>`;
       h += `<div id="an-anomalies" class="an-anomaly-list"></div>`;
