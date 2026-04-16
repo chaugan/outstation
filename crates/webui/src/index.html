@@ -2783,7 +2783,20 @@ function renderAnalysis(r) {
   const delivOk = pb.delivered_iframes === pb.expected_iframes;
   h += `<div class="k">delivered</div><div class="v ${delivOk?'ok':'bad'}">${pb.delivered_iframes}</div>`;
   h += `<div class="k">type-id sequence</div><div class="v ${pb.type_id_sequence_match?'ok':'warn'}">${pb.type_id_sequence_match ? 'match' : 'divergent'} · ${pb.matched_type_ids}/${pb.expected_iframes} matched</div>`;
-  h += `<div class="k">byte-identical</div><div class="v">${pb.byte_identical_count}/${pb.expected_iframes}</div>`;
+  // Three-way classification: byte-identical · cp56-only · real diff.
+  // cp56-only is expected when fresh-timestamps mode rewrote the
+  // playback stream; surfacing it explicitly keeps the score honest.
+  const cp56Only = pb.cp56_only_count || 0;
+  const realMm = (pb.real_mismatch_count != null) ? pb.real_mismatch_count : pb.mismatches.length;
+  const allOk = (pb.byte_identical_count + cp56Only) === pb.expected_iframes && realMm === 0;
+  let bdLine = `${pb.byte_identical_count}/${pb.expected_iframes} byte-identical`;
+  if (cp56Only > 0) {
+    bdLine += ` · <span style="color:var(--ok)">${cp56Only} CP56-only (fresh-timestamps)</span>`;
+  }
+  if (realMm > 0) {
+    bdLine += ` · <span style="color:var(--bad,var(--err))">${realMm} real mismatch${realMm===1?'':'es'}</span>`;
+  }
+  h += `<div class="k">body diff</div><div class="v ${allOk?'ok':(realMm>0?'bad':'')}">${bdLine}</div>`;
   if (pb.missing_indices.length) {
     h += `<div class="k">missing idx</div><div class="v bad">${pb.missing_indices.slice(0,20).join(', ')}${pb.missing_indices.length>20?'…':''}</div>`;
   }
@@ -2791,7 +2804,8 @@ function renderAnalysis(r) {
   h += `<div class="an-tid-seq">expected: ${pb.expected_type_ids.join(' ')}</div>`;
   h += `<div class="an-tid-seq">captured: ${pb.delivered_type_ids.join(' ')}</div>`;
   if (pb.mismatches.length) {
-    h += `<div class="an-h">MISMATCHES (${pb.mismatches.length})</div>`;
+    h += `<div class="an-h">REAL MISMATCHES (${pb.mismatches.length})</div>`;
+    h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">CP56-only diffs (timestamps we deliberately rewrote) are excluded — they're tallied above.</div>`;
     for (const d of pb.mismatches.slice(0, 20)) {
       h += `<div class="an-diff-row">`;
       h += `  <div><span class="lbl">idx</span> ${d.index} · exp tid=${d.expected_type_id} · got tid=${d.actual_type_id}</div>`;
@@ -2843,7 +2857,15 @@ function renderAnalysis(r) {
     h += `<div class="k">original sent</div><div class="v">${c.expected_iframes} i-frames</div>`;
     h += `<div class="k">target sent</div><div class="v">${c.actual_iframes} i-frames</div>`;
     h += `<div class="k">type-id overlap</div><div class="v">${c.lcs_type_ids}/${c.expected_iframes} &middot; ${(c.lcs_similarity*100).toFixed(0)}% similarity (lcs)</div>`;
-    h += `<div class="k">byte-identical</div><div class="v">${c.byte_identical_count}</div>`;
+    const cCp56Only = c.cp56_only_count || 0;
+    let cBdLine = `${c.byte_identical_count} byte-identical`;
+    if (cCp56Only > 0) {
+      cBdLine += ` · <span style="color:var(--ok)">${cCp56Only} CP56-only</span>`;
+    }
+    if (c.total_mismatches > 0) {
+      cBdLine += ` · <span style="color:var(--bad,var(--err))">${c.total_mismatches} real diff${c.total_mismatches===1?'':'s'}</span>`;
+    }
+    h += `<div class="k">body diff</div><div class="v">${cBdLine}</div>`;
     h += `<div class="k">matched prefix</div><div class="v">${c.matched_type_id_prefix}/${c.expected_iframes} (index-by-index)</div>`;
     h += `</div>`;
     // Side-by-side type-id sequences.

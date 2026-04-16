@@ -93,8 +93,25 @@ pub struct PlaybackReport {
     pub delivered_iframes: usize,
     pub matched_type_ids: usize,
     pub type_id_sequence_match: bool,
+    /// Frames where every byte (including embedded CP56Time2a) matches
+    /// the original.
     pub byte_identical_count: usize,
+    /// Frames whose only difference from the original is inside the
+    /// CP56Time2a field(s) — same DUI, same IOA, same payload, just
+    /// a different timestamp. Expected when the run had
+    /// fresh-timestamps mode on.
+    #[serde(default)]
+    pub cp56_only_count: usize,
+    /// Frames whose bytes differ in fields *other* than CP56Time2a —
+    /// the count of `mismatches`. Tracked separately so the score
+    /// reflects real protocol-level deviations and not the timestamp
+    /// rewriting we asked for.
+    #[serde(default)]
+    pub real_mismatch_count: usize,
     pub missing_indices: Vec<usize>,
+    /// Only the *real* mismatches are listed here — frames whose only
+    /// diff is the CP56Time2a stamp are tallied in `cp56_only_count`
+    /// instead, to keep this list honest.
     pub mismatches: Vec<IFrameDiff>,
     pub expected_type_ids: Vec<u8>,
     pub delivered_type_ids: Vec<u8>,
@@ -130,6 +147,12 @@ pub struct CorrectnessCheck {
     pub missing_tail: Vec<u8>,
     pub extra_tail: Vec<u8>,
     pub byte_identical_count: usize,
+    /// Frames where the target's reply differs from the original only
+    /// in the CP56Time2a stamp — common because live targets generate
+    /// stamps from their own clock. Counted here so they don't inflate
+    /// `total_mismatches` (which counts *real* protocol deviations).
+    #[serde(default)]
+    pub cp56_only_count: usize,
     pub total_mismatches: usize,
     /// Length of the longest common subsequence of Type IDs between
     /// what the original target sent and what the live target sent.
@@ -391,6 +414,60 @@ fn compute_cp56_drift(
         invalid_flag_count,
         summer_flag_count,
     })
+}
+
+/// Outcome of comparing two ASDU buffers. The "is the data the same?"
+/// question splits three ways once you account for the fact that
+/// fresh-timestamps mode (and live targets that read their own clock)
+/// will produce different CP56Time2a bytes for the same underlying
+/// event — those differences are not protocol deviations and must not
+/// be counted as mismatches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsduCmp {
+    /// Byte-for-byte identical, including embedded CP56Time2a.
+    Identical,
+    /// Same length and same bytes outside the CP56Time2a fields; only
+    /// the timestamp(s) differ. Expected for runs with fresh
+    /// timestamps on, or for live targets with independent clocks.
+    Cp56Only,
+    /// Bytes differ in fields outside CP56Time2a (or layouts disagree).
+    /// A real protocol-level deviation.
+    Different,
+}
+
+/// Compare two ASDU buffers. Distinguishes "byte-identical",
+/// "differs only in CP56Time2a bytes", and "really different" so the
+/// analyzer can keep the score honest when CP56 stamps are
+/// deliberately rewritten by fresh-timestamps mode.
+pub fn compare_asdu(a: &[u8], b: &[u8]) -> AsduCmp {
+    if a == b {
+        return AsduCmp::Identical;
+    }
+    if a.len() != b.len() {
+        return AsduCmp::Different;
+    }
+    let offs_a = cp56_field_offsets(a);
+    let offs_b = cp56_field_offsets(b);
+    if offs_a.is_empty() || offs_a != offs_b {
+        // No CP56 fields, or layout differs — diff is genuine.
+        return AsduCmp::Different;
+    }
+    // Mask every CP56 region (7 bytes each) and re-compare.
+    let mut ma = a.to_vec();
+    let mut mb = b.to_vec();
+    for &off in &offs_a {
+        if off + 7 <= ma.len() {
+            for i in 0..7 {
+                ma[off + i] = 0;
+                mb[off + i] = 0;
+            }
+        }
+    }
+    if ma == mb {
+        AsduCmp::Cp56Only
+    } else {
+        AsduCmp::Different
+    }
 }
 
 /// Walk an ASDU and return the byte offset of every CP56Time2a field
@@ -715,24 +792,27 @@ pub fn analyze(
         .collect();
 
     // Sequence comparison: walk both in parallel, count matched TIDs
-    // in order. Anything after the first mismatch is flagged.
+    // in order. Frame-by-frame body diff is classified three ways
+    // (identical / cp56-only / really-different) so the score reflects
+    // protocol deviations, not the timestamp rewriting we asked for.
     let mut matched_type_ids = 0usize;
     let mut byte_identical = 0usize;
+    let mut cp56_only = 0usize;
     let mut mismatches: Vec<IFrameDiff> = Vec::new();
     let cmp_len = expected_tids.len().min(delivered_tids.len());
     for i in 0..cmp_len {
         if expected_tids[i] == delivered_tids[i] {
             matched_type_ids += 1;
-            if expected_iframes[i] == delivered_iframes[i] {
-                byte_identical += 1;
-            } else {
-                mismatches.push(IFrameDiff {
+            match compare_asdu(&expected_iframes[i], &delivered_iframes[i]) {
+                AsduCmp::Identical => byte_identical += 1,
+                AsduCmp::Cp56Only => cp56_only += 1,
+                AsduCmp::Different => mismatches.push(IFrameDiff {
                     index: i,
                     expected_type_id: expected_tids[i],
                     actual_type_id: delivered_tids[i],
                     expected_asdu_hex: to_hex(&expected_iframes[i]),
                     actual_asdu_hex: to_hex(&delivered_iframes[i]),
-                });
+                }),
             }
         } else {
             mismatches.push(IFrameDiff {
@@ -744,6 +824,7 @@ pub fn analyze(
             });
         }
     }
+    let real_mismatch_count = mismatches.len();
     let missing_indices: Vec<usize> = if delivered_tids.len() < expected_tids.len() {
         (delivered_tids.len()..expected_tids.len()).collect()
     } else {
@@ -761,6 +842,8 @@ pub fn analyze(
         type_id_sequence_match: matched_type_ids == expected_tids.len()
             && matched_type_ids == delivered_tids.len(),
         byte_identical_count: byte_identical,
+        cp56_only_count: cp56_only,
+        real_mismatch_count,
         missing_indices,
         mismatches,
         expected_type_ids: expected_tids,
@@ -806,14 +889,15 @@ pub fn analyze(
         let cmp = target_expected_tids.len().min(target_tids.len());
         let mut matched = 0usize;
         let mut byte_id = 0usize;
+        let mut cp56_only_t = 0usize;
         let mut total_mm = 0usize;
         for i in 0..cmp {
             if target_expected_tids[i] == target_tids[i] {
                 matched += 1;
-                if target_expected_iframes[i] == target_iframes_body[i] {
-                    byte_id += 1;
-                } else {
-                    total_mm += 1;
+                match compare_asdu(&target_expected_iframes[i], &target_iframes_body[i]) {
+                    AsduCmp::Identical => byte_id += 1,
+                    AsduCmp::Cp56Only => cp56_only_t += 1,
+                    AsduCmp::Different => total_mm += 1,
                 }
             } else {
                 total_mm += 1;
@@ -848,6 +932,7 @@ pub fn analyze(
             missing_tail,
             extra_tail,
             byte_identical_count: byte_id,
+            cp56_only_count: cp56_only_t,
             total_mismatches: total_mm,
             lcs_type_ids: lcs,
             lcs_similarity: similarity,
@@ -978,6 +1063,8 @@ fn empty_playback(role: RoleHint, orig_client: &[Vec<u8>], orig_server: &[Vec<u8
         matched_type_ids: 0,
         type_id_sequence_match: false,
         byte_identical_count: 0,
+        cp56_only_count: 0,
+        real_mismatch_count: 0,
         missing_indices: (0..expected.len()).collect(),
         mismatches: Vec::new(),
         expected_type_ids: expected_tids,
@@ -1325,6 +1412,63 @@ mod tests {
         // abs(100ms) and signed should be +100ms (stamp trailed wire by 100ms).
         assert!((drift.mean_ms - 100.0).abs() < 2.0, "{}", drift.mean_ms);
         assert!(drift.mean_signed_ms > 80.0);
+    }
+
+    #[test]
+    fn compare_asdu_identical_returns_identical() {
+        let a = vec![1, 0x01, 0x03, 0, 0x01, 0, 0x01, 0, 0, 0x42];
+        assert_eq!(compare_asdu(&a, &a), AsduCmp::Identical);
+    }
+
+    #[test]
+    fn compare_asdu_cp56_only_diff_classified() {
+        // Type 36 (M_ME_TF_1): float + QDS + CP56. SQ=0, N=1.
+        // Same DUI, IOA, payload — only the trailing CP56 bytes differ.
+        let mut a = vec![
+            36, 0x01, 0x03, 0, 0x01, 0,    // DUI
+            0x01, 0, 0,                    // IOA
+            0xde, 0xad, 0xbe, 0xef, 0x00,  // float + QDS
+        ];
+        let mut b = a.clone();
+        // Append two different CP56 stamps.
+        a.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x04, 0x18]);
+        b.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x18]);
+        assert_eq!(compare_asdu(&a, &b), AsduCmp::Cp56Only);
+    }
+
+    #[test]
+    fn compare_asdu_real_diff_in_payload_classified() {
+        // Same as above but the float byte changes too.
+        let mut a = vec![
+            36, 0x01, 0x03, 0, 0x01, 0,
+            0x01, 0, 0,
+            0xde, 0xad, 0xbe, 0xef, 0x00,
+        ];
+        let mut b = a.clone();
+        b[12] = 0xff;  // mutate the float payload
+        a.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x04, 0x18]);
+        b.extend_from_slice(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x18]);
+        assert_eq!(compare_asdu(&a, &b), AsduCmp::Different);
+    }
+
+    #[test]
+    fn compare_asdu_no_cp56_field_is_real_diff() {
+        // Type 13 (M_ME_NC_1): no CP56 -> any byte diff is real.
+        let a = vec![
+            13, 0x01, 0x03, 0, 0x01, 0,
+            0x01, 0, 0,
+            0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut b = a.clone();
+        b[12] = 0xff;
+        assert_eq!(compare_asdu(&a, &b), AsduCmp::Different);
+    }
+
+    #[test]
+    fn compare_asdu_different_lengths_is_different() {
+        let a = vec![36, 0x01, 0x03, 0, 0x01, 0];
+        let b = vec![36, 0x01, 0x03, 0, 0x01, 0, 0xff];
+        assert_eq!(compare_asdu(&a, &b), AsduCmp::Different);
     }
 
     #[test]
