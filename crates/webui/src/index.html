@@ -1414,6 +1414,21 @@
         </div>
       </div>
 
+      <div class="field span-4">
+        <label>timestamps <span class="opt">(IEC 104 only)</span></label>
+        <div class="checks">
+          <label title="Rewrite every CP56Time2a inside outgoing ASDUs to the actual wall-clock send moment. SCADA sees fresh event timestamps; intra-pcap spacing preserved. IV flag preserved from source; SU flag follows the chosen timezone's DST state.">
+            <input id="run-fresh-timestamps" type="checkbox"> fresh timestamps &middot; rewrite CP56Time2a to wall-clock
+          </label>
+          <label title="Local time (default): server's calendar with SU bit following DST \u2014 matches most plant SCADA HMIs.">
+            <input type="radio" name="run-cp56-zone" value="local" checked> local time (SU follows DST)
+          </label>
+          <label title="UTC: server's UTC calendar, SU always 0 \u2014 matches ICCP-style links.">
+            <input type="radio" name="run-cp56-zone" value="utc"> UTC (SU=0)
+          </label>
+        </div>
+      </div>
+
       <div class="bench-panel" id="bench-controls" style="display:none">
         <div class="hd">BENCHMARK MODE &middot; STATEFUL SESSION REPLAY</div>
         <div class="bench-grid">
@@ -1557,6 +1572,11 @@
           <label><input type="radio" name="an-mode" value="generic" checked> <b>generic</b> &middot; target is different software &middot; only check that we delivered the expected frames and the handshake held up</label>
           <label><input type="radio" name="an-mode" value="correct"> <b>correct</b> &middot; target is the same rtu/scada as the pcap &middot; target's replies should match the original byte-for-byte</label>
         </div>
+        <div style="margin-top:14px">
+          <label style="font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);display:block;margin-bottom:4px">CP56 drift tolerance (ms)</label>
+          <input id="an-cp56-tol" type="number" min="0" step="10" value="50" style="width:90px" title="Max acceptable |stamp \u2212 wire| difference. 50 ms is tight (intra-host); 200 ms is realistic when capture and replayer are different machines or VMs. Only used when the run had fresh-timestamps enabled.">
+          <span class="muted" style="font-family:var(--mono);font-size:11px;margin-left:8px">default 50 \u00b7 raise to 200 for cross-host capture</span>
+        </div>
         <div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap">
           <button class="primary" id="an-run-btn" onclick="runAnalysis()" disabled>ANALYZE</button>
           <a id="an-download-json" style="display:none;font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);text-decoration:none">DOWNLOAD JSON</a>
@@ -1619,6 +1639,14 @@ const fmtTimeAgo = tsMs => {
   return `${Math.floor(d/86400)}d ago`;
 };
 const basename = p => (p || '').split('/').pop() || (p || '');
+// Compact UTC timestamp for pcap capture ranges: "2026-04-16 17:02Z"
+const fmtUtcShort = ms => {
+  if (!ms || typeof ms !== 'number') return '';
+  const d = new Date(ms);
+  if (isNaN(d)) return '';
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}Z`;
+};
 
 async function api(path, method='GET', body=null) {
   const opts = { method, headers: {} };
@@ -1684,10 +1712,22 @@ function renderLibrary() {
     if (p.mac_collisions && p.mac_collisions > 0) {
       badge += `<span class="badge mac_warn" title="${p.mac_collisions} source IP(s) had multiple MACs in the pcap — replay uses most-common pick">MAC ${p.mac_collisions}</span>`;
     }
+    // Absolute capture range (UTC) — shown as a secondary hint so
+    // users eyeing fresh-timestamps mode can see how stale the pcap's
+    // own CP56Time2a stamps are.
+    let rangeStr = '';
+    if (p.pcap_start_unix_ms && p.pcap_end_unix_ms) {
+      const a = fmtUtcShort(p.pcap_start_unix_ms);
+      const b = fmtUtcShort(p.pcap_end_unix_ms);
+      if (a && b) rangeStr = a === b ? a : `${a} → ${b}`;
+    }
     h += `<div class="pcap-row ${sel}" onclick="selectPcap('${esc(p.id)}')">`;
     h += `  <div>`;
     h += `    <div class="name">${esc(p.name)}${badge}</div>`;
     h += `    <div class="meta">${p.packets.toLocaleString()} pkts &middot; ${srcDesc} &middot; ${p.tcp_flows} flows &middot; ${fmtDuration(p.duration_ms)} &middot; ${fmtBytes(p.size_bytes)} &middot; ${fmtTimeAgo(p.uploaded_at_ms)}</div>`;
+    if (rangeStr) {
+      h += `    <div class="meta" style="opacity:0.7" title="Pcap capture time range (UTC)">captured ${esc(rangeStr)}</div>`;
+    }
     h += `  </div>`;
     h += `  <div class="actions">`;
     h += `    <button onclick="event.stopPropagation(); renamePcap('${esc(p.id)}')">rename</button>`;
@@ -1962,6 +2002,8 @@ async function startRun() {
     role,
     listen_port_base: parseInt(el('run-listen-port-base').value) || 2404,
     pacing,
+    rewrite_cp56_to_now: el('run-fresh-timestamps')?.checked || false,
+    cp56_zone: document.querySelector('input[name="run-cp56-zone"]:checked')?.value || 'local',
   };
   if (isBench && el('run-scada-gw-enable').checked) {
     const gw = el('run-scada-gw-ip').value.trim();
@@ -2681,6 +2723,10 @@ async function runAnalysis() {
   const fd = new FormData();
   fd.append('file', analysisFile);
   fd.append('mode', mode);
+  const tolRaw = parseFloat(el('an-cp56-tol')?.value);
+  if (Number.isFinite(tolRaw) && tolRaw >= 0) {
+    fd.append('cp56_tolerance_ms', String(tolRaw));
+  }
   try {
     const r = await fetch('/api/analyze', { method: 'POST', body: fd });
     const text = await r.text();
@@ -2822,6 +2868,29 @@ function renderAnalysis(r) {
   h += `<div class="k">p50 gap</div><div class="v">orig ${t.original_p50_gap_ms.toFixed(1)} ms · capt ${t.captured_p50_gap_ms.toFixed(2)} ms</div>`;
   h += `<div class="k">p99 gap</div><div class="v">orig ${t.original_p99_gap_ms.toFixed(1)} ms · capt ${t.captured_p99_gap_ms.toFixed(2)} ms</div>`;
   h += `</div>`;
+
+  // CP56Time2a drift — only present when the run used fresh-timestamps mode.
+  if (r.cp56_drift) {
+    const d = r.cp56_drift;
+    const passed = d.out_of_tolerance === 0;
+    const withinPct = d.samples > 0
+      ? (100 * (d.samples - d.out_of_tolerance) / d.samples).toFixed(2)
+      : '0.00';
+    h += `<div class="an-h">EMBEDDED TIMESTAMP ACCURACY <span class="opt">(fresh-timestamps mode)</span></div>`;
+    h += `<div class="an-kv">`;
+    h += `<div class="k">verdict</div><div class="v" style="color:${passed ? 'var(--ok,#6a0)' : 'var(--err,#c33)'}">` +
+         `${withinPct}% of ${d.samples} CP56Time2a fields within ±${d.tolerance_ms.toFixed(0)} ms of wire time</div>`;
+    h += `<div class="k">frames with CP56</div><div class="v">${d.iframes_with_cp56}</div>`;
+    h += `<div class="k">mean drift</div><div class="v">${d.mean_ms.toFixed(2)} ms (signed ${d.mean_signed_ms.toFixed(2)})</div>`;
+    h += `<div class="k">p50 / p99 / max</div><div class="v">${d.p50_ms.toFixed(2)} / ${d.p99_ms.toFixed(2)} / ${d.max_ms.toFixed(2)} ms</div>`;
+    if (d.out_of_tolerance > 0) {
+      h += `<div class="k">out of tolerance</div><div class="v" style="color:var(--err,#c33)">${d.out_of_tolerance} / ${d.samples}</div>`;
+    }
+    if (d.invalid_flag_count > 0 || d.summer_flag_count > 0) {
+      h += `<div class="k">flags observed</div><div class="v">IV=${d.invalid_flag_count} · SU=${d.summer_flag_count}</div>`;
+    }
+    h += `</div>`;
+  }
 
   if (r.notes && r.notes.length) {
     h += `<div class="an-h">NOTES</div>`;

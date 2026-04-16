@@ -228,6 +228,7 @@ Everything needed to reproduce a working 200-RTU replay lives under [`examples/`
 
 - [`examples/gen_iec104_traffic.py`](examples/gen_iec104_traffic.py) — the synthetic IEC 104 traffic generator described above.
 - [`examples/synth_iec104_rtus200_lan10.pcap`](examples/synth_iec104_rtus200_lan10.pcap) — a 200-RTU pcap on `192.168.10.2..201` with one master at `192.168.86.1`, ~180 s duration, ~2.8 MB, suitable for slave-mode runs against an external IEC 104 master on any LAN where the RTU subnet is routable.
+- [`examples/anonymize_pcap.py`](examples/anonymize_pcap.py) — standalone pure-Python 3 stdlib tool that anonymises IEC 104 pcaps for safe sharing. Reads libpcap and pcapng; remaps every IPv4 address (into a user-supplied subnet), MAC (to random locally-administered), IEC 104 Common Address (16-bit), and IEC 104 IOA (24-bit) with a consistent per-value mapping. Recomputes IPv4/TCP/UDP checksums, preserves IOA=0 and CA=0/0xFFFF sentinels, leaves TCP/UDP ports alone, and passes non-IPv4 traffic through unchanged. Output: `<UTC>_<original-stem>_anon.pcap` plus a sidecar `.mapping.json` audit file. Zero dependencies — runs on offline Windows/Linux. Example: `python3 examples/anonymize_pcap.py capture.pcapng --subnet 10.200.0.0/16 --seed 42`.
 
 Upload the pcap directly in the browser UI to skip the generator step.
 

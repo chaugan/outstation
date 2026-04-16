@@ -57,6 +57,14 @@ pub struct StoredRun {
     pub speed: f64,
     pub top_speed: bool,
     pub realtime: bool,
+    /// Whether this run was started with the IEC 104 fresh-timestamps
+    /// feature enabled. Needed at analysis time so the CP56Time2a
+    /// drift report knows to expect rewritten stamps.
+    pub rewrite_cp56_to_now: bool,
+    /// Timezone convention for CP56Time2a ("local" or "utc").
+    /// Required at analysis time so captured stamps are decoded with
+    /// the matching convention.
+    pub cp56_zone: String,
     pub planned: u64,
     pub sent: u64,
     pub bytes: u64,
@@ -98,11 +106,24 @@ impl Db {
                 report_json     TEXT,
                 benchmark_json  TEXT,
                 per_source_json TEXT,
-                throughput_json TEXT
+                throughput_json TEXT,
+                rewrite_cp56_to_now INTEGER NOT NULL DEFAULT 0,
+                cp56_zone       TEXT NOT NULL DEFAULT 'local'
             );
             "#,
         )
         .context("create schema")?;
+        // Forward migrations for databases created before these
+        // columns existed. Each ALTER is ignored if the column is
+        // already present.
+        let _ = conn.execute(
+            "ALTER TABLE runs ADD COLUMN rewrite_cp56_to_now INTEGER NOT NULL DEFAULT 0",
+            [],
+        );
+        let _ = conn.execute(
+            "ALTER TABLE runs ADD COLUMN cp56_zone TEXT NOT NULL DEFAULT 'local'",
+            [],
+        );
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -115,8 +136,9 @@ impl Db {
         conn.execute(
             "INSERT OR REPLACE INTO runs
              (id, started_at, status, pcap, target_ip, target_mac, mode, role,
-              target_port, speed, top_speed, realtime, planned, sent, bytes)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              target_port, speed, top_speed, realtime, planned, sent, bytes,
+              rewrite_cp56_to_now, cp56_zone)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 run.id as i64,
                 run.started_at as i64,
@@ -133,6 +155,8 @@ impl Db {
                 run.planned as i64,
                 run.sent as i64,
                 run.bytes as i64,
+                run.rewrite_cp56_to_now as i64,
+                run.cp56_zone,
             ],
         )?;
         Ok(())
@@ -207,7 +231,8 @@ impl Db {
         let mut stmt = conn.prepare(
             "SELECT id, started_at, status, pcap, target_ip, target_mac, mode, role,
                     target_port, speed, top_speed, realtime, planned, sent, bytes,
-                    error, report_json, benchmark_json, per_source_json, throughput_json
+                    error, report_json, benchmark_json, per_source_json, throughput_json,
+                    rewrite_cp56_to_now, cp56_zone
              FROM runs
              ORDER BY id",
         )?;
@@ -233,6 +258,17 @@ impl Db {
                 benchmark_json: row.get(17)?,
                 per_source_json: row.get(18)?,
                 throughput_json: row.get(19)?,
+                rewrite_cp56_to_now: row
+                    .get::<_, Option<i64>>(20)
+                    .ok()
+                    .flatten()
+                    .map(|v| v != 0)
+                    .unwrap_or(false),
+                cp56_zone: row
+                    .get::<_, Option<String>>(21)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_else(|| "local".into()),
             })
         })?;
         let mut out = Vec::new();

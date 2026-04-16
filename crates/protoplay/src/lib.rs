@@ -166,6 +166,19 @@ pub struct ProtoRunCfg {
     /// (ns from the first I-frame) at which the replayer should
     /// emit that frame. Empty vec disables per-frame pacing.
     pub frame_times_ns: Vec<u64>,
+    /// If true, every CP56Time2a timestamp field inside an IEC 104
+    /// ASDU is rewritten to the wall-clock moment the carrying frame
+    /// is actually emitted, so SCADA sees fresh timestamps while
+    /// intra-pcap gaps are still honored by the scheduler. The IV
+    /// (invalid) flag bit from the source field is preserved per
+    /// element. The SU (summer-time) bit is set according to
+    /// [`cp56_zone`] at encode time.
+    pub rewrite_cp56_to_now: bool,
+    /// Timezone convention used when `rewrite_cp56_to_now` is on.
+    /// `"utc"` — bytes encode UTC, SU always 0. `"local"` — bytes
+    /// encode the server's local calendar with SU following DST
+    /// (matches most plant SCADA HMIs). Default: "local".
+    pub cp56_zone: String,
 }
 
 /// Result of a single-flow replay.

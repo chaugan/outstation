@@ -734,6 +734,7 @@ name = "proto_iec104"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "protoplay",
  "raw_replay",
  "serde",

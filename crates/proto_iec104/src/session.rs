@@ -27,7 +27,17 @@ use crate::apdu::{
     write_apdu, Apdu, ApduReader, U_STARTDT_ACT, U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON,
     U_TESTFR_ACT, U_TESTFR_CON,
 };
-use crate::asdu::{load_rewrite_map, rewrite_asdu, RewriteMap};
+use crate::asdu::{
+    load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone, RewriteMap,
+};
+
+#[inline]
+fn wall_clock_unix_ns() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0)
+}
 
 const DEFAULT_W: u16 = 8;
 const DEFAULT_K: u16 = 12;
@@ -444,10 +454,15 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
             );
         }
 
+        let mut patched = asdu.clone();
+        if cfg.rewrite_cp56_to_now {
+            let zone = Cp56Zone::parse(&cfg.cp56_zone).unwrap_or(Cp56Zone::Local);
+            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), zone);
+        }
         let apdu = Apdu::I {
             ns: my_ns,
             nr: my_nr,
-            asdu: asdu.clone(),
+            asdu: patched,
         };
         let send_ns = now_ns();
         let wire_len = apdu.serialize().len() as u64;
@@ -886,10 +901,15 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             );
         }
 
+        let mut patched = asdu.clone();
+        if cfg.rewrite_cp56_to_now {
+            let zone = Cp56Zone::parse(&cfg.cp56_zone).unwrap_or(Cp56Zone::Local);
+            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), zone);
+        }
         let apdu = Apdu::I {
             ns: my_ns,
             nr: my_nr,
-            asdu: asdu.clone(),
+            asdu: patched,
         };
         let send_ns = now_ns();
         let wire_len = apdu.serialize().len() as u64;
@@ -1081,6 +1101,8 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
+            rewrite_cp56_to_now: false,
+            cp56_zone: "local".into(),
         };
 
         let report = run_session(cfg);
@@ -1189,6 +1211,8 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
+            rewrite_cp56_to_now: false,
+            cp56_zone: "local".into(),
         };
 
         let report = run_session(cfg);

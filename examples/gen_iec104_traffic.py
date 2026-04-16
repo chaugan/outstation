@@ -118,13 +118,29 @@ COT_ACTCON = 7
 COT_ACTTERM = 10
 COT_INROGEN = 20
 
+# ASDUs without a time tag.
 M_SP_NA_1 = 1   # single point
 M_DP_NA_1 = 3   # double point
 M_ME_NA_1 = 9   # measured value, normalized
+M_ME_NB_1 = 11  # measured value, scaled
 M_ME_NC_1 = 13  # measured value, short float
+M_IT_NA_1 = 15  # integrated totals (counter)
 M_EI_NA_1 = 70  # end of initialization
-C_SC_NA_1 = 45
-C_IC_NA_1 = 100
+C_SC_NA_1 = 45  # single command
+C_SE_NC_1 = 50  # set-point short float
+C_IC_NA_1 = 100 # station interrogation
+C_CI_NA_1 = 101 # counter interrogation
+
+# ASDUs with a 7-byte CP56Time2a time tag appended to every element.
+M_SP_TB_1 = 30
+M_DP_TB_1 = 31
+M_ME_TD_1 = 34  # NVA + QDS + CP56
+M_ME_TE_1 = 35  # SVA + QDS + CP56
+M_ME_TF_1 = 36  # float + QDS + CP56  (most common in real traffic)
+M_IT_TB_1 = 37  # BCR + CP56
+C_SC_TA_1 = 58  # single command with CP56
+C_SE_TC_1 = 63  # set-point float with CP56
+C_CS_NA_1 = 103 # clock synchronisation (bare CP56)
 
 
 def apci_u(ctrl):
@@ -184,6 +200,56 @@ def diq(state, quality=0):
 
 def float_short(value, qds=0):
     return struct.pack("<f", value) + bytes([qds])
+
+
+def nva(value_norm, qds=0):
+    # Normalised value: signed 16-bit in [-1.0, 1.0).
+    v = max(-32768, min(32767, int(round(value_norm * 32767))))
+    return struct.pack("<h", v) + bytes([qds])
+
+
+def sva(value_int, qds=0):
+    v = max(-32768, min(32767, int(value_int)))
+    return struct.pack("<h", v) + bytes([qds])
+
+
+def bcr(counter_value, seq=0, iv=False, ca=False, cy=False):
+    # Binary counter reading: 4-byte value + 1-byte qualifier.
+    qual = (seq & 0x1F) | (0x20 if cy else 0) | (0x40 if ca else 0) | (0x80 if iv else 0)
+    return struct.pack("<I", counter_value & 0xFFFFFFFF) + bytes([qual])
+
+
+def sco(on, qu=0, se=0):
+    # Single command object: bits 0=SCS, 1=reserved, 2..7=QU, 7=S/E.
+    return bytes([(on & 1) | ((qu & 0x1F) << 2) | ((se & 1) << 7)])
+
+
+def qos(ql=0, se=0):
+    # Qualifier of set-point command.
+    return bytes([(ql & 0x7F) | ((se & 1) << 7)])
+
+
+def cp56time2a(unix_time_sec, iv=False, su=False):
+    """Encode a CP56Time2a 7-byte field for the given UTC epoch seconds.
+
+    IV (invalid) and SU (summer time) flag bits are caller-supplied so a
+    replay can faithfully reproduce "data-quality" scenarios. Day-of-week
+    is always populated from the calendar date (some older RTUs reject
+    DOW=0 even though the spec allows it).
+    """
+    dt = datetime.fromtimestamp(unix_time_sec, tz=timezone.utc)
+    ms_in_min = dt.second * 1000 + dt.microsecond // 1000
+    iso_dow = dt.isoweekday()  # Mon=1 .. Sun=7
+    year_mod = dt.year - 2000
+    return bytes([
+        ms_in_min & 0xFF,
+        (ms_in_min >> 8) & 0xFF,
+        (0x80 if iv else 0) | (dt.minute & 0x3F),
+        (0x80 if su else 0) | (dt.hour & 0x1F),
+        ((iso_dow & 0x07) << 5) | (dt.day & 0x1F),
+        dt.month & 0x0F,
+        year_mod & 0x7F,
+    ])
 
 
 # --- session state --------------------------------------------------------
@@ -252,15 +318,79 @@ class Session:
 
 # --- session scripting ----------------------------------------------------
 
-def _spont_element(kind, rng):
-    if kind == M_SP_NA_1:
+def _payload_for(kind, rng, counters, counter_ioa_set):
+    """Build the per-element payload bytes for a monitor-side ASDU.
+
+    For counter types the caller passes `counters[ioa]` state so the
+    generated stream looks like a monotonic counter reading. Everything
+    else uses freshly-sampled random values.
+    """
+    if kind in (M_SP_NA_1, M_SP_TB_1):
         return siq(rng.randint(0, 1))
-    if kind == M_DP_NA_1:
+    if kind in (M_DP_NA_1, M_DP_TB_1):
         return diq(rng.choice([1, 2]))
-    return float_short(rng.uniform(-1000.0, 1000.0))
+    if kind in (M_ME_NA_1, M_ME_TD_1):
+        return nva(rng.uniform(-0.95, 0.95))
+    if kind == M_ME_NB_1 or kind == M_ME_TE_1:
+        return sva(rng.randint(-30000, 30000))
+    if kind in (M_ME_NC_1, M_ME_TF_1):
+        return float_short(rng.uniform(-1000.0, 1000.0))
+    if kind in (M_IT_NA_1, M_IT_TB_1):
+        # Internal stub: caller overrides with a monotonic counter.
+        return bcr(0)
+    raise ValueError(f"unsupported kind: {kind}")
 
 
-def run_session(sess, t0, duration, rng, mean_interval, jitter):
+# Type catalogue for the monitor-side spontaneous / inrogen stream.
+# Weights are intentionally realistic: float measurements dominate,
+# single/double points common, scaled values and counters rarer.
+MONITOR_WEIGHTS_NO_TS = [
+    (M_SP_NA_1, 6),
+    (M_DP_NA_1, 3),
+    (M_ME_NC_1, 10),
+    (M_ME_NA_1, 2),
+    (M_ME_NB_1, 2),
+    (M_IT_NA_1, 1),
+]
+MONITOR_WEIGHTS_WITH_TS = [
+    (M_SP_TB_1, 6),
+    (M_DP_TB_1, 3),
+    (M_ME_TF_1, 10),  # float + CP56 — the workhorse
+    (M_ME_TD_1, 2),
+    (M_ME_TE_1, 2),
+    (M_IT_TB_1, 1),
+]
+
+
+def pick_monitor_kind(rng, with_timestamps):
+    table = MONITOR_WEIGHTS_WITH_TS if with_timestamps else MONITOR_WEIGHTS_NO_TS
+    kinds, weights = zip(*table)
+    return rng.choices(kinds, weights=weights, k=1)[0]
+
+
+def monitor_element_bytes(kind, rng, counter_state, wall_time_sec):
+    """Return the per-IOA element bytes (no IOA prefix) for a single
+    monitor object of `kind`. Counter types draw from and update the
+    per-IOA `counter_state` dict so the value stream advances realistically.
+    `wall_time_sec` is the UTC epoch to embed if the type carries CP56."""
+    if kind == M_IT_NA_1:
+        # Counter value advances slowly; pick the first counter slot.
+        ioa = next(iter(counter_state), 1)
+        counter_state[ioa] = counter_state.get(ioa, rng.randrange(1000, 10_000)) + rng.randint(0, 7)
+        return bcr(counter_state[ioa], seq=rng.randrange(0, 32))
+    if kind == M_IT_TB_1:
+        ioa = next(iter(counter_state), 1)
+        counter_state[ioa] = counter_state.get(ioa, rng.randrange(1000, 10_000)) + rng.randint(0, 7)
+        return bcr(counter_state[ioa], seq=rng.randrange(0, 32)) + cp56time2a(wall_time_sec)
+    body = _payload_for(kind, rng, counter_state, set())
+    # TB variants append CP56 after the base element bytes.
+    if kind in (M_SP_TB_1, M_DP_TB_1, M_ME_TD_1, M_ME_TE_1, M_ME_TF_1):
+        return body + cp56time2a(wall_time_sec)
+    return body
+
+
+def run_session(sess, t0, duration, rng, mean_interval, jitter,
+                with_timestamps, master_commands, clock_sync):
     t = t0
     ca = sess.rtu["asdu_addr"]
 
@@ -290,6 +420,23 @@ def run_session(sess, t0, duration, rng, mean_interval, jitter):
     sess._emit(t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, ei), TCP_PSH | TCP_ACK)
     sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
 
+    # Optional: master sends a clock-sync command right after init.
+    # Type 103 (C_CS_NA_1) carries a bare CP56Time2a and is the best
+    # real-world example of a timestamp crossing the wire.
+    if clock_sync:
+        t += rng.uniform(0.02, 0.1)
+        cs_frame = asdu(C_CS_NA_1, cot=COT_ACT, common_addr=ca,
+                        objects=[(0, cp56time2a(t))])
+        sess._emit(t, "mst", apci_i(sess.mst_ns, sess.rtu_ns, cs_frame),
+                   TCP_PSH | TCP_ACK)
+        sess.mst_ns = (sess.mst_ns + 1) & 0x7FFF
+        t += rng.uniform(0.002, 0.015)
+        cs_con = asdu(C_CS_NA_1, cot=COT_ACTCON, common_addr=ca,
+                      objects=[(0, cp56time2a(t))])
+        sess._emit(t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, cs_con),
+                   TCP_PSH | TCP_ACK)
+        sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
+
     # General interrogation: master requests a snapshot, RTU confirms,
     # streams every point with COT=inrogen, then sends ActTerm.
     t += rng.uniform(0.01, 0.08)
@@ -304,11 +451,30 @@ def run_session(sess, t0, duration, rng, mean_interval, jitter):
     sess._emit(t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, gi_con), TCP_PSH | TCP_ACK)
     sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
 
+    # Inrogen burst: one monitor frame per IOA, kind drawn from the
+    # mix. Type-per-IOA is pinned so the same point reports the same
+    # type every time — matches how real RTUs expose their points.
+    counter_state = {}
+    ioa_kinds = {}
+    for point in sess.rtu["points"]:
+        # Counter IOAs get counter types; rest use non-counter mix.
+        if rng.random() < 0.15:
+            ioa_kinds[point] = M_IT_TB_1 if with_timestamps else M_IT_NA_1
+            counter_state[point] = rng.randrange(1000, 100_000)
+        else:
+            ioa_kinds[point] = pick_monitor_kind(rng, with_timestamps)
+
     for point in sess.rtu["points"]:
         t += rng.uniform(0.0005, 0.004)
-        kind = rng.choice([M_SP_NA_1, M_DP_NA_1, M_ME_NC_1])
+        kind = ioa_kinds[point]
+        # For inrogen bursts we still stamp with `t` if the type
+        # carries CP56 — the RTU is reporting "current value as of now".
+        per_counter = {point: counter_state[point]} if point in counter_state else {}
+        elem = monitor_element_bytes(kind, rng, per_counter, t)
+        if point in counter_state:
+            counter_state[point] = per_counter[point]
         frame = asdu(kind, cot=COT_INROGEN, common_addr=ca,
-                     objects=[(point, _spont_element(kind, rng))])
+                     objects=[(point, elem)])
         sess._emit(t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, frame),
                    TCP_PSH | TCP_ACK)
         sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
@@ -324,20 +490,27 @@ def run_session(sess, t0, duration, rng, mean_interval, jitter):
     sess._emit(t, "mst", apci_s(sess.rtu_ns), TCP_PSH | TCP_ACK)
 
     # Spontaneous monitor stream: RTU pushes events, master S-acks
-    # periodically, either side may probe with TESTFR.
+    # periodically, either side may probe with TESTFR, optionally
+    # master also issues occasional commands.
     points = sess.rtu["points"]
     end = t0 + duration
     next_s_ack = t + rng.uniform(5, 15)
     next_testfr = t + rng.uniform(20, 45)
+    next_command = t + rng.uniform(30, 90) if master_commands else end + 1
+    next_counter_interrogation = t + rng.uniform(40, 120)
+    # Pick a small subset of points as "commandable outputs" so
+    # master commands always target a valid IOA.
+    commandable = rng.sample(points, min(3, len(points))) if points else []
 
     while t < end:
         point = rng.choice(points)
-        kind = rng.choices(
-            [M_SP_NA_1, M_DP_NA_1, M_ME_NC_1],
-            weights=[3, 2, 4],
-        )[0]
+        kind = ioa_kinds[point]
+        per_counter = {point: counter_state[point]} if point in counter_state else {}
+        elem = monitor_element_bytes(kind, rng, per_counter, t)
+        if point in counter_state:
+            counter_state[point] = per_counter[point]
         frame = asdu(kind, cot=COT_SPONT, common_addr=ca,
-                     objects=[(point, _spont_element(kind, rng))])
+                     objects=[(point, elem)])
         sess._emit(t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, frame),
                    TCP_PSH | TCP_ACK)
         sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
@@ -357,6 +530,73 @@ def run_session(sess, t0, duration, rng, mean_interval, jitter):
             sess._emit(sub_t, "rtu", apci_u(TESTFR_CON), TCP_PSH | TCP_ACK)
             sub_t += rng.uniform(0.0005, 0.002)
             next_testfr = t + rng.uniform(25, 60)
+
+        # Optional master-side command (C_SC_NA_1 or C_SC_TA_1) against
+        # one of the commandable IOAs. RTU replies ActCon then ActTerm,
+        # and emits a spontaneous status update for that point.
+        if t >= next_command and commandable:
+            target_ioa = rng.choice(commandable)
+            on = rng.randint(0, 1)
+            if with_timestamps:
+                cmd_kind = C_SC_TA_1
+                cmd_elem = sco(on, qu=0, se=0) + cp56time2a(sub_t)
+            else:
+                cmd_kind = C_SC_NA_1
+                cmd_elem = sco(on, qu=0, se=0)
+            cmd_act = asdu(cmd_kind, cot=COT_ACT, common_addr=ca,
+                           objects=[(target_ioa, cmd_elem)])
+            sess._emit(sub_t, "mst", apci_i(sess.mst_ns, sess.rtu_ns, cmd_act),
+                       TCP_PSH | TCP_ACK)
+            sess.mst_ns = (sess.mst_ns + 1) & 0x7FFF
+            sub_t += rng.uniform(0.005, 0.03)
+
+            # RTU ActCon.
+            cmd_con_elem = sco(on, qu=0, se=0)
+            if with_timestamps:
+                cmd_con_elem += cp56time2a(sub_t)
+            cmd_con = asdu(cmd_kind, cot=COT_ACTCON, common_addr=ca,
+                           objects=[(target_ioa, cmd_con_elem)])
+            sess._emit(sub_t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, cmd_con),
+                       TCP_PSH | TCP_ACK)
+            sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
+            sub_t += rng.uniform(0.01, 0.08)
+
+            # RTU ActTerm.
+            cmd_term = asdu(cmd_kind, cot=COT_ACTTERM, common_addr=ca,
+                            objects=[(target_ioa, cmd_con_elem)])
+            sess._emit(sub_t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, cmd_term),
+                       TCP_PSH | TCP_ACK)
+            sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
+            next_command = t + rng.uniform(40, 150)
+
+        # Occasional counter interrogation request: master sends
+        # C_CI_NA_1, RTU replies with ActCon then freezes every counter
+        # point as a burst of counter frames.
+        if t >= next_counter_interrogation and counter_state:
+            ci_act = asdu(C_CI_NA_1, cot=COT_ACT, common_addr=ca,
+                          objects=[(0, bytes([5]))])  # QCC=5 general
+            sess._emit(sub_t, "mst", apci_i(sess.mst_ns, sess.rtu_ns, ci_act),
+                       TCP_PSH | TCP_ACK)
+            sess.mst_ns = (sess.mst_ns + 1) & 0x7FFF
+            sub_t += rng.uniform(0.002, 0.015)
+            ci_con = asdu(C_CI_NA_1, cot=COT_ACTCON, common_addr=ca,
+                          objects=[(0, bytes([5]))])
+            sess._emit(sub_t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, ci_con),
+                       TCP_PSH | TCP_ACK)
+            sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
+            sub_t += rng.uniform(0.002, 0.01)
+            for ioa, val in list(counter_state.items()):
+                kind = M_IT_TB_1 if with_timestamps else M_IT_NA_1
+                elem_body = bcr(val, seq=rng.randrange(0, 32))
+                if with_timestamps:
+                    elem_body += cp56time2a(sub_t)
+                ct_frame = asdu(kind, cot=37, common_addr=ca,  # COT=37 requested by counter-interrogation
+                                objects=[(ioa, elem_body)])
+                sess._emit(sub_t, "rtu", apci_i(sess.rtu_ns, sess.mst_ns, ct_frame),
+                           TCP_PSH | TCP_ACK)
+                sess.rtu_ns = (sess.rtu_ns + 1) & 0x7FFF
+                sub_t += rng.uniform(0.0005, 0.003)
+            next_counter_interrogation = t + rng.uniform(60, 180)
 
         dt = rng.expovariate(1.0 / max(mean_interval, 0.05))
         dt *= rng.uniform(max(0.0, 1 - jitter), 1 + jitter)
@@ -433,6 +673,23 @@ def main(argv=None):
                     help="inter-event jitter fraction 0..1 (default: 0.5)")
     ap.add_argument("--points-per-rtu", type=int, default=12,
                     help="number of distinct IOAs each RTU reports (default: 12)")
+    ap.add_argument("--no-timestamps", dest="with_timestamps",
+                    action="store_false", default=True,
+                    help="use legacy NA-series ASDUs with no CP56Time2a "
+                         "embedded (old behaviour). Default is ON, which "
+                         "emits TB-series types (30/31/34/35/36/37, and "
+                         "58 + 103 for commands) — required if you want "
+                         "to exercise outstation's --fresh-timestamps "
+                         "rewrite feature.")
+    ap.add_argument("--no-master-commands", dest="master_commands",
+                    action="store_false", default=True,
+                    help="suppress master-side C_SC commands during the "
+                         "spontaneous phase. Default is ON so a single "
+                         "capture exercises both directions.")
+    ap.add_argument("--no-clock-sync", dest="clock_sync",
+                    action="store_false", default=True,
+                    help="skip the C_CS_NA_1 (type 103) clock-sync "
+                         "exchange after init. Default is ON.")
     args = ap.parse_args(argv)
 
     rng = random.Random(args.seed)
@@ -483,7 +740,10 @@ def main(argv=None):
         sess = Session(master, rtu, events, rng)
         offset = rng.uniform(0, min(3.0, max(args.duration * 0.1, 0.01)))
         run_session(sess, start + offset, args.duration, rng,
-                    args.mean_interval, args.jitter)
+                    args.mean_interval, args.jitter,
+                    with_timestamps=args.with_timestamps,
+                    master_commands=args.master_commands,
+                    clock_sync=args.clock_sync)
 
     events.sort(key=lambda x: x[0])
 

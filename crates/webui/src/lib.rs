@@ -22,7 +22,8 @@ use std::thread;
 
 mod analysis;
 mod db;
-use analysis::{analyze, AnalysisMode, RoleHint};
+use analysis::{analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
+use proto_iec104::asdu::Cp56Zone;
 use db::{Db, StoredRun};
 
 use anyhow::Result;
@@ -89,6 +90,15 @@ pub struct RunState {
     pub speed: f64,
     pub top_speed: bool,
     pub realtime: bool,
+    /// Whether CP56Time2a timestamps were rewritten to wall-clock on
+    /// every outgoing IEC 104 ASDU for this run. Persisted so the
+    /// post-run fidelity/analysis pass knows to expect fresh stamps.
+    #[serde(default)]
+    pub rewrite_cp56_to_now: bool,
+    /// Timezone convention used for the CP56 rewrite, either
+    /// `"local"` or `"utc"`. Required at analysis time so the drift
+    /// check decodes stamps with the same zone convention.
+    pub cp56_zone: String,
     pub error: Option<String>,
     pub report: Option<RunReportJson>,
     pub benchmark: Option<BenchmarkReportJson>,
@@ -160,6 +170,8 @@ fn runstate_to_stored(rs: &RunState) -> StoredRun {
         speed: rs.speed,
         top_speed: rs.top_speed,
         realtime: rs.realtime,
+        rewrite_cp56_to_now: rs.rewrite_cp56_to_now,
+        cp56_zone: rs.cp56_zone.clone(),
         planned: rs.planned,
         sent: rs.sent,
         bytes: rs.bytes_progress,
@@ -213,6 +225,8 @@ fn stored_to_runstate(s: &StoredRun) -> Option<RunState> {
         speed: s.speed,
         top_speed: s.top_speed,
         realtime: s.realtime,
+        rewrite_cp56_to_now: s.rewrite_cp56_to_now,
+        cp56_zone: s.cp56_zone.clone(),
         error: s.error.clone(),
         report,
         benchmark,
@@ -797,6 +811,20 @@ struct RunReq {
     /// enabled and SCADA's non-capture egress is NAT'd out this NIC.
     #[serde(default)]
     upstream_nat_iface: Option<String>,
+    /// IEC 104 only: rewrite every CP56Time2a timestamp inside
+    /// outgoing ASDUs to the actual wall-clock moment the frame is
+    /// emitted. SCADA sees fresh event timestamps; intra-pcap
+    /// spacing preserved; IV preserved from source.
+    #[serde(default)]
+    rewrite_cp56_to_now: bool,
+    /// Timezone convention for the rewrite: `"local"` (default) or
+    /// `"utc"`. Ignored unless `rewrite_cp56_to_now` is true.
+    #[serde(default = "default_cp56_zone")]
+    cp56_zone: String,
+}
+
+fn default_cp56_zone() -> String {
+    "local".into()
 }
 
 fn default_iterations() -> u64 {
@@ -899,6 +927,8 @@ async fn api_run(
         speed: req.speed,
         top_speed: req.top_speed,
         realtime: req.realtime,
+        rewrite_cp56_to_now: req.rewrite_cp56_to_now,
+        cp56_zone: req.cp56_zone.clone(),
         error: None,
         report: None,
         benchmark: None,
@@ -963,6 +993,8 @@ async fn api_run(
             scada_gateway_iface: req.scada_gateway_iface.clone(),
             upstream_nat_iface: req.upstream_nat_iface.clone(),
             alias_state_path: Some(alias_state_path()),
+            rewrite_cp56_to_now: req.rewrite_cp56_to_now,
+            cp56_zone: req.cp56_zone.clone(),
         };
         let db_bench = state.db.clone();
         thread::Builder::new()
@@ -1031,6 +1063,8 @@ async fn api_run(
             startup_delay_secs: req.warmup_secs,
             capture_path: Some(capture_pb.clone()),
             iterations: req.iterations,
+            rewrite_cp56_to_now: req.rewrite_cp56_to_now,
+            cp56_zone: req.cp56_zone.clone(),
         };
         let db_raw = state.db.clone();
         thread::Builder::new()
@@ -1577,6 +1611,7 @@ async fn api_analyze(
     let mut captured_bytes: Option<Vec<u8>> = None;
     let mut mode: AnalysisMode = AnalysisMode::Generic;
     let mut run_id_opt: Option<u64> = None;
+    let mut cp56_tolerance_ms: f64 = DEFAULT_CP56_TOLERANCE_MS;
     while let Some(mut field) = mp
         .next_field()
         .await
@@ -1612,6 +1647,17 @@ async fn api_analyze(
                     .await
                     .map_err(|e| AppError::BadRequest(format!("read run_id: {e}")))?;
                 run_id_opt = s.trim().parse().ok();
+            }
+            "cp56_tolerance_ms" => {
+                let s = field
+                    .text()
+                    .await
+                    .map_err(|e| AppError::BadRequest(format!("read cp56 tol: {e}")))?;
+                if let Ok(v) = s.trim().parse::<f64>() {
+                    if v >= 0.0 {
+                        cp56_tolerance_ms = v;
+                    }
+                }
             }
             _ => {}
         }
@@ -1661,11 +1707,25 @@ async fn api_analyze(
     std::fs::write(&tmp_path, &bytes)
         .map_err(|e| AppError::Internal(format!("write tmp: {e}")))?;
 
+    let rewrite_cp56_was_on = rs.rewrite_cp56_to_now;
+    let cp56_zone = Cp56Zone::parse(&rs.cp56_zone).unwrap_or(Cp56Zone::Local);
     let report = tokio::task::spawn_blocking({
         let original_pcap = rs.pcap.clone();
         let tmp_path = tmp_path.clone();
         let run_id = rs.id;
-        move || analyze(&original_pcap, &tmp_path, run_id, target_port, role_hint, mode)
+        move || {
+            analyze(
+                &original_pcap,
+                &tmp_path,
+                run_id,
+                target_port,
+                role_hint,
+                mode,
+                rewrite_cp56_was_on,
+                cp56_zone,
+                cp56_tolerance_ms,
+            )
+        }
     })
     .await
     .map_err(|e| AppError::Internal(format!("analyze task: {e}")))?
@@ -2071,6 +2131,14 @@ struct LibraryEntry {
     non_ip_sources: u64,
     tcp_flows: u64,
     duration_ms: f64,
+    /// Absolute UTC start / end of the pcap (unix epoch ms), so the
+    /// UI can show "captured 2026-02-14 — 2026-02-14" alongside the
+    /// duration. Makes it easy to spot when the pcap is old enough
+    /// that SCADA will treat its CP56Time2a stamps as stale.
+    #[serde(default)]
+    pcap_start_unix_ms: Option<u64>,
+    #[serde(default)]
+    pcap_end_unix_ms: Option<u64>,
     /// Number of source IPs whose MAC was ambiguous in the pcap
     /// (multiple MACs observed for the same IP). Surfaced in the UI
     /// so the user knows the replay-side MAC is a "most-common" pick.
@@ -2143,22 +2211,46 @@ fn save_library_entry(dir: &StdPath, entry: &LibraryEntry) -> std::io::Result<()
     std::fs::write(library_sidecar_path(dir, &entry.id), bytes)
 }
 
-fn quick_inspect(path: &StdPath) -> (u64, u64, u64, u64, f64, u64, Option<Viability>) {
+struct QuickInspect {
+    packets: u64,
+    ip_sources: u64,
+    non_ip_sources: u64,
+    tcp_flows: u64,
+    duration_ms: f64,
+    pcap_start_unix_ms: Option<u64>,
+    pcap_end_unix_ms: Option<u64>,
+    mac_collisions: u64,
+    viability: Option<Viability>,
+}
+
+fn quick_inspect(path: &StdPath) -> QuickInspect {
     match load(path) {
         Ok(p) => {
             let viability = compute_viability(&p, path);
             let mac_collisions = p.sources.values().filter(|s| s.mac_collision).count() as u64;
-            (
-                p.packets.len() as u64,
-                p.sources.len() as u64,
-                p.non_ip_sources.len() as u64,
-                p.flows.len() as u64,
-                (p.last_ts_ns.saturating_sub(p.first_ts_ns)) as f64 / 1e6,
+            QuickInspect {
+                packets: p.packets.len() as u64,
+                ip_sources: p.sources.len() as u64,
+                non_ip_sources: p.non_ip_sources.len() as u64,
+                tcp_flows: p.flows.len() as u64,
+                duration_ms: (p.last_ts_ns.saturating_sub(p.first_ts_ns)) as f64 / 1e6,
+                pcap_start_unix_ms: (p.first_ts_ns > 0).then(|| p.first_ts_ns / 1_000_000),
+                pcap_end_unix_ms: (p.last_ts_ns > 0).then(|| p.last_ts_ns / 1_000_000),
                 mac_collisions,
-                Some(viability),
-            )
+                viability: Some(viability),
+            }
         }
-        Err(_) => (0, 0, 0, 0, 0.0, 0, None),
+        Err(_) => QuickInspect {
+            packets: 0,
+            ip_sources: 0,
+            non_ip_sources: 0,
+            tcp_flows: 0,
+            duration_ms: 0.0,
+            pcap_start_unix_ms: None,
+            pcap_end_unix_ms: None,
+            mac_collisions: 0,
+            viability: None,
+        },
     }
 }
 
@@ -2402,6 +2494,8 @@ async fn api_library_upload(
         non_ip_sources: 0,
         tcp_flows: 0,
         duration_ms: 0.0,
+        pcap_start_unix_ms: None,
+        pcap_end_unix_ms: None,
         mac_collisions: 0,
         viability: None,
     };
@@ -2419,16 +2513,8 @@ async fn api_library_upload(
     std::thread::Builder::new()
         .name(format!("library-analyze-{id}"))
         .spawn(move || {
-            let (
-                packets,
-                ip_sources,
-                non_ip_sources,
-                tcp_flows,
-                duration_ms,
-                mac_collisions,
-                viability,
-            ) = quick_inspect(&final_path_owned);
-            if packets == 0 {
+            let qi = quick_inspect(&final_path_owned);
+            if qi.packets == 0 {
                 // Parse failed after passing the magic check — rare
                 // (truncated body, exotic linktype). Mark the sidecar
                 // with a sentinel and leave it for the user to delete.
@@ -2443,6 +2529,8 @@ async fn api_library_upload(
                     non_ip_sources: 0,
                     tcp_flows: 0,
                     duration_ms: 0.0,
+                    pcap_start_unix_ms: None,
+                    pcap_end_unix_ms: None,
                     mac_collisions: 0,
                     viability: Some(Viability {
                         client_payload_bytes: 0,
@@ -2463,18 +2551,20 @@ async fn api_library_upload(
                 name: original_name_for_thread,
                 uploaded_at_ms,
                 size_bytes,
-                packets,
-                ip_sources,
-                non_ip_sources,
-                tcp_flows,
-                duration_ms,
-                mac_collisions,
-                viability,
+                packets: qi.packets,
+                ip_sources: qi.ip_sources,
+                non_ip_sources: qi.non_ip_sources,
+                tcp_flows: qi.tcp_flows,
+                duration_ms: qi.duration_ms,
+                pcap_start_unix_ms: qi.pcap_start_unix_ms,
+                pcap_end_unix_ms: qi.pcap_end_unix_ms,
+                mac_collisions: qi.mac_collisions,
+                viability: qi.viability,
             };
             if let Err(e) = save_library_entry(&dir_owned, &final_entry) {
                 warn!(id = %id_for_thread, error = %e, "sidecar rewrite failed");
             } else {
-                info!(id = %id_for_thread, packets, "background analysis complete");
+                info!(id = %id_for_thread, packets = qi.packets, "background analysis complete");
             }
         })
         .map_err(|e| AppError::Internal(format!("spawn analyzer: {e}")))?;

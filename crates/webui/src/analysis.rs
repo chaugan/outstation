@@ -24,7 +24,15 @@ use std::path::Path;
 
 use pcapload::{LoadedPcap, ReassembledFlow};
 use proto_iec104::apdu::{Apdu, ApduReader, U_STARTDT_ACT, U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON};
+use proto_iec104::asdu::{
+    cp56_offset_in_element, decode_cp56time2a, decode_cp56time2a_local, element_len, vsq,
+    Cp56Zone, DUI_LEN, IOA_LEN,
+};
 use serde::Serialize;
+
+/// Default tolerance for the CP56Time2a drift analyzer: 50 ms is
+/// generous for a LAN SCADA session but keeps noise out of the count.
+pub const DEFAULT_CP56_TOLERANCE_MS: f64 = 50.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisMode {
@@ -58,6 +66,12 @@ pub struct AnalysisReport {
     pub playback: PlaybackReport,
     pub target: TargetReport,
     pub timing: TimingReport,
+    /// CP56Time2a drift statistics. Populated only when the run used
+    /// the fresh-timestamps feature (else `None` — stamps were the
+    /// pcap's originals, so comparing them to wire send times isn't
+    /// meaningful).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cp56_drift: Option<Cp56DriftReport>,
     pub verdict: &'static str,
     pub verdict_reason: String,
     pub score_pct: f64,
@@ -141,6 +155,35 @@ pub struct CorrectnessCheck {
     ///                         Not an error, just a different peer.
     ///   `"silent"`          — target sent zero I-frames.
     pub target_script_kind: &'static str,
+}
+
+/// Per-run statistics on how closely each captured CP56Time2a stamp
+/// matches the wall-clock moment at which its carrying frame actually
+/// hit the wire. Only meaningful when the run enabled
+/// `rewrite_cp56_to_now` — otherwise the stamps are the pcap's original
+/// capture times and drift metrics describe "how stale was the pcap"
+/// rather than "how accurate is our rewrite".
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct Cp56DriftReport {
+    /// Number of CP56Time2a fields compared.
+    pub samples: usize,
+    /// Number of captured I-frames containing at least one CP56 field.
+    pub iframes_with_cp56: usize,
+    /// Absolute difference (send_wall - decoded_stamp) stats, ms.
+    pub mean_ms: f64,
+    pub p50_ms: f64,
+    pub p99_ms: f64,
+    pub max_ms: f64,
+    /// Samples whose drift exceeds `tolerance_ms`. Good runs have 0.
+    pub out_of_tolerance: usize,
+    pub tolerance_ms: f64,
+    /// Signed mean drift (positive = stamp trailed wire time, i.e.
+    /// stamp in the past relative to actual send). Included to make
+    /// a systematic bias easy to spot.
+    pub mean_signed_ms: f64,
+    /// IV (invalid) flag counts seen on captured stamps.
+    pub invalid_flag_count: usize,
+    pub summer_flag_count: usize,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -234,6 +277,174 @@ fn iframe_gap_timings(flow: &ReassembledFlow) -> Vec<f64> {
     let mut out = Vec::with_capacity(ts.len() - 1);
     for w in ts.windows(2) {
         out.push((w[1].saturating_sub(w[0])) as f64 / 1e6);
+    }
+    out
+}
+
+/// Walk every I-frame in `flow`, extract each CP56Time2a field inside
+/// the ASDU, and compare its decoded wall time to the wire send time
+/// for the frame's starting byte.
+///
+/// `flow.ts_for_byte` returns the packet's timestamp **relative** to
+/// the pcap's first packet, so `capture_epoch_ns` must be added to
+/// land in absolute UTC — the same epoch that CP56Time2a encodes.
+/// Returns `None` if no CP56 fields were seen.
+fn compute_cp56_drift(
+    flow: &ReassembledFlow,
+    capture_epoch_ns: u64,
+    zone: Cp56Zone,
+    tolerance_ms: f64,
+) -> Option<Cp56DriftReport> {
+    let payload = &flow.payload;
+    let mut abs_ms: Vec<f64> = Vec::new();
+    let mut signed_ms_sum: f64 = 0.0;
+    let mut iframes_with_cp56: usize = 0;
+    let mut invalid_flag_count: usize = 0;
+    let mut summer_flag_count: usize = 0;
+
+    let mut i = 0usize;
+    while i + 6 <= payload.len() {
+        if payload[i] != 0x68 {
+            i += 1;
+            continue;
+        }
+        let ln = payload[i + 1] as usize;
+        if i + 2 + ln > payload.len() {
+            break;
+        }
+        let frame_start = i;
+        let cf1 = payload[i + 2];
+        let body_start = i + 2; // APCI: 4 control bytes start at +2 of 0x68
+        // I-frame test: LSB of CF1 is 0.
+        if cf1 & 0x01 == 0 {
+            // ASDU begins after 4-byte control field.
+            let asdu_start = body_start + 4;
+            let asdu_end = i + 2 + ln;
+            if asdu_end > payload.len() {
+                break;
+            }
+            let asdu = &payload[asdu_start..asdu_end];
+            // Extract every CP56Time2a in this ASDU (same SQ=0/SQ=1
+            // walk as rewrite, reusing asdu.rs offset helpers).
+            let stamps = extract_cp56_from_asdu(asdu);
+            let stamps = match zone {
+                Cp56Zone::Utc => stamps,
+                Cp56Zone::Local => {
+                    // Re-decode per element using the local-timezone
+                    // decoder so drift math lands on the same epoch.
+                    let mut redone = Vec::with_capacity(stamps.len());
+                    for off in cp56_field_offsets(asdu) {
+                        if off + 7 <= asdu.len() {
+                            let mut arr = [0u8; 7];
+                            arr.copy_from_slice(&asdu[off..off + 7]);
+                            let (ns, iv) = decode_cp56time2a_local(&arr);
+                            let su = arr[3] & 0x80 != 0;
+                            redone.push((ns, iv, su));
+                        }
+                    }
+                    redone
+                }
+            };
+            if !stamps.is_empty() {
+                iframes_with_cp56 += 1;
+                let send_ns = capture_epoch_ns.saturating_add(flow.ts_for_byte(frame_start));
+                for (stamp_ns, iv, su) in stamps {
+                    if iv {
+                        invalid_flag_count += 1;
+                    }
+                    if su {
+                        summer_flag_count += 1;
+                    }
+                    let diff_ns = send_ns as i128 - stamp_ns as i128;
+                    let diff_ms = diff_ns as f64 / 1e6;
+                    signed_ms_sum += diff_ms;
+                    abs_ms.push(diff_ms.abs());
+                }
+            }
+        }
+        i += 2 + ln;
+    }
+
+    if abs_ms.is_empty() {
+        return None;
+    }
+    let samples = abs_ms.len();
+    let mean = abs_ms.iter().sum::<f64>() / samples as f64;
+    let mean_signed = signed_ms_sum / samples as f64;
+    let mut sorted = abs_ms.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let max = *sorted.last().unwrap_or(&0.0);
+    let p50 = percentile(&sorted, 0.5);
+    let p99 = percentile(&sorted, 0.99);
+    let out_of_tolerance = abs_ms.iter().filter(|&&d| d > tolerance_ms).count();
+
+    Some(Cp56DriftReport {
+        samples,
+        iframes_with_cp56,
+        mean_ms: mean,
+        p50_ms: p50,
+        p99_ms: p99,
+        max_ms: max,
+        out_of_tolerance,
+        tolerance_ms,
+        mean_signed_ms: mean_signed,
+        invalid_flag_count,
+        summer_flag_count,
+    })
+}
+
+/// Walk an ASDU and return the byte offset of every CP56Time2a field
+/// it contains. Caller supplies the zone-appropriate decoder.
+fn cp56_field_offsets(asdu: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if asdu.len() < DUI_LEN {
+        return out;
+    }
+    let type_id = asdu[0];
+    let Some(cp56_off_in_elem) = cp56_offset_in_element(type_id) else {
+        return out;
+    };
+    let Some(elem) = element_len(type_id) else {
+        return out;
+    };
+    let (sq, n) = vsq(asdu);
+    let n = n as usize;
+    if n == 0 {
+        return out;
+    }
+
+    if sq {
+        let mut off = DUI_LEN + IOA_LEN;
+        for _ in 0..n {
+            let cp_start = off + cp56_off_in_elem;
+            if cp_start + 7 > asdu.len() {
+                break;
+            }
+            out.push(cp_start);
+            off += elem;
+        }
+    } else {
+        let stride = IOA_LEN + elem;
+        let mut off = DUI_LEN;
+        for _ in 0..n {
+            let cp_start = off + IOA_LEN + cp56_off_in_elem;
+            if cp_start + 7 > asdu.len() {
+                break;
+            }
+            out.push(cp_start);
+            off += stride;
+        }
+    }
+    out
+}
+
+/// Convenience: walk an ASDU and return every CP56Time2a as
+/// `(unix_ns, iv, su)`, decoded with the UTC decoder.
+fn extract_cp56_from_asdu(asdu: &[u8]) -> Vec<(u64, bool, bool)> {
+    let mut out = Vec::new();
+    for off in cp56_field_offsets(asdu) {
+        let arr: [u8; 7] = asdu[off..off + 7].try_into().unwrap();
+        out.push(decode_cp56time2a(&arr));
     }
     out
 }
@@ -362,6 +573,9 @@ pub fn analyze(
     target_port: u16,
     role: RoleHint,
     mode: AnalysisMode,
+    rewrite_cp56_was_on: bool,
+    cp56_zone: Cp56Zone,
+    cp56_tolerance_ms: f64,
 ) -> anyhow::Result<AnalysisReport> {
     use anyhow::Context;
 
@@ -437,6 +651,7 @@ pub fn analyze(
                     correctness: None,
                 },
                 timing: TimingReport::default(),
+                cp56_drift: None,
                 verdict: "no_session",
                 verdict_reason: format!(
                     "captured pcap has no TCP flow on port {target_port}"
@@ -685,6 +900,23 @@ pub fn analyze(
         captured_gaps_ms: cap_gaps,
     };
 
+    // --- CP56Time2a drift (fresh-timestamps mode only) ---
+    let cp56_drift = if rewrite_cp56_was_on {
+        let cap_epoch_ns = captured.first_ts_ns;
+        playback_rf
+            .and_then(|rf| compute_cp56_drift(rf, cap_epoch_ns, cp56_zone, cp56_tolerance_ms))
+    } else {
+        None
+    };
+    if rewrite_cp56_was_on && cp56_drift.is_none() {
+        notes.push(
+            "fresh-timestamps mode was enabled but captured flow contained no CP56Time2a \
+             fields — either the ASDU types in this pcap carry no time tag or the playback \
+             side had no I-frames to inspect"
+                .into(),
+        );
+    }
+
     // --- Verdict ---
     let (verdict, reason, score) = decide_verdict(&playback, &target, mode, &notes);
 
@@ -699,6 +931,7 @@ pub fn analyze(
         playback,
         target,
         timing,
+        cp56_drift,
         verdict,
         verdict_reason: reason,
         score_pct: score,
@@ -1025,5 +1258,85 @@ mod tests {
         let orig = vec![1, 2, 3];
         let actual: Vec<u8> = vec![];
         assert_eq!(classify_script(&orig, &actual, 0, 0), "silent");
+    }
+
+    /// Build an IEC 104 APCI I-frame wrapping a type-36 (M_ME_TF_1)
+    /// ASDU with a single CP56Time2a stamp set to `stamp_ns`.
+    fn build_type36_iframe(stamp_ns: u64) -> Vec<u8> {
+        use proto_iec104::asdu::encode_cp56time2a;
+        let mut asdu = vec![
+            36,           // type
+            0x01,         // VSQ: SQ=0, N=1
+            0x03, 0x00,   // COT
+            0x01, 0x00,   // CA
+            0x01, 0x00, 0x00, // IOA
+            0x00, 0x00, 0x00, 0x00, // float payload
+            0x00,         // QDS
+        ];
+        asdu.extend_from_slice(&encode_cp56time2a(stamp_ns, false, false));
+        // APCI: start byte, length, 4 control bytes (I-frame, ns=0, nr=0).
+        let mut frame = vec![0x68, (asdu.len() + 4) as u8, 0x00, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(&asdu);
+        frame
+    }
+
+    fn fake_flow(payload: Vec<u8>, frame_positions: Vec<(u64, usize)>) -> ReassembledFlow {
+        ReassembledFlow {
+            flow_idx: 0,
+            client: ("10.0.0.1".parse().unwrap(), 12345),
+            server: ("10.0.0.2".parse().unwrap(), 2404),
+            dup_bytes: 0,
+            payload,
+            packet_offsets: frame_positions,
+        }
+    }
+
+    #[test]
+    fn cp56_drift_zero_when_stamp_matches_send_time() {
+        // stamp encodes the exact wire-send epoch → drift = 0.
+        const CAP_EPOCH_NS: u64 = 1_710_428_966_000_000_000; // pcap's first-packet ts
+        const SEND_REL_NS: u64 = 12_345_678_900; // 12.345 s after first packet
+        let stamp_absolute = CAP_EPOCH_NS + SEND_REL_NS;
+
+        let iframe = build_type36_iframe(stamp_absolute);
+        let flow = fake_flow(iframe.clone(), vec![(SEND_REL_NS, 0)]);
+
+        let drift = compute_cp56_drift(&flow, CAP_EPOCH_NS, Cp56Zone::Utc, 50.0)
+            .expect("should yield drift");
+        assert_eq!(drift.samples, 1);
+        assert_eq!(drift.iframes_with_cp56, 1);
+        assert!(drift.max_ms < 1.0, "drift.max_ms = {}", drift.max_ms);
+        assert_eq!(drift.out_of_tolerance, 0);
+    }
+
+    #[test]
+    fn cp56_drift_flags_out_of_tolerance() {
+        // Stamp 100 ms earlier than actual send time → 100 ms drift,
+        // outside a 50 ms tolerance.
+        const CAP_EPOCH_NS: u64 = 1_710_428_966_000_000_000;
+        const SEND_REL_NS: u64 = 5_000_000_000;
+        let stale_stamp = CAP_EPOCH_NS + SEND_REL_NS - 100_000_000; // 100 ms stale
+
+        let iframe = build_type36_iframe(stale_stamp);
+        let flow = fake_flow(iframe, vec![(SEND_REL_NS, 0)]);
+
+        let drift = compute_cp56_drift(&flow, CAP_EPOCH_NS, Cp56Zone::Utc, 50.0).unwrap();
+        assert_eq!(drift.out_of_tolerance, 1);
+        // abs(100ms) and signed should be +100ms (stamp trailed wire by 100ms).
+        assert!((drift.mean_ms - 100.0).abs() < 2.0, "{}", drift.mean_ms);
+        assert!(drift.mean_signed_ms > 80.0);
+    }
+
+    #[test]
+    fn cp56_drift_none_when_no_cp56_types() {
+        // Type 13 (M_ME_NC_1) has no CP56 field.
+        let asdu = vec![
+            13, 0x01, 0x03, 0x00, 0x01, 0x00,
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
+        let mut frame = vec![0x68, (asdu.len() + 4) as u8, 0x00, 0x00, 0x00, 0x00];
+        frame.extend_from_slice(&asdu);
+        let flow = fake_flow(frame, vec![(0, 0)]);
+        assert!(compute_cp56_drift(&flow, 0, Cp56Zone::Utc, 50.0).is_none());
     }
 }
