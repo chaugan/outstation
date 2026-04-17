@@ -3324,11 +3324,75 @@ function initSlaveCharts(slug, d) {
   }
 }
 
+function renderFleetDriftChart(r) {
+  const tl = r.fleet_drift_timeline;
+  if (!tl || !tl.samples || tl.samples.length === 0) return '';
+  const iters = (tl.iteration_starts_ms || []).length;
+  const iterNote = iters > 1
+    ? ` &middot; ${iters} loop iterations annotated`
+    : (iters === 1 ? ` &middot; single run` : '');
+  const decNote = tl.decimated
+    ? ` &middot; decimated from ${tl.total_samples.toLocaleString()} samples`
+    : ` &middot; ${tl.total_samples.toLocaleString()} samples`;
+  let h = `<div class="an-h">FLEET CP56 DRIFT &middot; AGGREGATED OVER TIME</div>`;
+  h += `<div class="an-chart-caption">every CP56 sample across all slaves on a unified time axis${iterNote}${decNote}</div>`;
+  h += `<div class="an-chart-axes">X: wall-clock seconds since capture start &middot; Y: signed drift (ms)</div>`;
+  h += `<div id="an-fleet-drift-chart" class="an-chart"></div>`;
+  return h;
+}
+
+function initFleetDriftChart(r) {
+  const tl = r.fleet_drift_timeline;
+  if (!tl || !tl.samples || tl.samples.length === 0) return;
+  const node = document.getElementById('an-fleet-drift-chart');
+  if (!node) return;
+  const chart = echarts.init(node, null, { renderer: 'canvas' });
+  // Convert wall_ms → seconds for the axis label readability.
+  const data = tl.samples.map(s => [s[0] / 1000, s[1]]);
+  // Iteration-boundary markers.
+  const iters = tl.iteration_starts_ms || [];
+  const markLines = iters.length > 1 ? {
+    silent: true,
+    symbol: ['none', 'none'],
+    lineStyle: { type: 'dashed', color: '#888', width: 1 },
+    label: { color: '#888', fontFamily: 'var(--mono)', fontSize: 10, formatter: p => p.data.label },
+    data: iters.map((ms, i) => ({
+      xAxis: ms / 1000,
+      label: { formatter: `iter ${i + 1}`, position: 'insideStartTop' }
+    })),
+  } : undefined;
+  chart.setOption({
+    grid: { left: 50, right: 20, top: 16, bottom: 36 },
+    tooltip: {
+      trigger: 'item',
+      formatter: p => `t = ${p.value[0].toFixed(2)} s<br>drift = ${p.value[1].toFixed(2)} ms`,
+    },
+    xAxis: { type: 'value', name: 's', nameLocation: 'middle', nameGap: 22 },
+    yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 36 },
+    dataZoom: [
+      { type: 'inside', xAxisIndex: 0 },
+      { type: 'inside', yAxisIndex: 0 },
+    ],
+    toolbox: { feature: { dataZoom: { yAxisIndex: 'none' }, restore: {} }, right: 8, top: 4 },
+    series: [{
+      type: 'scatter',
+      symbolSize: 3,
+      itemStyle: { color: '#4a90e2', opacity: 0.45 },
+      data,
+      markLine: markLines,
+      large: true,
+      largeThreshold: 1000,
+    }],
+  });
+  _anCharts.push(chart);
+}
+
 function renderAnalysis(r) {
   _resetAnalysisCharts();
   const out = el('an-result');
   let h = `<div class="an-card">`;
   h += renderFleetHeader(r);
+  h += renderFleetDriftChart(r);
   h += renderRunContext(r);
   if (r.notes && r.notes.length) {
     h += `<div class="an-h">FLEET NOTES</div>`;
@@ -3337,6 +3401,7 @@ function renderAnalysis(r) {
   h += renderSlaveTable(r);
   h += `</div>`;
   out.innerHTML = h;
+  setTimeout(() => initFleetDriftChart(r), 0);
   setupSlaveDetailExpand(r);
 }
 

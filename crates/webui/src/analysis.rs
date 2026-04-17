@@ -84,6 +84,12 @@ pub struct AnalysisReport {
     /// .86.223 across N sessions".
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub master_ip_mapping: Option<MasterIpMapping>,
+    /// Fleet-wide aggregated CP56Time2a drift over time. Drives the
+    /// top-of-card aggregated drift chart in the UI. `None` when
+    /// fresh-timestamps mode wasn't used or no slave produced any
+    /// CP56 samples.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_drift_timeline: Option<FleetDriftTimeline>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -152,6 +158,37 @@ pub struct MasterIpMapping {
     /// i.e. there's a meaningful captured→live rename to surface.
     pub renamed: bool,
 }
+
+/// Fleet-wide CP56Time2a drift timeline. Aggregates per-frame drift
+/// samples from every slave onto a single wall-clock axis so the UI
+/// can render one chart that reflects the whole run. Decimated to
+/// ~`MAX_FLEET_TIMELINE_POINTS` points to keep the response small.
+///
+/// Populated only when fresh-timestamps mode was on (else there are
+/// no meaningful drift samples). When the run was a loop with
+/// multiple iterations, `iteration_starts_ms` carries one entry per
+/// iteration boundary so the UI can annotate the chart.
+#[derive(Serialize, Debug, Clone)]
+pub struct FleetDriftTimeline {
+    /// One entry per kept sample after decimation. `[wall_ms, drift_ms]`.
+    pub samples: Vec<[f64; 2]>,
+    /// Total samples observed before decimation (samples.len() will
+    /// be ≤ this).
+    pub total_samples: usize,
+    /// True when decimation discarded samples to keep the response
+    /// size manageable. Aggregates (mean / p99) stay accurate.
+    pub decimated: bool,
+    /// Wall-clock ms (relative to capture start) of each detected
+    /// iteration start. For a single-run benchmark this contains one
+    /// entry near 0 (or is empty if detection found no clear burst);
+    /// the UI suppresses single-iteration annotations.
+    pub iteration_starts_ms: Vec<f64>,
+}
+
+/// Cap on points emitted in `FleetDriftTimeline.samples`. With ~165
+/// slaves × ~3 894 CP56 fields each, raw counts can hit 600k+.
+/// Decimating to ~5 000 keeps the JSON small and ECharts smooth.
+pub const MAX_FLEET_TIMELINE_POINTS: usize = 5_000;
 
 #[derive(Serialize, Debug, Clone)]
 pub struct FlowInfo {
@@ -298,6 +335,13 @@ pub struct Cp56DriftReport {
     /// ASDU type ID for the same frame. Same length again.
     #[serde(default)]
     pub sample_type_ids: Vec<u8>,
+    /// Wall-clock timestamp (ms relative to the captured pcap's first
+    /// packet) at which this sample's frame hit the wire. Same length
+    /// as `drift_samples_ms`. Used by the fleet-level aggregated
+    /// drift chart so per-slave samples can be unified onto a single
+    /// time axis.
+    #[serde(default)]
+    pub sample_wall_ms: Vec<f64>,
     /// True when the per-sample arrays were capped because the run
     /// produced more CP56 fields than `MAX_DRIFT_SAMPLES`.
     #[serde(default)]
@@ -427,6 +471,7 @@ fn compute_cp56_drift(
     let mut drift_samples_ms: Vec<f64> = Vec::new();
     let mut sample_frame_indices: Vec<u32> = Vec::new();
     let mut sample_type_ids: Vec<u8> = Vec::new();
+    let mut sample_wall_ms: Vec<f64> = Vec::new();
     let mut samples_truncated = false;
     // Local I-frame index, incremented for every I-frame walked
     // regardless of CP56 presence — matches what the UI sees as "the
@@ -497,6 +542,10 @@ fn compute_cp56_drift(
                         drift_samples_ms.push(diff_ms);
                         sample_frame_indices.push(this_iframe_idx);
                         sample_type_ids.push(type_id);
+                        // Wall ms is the byte timestamp relative to
+                        // the pcap's first packet — already what
+                        // ts_for_byte returns. Convert ns → ms.
+                        sample_wall_ms.push(flow.ts_for_byte(frame_start) as f64 / 1e6);
                     } else {
                         samples_truncated = true;
                     }
@@ -534,6 +583,7 @@ fn compute_cp56_drift(
         drift_samples_ms,
         sample_frame_indices,
         sample_type_ids,
+        sample_wall_ms,
         samples_truncated,
     })
 }
@@ -874,6 +924,12 @@ pub fn analyze(
 
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
 
+    // Fleet-wide drift timeline: union of every slave's per-sample
+    // (wall_ms, drift_ms), decimated, plus iteration boundary marks
+    // detected from the captured pcap's STARTDT_act bursts.
+    let fleet_drift_timeline =
+        build_fleet_drift_timeline(&details, &captured, target_port, fleet.slave_count);
+
     Ok(AnalysisReport {
         run_id,
         mode: mode_str(mode),
@@ -889,7 +945,132 @@ pub fn analyze(
         slaves: summaries,
         details_by_ip: details,
         master_ip_mapping,
+        fleet_drift_timeline,
     })
+}
+
+/// Walk every slave's per-sample drift array, merge into one
+/// time-sorted timeline, decimate to `MAX_FLEET_TIMELINE_POINTS` if
+/// needed, and detect iteration boundaries from the captured pcap.
+/// Returns None when no slave had any CP56 samples (e.g.
+/// fresh-timestamps mode wasn't on for this run).
+fn build_fleet_drift_timeline(
+    details: &BTreeMap<String, SlaveDetail>,
+    captured: &LoadedPcap,
+    target_port: u16,
+    expected_slave_count: usize,
+) -> Option<FleetDriftTimeline> {
+    let mut all: Vec<(f64, f64)> = Vec::new();
+    for d in details.values() {
+        let Some(dr) = d.cp56_drift.as_ref() else { continue };
+        // Both arrays share length; tolerate any drift.
+        let n = dr.drift_samples_ms.len().min(dr.sample_wall_ms.len());
+        for i in 0..n {
+            all.push((dr.sample_wall_ms[i], dr.drift_samples_ms[i]));
+        }
+    }
+    if all.is_empty() {
+        return None;
+    }
+    let total_samples = all.len();
+    all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Decimate by stride if oversized. Aggregate stats stay accurate
+    // because the per-slave Cp56DriftReport already carries them.
+    let decimated = total_samples > MAX_FLEET_TIMELINE_POINTS;
+    let kept: Vec<[f64; 2]> = if decimated {
+        let stride = (total_samples + MAX_FLEET_TIMELINE_POINTS - 1) / MAX_FLEET_TIMELINE_POINTS;
+        all.iter()
+            .step_by(stride)
+            .map(|&(t, d)| [t, d])
+            .collect()
+    } else {
+        all.iter().map(|&(t, d)| [t, d]).collect()
+    };
+
+    let iteration_starts_ms = detect_iteration_starts(captured, target_port, expected_slave_count);
+
+    Some(FleetDriftTimeline {
+        samples: kept,
+        total_samples,
+        decimated,
+        iteration_starts_ms,
+    })
+}
+
+/// Detect iteration boundaries by clustering TCP SYN packets to
+/// `target_port`. In a single benchmark iteration every slave handshake
+/// happens in a tight burst near the run start. A loop iteration adds
+/// another burst at each restart. We bin SYNs by 1-second windows and
+/// flag bins that contain at least 30 % of the expected slave count.
+/// Adjacent flagged bins coalesce into a single iteration start.
+///
+/// Returns wall-clock ms (relative to captured pcap's first packet)
+/// for each detected iteration start. Empty when no clear bursts
+/// are found.
+fn detect_iteration_starts(
+    captured: &LoadedPcap,
+    target_port: u16,
+    expected_slave_count: usize,
+) -> Vec<f64> {
+    if expected_slave_count == 0 {
+        return Vec::new();
+    }
+    // Threshold: need at least this many SYNs in one second to count
+    // as a burst. 30 % of expected slaves, floored at 5 so tiny runs
+    // still register.
+    let threshold = ((expected_slave_count as f64) * 0.30).max(5.0) as usize;
+
+    // Collect (rel_ms, port_match) for every SYN packet (no ACK).
+    let mut syn_times_ms: Vec<f64> = Vec::new();
+    for (idx, flow) in captured.flows.iter().enumerate() {
+        let Some((_, sp)) = flow.server else { continue };
+        if sp != target_port {
+            continue;
+        }
+        // First packet of this flow in time order is the SYN (or our
+        // best mid-flow approximation). flow.packet_indices[0] is
+        // the earliest captured packet for the flow.
+        if let Some(&first_pkt_idx) = flow.packet_indices.first() {
+            let pkt = &captured.packets[first_pkt_idx];
+            syn_times_ms.push(pkt.rel_ts_ns as f64 / 1e6);
+        }
+        let _ = idx;
+    }
+    if syn_times_ms.is_empty() {
+        return Vec::new();
+    }
+    syn_times_ms.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+    // Bin by 1-second windows.
+    let max_ms = *syn_times_ms.last().unwrap();
+    let bin_count = ((max_ms / 1000.0) as usize).saturating_add(2);
+    let mut bins: Vec<usize> = vec![0; bin_count];
+    for &t in &syn_times_ms {
+        let b = (t / 1000.0) as usize;
+        if b < bins.len() {
+            bins[b] += 1;
+        }
+    }
+
+    // Find peaks: any bin >= threshold. Coalesce adjacent peaks
+    // (within 5 s of each other) into a single iteration start.
+    let mut starts: Vec<f64> = Vec::new();
+    let mut last_start_ms: Option<f64> = None;
+    for (b, &count) in bins.iter().enumerate() {
+        if count < threshold {
+            continue;
+        }
+        let bin_start_ms = b as f64 * 1000.0;
+        if let Some(prev) = last_start_ms {
+            if bin_start_ms - prev < 5_000.0 {
+                continue;
+            }
+        }
+        starts.push(bin_start_ms);
+        last_start_ms = Some(bin_start_ms);
+    }
+    starts
 }
 
 /// Run the single-slave comparison: pick the original flow for this
