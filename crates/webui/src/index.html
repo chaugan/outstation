@@ -3337,6 +3337,7 @@ function renderFleetDriftChart(r) {
   let h = `<div class="an-h">FLEET CP56 DRIFT &middot; AGGREGATED OVER TIME</div>`;
   h += `<div class="an-chart-caption">every CP56 sample across all slaves on a unified time axis${iterNote}${decNote}</div>`;
   h += `<div class="an-chart-axes">X: wall-clock seconds since capture start &middot; Y: signed drift (ms)</div>`;
+  h += `<div class="an-chart-axes" style="color:var(--ink-2);font-style:italic">flat orange line = constant offset (host clock skew). slope or curve = cumulative pacing drift across the run. dashed grey = p05/p95 envelope per time bucket.</div>`;
   h += `<div id="an-fleet-drift-chart" class="an-chart"></div>`;
   return h;
 }
@@ -3349,7 +3350,42 @@ function initFleetDriftChart(r) {
   const chart = echarts.init(node, null, { renderer: 'canvas' });
   // Convert wall_ms → seconds for the axis label readability.
   const data = tl.samples.map(s => [s[0] / 1000, s[1]]);
-  // Iteration-boundary markers.
+
+  // Bucket the samples into ~100 time bins and compute mean / p05 / p95
+  // per bin. The mean line is the main "is this drifting?" signal —
+  // a flat line means the offset is constant (e.g. clock skew), a
+  // slope or curve means cumulative drift over the run.
+  const N_BINS = 100;
+  let tMin = Infinity, tMax = -Infinity;
+  for (const s of data) { if (s[0] < tMin) tMin = s[0]; if (s[0] > tMax) tMax = s[0]; }
+  const binWidth = Math.max((tMax - tMin) / N_BINS, 1e-9);
+  const bins = Array.from({ length: N_BINS }, () => []);
+  for (const s of data) {
+    let bi = Math.floor((s[0] - tMin) / binWidth);
+    if (bi >= N_BINS) bi = N_BINS - 1;
+    if (bi < 0) bi = 0;
+    bins[bi].push(s[1]);
+  }
+  const meanLine = [];
+  const p05Line = [];
+  const p95Line = [];
+  for (let i = 0; i < N_BINS; i++) {
+    const arr = bins[i];
+    if (arr.length === 0) continue;
+    arr.sort((a, b) => a - b);
+    const tCenter = tMin + (i + 0.5) * binWidth;
+    const mean = arr.reduce((a, b) => a + b, 0) / arr.length;
+    const p05 = arr[Math.floor(arr.length * 0.05)];
+    const p95 = arr[Math.min(arr.length - 1, Math.floor(arr.length * 0.95))];
+    meanLine.push([tCenter, mean]);
+    p05Line.push([tCenter, p05]);
+    p95Line.push([tCenter, p95]);
+  }
+  const drift_first = meanLine.length ? meanLine[0][1] : 0;
+  const drift_last  = meanLine.length ? meanLine[meanLine.length - 1][1] : 0;
+  const cumulative_change = drift_last - drift_first;
+
+  // Iteration-boundary markers (only when > 1 detected).
   const iters = tl.iteration_starts_ms || [];
   const markLines = iters.length > 1 ? {
     silent: true,
@@ -3361,28 +3397,78 @@ function initFleetDriftChart(r) {
       label: { formatter: `iter ${i + 1}`, position: 'insideStartTop' }
     })),
   } : undefined;
+
   chart.setOption({
-    grid: { left: 50, right: 20, top: 16, bottom: 36 },
+    grid: { left: 56, right: 20, top: 24, bottom: 40 },
     tooltip: {
       trigger: 'item',
-      formatter: p => `t = ${p.value[0].toFixed(2)} s<br>drift = ${p.value[1].toFixed(2)} ms`,
+      formatter: p => {
+        if (p.seriesName === 'samples') return `t = ${p.value[0].toFixed(2)} s<br>drift = ${p.value[1].toFixed(2)} ms`;
+        if (p.seriesName === 'mean (per-bucket)') return `t = ${p.value[0].toFixed(2)} s<br>bucket mean = <b>${p.value[1].toFixed(2)} ms</b>`;
+        return `t = ${p.value[0].toFixed(2)} s<br>${p.seriesName} = ${p.value[1].toFixed(2)} ms`;
+      },
     },
-    xAxis: { type: 'value', name: 's', nameLocation: 'middle', nameGap: 22 },
-    yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 36 },
+    legend: {
+      top: 0, right: 8,
+      textStyle: { fontFamily: 'var(--mono)', fontSize: 10 },
+      data: ['samples', 'p95 (per-bucket)', 'p05 (per-bucket)', 'mean (per-bucket)'],
+    },
+    title: {
+      text: `cumulative change in mean drift across this run: ${cumulative_change >= 0 ? '+' : ''}${cumulative_change.toFixed(2)} ms`,
+      left: 'center',
+      top: 0,
+      textStyle: { fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 'normal', color: '#666' },
+    },
+    xAxis: { type: 'value', name: 's', nameLocation: 'middle', nameGap: 26 },
+    yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 42 },
     dataZoom: [
       { type: 'inside', xAxisIndex: 0 },
       { type: 'inside', yAxisIndex: 0 },
     ],
-    toolbox: { feature: { dataZoom: { yAxisIndex: 'none' }, restore: {} }, right: 8, top: 4 },
-    series: [{
-      type: 'scatter',
-      symbolSize: 3,
-      itemStyle: { color: '#4a90e2', opacity: 0.45 },
-      data,
-      markLine: markLines,
-      large: true,
-      largeThreshold: 1000,
-    }],
+    toolbox: { feature: { dataZoom: { yAxisIndex: 'none' }, restore: {} }, right: 8, top: 24 },
+    series: [
+      {
+        name: 'samples',
+        type: 'scatter',
+        symbolSize: 3,
+        itemStyle: { color: '#4a90e2', opacity: 0.35 },
+        data,
+        large: true,
+        largeThreshold: 1000,
+        z: 1,
+      },
+      {
+        name: 'p95 (per-bucket)',
+        type: 'line',
+        data: p95Line,
+        lineStyle: { color: '#888', width: 1, type: 'dashed' },
+        itemStyle: { color: '#888' },
+        showSymbol: false,
+        smooth: true,
+        z: 2,
+      },
+      {
+        name: 'p05 (per-bucket)',
+        type: 'line',
+        data: p05Line,
+        lineStyle: { color: '#888', width: 1, type: 'dashed' },
+        itemStyle: { color: '#888' },
+        showSymbol: false,
+        smooth: true,
+        z: 3,
+      },
+      {
+        name: 'mean (per-bucket)',
+        type: 'line',
+        data: meanLine,
+        lineStyle: { color: '#d8741a', width: 2.5 },
+        itemStyle: { color: '#d8741a' },
+        showSymbol: false,
+        smooth: true,
+        markLine: markLines,
+        z: 4,
+      },
+    ],
   });
   _anCharts.push(chart);
 }
