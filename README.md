@@ -114,89 +114,122 @@ Every run is reversible: the bridge, veth pairs, IP aliases, sysctl state, iptab
 
 ### Using the web UI
 
-The single `outstation serve` binary hosts everything over `:8080`. A
-run moves through five screens in order — library, configuration, live
-replay, per-session results, and analysis — with the session history
-persisted to SQLite so refreshing the tab or restarting the service
-never loses a completed run.
+The single `outstation serve` binary hosts everything over `:8080`.
+A run moves through five screens in order — library, configuration,
+live replay, per-session results, and analysis — with the session
+history persisted to SQLite so refreshing the tab or restarting the
+service never loses a completed run.
+
+#### 1. Library + run configuration
 
 ![Pcap library above, run configuration below — viability advisory on the left, form for target IP / TCP_NODELAY / speed / warmup / iterations / flags / timestamps / benchmark role / protocol / pacing / ASDU rewrite map](doc/images/ui-01-run-config.jpg)
 
-**Library + run configuration (screen 1).** Drop a `.pcap`, `.pcapng`,
-or `.cap` file anywhere on the upload area to add it to the library.
-The viability analyser runs on upload and annotates each row with
-`OK` / `CAUTION` / `HEAVY` / `NOT RECOMMENDED` plus a one-line reason
-("165 of 171 flows are mid-flow — the replayer will synthesize a
-fresh TCP+STARTDT prelude and resync to the first clean APCI
-boundary"). Click a library row to pick it as the source pcap for the
-next run — that populates the **Run Configuration** form below with
-the selected pcap, the viability advisory, and sensible defaults for
-target IP, TCP_NODELAY, speed, warmup, and iterations. The form also
-collects protocol-specific knobs (IEC 104 CP56-rewrite settings, ASDU
-rewrite map) that only appear when the matching protocol is selected
-in the `PROTOCOL` dropdown. Tick **BENCHMARK MODE** to expose the
-role (master / slave), target port, concurrency model, pacing
-strategy, and — if your lab needs it — the SCADA-gateway mode for
-subnet-isolated targets. **START RUN** hands everything to the
-scheduler and transitions the page to the live-replay view.
+Top card is the **pcap library**; bottom card is **Run Configuration**.
+
+- **Upload.** Drop a `.pcap`, `.pcapng`, or `.cap` file anywhere on the
+  library upload area. Each file becomes a library row.
+- **Viability advisory.** The analyser runs on upload and tags the row
+  with `OK` / `CAUTION` / `HEAVY` / `NOT RECOMMENDED` plus a one-line
+  reason — e.g. *"165 of 171 flows are mid-flow — the replayer will
+  synthesize a fresh TCP+STARTDT prelude and resync to the first
+  clean APCI boundary"*.
+- **Pick a pcap.** Clicking a library row promotes it to the source
+  pcap for the next run and pre-populates the form below.
+- **Run form.** Target IP + MAC (MAC is raw-replay only), source-port
+  bind, `TCP_NODELAY` override, speed, warmup, iteration count,
+  and the usual flags (top speed, realtime, skip non-IP).
+- **Protocol-specific knobs.** Hidden by default; visible only when
+  the matching protocol is picked in the `PROTOCOL` dropdown. For
+  IEC 104 that's the CP56Time2a rewrite + timezone controls and
+  the ASDU rewrite map.
+- **Benchmark mode.** Tick the box to expose the benchmark panel —
+  role (`master` = tool dials out, `slave` = tool listens), target
+  port, concurrency model, pacing strategy, and the SCADA-gateway
+  toggle for subnet-isolated targets.
+- **`START RUN`.** Hands everything to the scheduler and transitions
+  the page to the live-replay view.
+
+#### 2. Live replay + per-session control
 
 ![Live traffic hub-and-spoke diagram with 165 RTU nodes around a central TARGET, run header with live SENT / UPLINK PPS / DOWNLINK PPS / ACTIVE counters, fleet session grid below with PENDING rows that each have a listener IP:port + VERIFY + START LISTENING + ABORT control, plus a fleet-wide START ALL](doc/images/ui-02-fleet-grid.jpeg)
 
-**Live replay + per-session control (screen 2).** Top card is the
-live traffic diagram — target at the centre, one node per captured
-RTU around it, animated particle streams sized by real packet-per-
-second rate and bucketed so a quiet 1 pps session looks different
-from a 1 000 pps one. FULLSCREEN pops it out for projection on a
-separate monitor. The header strip above keeps the live counters
-(SENT, UPLINK PPS, DOWNLINK PPS, active stream count out of the
-planned fleet size). Under the diagram, the per-run panel shows the
-session grid — one row per captured RTU. In slave mode each row is
-parked at **PENDING** with the listener IP:port prefilled from the
-capture. The `VERIFY` link checks address reachability without
-opening a socket. `START LISTENING` flips the ready flag and the row
-transitions `LISTENING → CONNECTED → ACTIVE → COMPLETED` as the
-target master connects in. **START ALL** fans the ready flag across
-every pending row in one click; **ABORT** cancels a single session
-without bringing down the rest of the fleet.
+Top card is the **live traffic diagram**; bottom card is the
+**session grid** for the running benchmark.
+
+- **Hub-and-spoke diagram.** Target at the centre, one node per
+  captured RTU around it. Animated particle streams are sized by
+  real packet-per-second rate and bucketed so a 1 pps session looks
+  visibly different from a 1 000 pps one. `FULLSCREEN` pops it out
+  for projection on a separate monitor.
+- **Live counters.** `SENT`, `UPLINK PPS`, `DOWNLINK PPS`, and
+  `ACTIVE / STREAMS` (active session count vs planned fleet size).
+- **Session grid.** One row per captured RTU. In slave-mode runs
+  each row is parked at **`PENDING`** with the listener IP:port
+  prefilled from the capture.
+- **Per-row controls.**
+    - `VERIFY` — check address reachability without opening a socket.
+    - `START LISTENING` — flip the ready flag; the row then walks
+      `LISTENING → CONNECTED → ACTIVE → COMPLETED` as the target
+      master connects in.
+    - `ABORT` — cancel a single session without disturbing the rest.
+- **Fleet controls.** `START ALL (N)` fans the ready flag across
+  every pending row in one click.
+
+#### 3. Session progress as the run unfolds
 
 ![Same run, now every row shows COMPLETED with a full green progress bar and the exact captured-frame count matching the delivered count — 9 423 / 9 423, 2 907 / 2 907, 12 005 / 12 005, etc.](doc/images/ui-03-session-progress.jpg)
 
-**Session progress during a run (still screen 2).** As RTUs come
-online the green progress bar fills toward `delivered / planned`
-message counts. Partial progress is visible per-row without
-refreshing the page; the scheduler atomics update over WebSocket
-every 250 ms. Once every session is at 100 % the run flips to
-`COMPLETED` at the top of the card. Any per-row progress bar that
-stays red or stalls is a slave the target master never handshook
-with — cheapest diagnostic for "did the SCADA even see this RTU" is
-this grid.
+- **Per-row progress bar** fills toward the `delivered / planned`
+  message count (green when running cleanly, red on stalls).
+- **Update cadence.** Scheduler atomics are streamed over WebSocket
+  every 250 ms — no page refresh, no polling.
+- **Completion.** When every session hits 100 % the run-card status
+  flips to `COMPLETED`.
+- **Diagnostics-at-a-glance.** A row stuck red or stalled at an
+  intermediate count is the cheapest answer to *"did the SCADA
+  even handshake with this RTU?"* — no need to pull up a packet
+  capture.
+
+#### 4. Run detail + per-session benchmark
 
 ![Throughput sparkline above a key-value readout (pcap path, target, speed, sessions 165, messages 151 068 sent, throughput 601.1 msg/s, latency min / p50 / p90 / p99 / max), per-session benchmark table below with SRC IP, SENT, RECV, P50 / P99 / MAX ms, MSG/S, STALLS, STATUS columns](doc/images/ui-04-per-session-benchmark.jpg)
 
-**Run detail + per-session benchmark (screen 3).** Click `SHOW
-DETAILS` on a completed run for the post-replay breakdown. The
-throughput sparkline charts aggregate packets-per-second over the
-whole run — spikes or a dropoff near the end usually mean the target
-was at its window. The stat strip under it is the copy-paste-ready
-one-liner for a status report: run settings, total messages, mean
-throughput, full latency percentile set. The per-session benchmark
-table ranks every RTU by SENT volume and flags any non-zero
-`STALLS` count (the replayer blocked waiting for the target to free
-the flow-control window). Buttons at the top of this block also
-expose `DELETE` (remove the run from history) and the download links
-for the mirror pcap that feeds the analyser.
+Click `SHOW DETAILS` on a completed run card.
+
+- **Throughput sparkline.** Aggregate pkts/s over the run. A dropoff
+  near the end usually means the target sat on its flow-control
+  window.
+- **Stat strip.** Copy-paste-ready one-liner: pcap path, target,
+  speed, session count, total messages, mean throughput, and the
+  full latency percentile set (min / p50 / p90 / p99 / max).
+- **Per-session benchmark table.** One row per RTU sorted by `SENT`
+  volume.
+    - `SENT / RECV` — message counts each way.
+    - `P50 / P99 / MAX ms` — per-session latency.
+    - `MSG/S` — sustained throughput.
+    - `STALLS` — times the replayer blocked on the target's flow-
+      control window. A non-zero value here is the first thing to
+      check when the fleet's mean throughput looks low.
+    - `STATUS` — `ok` or the failure tag.
+- **Actions.** `DELETE` removes the run from history; download links
+  above expose the mirror pcap that feeds the analyser.
+
+#### 5. Latency distribution
 
 ![Latency distribution histogram with blue bars bucketed on a log X-axis from 10 µs to 1 s, dashed vertical lines at p50 (126 788 µs) and p99 (6 962 870 µs), legend top-left with LATENCY SAMPLES / P50 / P99 and a sample count of 5 000 on the top-right](doc/images/ui-05-latency-histogram.jpg)
 
-**Latency distribution (still screen 3).** Send→ACK latency
-histogram on a log X-axis so sub-millisecond tails and multi-second
-outliers land in the same view. Dashed markers show p50 / p99 with
-their exact µs values so the distribution's shape is instantly
-readable — a single tall peak means the target is responding at a
-steady rate; a long right tail means individual ACKs are getting
-stuck behind the flow-control window or behind a slow target thread.
-Sample cap (5 000) is shown in the top-right so there's no
-ambiguity about whether the distribution was truncated.
+Send → ACK latency for the run, rendered as a histogram.
+
+- **Log X-axis** (10 µs → 1 s) so sub-millisecond tails and multi-
+  second outliers both land in the same view.
+- **p50 / p99 markers** — dashed vertical lines with their exact µs
+  values called out.
+- **Shape tells you the story.**
+    - A single tall peak = the target is responding at a steady rate.
+    - A long right tail = individual ACKs are sitting behind the
+      flow-control window or a slow target thread.
+- **Sample cap** (top-right) so there's no ambiguity about whether
+  the distribution was truncated.
 
 ### Post-run fidelity analysis
 
@@ -204,37 +237,112 @@ ambiguity about whether the distribution was truncated.
 - Flow pairing is pinned on the captured session's server IP, so in a 200-RTU pcap the analyser always compares the right source flow against the right captured flow.
 - A sample report produced end-to-end from a 200-RTU run is in [`fidelity_report_run2.md`](fidelity_report_run2.md).
 
+#### Upload a capture
+
 ![ANALYSIS card with a dashed-line drop zone on the left labelled "DROP CAPTURED PCAP · WIRESHARK OUTPUT FROM THE TARGET SIDE", right-hand controls for target correctness mode (generic / correct) and CP56 drift tolerance (ms), and an ANALYZE button](doc/images/ui-06-analysis-upload.jpg)
 
-**Upload a capture to compare against the last run (screen 4).**
-Drop a Wireshark capture taken on the target side into the dashed
-box on the left. Pick **generic** when the target is a different
-piece of software than the one in the source pcap (only delivery +
-handshake are judged); pick **correct** when it's the same RTU /
-SCADA and the target's own I-frames are expected to match the
-captured server-side flow byte-for-byte. `CP56 DRIFT TOLERANCE (MS)`
-is the ±band outside of which a per-frame stamp-vs-wire drift counts
-as an anomaly — 50 ms for tight intra-host runs, bump to 200 ms when
-the target capture comes from a different VM. **ANALYZE** runs the
-comparison and renders the report below.
+- **Drop zone.** Drop a Wireshark capture taken *on the target side*
+  into the dashed box on the left.
+- **Analysis mode.**
+    - **`generic`** — target is different software from the one in
+      the source pcap. Only delivery and handshake completion are
+      scored.
+    - **`correct`** — target is the same RTU / SCADA. The target's
+      own I-frames are additionally compared byte-for-byte against
+      the captured server-side flow.
+- **`CP56 DRIFT TOLERANCE (MS)`** — the ±band outside of which a
+  per-frame stamp-vs-wire drift counts as an anomaly.
+    - 50 ms — tight, intra-host runs.
+    - 200 ms — realistic when the target capture comes from a
+      different VM.
+- **`ANALYZE`.** Runs the comparison and renders the report below.
+
+#### Reading the report
 
 ![IEC 104 analysis view — fleet rollup with pacing and CP56 drift charts, per-slave drill-down, anomaly detection charts, and timestamp accuracy summary](doc/images/iec104-generic-analysis.jpeg)
 
-Reading the page, top to bottom:
+Top to bottom:
 
-- **Top-right controls.** `ANALYSIS MODE` → `generic` compares the captured output against the expected frames *and* a viable TCP handshake; `correct` additionally walks the target's replies byte-for-byte against the original server-side flow to score target behaviour. `CP56 DRIFT TOLERANCE (MS)` is the threshold above which a per-frame stamp-vs-wire drift counts as an anomaly (50 ms is tight; 200 ms is realistic across VM boundaries). `ANALYZE` runs the comparison; `DOWNLOAD JSON` dumps the raw report for offline inspection.
-- **Top banner** — overall verdict badge (`ALL CORRECT` / `PARTIAL` / `FAILED` / …) with the fleet score to its right, followed by one-line breakdown counts: total, all-correct, partial, failed, silent.
-- **Fleet pacing drift.** One dot per I-frame, X = seconds since capture start, Y = ms that the live replay sent that frame later than the original capture pace. Orange line = per-bucket mean across the fleet (flat ≈ 0 means the replayer held pace; upward slope = falling behind). Green dashed = p95 upper, red dashed = p05 lower. Iteration boundaries (loop runs) are annotated with dashed vertical lines. The stats strip below shows cumulative change (last bucket mean − first bucket mean), overall mean, and min → max.
-- **Fleet CP56 drift.** Same layout, but the Y-axis is signed stamp-vs-wire drift in ms — *only populated when the run had fresh-timestamps mode on*. A flat line means a constant clock offset between replayer and reference (NTP skew); a slope means the offset itself is drifting. Dots outside the ±tolerance corridor are the frames flagged as anomalies.
-- **Run context.** `run` (id, slave/master mode, generic/correct mode), `source pcap` path, `captured size` + packet count, `master ip` mapping with a `(renamed)` tag when the captured master IP differs from the live one. Informational — slave matching is pinned on slave IP, not master IP.
-- **Fleet notes.** Global observations the analyser surfaced at rollup time (e.g. the master-IP rename above).
-- **Slaves table.** One row per RTU in the source pcap, sorted worst-score-first. Columns: slave IP · packets seen in the captured pcap · delivered/expected I-frames · STARTDT handshake ✓/✗ · score · verdict tag. Click any row to expand its drill-down.
-- **Per-slave drill-down** (everything below the row). Starts with the `TCP FLOW` identity, then four protocol-specific sections, all powered by `crates/proto_iec104/src/analysis.rs` and rendered by `crates/proto_iec104/static/iec104_ui.js`:
-  - **`PLAYBACK SIDE`** — what outstation was supposed to emit. `expected / delivered` I-frame counts, type-ID sequence match verdict, and a three-way body-diff breakdown: byte-identical vs CP56-only (timestamps we deliberately rewrote) vs real mismatches. Side-by-side type-ID histogram (EXPECTED vs CAPTURED) with per-type deltas, plus a collapsible full-sequence dump for byte-level inspection.
-  - **`TARGET SIDE`** — what the live peer sent back. U/S/I frame counts, list of U-codes seen (STARTDT_ACT, STARTDT_CON, TESTFR_ACT, …), handshake-completion flag, and a single-column type-ID histogram of the target's I-frames. In `correct` mode this section also includes a target-script comparison (same_script / subset / divergent / silent) with LCS similarity to the original capture.
-  - **`TIMING`** — per-slave original vs captured run durations, speedup factor label (fast mode vs original pacing), and mean / p50 / p99 inter-frame gap statistics side by side.
-  - **`ANOMALY DETECTION`** — interactive charts. **CP56 drift over time** scatters every per-frame signed drift against frame index with the ±tolerance band shaded green; in-tolerance dots are green, out-of-tolerance dots red. **Inter-frame gap timing** overlays original (dashed) and captured (solid) gap duration per-index. **Drift distribution** bars |drift| in buckets with a dashed line at the tolerance threshold. **Worst CP56 drifts (top 10)** callout list ranks the frames most at risk.
-  - **`EMBEDDED TIMESTAMP ACCURACY`** — fresh-timestamps-mode summary. Verdict (within-tolerance percentage of CP56 samples), frames-with-CP56 count, mean / p50 / p99 / max drift, out-of-tolerance count, and any IV / SU flags observed.
+- **Top-right controls.** `ANALYSIS MODE`, `CP56 DRIFT TOLERANCE
+  (MS)`, `ANALYZE`, and `DOWNLOAD JSON` (dumps the raw report for
+  offline inspection).
+- **Top banner.** Overall verdict badge (`ALL CORRECT` / `PARTIAL` /
+  `FAILED` / …) with the fleet score next to it, followed by the
+  per-bucket counts: total, all-correct, partial, failed, silent.
+- **Fleet pacing drift.** One dot per I-frame. X = seconds since
+  capture start, Y = ms that the live replay sent that frame later
+  than the original capture pace.
+    - **Orange** = per-bucket mean across the fleet. Flat ≈ 0 means
+      the replayer held pace; an upward slope means it's falling
+      behind.
+    - **Green dashed** = p95 upper. **Red dashed** = p05 lower.
+    - **Dashed vertical lines** mark iteration boundaries on loop runs.
+    - **Stats strip** below: cumulative change (last bucket mean −
+      first bucket mean), overall mean, and min → max.
+- **Fleet CP56 drift.** Same layout, Y-axis is signed stamp-vs-wire
+  drift in ms — *only populated when the run had fresh-timestamps
+  mode on*.
+    - A flat line = constant clock offset (NTP skew).
+    - A slope = the offset itself is drifting.
+    - Dots outside the ±tolerance corridor are the frames flagged
+      as anomalies.
+- **Run context.** `run` (id, role, mode), `source pcap`, `captured
+  size` + packet count, `master ip` mapping with a `(renamed)` tag
+  when captured-side and live-side master IPs differ. Informational —
+  slave matching is pinned on slave IP, not master IP.
+- **Fleet notes.** Global observations the analyser surfaced at
+  rollup time (e.g. the master-IP rename above).
+- **Slaves table.** One row per RTU in the source pcap, sorted
+  worst-score-first. Columns: slave IP · packets seen · delivered /
+  expected I-frames · STARTDT handshake ✓/✗ · score · verdict tag.
+  Click any row to expand its drill-down.
+- **Per-slave drill-down** (everything below the row). Starts with
+  the `TCP FLOW` identity, then four protocol-specific sections,
+  all powered by `crates/proto_iec104/src/analysis.rs` and
+  rendered by `crates/proto_iec104/static/iec104_ui.js`:
+
+    - **`PLAYBACK SIDE`** — what outstation was supposed to emit.
+        - `expected / delivered` I-frame counts.
+        - Type-ID sequence match verdict.
+        - Three-way body-diff breakdown: byte-identical vs
+          CP56-only (timestamps we deliberately rewrote) vs real
+          mismatches.
+        - Side-by-side type-ID histogram (EXPECTED vs CAPTURED)
+          with per-type deltas, plus a collapsible full-sequence
+          dump for byte-level inspection.
+
+    - **`TARGET SIDE`** — what the live peer sent back.
+        - U / S / I frame counts.
+        - List of U-codes seen (`STARTDT_ACT`, `STARTDT_CON`,
+          `TESTFR_ACT`, …).
+        - Handshake-completion flag.
+        - Single-column type-ID histogram of the target's I-frames.
+        - In `correct` mode: target-script comparison (`same_script`
+          / `subset` / `divergent` / `silent`) with LCS similarity
+          to the original capture.
+
+    - **`TIMING`** — per-slave original vs captured run durations,
+      speedup-factor label (fast mode vs original pacing), and
+      mean / p50 / p99 inter-frame gap statistics side by side.
+
+    - **`ANOMALY DETECTION`** — interactive charts.
+        - **CP56 drift over time** — every per-frame signed drift
+          against frame index, with the ±tolerance band shaded
+          green; in-tolerance dots green, out-of-tolerance dots red.
+        - **Inter-frame gap timing** — original (dashed) vs captured
+          (solid) gap duration per index.
+        - **Drift distribution** — `|drift|` bars in buckets with a
+          dashed line at the tolerance threshold.
+        - **Worst CP56 drifts (top 10)** — callout list ranks the
+          frames most at risk.
+
+    - **`EMBEDDED TIMESTAMP ACCURACY`** — fresh-timestamps-mode
+      summary.
+        - Verdict (within-tolerance % of CP56 samples).
+        - Frames-with-CP56 count.
+        - mean / p50 / p99 / max drift.
+        - Out-of-tolerance count.
+        - Any `IV` / `SU` flags observed.
 
 ### Networking
 
