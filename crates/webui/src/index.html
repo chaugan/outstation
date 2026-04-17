@@ -1236,6 +1236,21 @@
     color: var(--ink-2);
     margin: 0 0 2px;
   }
+  .an-chart-stats {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 18px;
+    font-family: var(--mono);
+    font-size: 11px;
+    color: var(--ink-2);
+    padding: 6px 8px;
+    margin: 0 0 8px;
+    background: var(--surface-2);
+    border-left: 2px solid var(--rule);
+  }
+  .an-chart-stats .ok { color: var(--ok); }
+  .an-chart-stats .warn { color: var(--warn); }
+  .an-chart-stats .bad { color: var(--err); }
   .an-diff-row {
     font-family: var(--mono);
     font-size: 10px;
@@ -3340,6 +3355,7 @@ function renderFleetTimelineChartBlock(tl, opts) {
   h += `<div class="an-chart-axes">${opts.axes}</div>`;
   h += `<div class="an-chart-axes" style="color:var(--ink-2);font-style:italic">${opts.legend}</div>`;
   h += `<div id="an-${opts.key}-chart" class="an-chart"></div>`;
+  h += `<div id="an-${opts.key}-stats" class="an-chart-stats"></div>`;
   return h;
 }
 
@@ -3418,34 +3434,89 @@ function initFleetTimelineChart(tl, key) {
     })),
   } : undefined;
 
+  // Stash stats on the chart node so the surrounding caption block
+  // can read them and update its text. Computed here instead of in
+  // the render function so the bucketing logic stays in one place.
+  const tooltipFmt = (params) => {
+    if (!params || params.length === 0) return '';
+    // params come from trigger='axis': one entry per series at the
+    // hover X. Extract X from the first entry (all share the axis
+    // value) and list each series' Y in a tidy mono-font block.
+    const t = (params[0].axisValue !== undefined)
+      ? params[0].axisValue
+      : params[0].value[0];
+    let html = `<div style="font-family:var(--mono);font-size:12px;line-height:1.45">`;
+    html += `<div style="font-weight:700;margin-bottom:4px">t = ${Number(t).toFixed(2)} s</div>`;
+    for (const p of params) {
+      if (!p.value) continue;
+      const y = Array.isArray(p.value) ? p.value[1] : p.value;
+      if (y === undefined || y === null) continue;
+      const swatch = `<span style="display:inline-block;width:8px;height:8px;background:${p.color};margin-right:6px;border-radius:2px"></span>`;
+      const yStr = Number(y).toFixed(2);
+      html += `<div>${swatch}${p.seriesName}: <b>${yStr} ms</b></div>`;
+    }
+    html += `</div>`;
+    return html;
+  };
+
   chart.setOption({
-    grid: { left: 56, right: 20, top: 24, bottom: 40 },
+    grid: { left: 64, right: 24, top: 48, bottom: 48 },
     tooltip: {
-      trigger: 'item',
-      formatter: p => {
-        if (p.seriesName === 'samples') return `t = ${p.value[0].toFixed(2)} s<br>drift = ${p.value[1].toFixed(2)} ms`;
-        if (p.seriesName === 'mean (per-bucket)') return `t = ${p.value[0].toFixed(2)} s<br>bucket mean = <b>${p.value[1].toFixed(2)} ms</b>`;
-        return `t = ${p.value[0].toFixed(2)} s<br>${p.seriesName} = ${p.value[1].toFixed(2)} ms`;
+      trigger: 'axis',
+      axisPointer: {
+        type: 'cross',
+        snap: true,
+        label: {
+          backgroundColor: '#333',
+          color: '#fff',
+          fontSize: 11,
+          fontFamily: 'var(--mono)',
+          formatter: (p) => {
+            // axis label on the cross hair lines.
+            const v = (typeof p.value === 'number') ? p.value : Number(p.value);
+            const unit = p.axisDimension === 'x' ? 's' : 'ms';
+            return `${v.toFixed(2)} ${unit}`;
+          },
+        },
       },
+      backgroundColor: 'rgba(255,255,255,0.97)',
+      borderColor: 'var(--rule)',
+      borderWidth: 1,
+      padding: [8, 12],
+      extraCssText: 'box-shadow: 0 2px 8px rgba(0,0,0,0.15);',
+      formatter: tooltipFmt,
     },
     legend: {
-      top: 0, right: 8,
-      textStyle: { fontFamily: 'var(--mono)', fontSize: 10 },
+      top: 6, left: 8,
+      textStyle: { fontFamily: 'var(--mono)', fontSize: 11, color: '#444' },
+      itemWidth: 18,
+      itemHeight: 8,
+      itemGap: 14,
       data: ['samples', 'p95 (per-bucket)', 'p05 (per-bucket)', 'mean (per-bucket)'],
     },
-    title: {
-      text: `cumulative change in mean drift across this run: ${cumulative_change >= 0 ? '+' : ''}${cumulative_change.toFixed(2)} ms`,
-      left: 'center',
-      top: 0,
-      textStyle: { fontFamily: 'var(--mono)', fontSize: 10, fontWeight: 'normal', color: '#666' },
+    xAxis: {
+      type: 'value',
+      name: 'seconds since capture start',
+      nameLocation: 'middle',
+      nameGap: 30,
+      nameTextStyle: { fontFamily: 'var(--mono)', fontSize: 10, color: '#777' },
     },
-    xAxis: { type: 'value', name: 's', nameLocation: 'middle', nameGap: 26 },
-    yAxis: { type: 'value', name: 'ms', nameLocation: 'middle', nameGap: 42 },
+    yAxis: {
+      type: 'value',
+      name: 'ms',
+      nameLocation: 'middle',
+      nameGap: 48,
+      nameTextStyle: { fontFamily: 'var(--mono)', fontSize: 10, color: '#777' },
+    },
     dataZoom: [
       { type: 'inside', xAxisIndex: 0 },
       { type: 'inside', yAxisIndex: 0 },
     ],
-    toolbox: { feature: { dataZoom: { yAxisIndex: 'none' }, restore: {} }, right: 8, top: 24 },
+    toolbox: {
+      feature: { dataZoom: { yAxisIndex: 'none' }, restore: {} },
+      right: 8,
+      top: 6,
+    },
     series: [
       {
         name: 'samples',
@@ -3491,6 +3562,24 @@ function initFleetTimelineChart(tl, key) {
     ],
   });
   _anCharts.push(chart);
+
+  // Stats summary line under the chart. Computed from the same
+  // bucketed mean line we already built — no second pass.
+  const statsNode = document.getElementById('an-' + key + '-stats');
+  if (statsNode && meanLine.length >= 2) {
+    const ys = data.map(s => s[1]);
+    const ymean = ys.reduce((a, b) => a + b, 0) / ys.length;
+    const ymin = Math.min(...ys);
+    const ymax = Math.max(...ys);
+    const cumStr = `${cumulative_change >= 0 ? '+' : ''}${cumulative_change.toFixed(2)} ms`;
+    const cumCls = Math.abs(cumulative_change) < 5 ? 'ok'
+                 : Math.abs(cumulative_change) < 50 ? 'warn'
+                 : 'bad';
+    statsNode.innerHTML =
+      `<span><b>cumulative change</b> (last bucket mean − first bucket mean): <span class="${cumCls}">${cumStr}</span></span>` +
+      `<span><b>overall mean</b>: ${ymean.toFixed(2)} ms</span>` +
+      `<span><b>range</b>: ${ymin.toFixed(2)} ms &rarr; ${ymax.toFixed(2)} ms</span>`;
+  }
 }
 
 function renderAnalysis(r) {
