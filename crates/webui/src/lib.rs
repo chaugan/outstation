@@ -2242,163 +2242,73 @@ fn quick_inspect(path: &StdPath) -> QuickInspect {
 /// the IEC 104 benchmark workflow. Counts unique client/server IPs on
 /// port 2404, sums TCP payload bytes per direction, and produces a
 /// bucketed verdict. Cheap enough to run on every upload.
-fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
-    use std::collections::HashSet;
-    const TARGET_PORT: u16 = 2404;
-    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+/// Adapter that lets a [`pcapload::LoadedPcap`] satisfy the
+/// [`protoplay::LoadedPcapView`] contract without dragging pcapload
+/// into protoplay or duplicating types. Each protocol replayer's
+/// `quick_viability` impl walks this view, so the same loaded pcap
+/// can be analysed by IEC 104 today and Modbus / DNP3 / etc. when
+/// they implement the trait.
+struct LoadedPcapAdapter<'a> {
+    inner: &'a pcapload::LoadedPcap,
+}
 
-    let mut client_ips: HashSet<Ipv4Addr> = HashSet::new();
-    let mut server_ips: HashSet<Ipv4Addr> = HashSet::new();
-    let mut client_payload_bytes: u64 = 0;
-    let mut server_payload_bytes: u64 = 0;
-    let mut midflow_flows: u64 = 0;
-    let mut clean_handshake_flows: u64 = 0;
-
-    for (idx, flow) in p.flows.iter().enumerate() {
-        let Some((server_ip, server_port)) = flow.server else {
-            continue;
-        };
-        if server_port != TARGET_PORT {
-            continue;
-        }
-        let Some((client_ip, _)) = flow.client else {
-            continue;
-        };
-        client_ips.insert(client_ip);
-        server_ips.insert(server_ip);
-        if flow.saw_syn {
-            clean_handshake_flows += 1;
-        } else {
-            midflow_flows += 1;
-        }
-
-        if let Ok(rf) = p.reassemble_client_payload(idx) {
-            client_payload_bytes += rf.payload.len() as u64;
-        }
-        if let Ok(rf) = p.reassemble_server_payload(idx) {
-            server_payload_bytes += rf.payload.len() as u64;
-        }
+impl<'a> protoplay::LoadedPcapView for LoadedPcapAdapter<'a> {
+    fn flows(&self) -> Box<dyn Iterator<Item = protoplay::FlowView> + '_> {
+        Box::new(self.inner.flows.iter().enumerate().map(|(idx, f)| {
+            protoplay::FlowView {
+                flow_idx: idx,
+                client: f.client,
+                server: f.server,
+                saw_syn: f.saw_syn,
+            }
+        }))
     }
-
-    let sessions_master_mode = client_ips.len() as u64;
-    let sessions_slave_mode = server_ips.len() as u64;
-
-    // Memory model. The "parsed packet store" is the dominant cost
-    // (LoadedPcap holds Vec<Packet> where each Packet owns its bytes).
-    // It is roughly the file size. Per-session payloads now move
-    // straight into worker threads (no clones), so they're owned
-    // exactly once. Latency reservoir is bounded at 80 KB/session.
-    // Per-thread stack budget: ~2 MB on Linux default.
-    let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
-    let parsed_store_mb = mb(file_size);
-    let max_session_count = sessions_master_mode.max(sessions_slave_mode);
-    let session_payload_mb = mb(client_payload_bytes.max(server_payload_bytes));
-    let reservoir_mb = mb(max_session_count * 80 * 1024);
-    let stack_mb = max_session_count * 2;
-    let estimated_peak_mb = parsed_store_mb + session_payload_mb + reservoir_mb + stack_mb + 32; // 32 MB headroom
-
-    // Bucketing: pick the heavier of file-size or session-count.
-    let (verdict, verdict_reason): (&str, String) = if file_size > 8 * 1024 * 1024 * 1024
-        || max_session_count > 1500
-    {
-        (
-            "not_recommended",
-            format!(
-                "{} sessions and a {} MB pcap exceed comfortable single-host limits",
-                max_session_count,
-                file_size / (1024 * 1024)
-            ),
-        )
-    } else if file_size > 2 * 1024 * 1024 * 1024 || max_session_count > 500 {
-        (
-            "heavy",
-            format!(
-                "{} sessions / {} MB pcap — needs a roomy host (≥ {} MB free RAM)",
-                max_session_count,
-                file_size / (1024 * 1024),
-                estimated_peak_mb
-            ),
-        )
-    } else if file_size > 500 * 1024 * 1024 || max_session_count > 100 {
-        (
-            "caution",
-            format!(
-                "{} sessions / {} MB pcap — feasible but expect ~{} MB peak RAM",
-                max_session_count,
-                file_size / (1024 * 1024),
-                estimated_peak_mb
-            ),
-        )
-    } else if max_session_count == 0 {
-        (
-            "ok",
-            format!(
-                "no IEC 104 flows on port 2404 — fine for raw replay; benchmark mode has nothing to drive"
-            ),
-        )
-    } else {
-        (
-            "ok",
-            format!(
-                "{} session(s) and {} MB pcap — easy to replay on this host",
-                max_session_count,
-                file_size / (1024 * 1024)
-            ),
-        )
-    };
-
-    let mut notes = Vec::new();
-    if max_session_count == 0 {
-        notes.push(
-            "no TCP flow with server_port=2404 found — benchmark mode would have nothing to do"
-                .into(),
-        );
-    } else {
-        notes.push(format!(
-            "{} unique client IPs talk to port 2404 (master-mode session count)",
-            sessions_master_mode
-        ));
-        notes.push(format!(
-            "{} unique server IPs listen on port 2404 (slave-mode session count)",
-            sessions_slave_mode
-        ));
-        notes.push(format!(
-            "{} MB of client TCP payload, {} MB of server TCP payload across all relevant flows",
-            client_payload_bytes / (1024 * 1024),
-            server_payload_bytes / (1024 * 1024),
-        ));
-        if midflow_flows > 0 {
-            notes.push(format!(
-                "{} of {} flows are mid-flow (no SYN observed) — the replayer will synthesize a fresh TCP+STARTDT prelude and resync to the first clean APCI boundary; {} flows had a clean handshake in the capture",
-                midflow_flows,
-                midflow_flows + clean_handshake_flows,
-                clean_handshake_flows,
-            ));
-        }
-    }
-    if file_size > 1024 * 1024 * 1024 {
-        notes.push(
-            "pcap is larger than 1 GB; pcapload reads it fully into RAM (no mmap path yet)".into(),
-        );
-    }
-    if max_session_count > 256 {
-        notes.push(
-            "session count exceeds 256 — ensure `ulimit -n` is large enough for one socket per session".into(),
-        );
-    }
-
-    Viability {
-        client_payload_bytes,
-        server_payload_bytes,
-        sessions_master_mode,
-        sessions_slave_mode,
-        estimated_peak_mb,
-        verdict: verdict.into(),
-        verdict_reason,
-        notes,
+    fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64) {
+        let cb = self
+            .inner
+            .reassemble_client_payload(flow_idx)
+            .map(|rf| rf.payload.len() as u64)
+            .unwrap_or(0);
+        let sb = self
+            .inner
+            .reassemble_server_payload(flow_idx)
+            .map(|rf| rf.payload.len() as u64)
+            .unwrap_or(0);
+        (cb, sb)
     }
 }
 
+/// Convert a generic [`protoplay::ProtoViability`] into the
+/// JSON-serialised [`Viability`] shape the HTTP response uses. Field
+/// names are preserved 1:1 so existing UI code keeps working.
+fn viability_from_proto(p: protoplay::ProtoViability) -> Viability {
+    Viability {
+        client_payload_bytes: p.client_payload_bytes,
+        server_payload_bytes: p.server_payload_bytes,
+        sessions_master_mode: p.sessions_master_mode,
+        sessions_slave_mode: p.sessions_slave_mode,
+        estimated_peak_mb: p.estimated_peak_mb,
+        verdict: p.verdict,
+        verdict_reason: p.verdict_reason,
+        notes: p.notes,
+    }
+}
+
+fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
+    let file_size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    let view = LoadedPcapAdapter { inner: p };
+    // Today only IEC 104 is wired in. When a future caller supplies
+    // the protocol name (e.g. taken from the upload metadata), look
+    // it up via proto_registry::lookup(name) instead and dispatch.
+    let replayer = proto_registry::lookup("iec104")
+        .expect("iec104 replayer always registered");
+    let proto = replayer.quick_viability(&view, file_size);
+    viability_from_proto(proto)
+}
+
+#[allow(dead_code)]
+
+#[allow(dead_code)]
 async fn api_library_list(State(state): State<AppState>) -> Json<Vec<LibraryEntry>> {
     let dir: &StdPath = state.library_dir.as_ref();
     let mut out: Vec<LibraryEntry> = Vec::new();

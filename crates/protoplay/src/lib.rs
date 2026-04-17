@@ -252,6 +252,39 @@ pub enum Readiness {
     Stub,
 }
 
+/// Generic, protocol-agnostic viability summary the analyser produces
+/// at pcap-upload time so the UI can warn about pcaps that are too
+/// large or session-rich to comfortably replay on the host.
+///
+/// All counts are on a per-protocol basis: a master-mode benchmark
+/// would spawn `sessions_master_mode` outgoing sessions; a slave-mode
+/// benchmark would bind `sessions_slave_mode` listeners.
+#[derive(Debug, Clone, Default)]
+pub struct ProtoViability {
+    /// Sum of TCP payload bytes from the client side of all flows
+    /// the protocol considers "interesting" (typically: server_port
+    /// matches one of `well_known_ports()`).
+    pub client_payload_bytes: u64,
+    /// Same for the server side.
+    pub server_payload_bytes: u64,
+    /// Distinct client IPs observed talking to the protocol's well-
+    /// known port. Master-mode session count.
+    pub sessions_master_mode: u64,
+    /// Distinct server IPs observed listening on the protocol's
+    /// well-known port. Slave-mode session count.
+    pub sessions_slave_mode: u64,
+    /// Rough peak working-set estimate in MB for replaying this
+    /// pcap on this host.
+    pub estimated_peak_mb: u64,
+    /// One of: "ok", "caution", "heavy", "not_recommended".
+    pub verdict: String,
+    /// Human-readable reason for the verdict.
+    pub verdict_reason: String,
+    /// Extra observations the UI can render as bullet notes
+    /// (e.g. "165 of 171 flows are mid-flow").
+    pub notes: Vec<String>,
+}
+
 /// The contract every protocol replayer must satisfy.
 pub trait ProtoReplayer: Send + Sync {
     fn name(&self) -> &'static str;
@@ -281,6 +314,84 @@ pub trait ProtoReplayer: Send + Sync {
     ) -> Vec<u64> {
         Vec::new()
     }
+
+    /// Walk a loaded pcap and produce a protocol-aware viability
+    /// summary: per-side payload bytes, per-mode session count, a
+    /// memory estimate and a verdict + notes for the UI.
+    ///
+    /// `file_size_bytes` is passed in (rather than re-stat'd) so
+    /// callers that hold the value already don't pay for a syscall;
+    /// implementations include it in the memory estimate.
+    ///
+    /// Default impl returns a generic skeleton based on
+    /// [`Self::well_known_ports`] — counts flows whose `server.port`
+    /// matches any of those ports and produces a verdict from raw
+    /// session counts. Protocols that need richer analysis (e.g.
+    /// IEC 104's mid-flow vs handshake breakdown) override this.
+    fn quick_viability(
+        &self,
+        p: &dyn LoadedPcapView,
+        file_size_bytes: u64,
+    ) -> ProtoViability {
+        use std::collections::HashSet;
+        let ports: &[u16] = self.well_known_ports();
+        let mut client_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
+        let mut server_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
+        let mut client_bytes = 0u64;
+        let mut server_bytes = 0u64;
+        for f in p.flows() {
+            let (sip, sp) = match f.server { Some(x) => x, None => continue };
+            if !ports.contains(&sp) { continue; }
+            let (cip, _) = match f.client { Some(x) => x, None => continue };
+            client_ips.insert(cip);
+            server_ips.insert(sip);
+            let (cb, sb) = p.flow_payload_bytes(f.flow_idx);
+            client_bytes += cb;
+            server_bytes += sb;
+        }
+        let m = client_ips.len() as u64;
+        let s = server_ips.len() as u64;
+        let max_sess = m.max(s);
+        let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
+        let est = mb(file_size_bytes) + mb(client_bytes.max(server_bytes)) + max_sess * 2 + 32;
+        let (verdict, reason): (&str, String) = if max_sess == 0 {
+            ("ok", format!("no flows for protocol {} on ports {:?}", self.name(), ports))
+        } else {
+            ("ok", format!("{} session(s) detected for {}", max_sess, self.name()))
+        };
+        ProtoViability {
+            client_payload_bytes: client_bytes,
+            server_payload_bytes: server_bytes,
+            sessions_master_mode: m,
+            sessions_slave_mode: s,
+            estimated_peak_mb: est,
+            verdict: verdict.into(),
+            verdict_reason: reason,
+            notes: Vec::new(),
+        }
+    }
+}
+
+/// Minimal view a [`ProtoReplayer::quick_viability`] impl needs over
+/// a loaded pcap. Defined here so `protoplay` doesn't need a hard
+/// dependency on the `pcapload` crate; webui adapts a real
+/// `pcapload::LoadedPcap` into this shape on the call.
+pub trait LoadedPcapView {
+    /// Iterate every TCP flow.
+    fn flows(&self) -> Box<dyn Iterator<Item = FlowView> + '_>;
+    /// Reassembled-payload byte counts for one flow:
+    /// `(client_bytes, server_bytes)`. Either can be zero if a
+    /// reassembly attempt failed (e.g. mid-flow capture with gaps).
+    fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64);
+}
+
+/// Minimal flow descriptor a viability impl needs.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowView {
+    pub flow_idx: usize,
+    pub client: Option<(std::net::Ipv4Addr, u16)>,
+    pub server: Option<(std::net::Ipv4Addr, u16)>,
+    pub saw_syn: bool,
 }
 
 /// Boilerplate helper for stub implementations.
