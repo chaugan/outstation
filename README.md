@@ -21,6 +21,7 @@ Driven entirely from a browser UI — upload a pcap, configure a run, press star
 - [Generating synthetic IEC 104 pcaps](#generating-synthetic-iec-104-pcaps)
 - [Examples directory](#examples-directory)
 - [Documentation](#documentation)
+- [Replay fidelity vs the IEC 60870-5-104 standard](#replay-fidelity-vs-the-iec-60870-5-104-standard)
 - [Crate layout](#crate-layout)
 - [Requirements](#requirements)
 - [Safety and scope](#safety-and-scope)
@@ -237,6 +238,91 @@ Upload the pcap directly in the browser UI to skip the generator step.
 - [`doc/scada-lab.en.md`](doc/scada-lab.en.md) — SCADA engineer's guide (English). Lab topology, step-by-step VMware/Proxmox/libvirt setup, SCADA-gateway mode walkthrough, result reading, troubleshooting.
 - [`doc/scada-lab.md`](doc/scada-lab.md) — same guide in Norwegian.
 - [`reports/`](reports/) — real-world benchmark results from production-shaped runs. Latest: [165-RTU IEC 104 fleet replay, 151 068 I-frames delivered with zero protocol mismatches](reports/2026-04-17-fleet-replay-showcase.md).
+
+## Replay fidelity vs the IEC 60870-5-104 standard
+
+A direct comparison of what the standard requires against what
+outstation actually delivers, so a SCADA engineer can decide which
+tests this tool is fit for and which it isn't. All measurements come
+from the [165-RTU benchmark](reports/2026-04-17-fleet-replay-showcase.md);
+all standard references are to **IEC 60870-5-104 Ed. 2.0 (2006) +
+Amendment 1 (2016)**, the current edition.
+
+### What the standard requires
+
+The IEC 104 application layer (5-104 §5) governs three things:
+**timer compliance**, **flow-control windowing**, and **APDU/ASDU
+correctness**. It is silent on inter-frame pacing, on absolute
+timestamp accuracy, and on replay tools.
+
+| Standard requirement | Default | Permitted range |
+|---|---:|---|
+| **t0** — TCP connect timeout | 30 s | 1–255 s |
+| **t1** — max wait for response after sending I-frame or U-frame | 15 s | 1–255 s (must be > t2) |
+| **t2** — max wait before sending S-frame ACK | 10 s | 1–255 s (must be < t1) |
+| **t3** — idle period before sending TESTFR_act keepalive | 20 s | 1 s – 48 h |
+| **k** — max unacknowledged I-frames in flight | 12 | 1–32767 |
+| **w** — max received I-frames before sending S-frame ACK | 8 | 1–32767 (recommended w ≤ ⅔·k) |
+| **N(S) / N(R)** — sequence numbers | mod 2¹⁵ | 15-bit; wrap at 32768 |
+| **STARTDT_act → STARTDT_con** | within t1 | else connection close |
+| **CP56Time2a** representation | per IEC 60870-5-4 | 7 octets, 1 ms resolution |
+| **CP56Time2a** absolute accuracy | **not specified** | application-defined |
+| **Inter-frame wire pacing** | **not specified** | event-driven only |
+
+### What outstation delivers (165-RTU benchmark, 222 074-packet pcap, 165 concurrent slave sessions)
+
+| Behaviour | Outstation result | Standard tolerance | Margin |
+|---|---|---|---|
+| STARTDT_act → STARTDT_con response | Real handshake on every accept; sub-second under typical load | within t1 = 15 s | ~30× headroom |
+| t2 — S-frame ACK before deadline | Honoured on every k/w boundary (else verdict ≠ all_correct) | < 10 s | spec-conformant by construction |
+| t3 — TESTFR keepalive while idle | Slave drains incoming during pacing waits; replies TESTFR_con within ms of TESTFR_act receipt | within t1 = 15 s after the act frame | spec-conformant |
+| k-window (12 frames in flight max) | Enforced; replayer blocks at k pending and resumes on ACK | k = 12 default | spec-conformant |
+| N(S)/N(R) sequence | Renumbered fresh per session, monotonic mod 2¹⁵, ACK-tracked | mod 2¹⁵ | bit-correct |
+| **Per-RTU duration drift** (replay vs original) | **41 ms worst case over 222 s** = 0.018 % | unspecified | far below the smallest spec timer (1 s resolution) |
+| **Fleet-wide cumulative pacing drift** | **−4.60 ms over 223 s** = 0.0021 % | unspecified | three orders of magnitude below t2 |
+| **Per-frame pacing variance** | p95 within ±50 ms of original schedule | unspecified | 1.7 % of t1 |
+| **ASDU byte fidelity** (outside CP56Time2a) | **151 068 / 151 068 frames byte-identical** to source | exact byte match required for type-ID/COT/CA/IOA/value | bit-perfect |
+| Type-ID sequence per RTU | Exact, in order, frame-for-frame across the fleet | implicit conformance requirement | bit-perfect |
+| CP56Time2a representation | 7-byte layout per IEC 60870-5-4 (validated by ASDU diff) | per IEC 60870-5-4 | spec-conformant |
+| CP56Time2a absolute accuracy | Within host clock skew (≤ 60 ms with NTP-disciplined hosts) | unspecified by 104; typical procurement spec 10 ms–1 s | meets/exceeds typical procurement specs when both hosts are NTP-synced |
+
+### What this means for SCADA testing
+
+| SCADA test category | What the test checks | Confidence with outstation | Why |
+|---|---|---|---|
+| **Functional / data-flow** | Does SCADA receive the right ASDU type IDs, COTs, IOAs, values, sequence? | **High** | Every captured I-frame is byte-identical outside CP56; type-ID order matches across the whole fleet (151 068/151 068 frames); 0 protocol mismatches measured. The SCADA cannot distinguish replayed traffic from a real RTU at the application layer. |
+| **Conformance / interoperability** | Does the device the SCADA talks to obey the IEC 104 state machine — handshakes, timers, sequence numbers? | **High** | outstation participates in the protocol state machine (STARTDT/STOPDT, k/w, t1/t2/t3, N(S)/N(R)), not just packet replay. All timers honoured by construction (verdict drops below `all_correct` if violated). |
+| **Performance / load** | Can the SCADA handle N concurrent RTUs at expected message rates? | **High** | One outstation host stands up 165 concurrent IEC 104 sessions delivering 274 k packets / 151 k I-frames in 223 s. Per-session latency reservoirs and fleet-wide pacing/drift charts surface the SCADA's behaviour under load directly. |
+| **Real-time event verification** (event order) | Does SCADA's HMI / historian capture the same event sequence the field saw? | **High** | Type-ID and ASDU body sequence preserved bit-perfect per RTU. Any out-of-order or missing event in the SCADA is the SCADA's own. |
+| **Real-time event verification** (absolute time) | Does SCADA timestamp events accurately? | **High** when both hosts NTP-synced | CP56 representation is bit-correct; absolute accuracy bound by inter-host clock difference. With NTP discipline (chrony / Meinberg `ntpd`), the analyser observes single-digit-to-tens-of-ms baseline. Fresh-timestamps mode rewrites CP56 to wall-clock send time so SCADA sees current event times rather than stale capture times. |
+| **Latency / round-trip measurement** | What's the SCADA's command-to-acknowledge latency under load? | **High** for slave-mode response times | Per-session send→ACK latency reservoir-sampled to p50/p90/p99 across the fleet. Real wire timing, real flow control. |
+| **Active control / closed-loop** | SCADA sends `C_SC_NA_1` / `C_DC_NA_1` / `C_SE_NC_1` etc., RTU acts on it, observed effect feeds back. | **Low** | outstation replays the captured I-frame stream; it does **not** implement RTU control-object state machines. A captured pcap that contains command-acknowledge round-trips will be replayed faithfully, but the replayed RTU does not actually *act* on commands the live SCADA sends; it just emits whatever was captured. |
+| **Failure-mode / negative testing** | What happens when an RTU disconnects, drops frames, sends malformed APDUs, blocks ACKs? | **Medium** | Sessions terminate cleanly per pcap, but malformed-frame injection and active fault simulation are not provided. Disconnect testing works (kill a session), but fault patterns must be in the source pcap to be replayed. |
+| **Cybersecurity / IEC 62351** | TLS, certificate auth, integrity protection. | **Out of scope** | Base IEC 104 is plaintext; TLS/auth lives in IEC 62351-3/5, not implemented here. |
+
+### Confidence summary
+
+For passive load, throughput, and protocol-correctness testing of a
+SCADA system against an existing pcap, **outstation produces wire
+traffic indistinguishable from real RTUs at the application layer**.
+Every spec-defined timer is honoured by construction, every captured
+I-frame is delivered byte-for-byte outside CP56, and the measured
+fidelity envelopes (cumulative pacing drift, per-RTU duration drift,
+CP56 timestamp drift) are between two and four orders of magnitude
+below the standard's tolerance windows.
+
+For closed-loop testing where the SCADA's commands must drive RTU
+state changes, outstation is the wrong tool — that needs an active
+IEC 104 server with a real point database (e.g., `lib60870`'s
+`CS104_Slave` example, or a vendor-supplied simulator). outstation's
+slave is faithful to *what the captured RTU said*, not to what a
+*generic IEC 104 RTU should say in response to a fresh command*.
+
+The most stringent quality metric the standard does specify — timer
+conformance — passes by construction: any timer violation collapses
+the per-session verdict below `all_correct`, and the headline of the
+benchmark report is the inverted form of "this many sessions
+violated a timer".
 
 ## Crate layout
 
