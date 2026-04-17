@@ -3362,20 +3362,20 @@ function renderFleetTimelineChartBlock(tl, opts) {
 function renderFleetDriftChart(r) {
   return renderFleetTimelineChartBlock(r.fleet_drift_timeline, {
     key: 'fleet-drift',
-    heading: 'FLEET CP56 DRIFT &middot; AGGREGATED OVER TIME',
-    caption: 'every CP56 sample across all slaves on a unified time axis',
+    heading: 'FLEET CP56 DRIFT &middot; EVERY SAMPLE FROM EVERY SLAVE OVER TIME',
+    caption: 'each dot is one CP56 sample. lines overlay per-time-bucket aggregates across the whole fleet',
     axes: 'X: wall-clock seconds since capture start &middot; Y: signed drift (ms)',
-    legend: 'flat orange line = constant offset (host clock skew). slope or curve = cumulative timestamp drift across the run. dashed grey = p05/p95 envelope per time bucket.',
+    legend: 'orange = mean per time bucket (the trend line — flat = constant offset / clock skew, slope = cumulative drift). green dashed = p95 upper bound, red dashed = p05 lower bound (envelope of variance per bucket).',
   });
 }
 
 function renderFleetPacingChart(r) {
   return renderFleetTimelineChartBlock(r.fleet_pacing_timeline, {
     key: 'fleet-pacing',
-    heading: 'FLEET PACING DRIFT &middot; HOW MUCH THE REPLAY FALLS BEHIND THE ORIGINAL SCHEDULE',
-    caption: 'per-I-frame: how many ms later the live replay sent this frame vs. the original capture pace',
+    heading: 'FLEET PACING DRIFT &middot; EVERY I-FRAME FROM EVERY SLAVE OVER TIME',
+    caption: 'each dot is one I-frame, plotted at how many ms later the live replay sent it vs. the original capture pace. lines overlay per-time-bucket aggregates across the whole fleet',
     axes: 'X: wall-clock seconds since capture start &middot; Y: pacing drift (ms, +ve = late)',
-    legend: 'flat orange line near zero = pacing held perfectly. upward slope across a single iteration = falling behind. step-down at iteration markers = each loop iteration restarts from zero. cumulative climb across iterations = each loop falls slightly more behind than the previous.',
+    legend: 'orange = mean per time bucket. flat near zero = pacing held perfectly; upward slope = falling behind. green dashed = p95 (the slowest 5% of frames in each bucket), red dashed = p05 (the earliest 5%). step-down at iteration markers = each loop restarts from zero.',
   });
 }
 
@@ -3469,8 +3469,8 @@ function initFleetTimelineChart(tl, key) {
       html += `<div>${swatch('#4a90e2')}sample: ${Number(y).toFixed(2)} ms</div>`;
     }
     if (meanY !== null) html += `<div>${solid('#d8741a')}mean: <b>${meanY.toFixed(2)} ms</b></div>`;
-    if (p95Y !== null)  html += `<div>${dash('#888')}p95:&nbsp; ${p95Y.toFixed(2)} ms</div>`;
-    if (p05Y !== null)  html += `<div>${dash('#888')}p05:&nbsp; ${p05Y.toFixed(2)} ms</div>`;
+    if (p95Y !== null)  html += `<div>${dash('#3c8a4a')}p95 (upper):&nbsp; ${p95Y.toFixed(2)} ms</div>`;
+    if (p05Y !== null)  html += `<div>${dash('#a4453c')}p05 (lower):&nbsp; ${p05Y.toFixed(2)} ms</div>`;
     html += `</div>`;
     return html;
   };
@@ -3510,7 +3510,7 @@ function initFleetTimelineChart(tl, key) {
       itemGap: 14,
       // Names carry the line-style cue because ECharts default
       // legend icons don't render lineStyle.type (dashed vs solid).
-      data: ['• samples', '── mean (per-bucket)', '┄┄ p95 (per-bucket)', '┄┄ p05 (per-bucket)'],
+      data: ['• samples', '── mean (per-bucket)', '┄┄ p95 upper', '┄┄ p05 lower'],
     },
     xAxis: {
       type: 'value',
@@ -3547,21 +3547,21 @@ function initFleetTimelineChart(tl, key) {
         z: 1,
       },
       {
-        name: '┄┄ p95 (per-bucket)',
+        name: '┄┄ p95 upper',
         type: 'line',
         data: p95Line,
-        lineStyle: { color: '#888', width: 1, type: 'dashed' },
-        itemStyle: { color: '#888' },
+        lineStyle: { color: '#3c8a4a', width: 1.2, type: 'dashed' },
+        itemStyle: { color: '#3c8a4a' },
         showSymbol: false,
         smooth: true,
         z: 2,
       },
       {
-        name: '┄┄ p05 (per-bucket)',
+        name: '┄┄ p05 lower',
         type: 'line',
         data: p05Line,
-        lineStyle: { color: '#888', width: 1, type: 'dashed' },
-        itemStyle: { color: '#888' },
+        lineStyle: { color: '#a4453c', width: 1.2, type: 'dashed' },
+        itemStyle: { color: '#a4453c' },
         showSymbol: false,
         smooth: true,
         z: 3,
