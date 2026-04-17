@@ -451,14 +451,7 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
 }
 
 fn get_proto(name: &str) -> Option<Arc<dyn protoplay::ProtoReplayer>> {
-    match name {
-        "iec104" => Some(Arc::new(proto_iec104::Iec104Replayer::new())),
-        "modbus_tcp" => Some(Arc::new(proto_modbus_tcp::ModbusTcpReplayer)),
-        "dnp3_tcp" => Some(Arc::new(proto_dnp3_tcp::Dnp3TcpReplayer)),
-        "iec61850_mms" => Some(Arc::new(proto_iec61850_mms::Iec61850MmsReplayer)),
-        "iec60870_6_iccp" => Some(Arc::new(proto_iec60870_6_iccp::IccpReplayer)),
-        _ => None,
-    }
+    proto_registry::lookup(name)
 }
 
 pub fn router(state: AppState) -> Router {
@@ -594,13 +587,7 @@ struct ProtoJson {
 }
 
 async fn api_protocols() -> Json<Vec<ProtoJson>> {
-    let registry: Vec<Box<dyn protoplay::ProtoReplayer>> = vec![
-        Box::new(proto_iec104::Iec104Replayer::new()),
-        Box::new(proto_modbus_tcp::ModbusTcpReplayer),
-        Box::new(proto_dnp3_tcp::Dnp3TcpReplayer),
-        Box::new(proto_iec61850_mms::Iec61850MmsReplayer),
-        Box::new(proto_iec60870_6_iccp::IccpReplayer),
-    ];
+    let registry = proto_registry::build();
     let out = registry
         .iter()
         .map(|m| ProtoJson {

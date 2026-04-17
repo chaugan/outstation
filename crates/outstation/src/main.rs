@@ -43,15 +43,7 @@ enum Cmd {
     },
 }
 
-fn build_proto_registry() -> Vec<Box<dyn protoplay::ProtoReplayer>> {
-    vec![
-        Box::new(proto_iec104::Iec104Replayer::new()),
-        Box::new(proto_modbus_tcp::ModbusTcpReplayer),
-        Box::new(proto_dnp3_tcp::Dnp3TcpReplayer),
-        Box::new(proto_iec61850_mms::Iec61850MmsReplayer),
-        Box::new(proto_iec60870_6_iccp::IccpReplayer),
-    ]
-}
+
 
 #[derive(clap::Args)]
 struct RunArgs {
@@ -147,7 +139,7 @@ fn main() -> Result<()> {
             }
         }
         Cmd::ListProtocols => {
-            let registry = build_proto_registry();
+            let registry = proto_registry::build();
             println!(
                 "{:<20} {:<8} {}",
                 "name", "status", "well-known ports"

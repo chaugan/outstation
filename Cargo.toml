@@ -14,6 +14,7 @@ members = [
     "crates/proto_dnp3_tcp",
     "crates/proto_iec61850_mms",
     "crates/proto_iec60870_6_iccp",
+    "crates/proto_registry",
     "crates/webui",
 ]
 
