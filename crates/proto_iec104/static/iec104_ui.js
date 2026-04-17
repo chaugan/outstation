@@ -97,7 +97,13 @@
     c.setOption({
       backgroundColor: 'transparent',
       animation: false,
-      grid: { left: 56, right: 14, top: 28, bottom: 56 },
+      grid: { left: 56, right: 14, top: 34, bottom: 56 },
+      legend: {
+        data: ['in tolerance', 'out of tolerance'],
+        textStyle: { color: dimColor, fontSize: 10 },
+        itemWidth: 10, itemHeight: 10, itemGap: 14,
+        top: 6, left: 8,
+      },
       toolbox: {
         right: 14, top: 2,
         feature: {
@@ -163,7 +169,12 @@
         },
         iconStyle: { borderColor: dimColor },
       },
-      legend: { data: ['original', 'captured'], textStyle: { color: dimColor, fontSize: 10 }, top: 4, right: 12 },
+      legend: {
+        data: ['original', 'captured'],
+        textStyle: { color: dimColor, fontSize: 10 },
+        itemWidth: 18, itemHeight: 8, itemGap: 14,
+        top: 6, left: 8,
+      },
       tooltip: {
         trigger: 'axis',
         formatter: (params) => {
