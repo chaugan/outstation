@@ -324,7 +324,7 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
     report.connected = true;
 
     let stream: TcpStream = sock.into();
-    stream.set_nodelay(true).ok();
+    stream.set_nodelay(cfg.tcp_nodelay).ok();
     let read_stream = match stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -788,7 +788,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     set_state(&progress, session_state::CONNECTED);
     report.connected = true;
 
-    write_stream.set_nodelay(true).ok();
+    write_stream.set_nodelay(cfg.tcp_nodelay).ok();
     let read_stream = match write_stream.try_clone() {
         Ok(s) => s,
         Err(e) => {
@@ -1158,6 +1158,7 @@ mod tests {
             bind_iface: None,
             target_ip: Ipv4Addr::new(127, 0, 0, 1),
             target_port: port,
+            tcp_nodelay: true,
             client_segments: vec![ClientSegment {
                 rel_ts_ns: 0,
                 bytes: iframes_blob(15),
@@ -1268,6 +1269,7 @@ mod tests {
             bind_iface: None,
             target_ip: Ipv4Addr::new(127, 0, 0, 1),
             target_port: port,
+            tcp_nodelay: true,
             client_segments: vec![ClientSegment {
                 rel_ts_ns: 0,
                 bytes: i_frame,

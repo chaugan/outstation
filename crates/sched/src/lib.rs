@@ -669,6 +669,15 @@ pub struct BenchmarkConfig {
     /// session originate from a specific local address regardless of
     /// what the pcap recorded. Ignored in slave mode.
     pub master_bind_ip: Option<Ipv4Addr>,
+    /// Whether to set TCP_NODELAY on each session's outbound socket.
+    /// `None` (default) resolves to role-based default at session
+    /// start: slave = true (matches real RTU behaviour, event-driven
+    /// low latency), master = false (master traffic is sparser, no
+    /// Nagle harm). `Some(true)` / `Some(false)` overrides regardless
+    /// of role. Note: NIC-level TSO/GSO/GRO can still coalesce
+    /// segments below this layer; use `ethtool -K <iface>` to fully
+    /// observe per-frame timing on the wire.
+    pub tcp_nodelay: Option<bool>,
 }
 
 impl Default for BenchmarkConfig {
@@ -696,6 +705,7 @@ impl Default for BenchmarkConfig {
             rewrite_cp56_to_now: false,
             cp56_zone: "local".into(),
             master_bind_ip: None,
+            tcp_nodelay: None,
         }
     }
 }
@@ -1149,6 +1159,11 @@ pub fn run_benchmark(
                         bind_iface: Some(bridge_side.clone()),
                         target_ip: cfg_cloned.target_ip,
                         target_port: cfg_cloned.target_port,
+                        // Resolve role default: master = false (don't
+                        // disable Nagle by default for master mode —
+                        // burstier and chattier than slave). Override
+                        // wins if user set tcp_nodelay explicitly.
+                        tcp_nodelay: cfg_cloned.tcp_nodelay.unwrap_or(false),
                         client_segments: vec![ClientSegment {
                             rel_ts_ns: 0,
                             bytes: (*payload_arc).clone(),
@@ -1588,6 +1603,11 @@ fn run_benchmark_slave(
                         bind_iface: None,
                         target_ip: cfg_cloned.target_ip,
                         target_port: cfg_cloned.target_port,
+                        // Resolve role default: slave = true (real
+                        // production RTUs disable Nagle by default —
+                        // event-driven, low-latency). Override wins
+                        // if user set tcp_nodelay explicitly.
+                        tcp_nodelay: cfg_cloned.tcp_nodelay.unwrap_or(true),
                         client_segments: vec![ClientSegment {
                             rel_ts_ns: 0,
                             bytes: (*payload_arc).clone(),

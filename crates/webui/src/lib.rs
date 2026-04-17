@@ -830,6 +830,12 @@ struct RunReq {
     /// (e.g. 192.168.10.10) doesn't exist on the replay host.
     #[serde(default)]
     master_bind_ip: Option<Ipv4Addr>,
+    /// Override TCP_NODELAY on the session sockets. Default (None)
+    /// uses the role-based default: slave = true (matches real RTU
+    /// event-driven behaviour), master = false. Set explicitly to
+    /// override either way for debugging or A/B comparisons.
+    #[serde(default)]
+    tcp_nodelay: Option<bool>,
 }
 
 fn default_cp56_zone() -> String {
@@ -1005,6 +1011,7 @@ async fn api_run(
             rewrite_cp56_to_now: req.rewrite_cp56_to_now,
             cp56_zone: req.cp56_zone.clone(),
             master_bind_ip: req.master_bind_ip,
+            tcp_nodelay: req.tcp_nodelay,
         };
         let db_bench = state.db.clone();
         thread::Builder::new()

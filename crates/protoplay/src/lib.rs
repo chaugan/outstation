@@ -140,6 +140,15 @@ pub struct ProtoRunCfg {
     pub bind_iface: Option<String>,
     pub target_ip: Ipv4Addr,
     pub target_port: u16,
+    /// Whether to set `TCP_NODELAY` on the session's TCP socket.
+    /// Disables Nagle's coalescing so each application write hits
+    /// the wire as its own segment. Real production IEC 104 RTUs
+    /// almost universally run with NODELAY because the protocol is
+    /// event-driven and the 40 ms Nagle ceiling fights low-latency
+    /// event delivery. Resolved from `BenchmarkConfig::tcp_nodelay`
+    /// (None = role-default: slave true, master false; Some(b) =
+    /// explicit override).
+    pub tcp_nodelay: bool,
     pub client_segments: Vec<ClientSegment>,
     pub connect_timeout: Duration,
     /// Original flow timing: start-of-flow timestamp in seconds, used

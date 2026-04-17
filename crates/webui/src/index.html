@@ -1548,6 +1548,14 @@
         <input id="run-master-bind-ip" type="text" placeholder="(use captured master ip)" spellcheck="false" title="Override the source IP every master session binds from. Default uses each captured master's IP — set this when the captured master IP doesn't exist locally and you want all sessions to originate from a single local address (e.g. the host's primary IP, or a pre-aliased address).">
       </div>
       <div class="field">
+        <label>tcp_nodelay <span class="opt">(optional override)</span></label>
+        <select id="run-tcp-nodelay" title="Whether to set TCP_NODELAY on each session's socket. Default uses role-based: slave=on (matches real RTU event-driven behaviour), master=off (master traffic is sparser). Override here to A/B compare or when debugging packet timing. Note: NIC-level TSO/GSO/GRO can still coalesce segments below this layer; use ethtool -K to fully observe per-frame timing on the wire.">
+          <option value="">(default by role: slave=on, master=off)</option>
+          <option value="on">on  (no Nagle — every frame its own segment)</option>
+          <option value="off">off (Nagle on — coalesce small frames)</option>
+        </select>
+      </div>
+      <div class="field">
         <label>target mac <span class="opt">(raw only)</span></label>
         <div style="display:flex;gap:6px">
           <input id="run-target-mac" type="text" placeholder="aa:bb:cc:dd:ee:ff" spellcheck="false" style="flex:1">
@@ -2178,6 +2186,12 @@ async function startRun() {
     rewrite_cp56_to_now: el('run-fresh-timestamps')?.checked || false,
     cp56_zone: document.querySelector('input[name="run-cp56-zone"]:checked')?.value || 'local',
     master_bind_ip: (el('run-master-bind-ip').value.trim() || null),
+    tcp_nodelay: (() => {
+      const v = el('run-tcp-nodelay').value;
+      if (v === 'on')  return true;
+      if (v === 'off') return false;
+      return null;  // role-default
+    })(),
   };
   if (isBench && el('run-scada-gw-enable').checked) {
     const gw = el('run-scada-gw-ip').value.trim();
