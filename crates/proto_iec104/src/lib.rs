@@ -48,4 +48,57 @@ impl ProtoReplayer for Iec104Replayer {
             Role::Slave => session::run_slave_session(cfg),
         }
     }
+
+    /// Walk the IEC 104 APCI framing in `payload` and emit one
+    /// timestamp per I-frame, derived from `packet_offsets`. The first
+    /// I-frame anchors at 0; subsequent frames are wall-clock-relative
+    /// to it. Length-prefixed frames are detected by the 0x68 start
+    /// byte + 1-byte APCI+ASDU length, with an I-frame discriminated
+    /// by the low bit of CF1 being 0.
+    fn extract_message_times_ns(
+        &self,
+        payload: &[u8],
+        packet_offsets: &[(u64, usize)],
+    ) -> Vec<u64> {
+        let mut starts: Vec<usize> = Vec::new();
+        let mut i = 0usize;
+        while i + 6 <= payload.len() {
+            if payload[i] != 0x68 {
+                i += 1;
+                continue;
+            }
+            let ln = payload[i + 1] as usize;
+            if i + 2 + ln > payload.len() {
+                break;
+            }
+            let cf1 = payload[i + 2];
+            if cf1 & 0x01 == 0 {
+                // I-frame
+                starts.push(i);
+            }
+            i += 2 + ln;
+        }
+        if starts.len() < 2 {
+            return Vec::new();
+        }
+        let ts_for = |byte: usize| -> u64 {
+            let mut lo = 0usize;
+            let mut hi = packet_offsets.len();
+            while lo < hi {
+                let mid = (lo + hi) / 2;
+                if packet_offsets[mid].1 <= byte {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if lo == 0 {
+                packet_offsets.first().map(|p| p.0).unwrap_or(0)
+            } else {
+                packet_offsets[lo - 1].0
+            }
+        };
+        let t0 = ts_for(starts[0]);
+        starts.iter().map(|&b| ts_for(b).saturating_sub(t0)).collect()
+    }
 }

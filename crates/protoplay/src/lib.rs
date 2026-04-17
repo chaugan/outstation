@@ -268,6 +268,29 @@ pub trait ProtoReplayer: Send + Sync {
     fn well_known_ports(&self) -> &'static [u16];
     fn readiness(&self) -> Readiness;
     fn run(&self, cfg: ProtoRunCfg) -> ProtoReport;
+
+    /// Extract one timestamp per protocol-level message in the
+    /// reassembled flow `payload`. Each timestamp is in nanoseconds,
+    /// **relative to the first message** (so `out[0]` is always 0).
+    /// `packet_offsets` is the byte-offset to packet-timestamp mapping
+    /// from the source pcap reassembly; the implementation can binary-
+    /// search it to resolve any byte position to a wall-clock send time.
+    ///
+    /// Used by [`Pacing::OriginalTiming`] in the scheduler so the live
+    /// replay can fire each message at its captured cadence.
+    ///
+    /// Default impl returns an empty `Vec`, in which case the scheduler
+    /// falls through to as-fast-as-possible behaviour for that flow.
+    /// Protocols that wrap their messages in length-prefixed framing
+    /// (IEC 104, DNP3, modbus-tcp, ...) override this with the framing-
+    /// specific message-start scan.
+    fn extract_message_times_ns(
+        &self,
+        _payload: &[u8],
+        _packet_offsets: &[(u64, usize)],
+    ) -> Vec<u64> {
+        Vec::new()
+    }
 }
 
 /// Boilerplate helper for stub implementations.

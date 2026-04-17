@@ -738,60 +738,6 @@ pub fn merge_proto_report(acc: &mut protoplay::ProtoReport, new: protoplay::Prot
     }
 }
 
-/// Parse IEC-104-style APDUs out of `payload` and, for each I-frame,
-/// emit a timestamp (relative to the first I-frame, ns) derived from
-/// the `packet_offsets` table. Generic enough for any length-prefixed
-/// protocol where byte 0 = 0x68 and byte 1 = APCI+ASDU length.
-///
-/// If no I-frames are found or only one is present (nothing to pace
-/// against), returns an empty vec.
-pub fn iec104_iframe_times_from(
-    payload: &[u8],
-    packet_offsets: &[(u64, usize)],
-) -> Vec<u64> {
-    let mut starts: Vec<usize> = Vec::new();
-    let mut i = 0usize;
-    while i + 6 <= payload.len() {
-        if payload[i] != 0x68 {
-            i += 1;
-            continue;
-        }
-        let ln = payload[i + 1] as usize;
-        if i + 2 + ln > payload.len() {
-            break;
-        }
-        let cf1 = payload[i + 2];
-        if cf1 & 0x01 == 0 {
-            // I-frame start
-            starts.push(i);
-        }
-        i += 2 + ln;
-    }
-    if starts.len() < 2 {
-        return Vec::new();
-    }
-    // Binary search packet_offsets for each I-frame start byte.
-    let ts_for = |byte: usize| -> u64 {
-        let mut lo = 0usize;
-        let mut hi = packet_offsets.len();
-        while lo < hi {
-            let mid = (lo + hi) / 2;
-            if packet_offsets[mid].1 <= byte {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if lo == 0 {
-            packet_offsets.first().map(|p| p.0).unwrap_or(0)
-        } else {
-            packet_offsets[lo - 1].0
-        }
-    };
-    let t0 = ts_for(starts[0]);
-    starts.iter().map(|&b| ts_for(b).saturating_sub(t0)).collect()
-}
-
 #[derive(Debug, Clone)]
 pub struct SessionReport {
     pub src_ip: Ipv4Addr,
@@ -908,8 +854,8 @@ pub fn run_benchmark(
             .unwrap_or(0);
         match pcap.reassemble_client_payload(idx) {
             Ok(reassembled) => {
-                let frame_times_ns =
-                    iec104_iframe_times_from(&reassembled.payload, &reassembled.packet_offsets);
+                let frame_times_ns = replayer
+                    .extract_message_times_ns(&reassembled.payload, &reassembled.packet_offsets);
                 picks.push(FlowPick {
                     flow_idx: idx,
                     client_ip,
@@ -1331,7 +1277,7 @@ fn run_benchmark_slave(
         match pcap.reassemble_server_payload(idx) {
             Ok(r) => {
                 let frame_times_ns =
-                    iec104_iframe_times_from(&r.payload, &r.packet_offsets);
+                    replayer.extract_message_times_ns(&r.payload, &r.packet_offsets);
                 picks.push(SlavePick {
                     flow_idx: idx,
                     server_ip,
