@@ -3324,8 +3324,9 @@ function initSlaveCharts(slug, d) {
   }
 }
 
-function renderFleetDriftChart(r) {
-  const tl = r.fleet_drift_timeline;
+// Generic fleet-timeline chart block. `key` is used both as DOM id
+// suffix and as a lookup field on the report.
+function renderFleetTimelineChartBlock(tl, opts) {
   if (!tl || !tl.samples || tl.samples.length === 0) return '';
   const iters = (tl.iteration_starts_ms || []).length;
   const iterNote = iters > 1
@@ -3334,18 +3335,37 @@ function renderFleetDriftChart(r) {
   const decNote = tl.decimated
     ? ` &middot; decimated from ${tl.total_samples.toLocaleString()} samples`
     : ` &middot; ${tl.total_samples.toLocaleString()} samples`;
-  let h = `<div class="an-h">FLEET CP56 DRIFT &middot; AGGREGATED OVER TIME</div>`;
-  h += `<div class="an-chart-caption">every CP56 sample across all slaves on a unified time axis${iterNote}${decNote}</div>`;
-  h += `<div class="an-chart-axes">X: wall-clock seconds since capture start &middot; Y: signed drift (ms)</div>`;
-  h += `<div class="an-chart-axes" style="color:var(--ink-2);font-style:italic">flat orange line = constant offset (host clock skew). slope or curve = cumulative pacing drift across the run. dashed grey = p05/p95 envelope per time bucket.</div>`;
-  h += `<div id="an-fleet-drift-chart" class="an-chart"></div>`;
+  let h = `<div class="an-h">${opts.heading}</div>`;
+  h += `<div class="an-chart-caption">${opts.caption}${iterNote}${decNote}</div>`;
+  h += `<div class="an-chart-axes">${opts.axes}</div>`;
+  h += `<div class="an-chart-axes" style="color:var(--ink-2);font-style:italic">${opts.legend}</div>`;
+  h += `<div id="an-${opts.key}-chart" class="an-chart"></div>`;
   return h;
 }
 
-function initFleetDriftChart(r) {
-  const tl = r.fleet_drift_timeline;
+function renderFleetDriftChart(r) {
+  return renderFleetTimelineChartBlock(r.fleet_drift_timeline, {
+    key: 'fleet-drift',
+    heading: 'FLEET CP56 DRIFT &middot; AGGREGATED OVER TIME',
+    caption: 'every CP56 sample across all slaves on a unified time axis',
+    axes: 'X: wall-clock seconds since capture start &middot; Y: signed drift (ms)',
+    legend: 'flat orange line = constant offset (host clock skew). slope or curve = cumulative timestamp drift across the run. dashed grey = p05/p95 envelope per time bucket.',
+  });
+}
+
+function renderFleetPacingChart(r) {
+  return renderFleetTimelineChartBlock(r.fleet_pacing_timeline, {
+    key: 'fleet-pacing',
+    heading: 'FLEET PACING DRIFT &middot; HOW MUCH THE REPLAY FALLS BEHIND THE ORIGINAL SCHEDULE',
+    caption: 'per-I-frame: how many ms later the live replay sent this frame vs. the original capture pace',
+    axes: 'X: wall-clock seconds since capture start &middot; Y: pacing drift (ms, +ve = late)',
+    legend: 'flat orange line near zero = pacing held perfectly. upward slope across a single iteration = falling behind. step-down at iteration markers = each loop iteration restarts from zero. cumulative climb across iterations = each loop falls slightly more behind than the previous.',
+  });
+}
+
+function initFleetTimelineChart(tl, key) {
   if (!tl || !tl.samples || tl.samples.length === 0) return;
-  const node = document.getElementById('an-fleet-drift-chart');
+  const node = document.getElementById('an-' + key + '-chart');
   if (!node) return;
   const chart = echarts.init(node, null, { renderer: 'canvas' });
   // Convert wall_ms → seconds for the axis label readability.
@@ -3478,6 +3498,7 @@ function renderAnalysis(r) {
   const out = el('an-result');
   let h = `<div class="an-card">`;
   h += renderFleetHeader(r);
+  h += renderFleetPacingChart(r);
   h += renderFleetDriftChart(r);
   h += renderRunContext(r);
   if (r.notes && r.notes.length) {
@@ -3487,7 +3508,10 @@ function renderAnalysis(r) {
   h += renderSlaveTable(r);
   h += `</div>`;
   out.innerHTML = h;
-  setTimeout(() => initFleetDriftChart(r), 0);
+  setTimeout(() => {
+    initFleetTimelineChart(r.fleet_pacing_timeline, 'fleet-pacing');
+    initFleetTimelineChart(r.fleet_drift_timeline,  'fleet-drift');
+  }, 0);
   setupSlaveDetailExpand(r);
 }
 

@@ -90,6 +90,11 @@ pub struct AnalysisReport {
     /// CP56 samples.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_drift_timeline: Option<FleetDriftTimeline>,
+    /// Fleet-wide pacing drift over time — answers "is the replayer
+    /// falling behind the original schedule?" Always populated when
+    /// at least one slave delivered I-frames in both pcaps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_pacing_timeline: Option<FleetPacingTimeline>,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -189,6 +194,25 @@ pub struct FleetDriftTimeline {
 /// slaves × ~3 894 CP56 fields each, raw counts can hit 600k+.
 /// Decimating to ~5 000 keeps the JSON small and ECharts smooth.
 pub const MAX_FLEET_TIMELINE_POINTS: usize = 5_000;
+
+/// Fleet-wide pacing-drift timeline. Per-I-frame samples of how much
+/// the live replay landed each frame later than the original
+/// schedule, aggregated across all slaves on a single capture-side
+/// wall-clock axis. Decimated to `MAX_FLEET_TIMELINE_POINTS`.
+///
+/// Shape mirrors `FleetDriftTimeline` so the UI can use the same
+/// chart template. Iteration boundaries are reused from the same
+/// detector — so loops show the per-iteration mean line clearly
+/// snapping back to ~0 at each restart (or trending upward across
+/// iterations if the replayer falls progressively behind).
+#[derive(Serialize, Debug, Clone)]
+pub struct FleetPacingTimeline {
+    /// `[capture_wall_ms, pacing_drift_ms]` per kept sample.
+    pub samples: Vec<[f64; 2]>,
+    pub total_samples: usize,
+    pub decimated: bool,
+    pub iteration_starts_ms: Vec<f64>,
+}
 
 #[derive(Serialize, Debug, Clone)]
 pub struct FlowInfo {
@@ -368,6 +392,15 @@ pub struct TimingReport {
     pub captured_p99_gap_ms: f64,
     pub original_gaps_ms: Vec<f64>,
     pub captured_gaps_ms: Vec<f64>,
+    /// Per-I-frame pacing-drift samples for this slave:
+    /// `[capture_wall_ms, pacing_drift_ms]` where pacing_drift_ms is
+    /// `(cap_t_i - cap_t_0) - (orig_t_i - orig_t_0)`. Positive means
+    /// the live replay landed the i-th frame later than the original
+    /// schedule. capture_wall_ms is absolute (relative to the
+    /// captured pcap's first packet) so cross-slave aggregation onto
+    /// a single time axis works.
+    #[serde(default)]
+    pub pacing_samples: Vec<[f64; 2]>,
 }
 
 /// Walk an APDU byte stream and return the I-frame bodies in order.
@@ -446,6 +479,36 @@ fn iframe_gap_timings(flow: &ReassembledFlow) -> Vec<f64> {
         out.push((w[1].saturating_sub(w[0])) as f64 / 1e6);
     }
     out
+}
+
+/// Walk a flow's payload and return the wire-send wall-clock time
+/// (ms relative to the pcap's first packet) of every I-frame, in
+/// order. Used by pacing-drift analysis: compare same-index frames
+/// across original and captured to see how much later (or earlier)
+/// the live replay sent each frame relative to the original schedule.
+fn iframe_wall_times_ms(flow: &ReassembledFlow) -> Vec<f64> {
+    let payload = &flow.payload;
+    let mut starts = Vec::new();
+    let mut i = 0usize;
+    while i + 6 <= payload.len() {
+        if payload[i] != 0x68 {
+            i += 1;
+            continue;
+        }
+        let ln = payload[i + 1] as usize;
+        if i + 2 + ln > payload.len() {
+            break;
+        }
+        let cf1 = payload[i + 2];
+        if cf1 & 0x01 == 0 {
+            starts.push(i);
+        }
+        i += 2 + ln;
+    }
+    starts
+        .into_iter()
+        .map(|b| flow.ts_for_byte(b) as f64 / 1e6)
+        .collect()
 }
 
 /// Walk every I-frame in `flow`, extract each CP56Time2a field inside
@@ -929,6 +992,8 @@ pub fn analyze(
     // detected from the captured pcap's STARTDT_act bursts.
     let fleet_drift_timeline =
         build_fleet_drift_timeline(&details, &captured, target_port, fleet.slave_count);
+    let fleet_pacing_timeline =
+        build_fleet_pacing_timeline(&details, &captured, target_port, fleet.slave_count);
 
     Ok(AnalysisReport {
         run_id,
@@ -946,6 +1011,45 @@ pub fn analyze(
         details_by_ip: details,
         master_ip_mapping,
         fleet_drift_timeline,
+        fleet_pacing_timeline,
+    })
+}
+
+/// Walk every slave's per-frame pacing samples, merge into one
+/// time-sorted timeline, and decimate. Same shape as the drift
+/// timeline so the UI can render with the same chart template.
+fn build_fleet_pacing_timeline(
+    details: &BTreeMap<String, SlaveDetail>,
+    captured: &LoadedPcap,
+    target_port: u16,
+    expected_slave_count: usize,
+) -> Option<FleetPacingTimeline> {
+    let mut all: Vec<(f64, f64)> = Vec::new();
+    for d in details.values() {
+        for s in &d.timing.pacing_samples {
+            all.push((s[0], s[1]));
+        }
+    }
+    if all.is_empty() {
+        return None;
+    }
+    let total_samples = all.len();
+    all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+    let decimated = total_samples > MAX_FLEET_TIMELINE_POINTS;
+    let kept: Vec<[f64; 2]> = if decimated {
+        let stride = (total_samples + MAX_FLEET_TIMELINE_POINTS - 1) / MAX_FLEET_TIMELINE_POINTS;
+        all.iter().step_by(stride).map(|&(t, d)| [t, d]).collect()
+    } else {
+        all.iter().map(|&(t, d)| [t, d]).collect()
+    };
+    let iteration_starts_ms = detect_iteration_starts(captured, target_port, expected_slave_count);
+
+    Some(FleetPacingTimeline {
+        samples: kept,
+        total_samples,
+        decimated,
+        iteration_starts_ms,
     })
 }
 
@@ -1393,6 +1497,30 @@ fn analyze_one_slave(
         .unwrap_or_default();
     let orig_dur = total_span_ms(&orig_gaps);
     let cap_dur = total_span_ms(&cap_gaps);
+    // Per-I-frame pacing drift: how much the live replay landed each
+    // frame later than the original schedule. Both wall-time series
+    // are normalised to their own first I-frame so cross-slave
+    // session-start differences don't pollute the metric.
+    let pacing_samples: Vec<[f64; 2]> = match (playback_rf, orig_playback_flow_opt) {
+        (Some(cap_rf), Some(orig_rf)) => {
+            let cap_walls = iframe_wall_times_ms(cap_rf);
+            let orig_walls = iframe_wall_times_ms(orig_rf);
+            if cap_walls.is_empty() || orig_walls.is_empty() {
+                Vec::new()
+            } else {
+                let cap_zero = cap_walls[0];
+                let orig_zero = orig_walls[0];
+                let n = cap_walls.len().min(orig_walls.len());
+                (0..n)
+                    .map(|i| {
+                        let drift = (cap_walls[i] - cap_zero) - (orig_walls[i] - orig_zero);
+                        [cap_walls[i], drift]
+                    })
+                    .collect()
+            }
+        }
+        _ => Vec::new(),
+    };
     let timing = TimingReport {
         original_iframes: expected_iframes.len(),
         captured_iframes: delivered_iframes.len(),
@@ -1411,6 +1539,7 @@ fn analyze_one_slave(
         captured_p99_gap_ms: percentile(&cap_gaps, 0.99),
         original_gaps_ms: orig_gaps,
         captured_gaps_ms: cap_gaps,
+        pacing_samples,
     };
 
     // --- CP56Time2a drift (fresh-timestamps mode only) ---
@@ -1775,6 +1904,7 @@ impl Default for TimingReport {
             captured_p99_gap_ms: 0.0,
             original_gaps_ms: Vec::new(),
             captured_gaps_ms: Vec::new(),
+            pacing_samples: Vec::new(),
         }
     }
 }
