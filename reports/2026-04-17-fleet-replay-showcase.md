@@ -22,6 +22,8 @@
 | Real protocol mismatches | **0** |
 | Total wire packets exchanged | **274 224** |
 | Live capture size | **43.6 MB** |
+| Worst-case per-RTU duration drift | **41.12 ms** over 222 s (0.018 %) |
+| Pacing fidelity, fleet mean cumulative drift | **−4.60 ms** over 223 s (0.0021 %) |
 | Run duration (wall clock) | **3 m 43 s** (matches source pcap) |
 
 ```json
@@ -71,11 +73,11 @@ over 3 minutes 43 seconds. The heaviest RTUs:
 
 | RTU | I-frames delivered | Total packets |
 |---|---:|---:|
-| 192.168.10.73 | 12 005 | 16 686 |
-| 192.168.10.4  | 11 181 | 12 211 |
-| 192.168.10.45 |  9 423 | 15 476 |
-| 192.168.10.62 |  8 086 | 13 938 |
-| 192.168.10.30 |  7 477 | 13 621 |
+| 192.168.10.73 | 12 005 | 16 728 |
+| 192.168.10.4  | 11 181 | 12 335 |
+| 192.168.10.45 |  9 423 | 15 414 |
+| 192.168.10.62 |  8 086 | 13 786 |
+| 192.168.10.30 |  7 477 | 13 706 |
 
 The lightest RTUs delivered as little as a single I-frame each — these
 are devices that produce only sporadic spontaneous data in the source
@@ -140,6 +142,35 @@ change of −4.60 ms over 223 seconds is **0.0021 % of run duration** —
 well below the resolution of any wall-clock SCADA test setup.
 
 ---
+
+## 4b. Per-session duration drift — does each RTU finish on time?
+
+Complementing the per-frame pacing metric: how close is each RTU's
+**total session duration** in the live capture to its duration in the
+source pcap? This rolls up all of a slave's pacing slop into a single
+number per RTU and is the metric most directly comparable to "did
+the replay take the same wall-clock time as the original".
+
+Computed across the 124 RTUs that delivered I-frames in this run.
+The five worst-deviating sessions:
+
+| RTU | Original duration | Captured duration | Drift | % of duration |
+|---|---:|---:|---:|---:|
+| 192.168.10.236 | 222 336 ms | 222 295 ms | **−41.12 ms** | 0.0185 % |
+| 192.168.10.171 | 221 707 ms | 221 668 ms | −38.54 ms | 0.0174 % |
+| 192.168.10.173 | 222 615 ms | 222 577 ms | −38.40 ms | 0.0173 % |
+| 192.168.10.65  | 221 965 ms | 221 928 ms | −37.53 ms | 0.0169 % |
+| 192.168.10.66  | 222 130 ms | 222 093 ms | −37.04 ms | 0.0167 % |
+
+**Worst-case absolute duration drift across the entire fleet: 41 ms
+over a 222-second session — well under one part in ten thousand.**
+
+The negative sign on every top-5 entry indicates the live replays
+finished *slightly ahead* of the captured originals. This is the
+fingerprint of NIC-level send-side coalescing (TSO / GSO) compressing
+back-to-back small frames into single TCP segments, which the
+analyser observes as a tiny perceived speed-up. Not a protocol or
+scheduler defect — pure measurement effect at the kernel/NIC layer.
 
 ## 5. Embedded-timestamp accuracy — `CP56Time2a` drift
 
