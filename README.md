@@ -112,11 +112,111 @@ Every run is reversible: the bridge, veth pairs, IP aliases, sysctl state, iptab
 - **START ALL** button in the run detail panel fans out the ready flag to every pending listener in one click. **STOP** on the run card fans out cancellation to all sessions in one click and flips them to `CANCELLED` so the UI doesn't keep showing stale `PENDING` rows.
 - Each session reports its own state (`PENDING → LISTENING → CONNECTED → ACTIVE → COMPLETED / CANCELLED / FAILED`) with live send/receive counts, byte counts, and per-session abort.
 
+### Using the web UI
+
+The single `outstation serve` binary hosts everything over `:8080`. A
+run moves through five screens in order — library, configuration, live
+replay, per-session results, and analysis — with the session history
+persisted to SQLite so refreshing the tab or restarting the service
+never loses a completed run.
+
+![Pcap library above, run configuration below — viability advisory on the left, form for target IP / TCP_NODELAY / speed / warmup / iterations / flags / timestamps / benchmark role / protocol / pacing / ASDU rewrite map](doc/images/ui-01-run-config.jpg)
+
+**Library + run configuration (screen 1).** Drop a `.pcap`, `.pcapng`,
+or `.cap` file anywhere on the upload area to add it to the library.
+The viability analyser runs on upload and annotates each row with
+`OK` / `CAUTION` / `HEAVY` / `NOT RECOMMENDED` plus a one-line reason
+("165 of 171 flows are mid-flow — the replayer will synthesize a
+fresh TCP+STARTDT prelude and resync to the first clean APCI
+boundary"). Click a library row to pick it as the source pcap for the
+next run — that populates the **Run Configuration** form below with
+the selected pcap, the viability advisory, and sensible defaults for
+target IP, TCP_NODELAY, speed, warmup, and iterations. The form also
+collects protocol-specific knobs (IEC 104 CP56-rewrite settings, ASDU
+rewrite map) that only appear when the matching protocol is selected
+in the `PROTOCOL` dropdown. Tick **BENCHMARK MODE** to expose the
+role (master / slave), target port, concurrency model, pacing
+strategy, and — if your lab needs it — the SCADA-gateway mode for
+subnet-isolated targets. **START RUN** hands everything to the
+scheduler and transitions the page to the live-replay view.
+
+![Live traffic hub-and-spoke diagram with 165 RTU nodes around a central TARGET, run header with live SENT / UPLINK PPS / DOWNLINK PPS / ACTIVE counters, fleet session grid below with PENDING rows that each have a listener IP:port + VERIFY + START LISTENING + ABORT control, plus a fleet-wide START ALL](doc/images/ui-02-fleet-grid.jpeg)
+
+**Live replay + per-session control (screen 2).** Top card is the
+live traffic diagram — target at the centre, one node per captured
+RTU around it, animated particle streams sized by real packet-per-
+second rate and bucketed so a quiet 1 pps session looks different
+from a 1 000 pps one. FULLSCREEN pops it out for projection on a
+separate monitor. The header strip above keeps the live counters
+(SENT, UPLINK PPS, DOWNLINK PPS, active stream count out of the
+planned fleet size). Under the diagram, the per-run panel shows the
+session grid — one row per captured RTU. In slave mode each row is
+parked at **PENDING** with the listener IP:port prefilled from the
+capture. The `VERIFY` link checks address reachability without
+opening a socket. `START LISTENING` flips the ready flag and the row
+transitions `LISTENING → CONNECTED → ACTIVE → COMPLETED` as the
+target master connects in. **START ALL** fans the ready flag across
+every pending row in one click; **ABORT** cancels a single session
+without bringing down the rest of the fleet.
+
+![Same run, now every row shows COMPLETED with a full green progress bar and the exact captured-frame count matching the delivered count — 9 423 / 9 423, 2 907 / 2 907, 12 005 / 12 005, etc.](doc/images/ui-03-session-progress.jpg)
+
+**Session progress during a run (still screen 2).** As RTUs come
+online the green progress bar fills toward `delivered / planned`
+message counts. Partial progress is visible per-row without
+refreshing the page; the scheduler atomics update over WebSocket
+every 250 ms. Once every session is at 100 % the run flips to
+`COMPLETED` at the top of the card. Any per-row progress bar that
+stays red or stalls is a slave the target master never handshook
+with — cheapest diagnostic for "did the SCADA even see this RTU" is
+this grid.
+
+![Throughput sparkline above a key-value readout (pcap path, target, speed, sessions 165, messages 151 068 sent, throughput 601.1 msg/s, latency min / p50 / p90 / p99 / max), per-session benchmark table below with SRC IP, SENT, RECV, P50 / P99 / MAX ms, MSG/S, STALLS, STATUS columns](doc/images/ui-04-per-session-benchmark.jpg)
+
+**Run detail + per-session benchmark (screen 3).** Click `SHOW
+DETAILS` on a completed run for the post-replay breakdown. The
+throughput sparkline charts aggregate packets-per-second over the
+whole run — spikes or a dropoff near the end usually mean the target
+was at its window. The stat strip under it is the copy-paste-ready
+one-liner for a status report: run settings, total messages, mean
+throughput, full latency percentile set. The per-session benchmark
+table ranks every RTU by SENT volume and flags any non-zero
+`STALLS` count (the replayer blocked waiting for the target to free
+the flow-control window). Buttons at the top of this block also
+expose `DELETE` (remove the run from history) and the download links
+for the mirror pcap that feeds the analyser.
+
+![Latency distribution histogram with blue bars bucketed on a log X-axis from 10 µs to 1 s, dashed vertical lines at p50 (126 788 µs) and p99 (6 962 870 µs), legend top-left with LATENCY SAMPLES / P50 / P99 and a sample count of 5 000 on the top-right](doc/images/ui-05-latency-histogram.jpg)
+
+**Latency distribution (still screen 3).** Send→ACK latency
+histogram on a log X-axis so sub-millisecond tails and multi-second
+outliers land in the same view. Dashed markers show p50 / p99 with
+their exact µs values so the distribution's shape is instantly
+readable — a single tall peak means the target is responding at a
+steady rate; a long right tail means individual ACKs are getting
+stuck behind the flow-control window or behind a slow target thread.
+Sample cap (5 000) is shown in the top-right so there's no
+ambiguity about whether the distribution was truncated.
+
 ### Post-run fidelity analysis
 
 - The analyser (`crates/webui/src/analysis.rs`) re-opens the mirror capture from the run and compares it flow-by-flow against the source pcap: expected vs delivered I-frame counts, type-ID sequence agreement, byte-identical frame count, inter-frame timing drift (mean / p50 / p99), and a verdict (`good_delivery`, `partial_delivery`, `no_session`) with a score.
 - Flow pairing is pinned on the captured session's server IP, so in a 200-RTU pcap the analyser always compares the right source flow against the right captured flow.
 - A sample report produced end-to-end from a 200-RTU run is in [`fidelity_report_run2.md`](fidelity_report_run2.md).
+
+![ANALYSIS card with a dashed-line drop zone on the left labelled "DROP CAPTURED PCAP · WIRESHARK OUTPUT FROM THE TARGET SIDE", right-hand controls for target correctness mode (generic / correct) and CP56 drift tolerance (ms), and an ANALYZE button](doc/images/ui-06-analysis-upload.jpg)
+
+**Upload a capture to compare against the last run (screen 4).**
+Drop a Wireshark capture taken on the target side into the dashed
+box on the left. Pick **generic** when the target is a different
+piece of software than the one in the source pcap (only delivery +
+handshake are judged); pick **correct** when it's the same RTU /
+SCADA and the target's own I-frames are expected to match the
+captured server-side flow byte-for-byte. `CP56 DRIFT TOLERANCE (MS)`
+is the ±band outside of which a per-frame stamp-vs-wire drift counts
+as an anomaly — 50 ms for tight intra-host runs, bump to 200 ms when
+the target capture comes from a different VM. **ANALYZE** runs the
+comparison and renders the report below.
 
 ![IEC 104 analysis view — fleet rollup with pacing and CP56 drift charts, per-slave drill-down, anomaly detection charts, and timestamp accuracy summary](doc/images/iec104-generic-analysis.jpeg)
 
