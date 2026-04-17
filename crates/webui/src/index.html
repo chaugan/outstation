@@ -2157,9 +2157,26 @@ async function startRun() {
     alert('select a pcap from the library or enter a raw path');
     return;
   }
-  const pc = el('run-proto-config').value.trim();
+  const pcRaw = el('run-proto-config').value.trim();
   const role = document.querySelector('input[name="run-role"]:checked')?.value || 'master';
   const pacing = document.querySelector('input[name="run-pacing"]:checked')?.value || 'fast';
+  // Merge protocol-specific knobs that used to be top-level RunReq
+  // fields into the proto_config JSON. The form's textarea may also
+  // contain an IEC 104 ASDU rewrite map; preserve those keys and
+  // attach a `cp56` sub-object with the fresh-timestamps controls.
+  let protoCfgObj = {};
+  if (pcRaw) {
+    try { protoCfgObj = JSON.parse(pcRaw) || {}; }
+    catch (_) { /* ignore — the backend reports the parse error */ }
+  }
+  const cp56Rewrite = el('run-fresh-timestamps')?.checked || false;
+  const cp56Zone = document.querySelector('input[name="run-cp56-zone"]:checked')?.value || 'local';
+  if (cp56Rewrite || cp56Zone !== 'local') {
+    protoCfgObj.cp56 = { rewrite_to_now: cp56Rewrite, zone: cp56Zone };
+  }
+  const pc = Object.keys(protoCfgObj).length > 0
+    ? JSON.stringify(protoCfgObj)
+    : null;
   const body = {
     target_ip:   el('run-target-ip').value.trim() || '0.0.0.0',
     target_mac:  el('run-target-mac').value.trim(),
@@ -2179,12 +2196,10 @@ async function startRun() {
     target_port: parseInt(el('run-target-port').value) || 2404,
     proto_name:  el('run-proto').value,
     concurrency,
-    proto_config: pc || null,
+    proto_config: pc,
     role,
     listen_port_base: parseInt(el('run-listen-port-base').value) || 2404,
     pacing,
-    rewrite_cp56_to_now: el('run-fresh-timestamps')?.checked || false,
-    cp56_zone: document.querySelector('input[name="run-cp56-zone"]:checked')?.value || 'local',
     master_bind_ip: (el('run-master-bind-ip').value.trim() || null),
     tcp_nodelay: (() => {
       const v = el('run-tcp-nodelay').value;

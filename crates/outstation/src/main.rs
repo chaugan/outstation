@@ -97,21 +97,6 @@ struct RunArgs {
     /// bridge or per-source ports before frames flow.
     #[arg(long, default_value_t = 0)]
     warmup: u64,
-
-    /// Rewrite every CP56Time2a timestamp inside outgoing IEC 104
-    /// ASDUs to the actual wall-clock moment the frame hits the wire,
-    /// so the SCADA system sees fresh event timestamps. Intra-pcap
-    /// inter-frame spacing is preserved via the scheduler.
-    #[arg(long)]
-    fresh_timestamps: bool,
-
-    /// Timezone for CP56Time2a when `--fresh-timestamps` is set:
-    /// `"local"` (default) encodes the server's local calendar with
-    /// the SU flag following DST — matches most plant SCADA HMIs.
-    /// `"utc"` encodes UTC with SU always 0 — matches ICCP-style
-    /// inter-utility links.
-    #[arg(long, default_value = "local")]
-    cp56_zone: String,
 }
 
 fn main() -> Result<()> {
@@ -193,8 +178,6 @@ fn run_cmd(args: RunArgs) -> Result<()> {
         startup_delay_secs: args.warmup,
         capture_path: None,
         iterations: 1,
-        rewrite_cp56_to_now: args.fresh_timestamps,
-        cp56_zone: args.cp56_zone.clone(),
     };
 
     let report = run_sched(pcap, cfg, RunContext::default()).context("run failed")?;

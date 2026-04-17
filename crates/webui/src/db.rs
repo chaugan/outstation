@@ -57,14 +57,11 @@ pub struct StoredRun {
     pub speed: f64,
     pub top_speed: bool,
     pub realtime: bool,
-    /// Whether this run was started with the IEC 104 fresh-timestamps
-    /// feature enabled. Needed at analysis time so the CP56Time2a
-    /// drift report knows to expect rewritten stamps.
-    pub rewrite_cp56_to_now: bool,
-    /// Timezone convention for CP56Time2a ("local" or "utc").
-    /// Required at analysis time so captured stamps are decoded with
-    /// the matching convention.
-    pub cp56_zone: String,
+    /// Free-form JSON the run was started with as the protocol
+    /// replayer's `proto_config`. Persisted so the post-run analyser
+    /// can read protocol-specific settings (e.g. IEC 104 CP56 rewrite
+    /// + zone, ASDU rewrite map). Optional — `None` means defaults.
+    pub proto_config: Option<String>,
     pub planned: u64,
     pub sent: u64,
     pub bytes: u64,
@@ -107,15 +104,19 @@ impl Db {
                 benchmark_json  TEXT,
                 per_source_json TEXT,
                 throughput_json TEXT,
-                rewrite_cp56_to_now INTEGER NOT NULL DEFAULT 0,
-                cp56_zone       TEXT NOT NULL DEFAULT 'local'
+                proto_config    TEXT
             );
             "#,
         )
         .context("create schema")?;
         // Forward migrations for databases created before these
         // columns existed. Each ALTER is ignored if the column is
-        // already present.
+        // already present (sqlite errors are absorbed).
+        //
+        // Older schemas had typed `rewrite_cp56_to_now` /
+        // `cp56_zone` columns for IEC 104. Those have been folded into
+        // the generic `proto_config` JSON; the legacy ALTERs are kept
+        // here so DBs that pre-date the JSON migration stay readable.
         let _ = conn.execute(
             "ALTER TABLE runs ADD COLUMN rewrite_cp56_to_now INTEGER NOT NULL DEFAULT 0",
             [],
@@ -124,6 +125,7 @@ impl Db {
             "ALTER TABLE runs ADD COLUMN cp56_zone TEXT NOT NULL DEFAULT 'local'",
             [],
         );
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN proto_config TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -137,8 +139,8 @@ impl Db {
             "INSERT OR REPLACE INTO runs
              (id, started_at, status, pcap, target_ip, target_mac, mode, role,
               target_port, speed, top_speed, realtime, planned, sent, bytes,
-              rewrite_cp56_to_now, cp56_zone)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              proto_config)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
             params![
                 run.id as i64,
                 run.started_at as i64,
@@ -155,8 +157,7 @@ impl Db {
                 run.planned as i64,
                 run.sent as i64,
                 run.bytes as i64,
-                run.rewrite_cp56_to_now as i64,
-                run.cp56_zone,
+                run.proto_config,
             ],
         )?;
         Ok(())
@@ -228,15 +229,45 @@ impl Db {
     /// Load every persisted run back into memory at startup.
     pub fn load_all(&self) -> Result<Vec<StoredRun>> {
         let conn = self.conn.lock().unwrap();
+        // SELECT both the new proto_config column and the legacy
+        // CP56 columns so DBs written by either schema generation
+        // round-trip cleanly. The mapping below prefers proto_config
+        // when present and synthesises an IEC 104 JSON from the legacy
+        // columns when not — keeping pre-migration runs analysable.
         let mut stmt = conn.prepare(
             "SELECT id, started_at, status, pcap, target_ip, target_mac, mode, role,
                     target_port, speed, top_speed, realtime, planned, sent, bytes,
                     error, report_json, benchmark_json, per_source_json, throughput_json,
-                    rewrite_cp56_to_now, cp56_zone
+                    proto_config, rewrite_cp56_to_now, cp56_zone
              FROM runs
              ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
+            let proto_config_raw: Option<String> = row.get(20).ok();
+            // Legacy IEC 104 columns. Optional because future schemas
+            // may drop them entirely; tolerate absence by mapping to None.
+            let legacy_rewrite: Option<bool> = row
+                .get::<_, Option<i64>>(21)
+                .ok()
+                .flatten()
+                .map(|v| v != 0);
+            let legacy_zone: Option<String> = row.get::<_, Option<String>>(22).ok().flatten();
+            // Migration: if proto_config is unset but the legacy
+            // CP56 columns hold non-default values, synthesise a tiny
+            // IEC 104 proto_config JSON so the analyser can still
+            // interpret CP56 drift correctly.
+            let proto_config = proto_config_raw.or_else(|| {
+                let rewrite = legacy_rewrite.unwrap_or(false);
+                let zone = legacy_zone.clone().unwrap_or_else(|| "local".into());
+                if rewrite || zone != "local" {
+                    Some(format!(
+                        r#"{{"cp56":{{"rewrite_to_now":{},"zone":"{}"}}}}"#,
+                        rewrite, zone
+                    ))
+                } else {
+                    None
+                }
+            });
             Ok(StoredRun {
                 id: row.get::<_, i64>(0)? as u64,
                 started_at: row.get::<_, i64>(1)? as u64,
@@ -258,17 +289,7 @@ impl Db {
                 benchmark_json: row.get(17)?,
                 per_source_json: row.get(18)?,
                 throughput_json: row.get(19)?,
-                rewrite_cp56_to_now: row
-                    .get::<_, Option<i64>>(20)
-                    .ok()
-                    .flatten()
-                    .map(|v| v != 0)
-                    .unwrap_or(false),
-                cp56_zone: row
-                    .get::<_, Option<String>>(21)
-                    .ok()
-                    .flatten()
-                    .unwrap_or_else(|| "local".into()),
+                proto_config,
             })
         })?;
         let mut out = Vec::new();

@@ -23,7 +23,7 @@ use std::thread;
 mod analysis;
 mod db;
 use analysis::{analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
-use proto_iec104::asdu::Cp56Zone;
+use proto_iec104::asdu::{Cp56Zone, Iec104ProtoConfig};
 use db::{Db, StoredRun};
 
 use anyhow::Result;
@@ -90,15 +90,6 @@ pub struct RunState {
     pub speed: f64,
     pub top_speed: bool,
     pub realtime: bool,
-    /// Whether CP56Time2a timestamps were rewritten to wall-clock on
-    /// every outgoing IEC 104 ASDU for this run. Persisted so the
-    /// post-run fidelity/analysis pass knows to expect fresh stamps.
-    #[serde(default)]
-    pub rewrite_cp56_to_now: bool,
-    /// Timezone convention used for the CP56 rewrite, either
-    /// `"local"` or `"utc"`. Required at analysis time so the drift
-    /// check decodes stamps with the same zone convention.
-    pub cp56_zone: String,
     pub error: Option<String>,
     pub report: Option<RunReportJson>,
     pub benchmark: Option<BenchmarkReportJson>,
@@ -109,6 +100,11 @@ pub struct RunState {
     /// Benchmark target port, 0 for raw.
     #[serde(default)]
     pub target_port: u16,
+    /// Free-form per-protocol JSON config the run was started with.
+    /// Persisted so the post-run analyser can read protocol-specific
+    /// settings (e.g. IEC 104 CP56 rewrite + zone).
+    #[serde(default)]
+    pub proto_config: Option<String>,
     /// Total frames planned for this run (snapshot from ctx.planned).
     pub planned: u64,
     /// Frames sent so far (snapshot from ctx.sent).
@@ -170,8 +166,7 @@ fn runstate_to_stored(rs: &RunState) -> StoredRun {
         speed: rs.speed,
         top_speed: rs.top_speed,
         realtime: rs.realtime,
-        rewrite_cp56_to_now: rs.rewrite_cp56_to_now,
-        cp56_zone: rs.cp56_zone.clone(),
+        proto_config: rs.proto_config.clone(),
         planned: rs.planned,
         sent: rs.sent,
         bytes: rs.bytes_progress,
@@ -225,14 +220,13 @@ fn stored_to_runstate(s: &StoredRun) -> Option<RunState> {
         speed: s.speed,
         top_speed: s.top_speed,
         realtime: s.realtime,
-        rewrite_cp56_to_now: s.rewrite_cp56_to_now,
-        cp56_zone: s.cp56_zone.clone(),
         error: s.error.clone(),
         report,
         benchmark,
         mode,
         role,
         target_port: s.target_port,
+        proto_config: s.proto_config.clone(),
         planned: s.planned,
         sent: s.sent,
         bytes_progress: s.bytes,
@@ -798,16 +792,6 @@ struct RunReq {
     /// enabled and SCADA's non-capture egress is NAT'd out this NIC.
     #[serde(default)]
     upstream_nat_iface: Option<String>,
-    /// IEC 104 only: rewrite every CP56Time2a timestamp inside
-    /// outgoing ASDUs to the actual wall-clock moment the frame is
-    /// emitted. SCADA sees fresh event timestamps; intra-pcap
-    /// spacing preserved; IV preserved from source.
-    #[serde(default)]
-    rewrite_cp56_to_now: bool,
-    /// Timezone convention for the rewrite: `"local"` (default) or
-    /// `"utc"`. Ignored unless `rewrite_cp56_to_now` is true.
-    #[serde(default = "default_cp56_zone")]
-    cp56_zone: String,
     /// Master-mode only: override the per-session bind IP. Default
     /// (None) keeps the captured client IPs as the source addresses
     /// of the replayed master sessions. Set to a local IP (or one we
@@ -823,10 +807,6 @@ struct RunReq {
     /// override either way for debugging or A/B comparisons.
     #[serde(default)]
     tcp_nodelay: Option<bool>,
-}
-
-fn default_cp56_zone() -> String {
-    "local".into()
 }
 
 fn default_iterations() -> u64 {
@@ -929,14 +909,13 @@ async fn api_run(
         speed: req.speed,
         top_speed: req.top_speed,
         realtime: req.realtime,
-        rewrite_cp56_to_now: req.rewrite_cp56_to_now,
-        cp56_zone: req.cp56_zone.clone(),
         error: None,
         report: None,
         benchmark: None,
         mode: mode_str,
         role: role_str,
         target_port: target_port_for_state,
+        proto_config: req.proto_config.clone(),
         planned: 0,
         sent: 0,
         bytes_progress: 0,
@@ -995,8 +974,6 @@ async fn api_run(
             scada_gateway_iface: req.scada_gateway_iface.clone(),
             upstream_nat_iface: req.upstream_nat_iface.clone(),
             alias_state_path: Some(alias_state_path()),
-            rewrite_cp56_to_now: req.rewrite_cp56_to_now,
-            cp56_zone: req.cp56_zone.clone(),
             master_bind_ip: req.master_bind_ip,
             tcp_nodelay: req.tcp_nodelay,
         };
@@ -1067,8 +1044,6 @@ async fn api_run(
             startup_delay_secs: req.warmup_secs,
             capture_path: Some(capture_pb.clone()),
             iterations: req.iterations,
-            rewrite_cp56_to_now: req.rewrite_cp56_to_now,
-            cp56_zone: req.cp56_zone.clone(),
         };
         let db_raw = state.db.clone();
         thread::Builder::new()
@@ -1711,8 +1686,13 @@ async fn api_analyze(
     std::fs::write(&tmp_path, &bytes)
         .map_err(|e| AppError::Internal(format!("write tmp: {e}")))?;
 
-    let rewrite_cp56_was_on = rs.rewrite_cp56_to_now;
-    let cp56_zone = Cp56Zone::parse(&rs.cp56_zone).unwrap_or(Cp56Zone::Local);
+    // CP56 settings live inside the IEC 104 proto_config JSON now —
+    // parse them out for the analyser. Non-IEC-104 runs leave the
+    // proto_config either None or holding their own protocol's JSON;
+    // in either case Iec104ProtoConfig::parse returns sensible defaults.
+    let cp56_cfg = Iec104ProtoConfig::parse(rs.proto_config.as_deref()).cp56;
+    let rewrite_cp56_was_on = cp56_cfg.rewrite_to_now;
+    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
     let report = tokio::task::spawn_blocking({
         let original_pcap = rs.pcap.clone();
         let tmp_path = tmp_path.clone();

@@ -28,7 +28,8 @@ use crate::apdu::{
     U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
-    load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone, RewriteMap,
+    load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone, Iec104ProtoConfig,
+    RewriteMap,
 };
 
 #[inline]
@@ -273,6 +274,8 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
+    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
+    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),
@@ -492,9 +495,8 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         }
 
         let mut patched = asdu.clone();
-        if cfg.rewrite_cp56_to_now {
-            let zone = Cp56Zone::parse(&cfg.cp56_zone).unwrap_or(Cp56Zone::Local);
-            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), zone);
+        if cp56_cfg.rewrite_to_now {
+            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
         }
         let apdu = Apdu::I {
             ns: my_ns,
@@ -701,6 +703,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
+    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
+    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),
@@ -971,9 +975,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         }
 
         let mut patched = asdu.clone();
-        if cfg.rewrite_cp56_to_now {
-            let zone = Cp56Zone::parse(&cfg.cp56_zone).unwrap_or(Cp56Zone::Local);
-            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), zone);
+        if cp56_cfg.rewrite_to_now {
+            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
         }
         let apdu = Apdu::I {
             ns: my_ns,
@@ -1171,8 +1174,6 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
-            rewrite_cp56_to_now: false,
-            cp56_zone: "local".into(),
         };
 
         let report = run_session(cfg);
@@ -1282,8 +1283,6 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
-            rewrite_cp56_to_now: false,
-            cp56_zone: "local".into(),
         };
 
         let report = run_session(cfg);

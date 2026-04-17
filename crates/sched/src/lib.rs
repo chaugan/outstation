@@ -172,14 +172,6 @@ pub struct RunConfig {
     /// per-source cancel flags break out cleanly between iterations
     /// or mid-iteration.
     pub iterations: u64,
-    /// IEC 104 only: rewrite every CP56Time2a timestamp inside each
-    /// outgoing ASDU to the wall-clock moment the frame hits the
-    /// wire. Ignored for raw-replay sources (non-IEC 104 traffic is
-    /// emitted verbatim — rewriting arbitrary bytes would corrupt
-    /// application payloads for protocols we can't parse).
-    pub rewrite_cp56_to_now: bool,
-    /// Timezone convention for CP56Time2a rewrite: `"utc"` or `"local"`.
-    pub cp56_zone: String,
 }
 
 impl Default for RunConfig {
@@ -198,8 +190,6 @@ impl Default for RunConfig {
             startup_delay_secs: 0,
             capture_path: None,
             iterations: 1,
-            rewrite_cp56_to_now: false,
-            cp56_zone: "local".into(),
         }
     }
 }
@@ -650,17 +640,6 @@ pub struct BenchmarkConfig {
     /// Path to the alias state file for crash-safe alias reclamation.
     /// If unset, defaults to `/var/lib/outstation/state-aliases.txt`.
     pub alias_state_path: Option<PathBuf>,
-    /// If true, every CP56Time2a embedded in an outgoing IEC 104 ASDU
-    /// is rewritten to the wall-clock moment its frame hits the wire
-    /// (IV flag preserved from the source, SU follows the chosen
-    /// timezone). Scheduler pacing is unchanged, so intra-pcap gaps
-    /// are honored and, across `iterations`, each loop emits
-    /// timestamps that naturally advance with no backward jumps.
-    pub rewrite_cp56_to_now: bool,
-    /// Timezone for CP56Time2a rewrite: `"utc"` or `"local"`.
-    /// Default `"local"` — matches what most plant SCADA systems
-    /// expect on the HMI, with SU bit following server DST state.
-    pub cp56_zone: String,
     /// Master-mode only: override the per-session bind IP. By
     /// default each master session binds from the captured client
     /// (master) IP — useful for fidelity replay on a host that owns
@@ -702,8 +681,6 @@ impl Default for BenchmarkConfig {
             scada_gateway_iface: None,
             upstream_nat_iface: None,
             alias_state_path: None,
-            rewrite_cp56_to_now: false,
-            cp56_zone: "local".into(),
             master_bind_ip: None,
             tcp_nodelay: None,
         }
@@ -1122,8 +1099,6 @@ pub fn run_benchmark(
                         listen_port: 0,
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
-                        rewrite_cp56_to_now: cfg_cloned.rewrite_cp56_to_now,
-                        cp56_zone: cfg_cloned.cp56_zone.clone(),
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();
@@ -1566,8 +1541,6 @@ fn run_benchmark_slave(
                         listen_port,
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
-                        rewrite_cp56_to_now: cfg_cloned.rewrite_cp56_to_now,
-                        cp56_zone: cfg_cloned.cp56_zone.clone(),
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();

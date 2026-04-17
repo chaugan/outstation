@@ -621,6 +621,11 @@ pub fn rewrite_cp56time2a_to_now_zoned(
 /// Parse the JSON proto_config into a [`RewriteMap`]. Returns an empty
 /// map if the JSON is `null` or an empty object. Used by
 /// [`crate::session`].
+///
+/// The full IEC 104 `proto_config` shape supports both the rewrite-map
+/// keys (flat at top level) and an optional `cp56` sub-object handled
+/// by [`Iec104ProtoConfig`]. This loader only extracts the rewrite map
+/// and silently ignores the `cp56` sub-object.
 pub fn load_rewrite_map(proto_config: Option<&str>) -> Result<RewriteMap> {
     let Some(s) = proto_config else {
         return Ok(RewriteMap::default());
@@ -630,6 +635,64 @@ pub fn load_rewrite_map(proto_config: Option<&str>) -> Result<RewriteMap> {
         return Ok(RewriteMap::default());
     }
     RewriteMap::from_json(trimmed)
+}
+
+/// Structured view of the IEC 104 `proto_config` JSON, narrowed to the
+/// CP56-rewrite section. Used by [`crate::session`] and webui's
+/// analyzer to read the CP56 settings without touching the rewrite
+/// map keys.
+///
+/// Wire shape (full proto_config):
+/// ```json
+/// {
+///   "common_address": {...},
+///   "cot": {...},
+///   "ioa": {...},
+///   "cp56": { "rewrite_to_now": false, "zone": "local" }
+/// }
+/// ```
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct Iec104ProtoConfig {
+    #[serde(default)]
+    pub cp56: Cp56Config,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct Cp56Config {
+    /// Whether to rewrite every CP56Time2a in outgoing ASDUs to the
+    /// wall-clock moment the carrying frame hits the wire.
+    #[serde(default, alias = "rewrite_cp56_to_now")]
+    pub rewrite_to_now: bool,
+    /// Timezone convention used by the rewrite. `"utc"` or `"local"`.
+    #[serde(default = "default_cp56_zone", alias = "cp56_zone")]
+    pub zone: String,
+}
+
+impl Default for Cp56Config {
+    fn default() -> Self {
+        Self {
+            rewrite_to_now: false,
+            zone: default_cp56_zone(),
+        }
+    }
+}
+
+fn default_cp56_zone() -> String {
+    "local".into()
+}
+
+impl Iec104ProtoConfig {
+    /// Parse `proto_config` JSON. Tolerates `None`, empty string,
+    /// `"null"`, `"{}"`, missing `cp56` sub-object — all default to
+    /// a no-rewrite local-zone config.
+    pub fn parse(proto_config: Option<&str>) -> Self {
+        let Some(s) = proto_config else { return Self::default() };
+        let trimmed = s.trim();
+        if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
+            return Self::default();
+        }
+        serde_json::from_str(trimmed).unwrap_or_default()
+    }
 }
 
 /// Convenience for tests and callers that already hold a map in memory.
