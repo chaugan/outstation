@@ -3434,27 +3434,43 @@ function initFleetTimelineChart(tl, key) {
     })),
   } : undefined;
 
-  // Stash stats on the chart node so the surrounding caption block
-  // can read them and update its text. Computed here instead of in
-  // the render function so the bucketing logic stays in one place.
+  // Binary-search the nearest Y in a sorted [[x,y],...] series.
+  const nearestY = (arr, t) => {
+    if (!arr || arr.length === 0) return null;
+    let lo = 0, hi = arr.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid][0] < t) lo = mid + 1; else hi = mid;
+    }
+    if (lo > 0 && Math.abs(arr[lo - 1][0] - t) < Math.abs(arr[lo][0] - t)) return arr[lo - 1][1];
+    return arr[lo][1];
+  };
+
+  // Tooltip formatter that always shows every series' value at the
+  // cursor X — even when the underlying bucketed line has no point
+  // exactly there (axis-trigger alone would silently drop those).
   const tooltipFmt = (params) => {
     if (!params || params.length === 0) return '';
-    // params come from trigger='axis': one entry per series at the
-    // hover X. Extract X from the first entry (all share the axis
-    // value) and list each series' Y in a tidy mono-font block.
-    const t = (params[0].axisValue !== undefined)
-      ? params[0].axisValue
-      : params[0].value[0];
-    let html = `<div style="font-family:var(--mono);font-size:12px;line-height:1.45">`;
+    const t = (params[0].axisValue !== undefined) ? params[0].axisValue : params[0].value[0];
+    // Pull scatter sample from ECharts' params (it has it).
+    const scatterEntry = params.find(p => p.seriesType === 'scatter');
+    // Manual nearest-bucket lookup for the line series — they only
+    // carry ~100 points so axis-trigger won't normally see them.
+    const meanY = nearestY(meanLine, t);
+    const p05Y  = nearestY(p05Line,  t);
+    const p95Y  = nearestY(p95Line,  t);
+    const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;vertical-align:middle"></span>`;
+    const dash = (color) => `<span style="display:inline-block;width:14px;height:0;border-top:1.5px dashed ${color};margin-right:4px;vertical-align:middle"></span>`;
+    const solid = (color) => `<span style="display:inline-block;width:14px;height:0;border-top:2.5px solid ${color};margin-right:4px;vertical-align:middle"></span>`;
+    let html = `<div style="font-family:var(--mono);font-size:12px;line-height:1.55">`;
     html += `<div style="font-weight:700;margin-bottom:4px">t = ${Number(t).toFixed(2)} s</div>`;
-    for (const p of params) {
-      if (!p.value) continue;
-      const y = Array.isArray(p.value) ? p.value[1] : p.value;
-      if (y === undefined || y === null) continue;
-      const swatch = `<span style="display:inline-block;width:8px;height:8px;background:${p.color};margin-right:6px;border-radius:2px"></span>`;
-      const yStr = Number(y).toFixed(2);
-      html += `<div>${swatch}${p.seriesName}: <b>${yStr} ms</b></div>`;
+    if (scatterEntry && scatterEntry.value) {
+      const y = scatterEntry.value[1];
+      html += `<div>${swatch('#4a90e2')}sample: ${Number(y).toFixed(2)} ms</div>`;
     }
+    if (meanY !== null) html += `<div>${solid('#d8741a')}mean: <b>${meanY.toFixed(2)} ms</b></div>`;
+    if (p95Y !== null)  html += `<div>${dash('#888')}p95:&nbsp; ${p95Y.toFixed(2)} ms</div>`;
+    if (p05Y !== null)  html += `<div>${dash('#888')}p05:&nbsp; ${p05Y.toFixed(2)} ms</div>`;
     html += `</div>`;
     return html;
   };
@@ -3492,7 +3508,9 @@ function initFleetTimelineChart(tl, key) {
       itemWidth: 18,
       itemHeight: 8,
       itemGap: 14,
-      data: ['samples', 'p95 (per-bucket)', 'p05 (per-bucket)', 'mean (per-bucket)'],
+      // Names carry the line-style cue because ECharts default
+      // legend icons don't render lineStyle.type (dashed vs solid).
+      data: ['• samples', '── mean (per-bucket)', '┄┄ p95 (per-bucket)', '┄┄ p05 (per-bucket)'],
     },
     xAxis: {
       type: 'value',
@@ -3519,7 +3537,7 @@ function initFleetTimelineChart(tl, key) {
     },
     series: [
       {
-        name: 'samples',
+        name: '• samples',
         type: 'scatter',
         symbolSize: 3,
         itemStyle: { color: '#4a90e2', opacity: 0.35 },
@@ -3529,7 +3547,7 @@ function initFleetTimelineChart(tl, key) {
         z: 1,
       },
       {
-        name: 'p95 (per-bucket)',
+        name: '┄┄ p95 (per-bucket)',
         type: 'line',
         data: p95Line,
         lineStyle: { color: '#888', width: 1, type: 'dashed' },
@@ -3539,7 +3557,7 @@ function initFleetTimelineChart(tl, key) {
         z: 2,
       },
       {
-        name: 'p05 (per-bucket)',
+        name: '┄┄ p05 (per-bucket)',
         type: 'line',
         data: p05Line,
         lineStyle: { color: '#888', width: 1, type: 'dashed' },
@@ -3549,7 +3567,7 @@ function initFleetTimelineChart(tl, key) {
         z: 3,
       },
       {
-        name: 'mean (per-bucket)',
+        name: '── mean (per-bucket)',
         type: 'line',
         data: meanLine,
         lineStyle: { color: '#d8741a', width: 2.5 },
