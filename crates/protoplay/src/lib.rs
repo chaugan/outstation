@@ -23,10 +23,13 @@
 //! gives each module freedom to customize socket options (keepalives,
 //! buffer sizes, etc.) without bloating the trait.
 
+use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
 use std::sync::Arc;
 use std::time::Duration;
+
+use serde::Serialize;
 
 /// Protocol-agnostic session lifecycle states. Live in a shared
 /// `AtomicU8` so the caller can observe transitions without locks.
@@ -370,6 +373,46 @@ pub trait ProtoReplayer: Send + Sync {
             notes: Vec::new(),
         }
     }
+
+    /// Per-slave deep analysis: compare the four reassembled flow sides
+    /// (captured-vs-original × playback-vs-target) and return a
+    /// protocol-specific drill-down plus a handful of common fields the
+    /// core rollup uses. Default impl returns [`ProtoSlaveAnalysis::default`]
+    /// — protocols implement this to participate in the analyze page.
+    ///
+    /// Each [`FlowSnapshot`] is `Option` because a slave might be missing
+    /// from either pcap (e.g. expected but never reached the wire).
+    fn analyze_flow(
+        &self,
+        _orig_playback: Option<FlowSnapshot>,
+        _cap_playback: Option<FlowSnapshot>,
+        _orig_target: Option<FlowSnapshot>,
+        _cap_target: Option<FlowSnapshot>,
+        _ctx: &AnalyzeCtx,
+    ) -> ProtoSlaveAnalysis {
+        ProtoSlaveAnalysis::default()
+    }
+
+    /// Fold per-slave `protocol_specific` JSON blobs into a single
+    /// fleet-level drift timeline. Called after all per-slave
+    /// [`Self::analyze_flow`] invocations have finished, so the protocol
+    /// can reach inside each blob to pull whatever "drift sample" series
+    /// it cares about (IEC 104: CP56Time2a drift; others: their own
+    /// metric) and aggregate onto a single time axis.
+    ///
+    /// `iteration_starts_ms` is computed by the core (from SYN bursts in
+    /// the captured pcap) and passed in so the aggregator can annotate
+    /// the timeline with loop boundaries without re-walking the pcap.
+    ///
+    /// Default returns `None` — protocols that want a fleet chart
+    /// override this.
+    fn aggregate_fleet_drift(
+        &self,
+        _per_slave: &BTreeMap<String, serde_json::Value>,
+        _iteration_starts_ms: &[f64],
+    ) -> Option<FleetDriftTimeline> {
+        None
+    }
 }
 
 /// Minimal view a [`ProtoReplayer::quick_viability`] impl needs over
@@ -392,6 +435,141 @@ pub struct FlowView {
     pub client: Option<(std::net::Ipv4Addr, u16)>,
     pub server: Option<(std::net::Ipv4Addr, u16)>,
     pub saw_syn: bool,
+}
+
+/// Lightweight borrowed view of a reassembled TCP flow, passed to
+/// [`ProtoReplayer::analyze_flow`]. Sidesteps a hard `pcapload`
+/// dependency on `protoplay`: callers holding a `pcapload::ReassembledFlow`
+/// construct a snapshot with `FlowSnapshot { payload: &rf.payload,
+/// packet_offsets: &rf.packet_offsets }` on the call.
+#[derive(Debug, Clone, Copy)]
+pub struct FlowSnapshot<'a> {
+    /// TCP-reassembled byte stream of the one-sided flow.
+    pub payload: &'a [u8],
+    /// Byte-offset → packet-timestamp mapping, sorted by offset.
+    /// `(pkt_rel_ts_ns, byte_offset_where_that_packet's_payload_starts)`.
+    pub packet_offsets: &'a [(u64, usize)],
+}
+
+impl<'a> FlowSnapshot<'a> {
+    /// Return the relative (ns-from-pcap-start) timestamp of the packet
+    /// whose payload starts at or before `byte_offset`. Binary-searches
+    /// `packet_offsets` (which must be sorted by the offset field).
+    pub fn ts_for_byte(&self, byte_offset: usize) -> u64 {
+        let mut lo = 0usize;
+        let mut hi = self.packet_offsets.len();
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            if self.packet_offsets[mid].1 <= byte_offset {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if lo == 0 {
+            self.packet_offsets.first().map(|p| p.0).unwrap_or(0)
+        } else {
+            self.packet_offsets[lo - 1].0
+        }
+    }
+}
+
+/// Context the webui analyzer hands to a protocol's [`ProtoReplayer::analyze_flow`].
+/// Carries the per-run knobs (role, mode, timestamp epoch, tolerance) plus the
+/// run's full `proto_config` JSON — each protocol parses what it needs.
+#[derive(Debug, Clone)]
+pub struct AnalyzeCtx {
+    /// Which side outstation acted as: [`Role::Master`] (drove the client
+    /// side) or [`Role::Slave`] (drove the server side).
+    pub role: Role,
+    /// Whether to run the "correct mode" target-side diff (byte-level
+    /// target behaviour comparison vs the original server). When false,
+    /// only delivery + handshake are scored.
+    pub mode_correct: bool,
+    /// Absolute UTC epoch (ns since Unix epoch) of the captured pcap's
+    /// first packet. Added to per-byte relative timestamps by analyzers
+    /// that need absolute wall time (e.g. IEC 104 CP56Time2a drift).
+    pub captured_first_ts_ns: u64,
+    /// The well-known target port for this run (e.g. 2404 for IEC 104).
+    pub target_port: u16,
+    /// Same free-form string the run was configured with; each protocol
+    /// parses its own sub-object (e.g. IEC 104 reads `{"cp56": {...}}`).
+    pub proto_config: Option<String>,
+    /// Drift-tolerance knob passed separately because it's an analyzer-
+    /// only concept — not part of the run's proto_config (the runner
+    /// never needs it).
+    pub cp56_tolerance_ms: f64,
+}
+
+/// Per-slave result the analyzer shell gets back from [`ProtoReplayer::analyze_flow`].
+///
+/// The shell stitches these into the top-level `SlaveDetail` / `SlaveSummary`
+/// structures: the protocol-specific payload lands under
+/// `SlaveDetail.protocol_specific`, and the common fields drive the fleet
+/// rollup so the shell doesn't have to know any protocol vocabulary.
+#[derive(Debug, Clone)]
+pub struct ProtoSlaveAnalysis {
+    pub score_pct: f64,
+    pub verdict: &'static str,
+    pub verdict_reason: String,
+    /// How many protocol-level messages the original pcap expected the
+    /// playback side to deliver. IEC 104 = I-frame count; Modbus =
+    /// transaction count; DNP3 = fragment count; etc.
+    pub expected_messages: usize,
+    /// How many the captured pcap actually saw on the wire.
+    pub delivered_messages: usize,
+    /// Protocol-level "did the handshake complete" flag (IEC 104:
+    /// STARTDT_CON or _ACT seen; TLS: CertificateVerify+Finished; etc.).
+    /// Feeds the summary table's green/red dot.
+    pub handshake_ok: bool,
+    /// Per-slave notes appended to the core's own notes. Good place for
+    /// protocol-level observations (e.g. "live target replayed a subset
+    /// of the original script").
+    pub notes: Vec<String>,
+    /// Opaque protocol-specific drill-down JSON. Rendered by the proto's
+    /// UI fragment on the slave-detail page. Shape is entirely the
+    /// protocol's — for IEC 104: `{ playback, target, cp56_drift, timing, ... }`.
+    pub protocol_specific: serde_json::Value,
+    /// Per-message pacing-drift samples `[capture_wall_ms, drift_ms]`,
+    /// used by the core's fleet pacing timeline builder. Every protocol
+    /// has a "when should each message have gone out" concept, so this
+    /// is a generic field rather than protocol_specific.
+    pub pacing_samples: Vec<[f64; 2]>,
+}
+
+impl Default for ProtoSlaveAnalysis {
+    fn default() -> Self {
+        Self {
+            score_pct: 0.0,
+            verdict: "unknown",
+            verdict_reason: String::new(),
+            expected_messages: 0,
+            delivered_messages: 0,
+            handshake_ok: false,
+            notes: Vec::new(),
+            protocol_specific: serde_json::Value::Null,
+            pacing_samples: Vec::new(),
+        }
+    }
+}
+
+/// Protocol-agnostic time-series wrapper for fleet-level drift charts.
+///
+/// Returned by [`ProtoReplayer::aggregate_fleet_drift`]: each protocol
+/// decides what "drift" means (IEC 104 CP56Time2a stamp-vs-wire; Modbus
+/// transaction-round-trip; …) and packs its per-slave samples into this
+/// shape. The webui renders it with one template regardless of protocol.
+#[derive(Serialize, Debug, Clone)]
+pub struct FleetDriftTimeline {
+    /// `[capture_wall_ms, drift_ms]` per kept sample after decimation.
+    pub samples: Vec<[f64; 2]>,
+    /// Total samples observed before decimation (samples.len() will be ≤ this).
+    pub total_samples: usize,
+    /// True iff decimation discarded samples.
+    pub decimated: bool,
+    /// Wall-clock ms of each detected iteration boundary. Empty for
+    /// single-iteration runs. Lets the UI annotate the chart.
+    pub iteration_starts_ms: Vec<f64>,
 }
 
 /// Boilerplate helper for stub implementations.

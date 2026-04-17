@@ -23,7 +23,6 @@ use std::thread;
 mod analysis;
 mod db;
 use analysis::{analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
-use proto_iec104::asdu::{Cp56Zone, Iec104ProtoConfig};
 use db::{Db, StoredRun};
 
 use anyhow::Result;
@@ -100,6 +99,11 @@ pub struct RunState {
     /// Benchmark target port, 0 for raw.
     #[serde(default)]
     pub target_port: u16,
+    /// Name of the protocol replayer used for this run (matches
+    /// [`protoplay::ProtoReplayer::name`]). Surfaced so the analyser
+    /// can look up the right replayer via [`proto_registry::lookup`].
+    #[serde(default = "default_proto_name")]
+    pub proto: String,
     /// Free-form per-protocol JSON config the run was started with.
     /// Persisted so the post-run analyser can read protocol-specific
     /// settings (e.g. IEC 104 CP56 rewrite + zone).
@@ -166,6 +170,7 @@ fn runstate_to_stored(rs: &RunState) -> StoredRun {
         speed: rs.speed,
         top_speed: rs.top_speed,
         realtime: rs.realtime,
+        proto: Some(rs.proto.clone()),
         proto_config: rs.proto_config.clone(),
         planned: rs.planned,
         sent: rs.sent,
@@ -226,6 +231,10 @@ fn stored_to_runstate(s: &StoredRun) -> Option<RunState> {
         mode,
         role,
         target_port: s.target_port,
+        proto: s
+            .proto
+            .clone()
+            .unwrap_or_else(default_proto_name),
         proto_config: s.proto_config.clone(),
         planned: s.planned,
         sent: s.sent,
@@ -915,6 +924,11 @@ async fn api_run(
         mode: mode_str,
         role: role_str,
         target_port: target_port_for_state,
+        proto: if is_benchmark {
+            req.proto_name.clone()
+        } else {
+            default_proto_name()
+        },
         proto_config: req.proto_config.clone(),
         planned: 0,
         sent: 0,
@@ -1686,27 +1700,27 @@ async fn api_analyze(
     std::fs::write(&tmp_path, &bytes)
         .map_err(|e| AppError::Internal(format!("write tmp: {e}")))?;
 
-    // CP56 settings live inside the IEC 104 proto_config JSON now —
-    // parse them out for the analyser. Non-IEC-104 runs leave the
-    // proto_config either None or holding their own protocol's JSON;
-    // in either case Iec104ProtoConfig::parse returns sensible defaults.
-    let cp56_cfg = Iec104ProtoConfig::parse(rs.proto_config.as_deref()).cp56;
-    let rewrite_cp56_was_on = cp56_cfg.rewrite_to_now;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
+    // Look up the replayer for this run's protocol. The analyzer
+    // dispatches CP56 / ASDU / handshake logic through the replayer's
+    // `analyze_flow` method, so each protocol parses whatever it needs
+    // out of `rs.proto_config` itself.
+    let replayer = proto_registry::lookup(&rs.proto)
+        .ok_or_else(|| AppError::BadRequest(format!("unknown protocol: {}", rs.proto)))?;
+    let proto_config = rs.proto_config.clone();
     let report = tokio::task::spawn_blocking({
         let original_pcap = rs.pcap.clone();
         let tmp_path = tmp_path.clone();
         let run_id = rs.id;
         move || {
             analyze(
+                replayer.as_ref(),
                 &original_pcap,
                 &tmp_path,
                 run_id,
                 target_port,
                 role_hint,
                 mode,
-                rewrite_cp56_was_on,
-                cp56_zone,
+                proto_config,
                 cp56_tolerance_ms,
             )
         }

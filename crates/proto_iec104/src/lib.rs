@@ -9,10 +9,14 @@
 //! rewriting is the `proto_config` JSON field — a follow-up will parse
 //! the ASDU header, apply rewrites, and reserialize before send.
 
+use std::collections::BTreeMap;
+
 use protoplay::{
-    LoadedPcapView, ProtoReplayer, ProtoReport, ProtoRunCfg, ProtoViability, Readiness, Role,
+    AnalyzeCtx, FleetDriftTimeline, FlowSnapshot, LoadedPcapView, ProtoReplayer, ProtoReport,
+    ProtoRunCfg, ProtoSlaveAnalysis, ProtoViability, Readiness, Role,
 };
 
+pub mod analysis;
 pub mod apdu;
 pub mod asdu;
 pub mod session;
@@ -245,5 +249,30 @@ impl ProtoReplayer for Iec104Replayer {
             verdict_reason,
             notes,
         }
+    }
+
+    /// IEC 104 analyzer: walk playback vs target, both original vs
+    /// captured, emit playback / target / timing / cp56_drift sub-
+    /// reports. Delegates to [`analysis::analyze_iec104_flow`].
+    fn analyze_flow(
+        &self,
+        orig_playback: Option<FlowSnapshot>,
+        cap_playback: Option<FlowSnapshot>,
+        orig_target: Option<FlowSnapshot>,
+        cap_target: Option<FlowSnapshot>,
+        ctx: &AnalyzeCtx,
+    ) -> ProtoSlaveAnalysis {
+        analysis::analyze_iec104_flow(orig_playback, cap_playback, orig_target, cap_target, ctx)
+    }
+
+    /// IEC 104 fleet-level drift aggregator: reads each slave's
+    /// `cp56_drift.{drift_samples_ms, sample_wall_ms}` arrays from
+    /// `protocol_specific`, merges + decimates.
+    fn aggregate_fleet_drift(
+        &self,
+        per_slave: &BTreeMap<String, serde_json::Value>,
+        iteration_starts_ms: &[f64],
+    ) -> Option<FleetDriftTimeline> {
+        analysis::aggregate_iec104_fleet_drift(per_slave, iteration_starts_ms)
     }
 }

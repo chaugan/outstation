@@ -57,6 +57,10 @@ pub struct StoredRun {
     pub speed: f64,
     pub top_speed: bool,
     pub realtime: bool,
+    /// Name of the protocol replayer the run used (e.g. `"iec104"`).
+    /// Optional — legacy rows without this column fall back to
+    /// `"iec104"` since that was the only shipped protocol.
+    pub proto: Option<String>,
     /// Free-form JSON the run was started with as the protocol
     /// replayer's `proto_config`. Persisted so the post-run analyser
     /// can read protocol-specific settings (e.g. IEC 104 CP56 rewrite
@@ -126,6 +130,7 @@ impl Db {
             [],
         );
         let _ = conn.execute("ALTER TABLE runs ADD COLUMN proto_config TEXT", []);
+        let _ = conn.execute("ALTER TABLE runs ADD COLUMN proto TEXT", []);
         Ok(Self {
             conn: Arc::new(Mutex::new(conn)),
         })
@@ -139,8 +144,8 @@ impl Db {
             "INSERT OR REPLACE INTO runs
              (id, started_at, status, pcap, target_ip, target_mac, mode, role,
               target_port, speed, top_speed, realtime, planned, sent, bytes,
-              proto_config)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+              proto_config, proto)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
             params![
                 run.id as i64,
                 run.started_at as i64,
@@ -158,6 +163,7 @@ impl Db {
                 run.sent as i64,
                 run.bytes as i64,
                 run.proto_config,
+                run.proto,
             ],
         )?;
         Ok(())
@@ -238,12 +244,13 @@ impl Db {
             "SELECT id, started_at, status, pcap, target_ip, target_mac, mode, role,
                     target_port, speed, top_speed, realtime, planned, sent, bytes,
                     error, report_json, benchmark_json, per_source_json, throughput_json,
-                    proto_config, rewrite_cp56_to_now, cp56_zone
+                    proto_config, rewrite_cp56_to_now, cp56_zone, proto
              FROM runs
              ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             let proto_config_raw: Option<String> = row.get(20).ok();
+            let proto: Option<String> = row.get::<_, Option<String>>(23).ok().flatten();
             // Legacy IEC 104 columns. Optional because future schemas
             // may drop them entirely; tolerate absence by mapping to None.
             let legacy_rewrite: Option<bool> = row
@@ -290,6 +297,7 @@ impl Db {
                 per_source_json: row.get(18)?,
                 throughput_json: row.get(19)?,
                 proto_config,
+                proto,
             })
         })?;
         let mut out = Vec::new();
