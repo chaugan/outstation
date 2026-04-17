@@ -125,16 +125,6 @@ pub struct SlaveDetail {
     /// [`analyze_flow`](protoplay::ProtoReplayer::analyze_flow). The
     /// matching UI renderer in `static/<proto>_ui.js` walks this blob.
     pub protocol_specific: serde_json::Value,
-    /// Top-level shortcuts into `protocol_specific` so pre-refactor
-    /// UI code (`d.playback / d.target / d.timing / d.cp56_drift`) keeps
-    /// rendering unchanged. The proto's analyzer decides which keys to
-    /// surface — for IEC 104 it's these four; other protocols can
-    /// supply their own and the UI's renderer will walk them. The
-    /// `flatten` serialization means these keys are emitted at the
-    /// same level as `tcp_flow`/`verdict`/etc., preserving the pre-
-    /// refactor JSON shape.
-    #[serde(flatten)]
-    pub protocol_fields: serde_json::Map<String, serde_json::Value>,
     pub verdict: &'static str,
     pub verdict_reason: String,
     pub score_pct: f64,
@@ -552,11 +542,9 @@ fn analyze_one_slave(
             let verdict_reason = format!(
                 "no TCP flow on port {target_port} for slave {slave_ip} in captured pcap"
             );
-            let protocol_fields = top_level_shortcuts(&analysis.protocol_specific);
             let detail = SlaveDetail {
                 tcp_flow: None,
                 protocol_specific: analysis.protocol_specific,
-                protocol_fields,
                 verdict: "not_attempted",
                 verdict_reason: verdict_reason.clone(),
                 score_pct: 0.0,
@@ -622,11 +610,9 @@ fn analyze_one_slave(
         packets: flow_info.packets,
         startdt_handshake_ok: analysis.handshake_ok,
     };
-    let protocol_fields = top_level_shortcuts(&analysis.protocol_specific);
     let detail = SlaveDetail {
         tcp_flow: Some(flow_info),
         protocol_specific: analysis.protocol_specific,
-        protocol_fields,
         verdict: analysis.verdict,
         verdict_reason: analysis.verdict_reason,
         score_pct: analysis.score_pct,
@@ -634,19 +620,6 @@ fn analyze_one_slave(
         pacing_samples: analysis.pacing_samples,
     };
     Ok((summary, detail))
-}
-
-/// Copy top-level sub-objects of `protocol_specific` into a flat map so
-/// the JSON response keeps emitting them at the same level as the
-/// generic fields. Keeps pre-refactor UI renderers working unchanged;
-/// `protocol_specific` remains the canonical location.
-fn top_level_shortcuts(
-    protocol_specific: &serde_json::Value,
-) -> serde_json::Map<String, serde_json::Value> {
-    match protocol_specific.as_object() {
-        Some(m) => m.clone(),
-        None => serde_json::Map::new(),
-    }
 }
 
 /// Resolve (playback, target) flow references from (client, server)

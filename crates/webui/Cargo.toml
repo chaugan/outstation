@@ -21,5 +21,4 @@ pcapload = { path = "../pcapload" }
 sched = { path = "../sched" }
 netctl = { path = "../netctl" }
 protoplay = { path = "../protoplay" }
-proto_iec104 = { path = "../proto_iec104" }
 proto_registry = { path = "../proto_registry" }

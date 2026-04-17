@@ -41,7 +41,12 @@ use sched::{
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
-const EMBEDDED_HTML: &str = include_str!("index.html");
+// Populated by `build.rs` after it splices each proto crate's
+// `static/*.js` into the `@@PROTO_STATIC_JS@@` placeholder in
+// `src/index.html`. Having the served HTML come out of OUT_DIR means
+// adding a new protocol is just dropping a `static/<name>_ui.js`
+// file under its crate — no webui edits required.
+const EMBEDDED_HTML: &str = include_str!(concat!(env!("OUT_DIR"), "/index.html"));
 const EMBEDDED_ECHARTS: &str = include_str!("echarts.min.js");
 
 #[derive(Clone)]
