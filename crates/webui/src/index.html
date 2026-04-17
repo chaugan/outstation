@@ -1756,7 +1756,7 @@
         <div style="margin-top:14px">
           <label style="font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);display:block;margin-bottom:4px">CP56 drift tolerance (ms)</label>
           <input id="an-cp56-tol" type="number" min="0" step="10" value="50" style="width:90px" title="Max acceptable |stamp \u2212 wire| difference. 50 ms is tight (intra-host); 200 ms is realistic when capture and replayer are different machines or VMs. Only used when the run had fresh-timestamps enabled.">
-          <span class="muted" style="font-family:var(--mono);font-size:11px;margin-left:8px">default 50 \u00b7 raise to 200 for cross-host capture</span>
+          <span class="muted" style="font-family:var(--mono);font-size:11px;margin-left:8px">default 50 &middot; raise to 200 for cross-host capture</span>
         </div>
         <div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap">
           <button class="primary" id="an-run-btn" onclick="runAnalysis()" disabled>ANALYZE</button>
