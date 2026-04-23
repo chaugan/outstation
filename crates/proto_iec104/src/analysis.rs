@@ -32,8 +32,13 @@ use crate::apdu::{
     U_TESTFR_CON,
 };
 use crate::asdu::{
-    cp56_offset_in_element, decode_cp56time2a, decode_cp56time2a_local, element_len, vsq,
-    Cp56Zone, Iec104ProtoConfig, DUI_LEN, IOA_LEN,
+    common_address, cot_value, cp56_offset_in_element, decode_cp56time2a, decode_cp56time2a_local,
+    element_len, vsq, Cp56Zone, Iec104ProtoConfig, DUI_LEN, IOA_LEN,
+};
+use crate::inventory::Inventory;
+use crate::responder::{
+    build_ci_response, build_gi_response, RequestEcho, COT_ACT_CON, COT_ACT_TERM,
+    COT_INROGEN_STATION, COT_REQCOGEN, COT_REQCO_GROUP_BASE,
 };
 
 /// Cap on points emitted in the fleet drift timeline. Aggregates
@@ -171,10 +176,22 @@ pub fn analyze_iec104_flow(
         .as_ref()
         .map(|rf| extract_iframes(rf.payload))
         .unwrap_or_default();
-    let delivered_iframes: Vec<Vec<u8>> = cap_playback
+    let delivered_iframes_all: Vec<Vec<u8>> = cap_playback
         .as_ref()
         .map(|rf| extract_iframes(rf.payload))
         .unwrap_or_default();
+    let delivered_total = delivered_iframes_all.len();
+    let delivered_iframes: Vec<Vec<u8>> = delivered_iframes_all
+        .into_iter()
+        .filter(|asdu| !is_gi_ci_response_frame(asdu))
+        .collect();
+    let synthesized_excluded = delivered_total - delivered_iframes.len();
+    if synthesized_excluded > 0 {
+        notes.push(format!(
+            "excluded {} I-frames belonging to synthesized GI/CI responses from the playback comparison",
+            synthesized_excluded
+        ));
+    }
 
     let expected_tids: Vec<u8> = expected_iframes
         .iter()
@@ -189,37 +206,83 @@ pub fn analyze_iec104_flow(
     let mut byte_identical = 0usize;
     let mut cp56_only = 0usize;
     let mut mismatches: Vec<IFrameDiff> = Vec::new();
-    let cmp_len = expected_tids.len().min(delivered_tids.len());
+    // Loop-aware comparison: when `delivered.len() > expected.len()`
+    // the slave is replaying the script multiple times in a single
+    // session (loop_within_session). Compare each delivered frame
+    // against `expected[i % expected.len()]` so a clean N×replay
+    // doesn't read as N×100% mismatches.
+    let cmp_len = if expected_tids.is_empty() {
+        0
+    } else {
+        delivered_tids.len()
+    };
+    let observed_iterations = if expected_tids.is_empty() {
+        0
+    } else {
+        delivered_tids.len() / expected_tids.len()
+    };
+    let trailing_partial = if expected_tids.is_empty() {
+        0
+    } else {
+        delivered_tids.len() % expected_tids.len()
+    };
     for i in 0..cmp_len {
-        if expected_tids[i] == delivered_tids[i] {
+        let src_idx = i % expected_tids.len();
+        if expected_tids[src_idx] == delivered_tids[i] {
             matched_type_ids += 1;
-            match compare_asdu(&expected_iframes[i], &delivered_iframes[i]) {
+            match compare_asdu(&expected_iframes[src_idx], &delivered_iframes[i]) {
                 AsduCmp::Identical => byte_identical += 1,
                 AsduCmp::Cp56Only => cp56_only += 1,
                 AsduCmp::Different => mismatches.push(IFrameDiff {
                     index: i,
-                    expected_type_id: expected_tids[i],
+                    expected_type_id: expected_tids[src_idx],
                     actual_type_id: delivered_tids[i],
-                    expected_asdu_hex: to_hex(&expected_iframes[i]),
+                    expected_asdu_hex: to_hex(&expected_iframes[src_idx]),
                     actual_asdu_hex: to_hex(&delivered_iframes[i]),
                 }),
             }
         } else {
             mismatches.push(IFrameDiff {
                 index: i,
-                expected_type_id: expected_tids[i],
+                expected_type_id: expected_tids[src_idx],
                 actual_type_id: delivered_tids[i],
-                expected_asdu_hex: to_hex(&expected_iframes[i]),
+                expected_asdu_hex: to_hex(&expected_iframes[src_idx]),
                 actual_asdu_hex: to_hex(&delivered_iframes[i]),
             });
         }
     }
     let real_mismatch_count = mismatches.len();
-    let missing_indices: Vec<usize> = if delivered_tids.len() < expected_tids.len() {
+    // Only the LAST (trailing partial) iteration counts as "missing":
+    // every full iteration covers the full expected set.
+    let missing_indices: Vec<usize> = if observed_iterations >= 1 && trailing_partial > 0 {
+        (trailing_partial..expected_tids.len()).collect()
+    } else if observed_iterations == 0 {
+        // Captured fewer than one full script — old single-run behaviour.
         (delivered_tids.len()..expected_tids.len()).collect()
     } else {
         Vec::new()
     };
+
+    // sequence_match is true iff every delivered I-frame matches its
+    // source-modular counterpart. For multi-iteration runs that means
+    // every loop is a clean replay; for single runs it's the legacy
+    // "every expected frame had its delivered counterpart" check.
+    let sequence_match = real_mismatch_count == 0
+        && matched_type_ids > 0
+        && (
+            (observed_iterations >= 1 && trailing_partial == 0)
+            || (observed_iterations == 0
+                && matched_type_ids == expected_tids.len()
+                && matched_type_ids == delivered_tids.len())
+        );
+
+    if observed_iterations > 1 {
+        notes.push(format!(
+            "captured stream contains {} full iterations of the source script ({} frames each); each delivered frame compared against its source-modular counterpart",
+            observed_iterations,
+            expected_tids.len()
+        ));
+    }
 
     let playback = PlaybackReport {
         direction: match ctx.role {
@@ -229,8 +292,7 @@ pub fn analyze_iec104_flow(
         expected_iframes: expected_iframes.len(),
         delivered_iframes: delivered_iframes.len(),
         matched_type_ids,
-        type_id_sequence_match: matched_type_ids == expected_tids.len()
-            && matched_type_ids == delivered_tids.len(),
+        type_id_sequence_match: sequence_match,
         byte_identical_count: byte_identical,
         cp56_only_count: cp56_only,
         real_mismatch_count,
@@ -416,6 +478,20 @@ pub fn analyze_iec104_flow(
         );
     }
 
+    // --- GI / CI audit (only meaningful in slave role, where the
+    // master sends interrogations and the slave-replayer synthesizes
+    // responses). Source-pcap inventory rebuilt from `orig_playback`.
+    let gi_ci_audit = match (ctx.role, cap_target.as_ref(), cap_playback.as_ref()) {
+        (Role::Slave, Some(t), Some(p)) => {
+            let mut inv = Inventory::default();
+            if let Some(orig) = orig_playback.as_ref() {
+                inv.ingest_payload(orig.payload);
+            }
+            Some(audit_master_commands(t, p, &inv))
+        }
+        _ => None,
+    };
+
     // --- Verdict ---
     let (verdict, reason, score) = decide_verdict(&playback, &target, ctx.mode_correct, &notes);
 
@@ -424,6 +500,7 @@ pub fn analyze_iec104_flow(
         "target": target,
         "timing": timing,
         "cp56_drift": cp56_drift,
+        "gi_ci_audit": gi_ci_audit,
     });
 
     ProtoSlaveAnalysis {
@@ -645,6 +722,14 @@ fn iframe_gap_timings(flow: &FlowSnapshot) -> Vec<f64> {
             continue;
         }
         let ln = payload[i + 1] as usize;
+        // APCI must be at least 4 control-field bytes; anything less
+        // is junk we mis-anchored on and would underflow the asdu
+        // slice. Skip and try the next byte instead of bailing — keeps
+        // the walker robust on midflow / desynced streams.
+        if ln < 4 {
+            i += 1;
+            continue;
+        }
         if i + 2 + ln > payload.len() {
             break;
         }
@@ -677,6 +762,14 @@ fn iframe_wall_times_ms(flow: &FlowSnapshot) -> Vec<f64> {
             continue;
         }
         let ln = payload[i + 1] as usize;
+        // APCI must be at least 4 control-field bytes; anything less
+        // is junk we mis-anchored on and would underflow the asdu
+        // slice. Skip and try the next byte instead of bailing — keeps
+        // the walker robust on midflow / desynced streams.
+        if ln < 4 {
+            i += 1;
+            continue;
+        }
         if i + 2 + ln > payload.len() {
             break;
         }
@@ -724,6 +817,14 @@ fn compute_cp56_drift(
             continue;
         }
         let ln = payload[i + 1] as usize;
+        // APCI must be at least 4 control-field bytes; anything less
+        // is junk we mis-anchored on and would underflow the asdu
+        // slice. Skip and try the next byte instead of bailing — keeps
+        // the walker robust on midflow / desynced streams.
+        if ln < 4 {
+            i += 1;
+            continue;
+        }
         if i + 2 + ln > payload.len() {
             break;
         }
@@ -979,6 +1080,27 @@ fn decide_verdict(
             100.0,
         );
     }
+    // Loop-aware: a clean N×replay shows up as
+    // `delivered_iframes = expected_iframes × N` with every delivered
+    // frame matching its source-modular counterpart (sequence_match
+    // picks this up). Treat as a good delivery rather than partial.
+    if pb.expected_iframes > 0
+        && pb.delivered_iframes >= pb.expected_iframes
+        && pb.delivered_iframes % pb.expected_iframes == 0
+        && pb.type_id_sequence_match
+        && pb.real_mismatch_count == 0
+        && tg.startdt_handshake_ok
+    {
+        let n = pb.delivered_iframes / pb.expected_iframes;
+        return (
+            "good_delivery",
+            format!(
+                "{} clean iterations × {} I-frames delivered (loop-within-session); STARTDT ok, zero protocol deviations",
+                n, pb.expected_iframes
+            ),
+            100.0,
+        );
+    }
     if pb.matched_type_ids > 0 && pb.matched_type_ids < pb.expected_iframes {
         return (
             "partial_delivery",
@@ -1069,6 +1191,436 @@ pub fn classify_script(
         return "subset";
     }
     "divergent"
+}
+
+// ---------------------------------------------------------------------
+// GI / CI audit — pairs master-side requests with slave-side responses
+// and judges spec compliance against four criteria. Used to:
+//   1. Surface synthesized GI/CI exchanges as their own first-class
+//      report section (`protocol_specific.gi_ci_audit`).
+//   2. Drive the per-event verdict shown in the slave detail UI.
+// The byte-for-byte expected response is regenerated from the source-
+// pcap inventory using `responder::build_gi_response` /
+// `build_ci_response`, the same code path the live slave-replayer uses
+// — so the analyzer and the replayer agree on what "spec-correct"
+// means.
+// ---------------------------------------------------------------------
+
+/// IEC 60870-5-104 §5.3 default t1 = 15s. Used as the upper bound on
+/// the ActCon delay that still counts as compliant.
+const T1_MS_RECOMMENDED: f64 = 15_000.0;
+
+/// Reasonable upper bound on how long after the last data frame an
+/// ActTerm may arrive while still counting the response as compliant.
+const ACTTERM_DELAY_MS_RECOMMENDED: f64 = 10_000.0;
+
+#[derive(Serialize, Debug, Clone)]
+pub struct GiCiEvent {
+    /// "GI" for C_IC_NA_1 (type 100), "CI" for C_CI_NA_1 (type 101).
+    pub kind: &'static str,
+    /// Wall-clock time (ms from capture start) the master sent the request.
+    pub request_ts_ms: f64,
+    /// QOI byte (GI) or QCC byte (CI) carried in the request.
+    pub qualifier: u8,
+    pub ca: u16,
+    pub oa: u8,
+    pub actcon_present: bool,
+    pub actcon_delay_ms: Option<f64>,
+    pub data_frame_count: usize,
+    pub data_element_count: usize,
+    pub actterm_present: bool,
+    /// Delay between the last data frame and the ActTerm (or between
+    /// ActCon and ActTerm if the response carried no data).
+    pub actterm_delay_ms: Option<f64>,
+    /// Every observed data frame carried the COT bucket the spec
+    /// expects for this qualifier (e.g. COT 22 for QOI 22).
+    pub all_cots_match_bucket: bool,
+    /// Slave's actual data frames matched the inventory-derived
+    /// expected response byte-for-byte (CP56-only diffs allowed).
+    pub bytewise_matches_inventory: bool,
+    /// Element count the inventory-derived expected response would
+    /// have carried.
+    pub expected_data_element_count: usize,
+    /// Aggregated verdict — "compliant", "partial", or "non_compliant".
+    pub verdict: &'static str,
+    pub notes: Vec<String>,
+}
+
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct GiCiAudit {
+    pub gi_total: usize,
+    pub gi_compliant: usize,
+    pub gi_partial: usize,
+    pub gi_non_compliant: usize,
+    pub ci_total: usize,
+    pub ci_compliant: usize,
+    pub ci_partial: usize,
+    pub ci_non_compliant: usize,
+    pub events: Vec<GiCiEvent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RequestRec {
+    ts_ms: f64,
+    type_id: u8,
+    qualifier: u8,
+    ca: u16,
+    oa: u8,
+    cot_byte: u8,
+}
+
+#[derive(Debug, Clone)]
+struct SlaveFrame {
+    ts_ms: f64,
+    type_id: u8,
+    cot_low: u8,
+    ca: u16,
+    element_count: usize,
+    asdu: Vec<u8>,
+}
+
+/// Walk a raw APDU stream and yield each I-frame as
+/// `(frame_byte_offset, asdu_bytes)`.
+fn iter_iframes_with_offset(flow: &FlowSnapshot) -> Vec<(usize, Vec<u8>)> {
+    let payload = flow.payload;
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    while i + 6 <= payload.len() {
+        if payload[i] != 0x68 {
+            i += 1;
+            continue;
+        }
+        let ln = payload[i + 1] as usize;
+        // APCI must be at least 4 control-field bytes; anything less
+        // is junk we mis-anchored on and would underflow the asdu
+        // slice. Skip and try the next byte instead of bailing — keeps
+        // the walker robust on midflow / desynced streams.
+        if ln < 4 {
+            i += 1;
+            continue;
+        }
+        if i + 2 + ln > payload.len() {
+            break;
+        }
+        let cf1 = payload[i + 2];
+        if cf1 & 0x01 == 0 {
+            let asdu_start = i + 6;
+            let asdu_end = i + 2 + ln;
+            if asdu_end <= payload.len() && asdu_start <= asdu_end {
+                out.push((i, payload[asdu_start..asdu_end].to_vec()));
+            }
+        }
+        i += 2 + ln;
+    }
+    out
+}
+
+fn count_elements(asdu: &[u8]) -> usize {
+    let (_sq, n) = vsq(asdu);
+    n as usize
+}
+
+fn collect_master_requests(flow: &FlowSnapshot) -> Vec<RequestRec> {
+    let mut out = Vec::new();
+    for (frame_off, asdu) in iter_iframes_with_offset(flow) {
+        if asdu.len() < DUI_LEN + IOA_LEN + 1 {
+            continue;
+        }
+        let type_id = asdu[0];
+        if type_id != 100 && type_id != 101 {
+            continue;
+        }
+        // COT 6 = activation request.
+        if cot_value(&asdu) != 6 {
+            continue;
+        }
+        out.push(RequestRec {
+            ts_ms: flow.ts_for_byte(frame_off) as f64 / 1e6,
+            type_id,
+            qualifier: asdu[DUI_LEN + IOA_LEN],
+            ca: common_address(&asdu),
+            oa: asdu[3],
+            cot_byte: asdu[2],
+        });
+    }
+    out
+}
+
+fn collect_slave_frames(flow: &FlowSnapshot) -> Vec<SlaveFrame> {
+    let mut out = Vec::new();
+    for (frame_off, asdu) in iter_iframes_with_offset(flow) {
+        if asdu.len() < DUI_LEN {
+            continue;
+        }
+        out.push(SlaveFrame {
+            ts_ms: flow.ts_for_byte(frame_off) as f64 / 1e6,
+            type_id: asdu[0],
+            cot_low: cot_value(&asdu),
+            ca: common_address(&asdu),
+            element_count: count_elements(&asdu),
+            asdu,
+        });
+    }
+    out
+}
+
+fn expected_data_cot_for_request(req: &RequestRec) -> u8 {
+    if req.type_id == 100 {
+        match req.qualifier {
+            20 => COT_INROGEN_STATION,
+            g @ 21..=36 => g,
+            _ => COT_INROGEN_STATION,
+        }
+    } else {
+        let qcq = req.qualifier & 0x3f;
+        match qcq {
+            5 => COT_REQCOGEN,
+            g @ 1..=4 => COT_REQCO_GROUP_BASE + (g - 1),
+            _ => COT_REQCOGEN,
+        }
+    }
+}
+
+/// Pair every master-side request with its slave-side response burst
+/// (ActCon → data frames → ActTerm), then judge each pairing against
+/// the four spec-compliance criteria.
+pub fn audit_master_commands(
+    cap_target: &FlowSnapshot,
+    cap_playback: &FlowSnapshot,
+    src_inv: &Inventory,
+) -> GiCiAudit {
+    let requests = collect_master_requests(cap_target);
+    let slave_frames = collect_slave_frames(cap_playback);
+    let mut audit = GiCiAudit::default();
+    let mut search_cursor = 0usize;
+
+    for req in &requests {
+        let kind: &'static str = if req.type_id == 100 { "GI" } else { "CI" };
+        let mut event = GiCiEvent {
+            kind,
+            request_ts_ms: req.ts_ms,
+            qualifier: req.qualifier,
+            ca: req.ca,
+            oa: req.oa,
+            actcon_present: false,
+            actcon_delay_ms: None,
+            data_frame_count: 0,
+            data_element_count: 0,
+            actterm_present: false,
+            actterm_delay_ms: None,
+            all_cots_match_bucket: true,
+            bytewise_matches_inventory: false,
+            expected_data_element_count: 0,
+            verdict: "non_compliant",
+            notes: Vec::new(),
+        };
+
+        // Find the first ActCon for the matching (type, ca) at or
+        // after the request's wall time.
+        let actcon_idx = (search_cursor..slave_frames.len()).find(|&i| {
+            let f = &slave_frames[i];
+            f.type_id == req.type_id
+                && f.cot_low == COT_ACT_CON
+                && f.ca == req.ca
+                && f.ts_ms + 0.5 >= req.ts_ms
+        });
+
+        let Some(ac_idx) = actcon_idx else {
+            event.notes.push("no matching ActCon found in slave-side stream".into());
+            push_event(&mut audit, event);
+            continue;
+        };
+        let actcon = &slave_frames[ac_idx];
+        event.actcon_present = true;
+        event.actcon_delay_ms = Some(actcon.ts_ms - req.ts_ms);
+
+        // Find the matching ActTerm or the next ActCon for the same
+        // (type, ca) — whichever comes first bounds the event window.
+        let mut term_idx: Option<usize> = None;
+        let mut window_end = slave_frames.len();
+        for j in (ac_idx + 1)..slave_frames.len() {
+            let f = &slave_frames[j];
+            if f.ca == req.ca && f.type_id == req.type_id {
+                if f.cot_low == COT_ACT_TERM {
+                    term_idx = Some(j);
+                    window_end = j;
+                    break;
+                }
+                if f.cot_low == COT_ACT_CON {
+                    window_end = j;
+                    break;
+                }
+            }
+        }
+
+        let expected_cot = expected_data_cot_for_request(req);
+        let mut last_data_ts: Option<f64> = None;
+        let mut data_frames: Vec<&SlaveFrame> = Vec::new();
+        for j in (ac_idx + 1)..window_end {
+            let f = &slave_frames[j];
+            if f.ca != req.ca {
+                continue;
+            }
+            let in_kind_bucket = if req.type_id == 100 {
+                (20..=36).contains(&f.cot_low)
+            } else {
+                (37..=41).contains(&f.cot_low)
+            };
+            if !in_kind_bucket {
+                continue;
+            }
+            event.data_frame_count += 1;
+            event.data_element_count += f.element_count;
+            if f.cot_low != expected_cot {
+                event.all_cots_match_bucket = false;
+            }
+            data_frames.push(f);
+            last_data_ts = Some(f.ts_ms);
+        }
+
+        if let Some(ti) = term_idx {
+            event.actterm_present = true;
+            let basis = last_data_ts.unwrap_or(actcon.ts_ms);
+            event.actterm_delay_ms = Some(slave_frames[ti].ts_ms - basis);
+        } else {
+            event.notes.push("no matching ActTerm found in slave-side stream".into());
+        }
+
+        // Bytewise verification against the source-inventory expected
+        // response. CP56-only diffs are accepted (the slave may have
+        // rewritten timestamps to the wire-send moment).
+        let echo = RequestEcho {
+            ca: req.ca,
+            oa: req.oa,
+            test: req.cot_byte & 0x80 != 0,
+            negative: req.cot_byte & 0x40 != 0,
+        };
+        let expected: Vec<Vec<u8>> = if req.type_id == 100 {
+            build_gi_response(src_inv, echo, req.qualifier)
+        } else {
+            build_ci_response(src_inv, echo, req.qualifier)
+        };
+        let expected_data: &[Vec<u8>] = if expected.len() >= 2 {
+            &expected[1..expected.len() - 1]
+        } else {
+            &[]
+        };
+        event.expected_data_element_count =
+            expected_data.iter().map(|a| count_elements(a)).sum();
+        event.bytewise_matches_inventory = expected_data.len() == data_frames.len()
+            && expected_data.iter().zip(data_frames.iter()).all(|(exp, got)| {
+                matches!(
+                    compare_asdu(exp, &got.asdu),
+                    AsduCmp::Identical | AsduCmp::Cp56Only
+                )
+            });
+
+        let actcon_ok = event
+            .actcon_delay_ms
+            .map(|d| d.abs() <= T1_MS_RECOMMENDED)
+            .unwrap_or(false);
+        let actterm_ok = event
+            .actterm_delay_ms
+            .map(|d| d.abs() <= ACTTERM_DELAY_MS_RECOMMENDED)
+            .unwrap_or(false);
+        let cots_ok = event.all_cots_match_bucket;
+        let bytes_ok = event.bytewise_matches_inventory;
+
+        event.verdict = if actcon_ok && actterm_ok && cots_ok && bytes_ok {
+            "compliant"
+        } else if !actcon_ok || !event.actterm_present {
+            "non_compliant"
+        } else {
+            "partial"
+        };
+
+        if !cots_ok {
+            event.notes.push(format!(
+                "one or more data frames carried a COT outside the expected bucket (expected {})",
+                expected_cot
+            ));
+        }
+        if !bytes_ok {
+            event.notes.push(format!(
+                "data frames did not match inventory-derived expected response ({} actual vs {} expected frames)",
+                data_frames.len(),
+                expected_data.len()
+            ));
+            // Diagnostic: dump the first diverging frame pair as hex
+            // so the UI / JSON consumer can see exactly what differs.
+            // Capped to keep payloads manageable (≤256 hex chars per side).
+            for (i, (exp, got)) in expected_data.iter().zip(data_frames.iter()).enumerate() {
+                if matches!(
+                    compare_asdu(exp, &got.asdu),
+                    AsduCmp::Different
+                ) {
+                    let cap = |b: &[u8]| -> String {
+                        let n = b.len().min(128);
+                        let mut s = String::with_capacity(n * 2);
+                        for x in &b[..n] {
+                            s.push_str(&format!("{:02x}", x));
+                        }
+                        if b.len() > n {
+                            s.push_str("…");
+                        }
+                        s
+                    };
+                    event
+                        .notes
+                        .push(format!("diverging frame #{}: expected={} actual={}", i, cap(exp), cap(&got.asdu)));
+                    break;
+                }
+            }
+        }
+
+        // Advance cursor past this event so a subsequent request with
+        // the same CA cannot reuse our ActCon.
+        search_cursor = term_idx.map(|i| i + 1).unwrap_or(window_end);
+
+        push_event(&mut audit, event);
+    }
+
+    audit
+}
+
+fn push_event(audit: &mut GiCiAudit, ev: GiCiEvent) {
+    match ev.kind {
+        "GI" => {
+            audit.gi_total += 1;
+            match ev.verdict {
+                "compliant" => audit.gi_compliant += 1,
+                "partial" => audit.gi_partial += 1,
+                _ => audit.gi_non_compliant += 1,
+            }
+        }
+        "CI" => {
+            audit.ci_total += 1;
+            match ev.verdict {
+                "compliant" => audit.ci_compliant += 1,
+                "partial" => audit.ci_partial += 1,
+                _ => audit.ci_non_compliant += 1,
+            }
+        }
+        _ => {}
+    }
+    audit.events.push(ev);
+}
+
+/// True when this ASDU is part of a synthesized GI/CI response —
+/// either the C_IC/C_CI ActCon/ActTerm echo or any data frame in the
+/// inrogen / reqcogen COT buckets. The playback comparison filters
+/// these out so ad-hoc interrogations triggered by a live SCADA master
+/// don't show up as false-positive mismatches against the source pcap.
+pub fn is_gi_ci_response_frame(asdu: &[u8]) -> bool {
+    if asdu.len() < DUI_LEN {
+        return false;
+    }
+    let type_id = asdu[0];
+    let cot = cot_value(asdu);
+    if (type_id == 100 || type_id == 101) && (cot == COT_ACT_CON || cot == COT_ACT_TERM) {
+        return true;
+    }
+    (20..=36).contains(&cot) || (37..=41).contains(&cot)
 }
 
 #[cfg(test)]
@@ -1243,5 +1795,173 @@ mod tests {
             packet_offsets: &packet_offsets,
         };
         assert!(compute_cp56_drift(&flow, 0, Cp56Zone::Utc, 50.0).is_none());
+    }
+
+    fn wrap_iframe(asdu: &[u8], ns: u16, nr: u16) -> Vec<u8> {
+        let len = asdu.len() + 4;
+        let mut out = Vec::with_capacity(2 + len);
+        out.push(0x68);
+        out.push(len as u8);
+        out.push(((ns & 0x7f) << 1) as u8); // I-frame: cf1 LSB = 0
+        out.push((ns >> 7) as u8);
+        out.push(((nr & 0x7f) << 1) as u8);
+        out.push((nr >> 7) as u8);
+        out.extend_from_slice(asdu);
+        out
+    }
+
+    #[test]
+    fn audit_pairs_request_with_compliant_response() {
+        // Inventory: one M_ME_NC_1 (type 13) point at CA=1, IOA=100,
+        // tagged Station-eligible via COT=20 ingestion.
+        let mut inv = Inventory::default();
+        let elem = element_len(13).unwrap();
+        let mut point = vec![0u8; DUI_LEN + IOA_LEN + elem];
+        point[0] = 13;
+        point[1] = 0x01;
+        point[2] = 20;
+        point[3] = 0;
+        point[4] = 1;
+        point[5] = 0;
+        crate::asdu::write_ioa(&mut point, DUI_LEN, 100);
+        point[DUI_LEN + IOA_LEN] = 0xaa;
+        inv.ingest_asdu(&point);
+
+        // Master sends C_IC_NA_1, COT=6, CA=1, OA=42, QOI=20.
+        let mut req_asdu = vec![0u8; DUI_LEN + IOA_LEN + 1];
+        req_asdu[0] = 100;
+        req_asdu[1] = 0x01;
+        req_asdu[2] = 6;
+        req_asdu[3] = 42;
+        req_asdu[4] = 1;
+        req_asdu[5] = 0;
+        req_asdu[DUI_LEN + IOA_LEN] = 20;
+        let req_frame = wrap_iframe(&req_asdu, 0, 0);
+
+        // Build the spec-correct response via the responder, then stitch
+        // the three ASDUs into a slave-side payload at known wall times.
+        let echo = RequestEcho { ca: 1, oa: 42, test: false, negative: false };
+        let resp = build_gi_response(&inv, echo, 20);
+        assert_eq!(resp.len(), 3);
+
+        let mut slave_payload = Vec::new();
+        let mut slave_offsets: Vec<(u64, usize)> = Vec::new();
+        for (i, asdu) in resp.iter().enumerate() {
+            slave_offsets.push((((i as u64) + 1) * 10_000_000, slave_payload.len()));
+            slave_payload.extend_from_slice(&wrap_iframe(asdu, 0, 0));
+        }
+
+        let master_offsets = vec![(0u64, 0usize)];
+        let cap_target = FlowSnapshot {
+            payload: &req_frame,
+            packet_offsets: &master_offsets,
+        };
+        let cap_playback = FlowSnapshot {
+            payload: &slave_payload,
+            packet_offsets: &slave_offsets,
+        };
+
+        let audit = audit_master_commands(&cap_target, &cap_playback, &inv);
+        assert_eq!(audit.gi_total, 1);
+        assert_eq!(audit.ci_total, 0);
+        assert_eq!(
+            audit.gi_compliant, 1,
+            "expected one compliant GI; events={:#?}",
+            audit.events
+        );
+        let ev = &audit.events[0];
+        assert_eq!(ev.kind, "GI");
+        assert_eq!(ev.qualifier, 20);
+        assert_eq!(ev.ca, 1);
+        assert_eq!(ev.oa, 42);
+        assert!(ev.actcon_present);
+        assert!(ev.actterm_present);
+        assert_eq!(ev.data_frame_count, 1);
+        assert_eq!(ev.data_element_count, 1);
+        assert_eq!(ev.expected_data_element_count, 1);
+        assert!(ev.all_cots_match_bucket);
+        assert!(ev.bytewise_matches_inventory);
+        assert_eq!(ev.verdict, "compliant");
+    }
+
+    #[test]
+    fn audit_flags_missing_actterm_as_non_compliant() {
+        let mut inv = Inventory::default();
+        let elem = element_len(13).unwrap();
+        let mut point = vec![0u8; DUI_LEN + IOA_LEN + elem];
+        point[0] = 13;
+        point[1] = 0x01;
+        point[2] = 20;
+        point[5] = 0;
+        point[4] = 1;
+        crate::asdu::write_ioa(&mut point, DUI_LEN, 100);
+        inv.ingest_asdu(&point);
+
+        let mut req_asdu = vec![0u8; DUI_LEN + IOA_LEN + 1];
+        req_asdu[0] = 100;
+        req_asdu[1] = 0x01;
+        req_asdu[2] = 6;
+        req_asdu[4] = 1;
+        req_asdu[DUI_LEN + IOA_LEN] = 20;
+        let req_frame = wrap_iframe(&req_asdu, 0, 0);
+
+        let echo = RequestEcho { ca: 1, oa: 0, test: false, negative: false };
+        let resp = build_gi_response(&inv, echo, 20);
+        // Drop the ActTerm to simulate a misbehaving slave.
+        let mut slave_payload = Vec::new();
+        let mut slave_offsets: Vec<(u64, usize)> = Vec::new();
+        for (i, asdu) in resp.iter().take(2).enumerate() {
+            slave_offsets.push((((i as u64) + 1) * 10_000_000, slave_payload.len()));
+            slave_payload.extend_from_slice(&wrap_iframe(asdu, 0, 0));
+        }
+
+        let master_offsets = vec![(0u64, 0usize)];
+        let cap_target = FlowSnapshot {
+            payload: &req_frame,
+            packet_offsets: &master_offsets,
+        };
+        let cap_playback = FlowSnapshot {
+            payload: &slave_payload,
+            packet_offsets: &slave_offsets,
+        };
+        let audit = audit_master_commands(&cap_target, &cap_playback, &inv);
+        assert_eq!(audit.gi_total, 1);
+        assert_eq!(audit.gi_non_compliant, 1);
+        assert_eq!(audit.events[0].verdict, "non_compliant");
+        assert!(!audit.events[0].actterm_present);
+    }
+
+    #[test]
+    fn cp56_drift_walker_survives_zero_length_apci_byte() {
+        // Construct a payload where a stray 0x68 byte is followed by a
+        // zero-length APCI byte and an I-frame-looking control byte.
+        // Pre-fix this triggered an `asdu_start > asdu_end` panic in
+        // compute_cp56_drift. Now the walker should treat ln<4 as junk
+        // and resync rather than panic.
+        let mut payload = vec![0u8; 32];
+        payload[0] = 0x68;
+        payload[1] = 0x00; // ln = 0  → would underflow asdu slice
+        payload[2] = 0x00; // cf1 LSB = 0 → looks like an I-frame
+        let packet_offsets = vec![(0u64, 0usize)];
+        let flow = FlowSnapshot {
+            payload: &payload,
+            packet_offsets: &packet_offsets,
+        };
+        // Should return None (no valid CP56 frames) instead of panicking.
+        let _ = compute_cp56_drift(&flow, 0, Cp56Zone::Utc, 50.0);
+    }
+
+    #[test]
+    fn is_gi_ci_response_frame_classifies_correctly() {
+        let actcon = vec![100, 0x01, 7, 0, 1, 0, 0, 0, 0, 20];
+        let actterm = vec![100, 0x01, 10, 0, 1, 0, 0, 0, 0, 20];
+        let inrogen_data = vec![13, 0x01, 20, 0, 1, 0, 0x64, 0, 0, 0, 0, 0, 0, 0];
+        let counter_group = vec![15, 0x01, 38, 0, 1, 0, 0xf4, 0x01, 0, 0, 0, 0, 0, 0];
+        let spontaneous = vec![13, 0x01, 3, 0, 1, 0, 0x64, 0, 0, 0, 0, 0, 0, 0];
+        assert!(is_gi_ci_response_frame(&actcon));
+        assert!(is_gi_ci_response_frame(&actterm));
+        assert!(is_gi_ci_response_frame(&inrogen_data));
+        assert!(is_gi_ci_response_frame(&counter_group));
+        assert!(!is_gi_ci_response_frame(&spontaneous));
     }
 }

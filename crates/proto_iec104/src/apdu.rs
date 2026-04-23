@@ -101,7 +101,14 @@ impl Apdu {
             }
         }
         let apci_asdu_len = out.len() - 2;
-        out[1] = apci_asdu_len as u8;
+        debug_assert!(
+            apci_asdu_len <= MAX_APDU_LEN,
+            "APDU body {} > {} (1-byte length would wrap, producing malformed wire frames). \
+             Caller must split larger payloads into multiple APDUs.",
+            apci_asdu_len,
+            MAX_APDU_LEN
+        );
+        out[1] = (apci_asdu_len.min(MAX_APDU_LEN)) as u8;
         out
     }
 }

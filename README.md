@@ -112,6 +112,23 @@ Every run is reversible: the bridge, veth pairs, IP aliases, sysctl state, iptab
 - **START ALL** button in the run detail panel fans out the ready flag to every pending listener in one click. **STOP** on the run card fans out cancellation to all sessions in one click and flips them to `CANCELLED` so the UI doesn't keep showing stale `PENDING` rows.
 - Each session reports its own state (`PENDING → LISTENING → CONNECTED → ACTIVE → COMPLETED / CANCELLED / FAILED`) with live send/receive counts, byte counts, and per-session abort.
 
+### Spec-correct GI / CI synthesis (slave mode)
+
+When the live SCADA master sends a General Interrogation (`C_IC_NA_1`, type 100) or Counter Interrogation (`C_CI_NA_1`, type 101), the slave-replayer answers with a fully spec-correct response sequence built from a per-RTU CA/IOA inventory derived from the captured pcap:
+
+- **Inventory.** At session start the slave walks the captured server-side bytes and builds a `BTreeMap<(CA, IOA), InventoryEntry>` of every distinct point, tagged with the type ID, latest element body, and observed group memberships (`COT 21..36` for GI groups 1..16, `COT 38..41` for CI groups 1..4). Spec ref: IEC 60870-5-101 §7.2.6.22.
+- **Response burst.** A request triggers `ActCon (COT=7) → Inrogen / Reqcogen data frames (COT 20+G or 37/38+G) → ActTerm (COT=10)`, with the master's QOI/QCC echoed and the response chunked across multiple ASDUs sized to fit the IEC 104 1-byte APDU length field (e.g. type 36 ≤ 16 elements per ASDU, type 1 ≤ 60).
+- **Master-command audit.** The post-run analyser pairs every captured request with its slave response and judges each pairing against four spec criteria: ActCon present + within `t1` (15 s), ActTerm present + within a reasonable window of the last data frame, every data frame in the matching COT bucket, and byte-for-byte agreement with the inventory-derived expected response. The verdict, headline counts, and a per-event audit table appear in the slave-detail UI; fleet-level stacked bars summarise GI/CI quality across every RTU at a glance.
+- **Polite shutdown.** On run cancel or end-of-script the slave drains pending acks and emits one final S-frame with the current `N(R)` so the master sees an explicit ack of every received I-frame before the FIN. Per IEC 104 the slave can't initiate STOPDT; the runner waits up to 2 s for the master to issue STOPDT_ACT and replies with STOPDT_CON if it arrives.
+
+### Pre-run RTU picker
+
+After a pcap is uploaded the run-config form shows a checklisted **"RTUs to simulate"** panel with one row per discovered slave IP, a horizontal bar sized by that RTU's payload bytes (so you can spot the talkative slaves at a glance), per-RTU I-frame count, and **Select all / Select none** buttons. Leaving every box checked runs the full fleet (default behaviour); checking a subset filters which slave listeners actually come up so you can iterate quickly on a single RTU before going wide.
+
+### Looped multi-iteration replay
+
+Slave-mode runs can loop the captured script `iterations` times either as **fresh accept cycles** (default — each iteration is a new STARTDT/script/STOPDT lifecycle) or as **loops within one TCP session** (new "loop iterations within one session" checkbox). The latter matches how a real RTU behaves — a single session held open indefinitely with a continuous stream of spontaneous I-frames — and works around polling masters that don't auto-reconnect after a STOPDT. Pacing is re-anchored at the top of each loop so `OriginalTiming` mode preserves the original cadence on every iteration. Live UI shows a per-iteration progress bar that resets 0–100% at the top of each loop plus an `iter X / Y` (or `iter X (looping until stopped)` when iterations=0) counter chip beside every running session.
+
 ### Using the web UI
 
 The single `outstation serve` binary hosts everything over `:8080`.

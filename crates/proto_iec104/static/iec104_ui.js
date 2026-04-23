@@ -484,12 +484,114 @@
       h += `</div>`;
     }
 
+    const audit = ps.gi_ci_audit;
+    if (audit) {
+      h += renderGiCiAudit(audit);
+    }
+
     if (d.notes && d.notes.length) {
       h += `<div class="an-h">NOTES</div>`;
       for (const n of d.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
     }
 
     return h;
+  }
+
+  // Per-slave GI/CI audit: compact summary strip + per-event table.
+  // Each event is judged against four spec-compliance criteria
+  // (ActCon present + within t1, ActTerm present + reasonable delay,
+  // every data frame in the right COT bucket, byte-for-byte match
+  // against the inventory-derived expected response).
+  function renderGiCiAudit(a) {
+    const giOk  = a.gi_compliant || 0;
+    const giPt  = a.gi_partial   || 0;
+    const giNc  = a.gi_non_compliant || 0;
+    const ciOk  = a.ci_compliant || 0;
+    const ciPt  = a.ci_partial   || 0;
+    const ciNc  = a.ci_non_compliant || 0;
+    const giTot = a.gi_total || 0;
+    const ciTot = a.ci_total || 0;
+
+    let s = `<div class="an-h">MASTER COMMANDS — GI / CI AUDIT</div>`;
+
+    // Summary strip.
+    s += `<div class="an-kv">`;
+    if (giTot > 0) {
+      const giOkAll = giOk === giTot;
+      const giParts = [];
+      giParts.push(`<span class="ok">${giOk} compliant</span>`);
+      if (giPt > 0) giParts.push(`<span class="warn">${giPt} partial</span>`);
+      if (giNc > 0) giParts.push(`<span class="bad">${giNc} non-compliant</span>`);
+      s += `<div class="k">general interrogation</div><div class="v ${giOkAll?'ok':(giNc>0?'bad':'warn')}">${giTot} request${giTot===1?'':'s'} · ${giParts.join(' · ')}</div>`;
+    } else {
+      s += `<div class="k">general interrogation</div><div class="v muted">no GI requests observed</div>`;
+    }
+    if (ciTot > 0) {
+      const ciOkAll = ciOk === ciTot;
+      const ciParts = [];
+      ciParts.push(`<span class="ok">${ciOk} compliant</span>`);
+      if (ciPt > 0) ciParts.push(`<span class="warn">${ciPt} partial</span>`);
+      if (ciNc > 0) ciParts.push(`<span class="bad">${ciNc} non-compliant</span>`);
+      s += `<div class="k">counter interrogation</div><div class="v ${ciOkAll?'ok':(ciNc>0?'bad':'warn')}">${ciTot} request${ciTot===1?'':'s'} · ${ciParts.join(' · ')}</div>`;
+    } else {
+      s += `<div class="k">counter interrogation</div><div class="v muted">no CI requests observed</div>`;
+    }
+    s += `</div>`;
+
+    if (!a.events || !a.events.length) {
+      return s;
+    }
+
+    // Per-event audit table — column meanings:
+    //   t      — request wall-clock ms from capture start
+    //   kind   — GI / CI
+    //   qual   — QOI (GI) or QCC (CI)
+    //   CA     — Common Address
+    //   AC Δ   — ActCon delay vs request (ms)
+    //   data   — frame_count / element_count
+    //   AT Δ   — ActTerm delay vs last data (ms)
+    //   COT?   — every data frame in the expected COT bucket
+    //   bytes? — byte-for-byte match vs inventory-derived expected
+    //   verdict
+    s += `<div style="overflow-x:auto;margin:6px 0 10px">`;
+    s += `<table class="an-tbl" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">`;
+    s += `<thead><tr style="text-align:left;color:var(--dim);font-weight:600">`;
+    s += `<th style="padding:4px 8px">t (ms)</th><th>kind</th><th>qual</th><th>CA</th>`;
+    s += `<th>AC Δ ms</th><th>data (frames / elems)</th><th>AT Δ ms</th>`;
+    s += `<th>COT?</th><th>bytes?</th><th>verdict</th>`;
+    s += `</tr></thead><tbody>`;
+    const rowColor = (v) => v === 'compliant' ? '' : (v === 'partial' ? 'background:rgba(255,200,0,0.06)' : 'background:rgba(255,80,80,0.06)');
+    const tickClass = (b) => b ? 'ok' : 'bad';
+    const tick = (b) => b ? '✓' : '✗';
+    for (const ev of a.events.slice(0, 200)) {
+      const acΔ = ev.actcon_delay_ms != null ? ev.actcon_delay_ms.toFixed(1) : '—';
+      const atΔ = ev.actterm_delay_ms != null ? ev.actterm_delay_ms.toFixed(1) : '—';
+      const expected = ev.expected_data_element_count;
+      const dataCell = `${ev.data_frame_count} / ${ev.data_element_count}` +
+        (expected !== ev.data_element_count ? ` <span class="muted" title="inventory-derived expected element count">(exp ${expected})</span>` : '');
+      const verdictColor = ev.verdict === 'compliant' ? 'var(--ok)' : (ev.verdict === 'partial' ? 'var(--warn)' : 'var(--err,#c33)');
+      s += `<tr style="border-top:1px solid var(--rule);${rowColor(ev.verdict)}">`;
+      s += `<td style="padding:4px 8px">${ev.request_ts_ms.toFixed(0)}</td>`;
+      s += `<td>${esc(ev.kind)}</td>`;
+      s += `<td>${ev.qualifier}</td>`;
+      s += `<td>${ev.ca}</td>`;
+      s += `<td class="${ev.actcon_present ? '' : 'bad'}">${ev.actcon_present ? acΔ : '—'}</td>`;
+      s += `<td>${dataCell}</td>`;
+      s += `<td class="${ev.actterm_present ? '' : 'bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
+      s += `<td class="${tickClass(ev.all_cots_match_bucket)}">${tick(ev.all_cots_match_bucket)}</td>`;
+      s += `<td class="${tickClass(ev.bytewise_matches_inventory)}">${tick(ev.bytewise_matches_inventory)}</td>`;
+      s += `<td style="color:${verdictColor};font-weight:600">${esc(ev.verdict)}</td>`;
+      s += `</tr>`;
+      if (ev.notes && ev.notes.length) {
+        s += `<tr style="${rowColor(ev.verdict)}"><td></td><td colspan="9" class="muted" style="padding:0 8px 4px;font-size:10px">${ev.notes.map(esc).join(' · ')}</td></tr>`;
+      }
+    }
+    s += `</tbody></table>`;
+    if (a.events.length > 200) {
+      s += `<div class="muted" style="font-size:10px;margin-top:4px">showing first 200 of ${a.events.length} events</div>`;
+    }
+    s += `</div>`;
+    return s;
   }
 
   // Entry point #2 — called after the slave row expands and the HTML
@@ -510,6 +612,62 @@
     }
   }
 
+  // Fleet-level rollup of GI/CI events across every slave. Walks
+  // `r.details_by_ip[*].protocol_specific.gi_ci_audit` so the backend
+  // doesn't need a parallel aggregator. Renders headline counts plus
+  // two stacked bars (GI / CI) split by verdict bucket.
+  function renderFleetExtras(r) {
+    const details = r.details_by_ip || {};
+    let giOk = 0, giPt = 0, giNc = 0, giTot = 0;
+    let ciOk = 0, ciPt = 0, ciNc = 0, ciTot = 0;
+    let slavesWithEvents = 0;
+    for (const ip of Object.keys(details)) {
+      const a = ((details[ip] || {}).protocol_specific || {}).gi_ci_audit;
+      if (!a) continue;
+      const evCount = (a.gi_total || 0) + (a.ci_total || 0);
+      if (evCount > 0) slavesWithEvents++;
+      giOk  += a.gi_compliant     || 0;
+      giPt  += a.gi_partial       || 0;
+      giNc  += a.gi_non_compliant || 0;
+      giTot += a.gi_total         || 0;
+      ciOk  += a.ci_compliant     || 0;
+      ciPt  += a.ci_partial       || 0;
+      ciNc  += a.ci_non_compliant || 0;
+      ciTot += a.ci_total         || 0;
+    }
+    if (giTot === 0 && ciTot === 0) {
+      return ``; // no GI/CI activity in this run; suppress the panel.
+    }
+
+    const seg = (count, color, title) => count > 0
+      ? `<div title="${title}: ${count}" style="flex:${count};background:${color};color:#fff;padding:6px 8px;font-family:var(--mono);font-size:11px;text-align:center;min-width:24px">${count}</div>`
+      : '';
+
+    let h = `<div class="an-h">FLEET INTERROGATION AUDIT &middot; ${slavesWithEvents} SLAVE${slavesWithEvents===1?'':'S'} WITH GI/CI ACTIVITY</div>`;
+    h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
+    h += `<div style="display:grid;grid-template-columns:120px 1fr;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;margin-bottom:8px">`;
+    if (giTot > 0) {
+      h += `<div>general (GI)</div>`;
+      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
+      h += seg(giOk, 'var(--ok,#3a3)',  'compliant');
+      h += seg(giPt, 'var(--warn,#fa0)', 'partial');
+      h += seg(giNc, 'var(--err,#c33)',  'non-compliant');
+      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${giTot} total</div>`;
+      h += `</div>`;
+    }
+    if (ciTot > 0) {
+      h += `<div>counter (CI)</div>`;
+      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
+      h += seg(ciOk, 'var(--ok,#3a3)',  'compliant');
+      h += seg(ciPt, 'var(--warn,#fa0)', 'partial');
+      h += seg(ciNc, 'var(--err,#c33)',  'non-compliant');
+      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${ciTot} total</div>`;
+      h += `</div>`;
+    }
+    h += `</div>`;
+    return h;
+  }
+
   window.PROTOCOL_RENDERERS = window.PROTOCOL_RENDERERS || {};
-  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts };
+  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts, renderFleetExtras };
 })();

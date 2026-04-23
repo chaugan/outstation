@@ -93,6 +93,14 @@ pub struct MessageProgress {
     /// when flipped. Independent from run-level `ctx.cancel` so the
     /// webui can stop one RTU without killing the whole run.
     pub cancel: Arc<AtomicBool>,
+    /// Current iteration the protocol is on (1-based, 0 before start).
+    /// Updated by replayers that loop the script within one session
+    /// (see `ProtoRunCfg::loop_iterations`); shared with the per-source
+    /// progress so the live UI shows "iter X / Y" without polling
+    /// outside the protocol layer.
+    pub iter_current: Arc<AtomicU64>,
+    /// Total iterations planned for this session (0 = unlimited).
+    pub iter_total: Arc<AtomicU64>,
 }
 
 /// Controls how the replayer paces its own sends. Benchmark mode
@@ -178,6 +186,15 @@ pub struct ProtoRunCfg {
     /// (ns from the first I-frame) at which the replayer should
     /// emit that frame. Empty vec disables per-frame pacing.
     pub frame_times_ns: Vec<u64>,
+    /// How many times to replay the captured script *within a single
+    /// connection*. `1` (default) means play once and close (current
+    /// behaviour). `n > 1` means play `n` times back-to-back inside
+    /// one accept/handshake/close cycle. `0` means loop forever until
+    /// the per-session cancel flag flips. Mostly relevant in slave
+    /// mode: real RTUs hold their TCP session open indefinitely, so
+    /// looping within one session is more spec-realistic than the
+    /// outer "fresh handshake per iteration" model.
+    pub loop_iterations: u64,
     // Note: protocol-specific knobs (e.g. IEC 104 CP56Time2a rewrite
     // settings, ASDU rewrite map) live inside `proto_config` JSON.
     // The protocol replayer parses what it needs from there.
@@ -286,6 +303,33 @@ pub struct ProtoViability {
     /// Extra observations the UI can render as bullet notes
     /// (e.g. "165 of 171 flows are mid-flow").
     pub notes: Vec<String>,
+    /// Per-RTU breakdown for slave-mode (one entry per distinct
+    /// server IP on the protocol's well-known port). Drives the
+    /// pre-run "select RTUs" picker AND the per-RTU traffic chart
+    /// so the operator can quickly see how heavy each slave is.
+    /// Empty when the protocol either ignores the question or saw
+    /// no slave-side endpoints.
+    pub slave_rtus: Vec<RtuTraffic>,
+    /// Same per-endpoint shape for master-mode (per distinct client IP).
+    pub master_clients: Vec<RtuTraffic>,
+}
+
+/// Per-endpoint traffic snapshot used by the run-config picker.
+#[derive(Debug, Clone, Default)]
+pub struct RtuTraffic {
+    /// IPv4 dotted-quad string of the endpoint.
+    pub ip: String,
+    /// Reassembled payload bytes the protocol would replay for this
+    /// endpoint (server-side bytes for slave-mode, client-side for
+    /// master-mode).
+    pub payload_bytes: u64,
+    /// Number of protocol-level messages observed (e.g. IEC 104
+    /// I-frames). Useful as a proxy for "how busy is this RTU."
+    pub messages: u64,
+    /// Wall-clock span of the flow in milliseconds (last packet ts
+    /// minus first packet ts, both relative to the pcap start).
+    /// Zero when the flow has fewer than two packets.
+    pub duration_ms: u64,
 }
 
 /// The contract every protocol replayer must satisfy.
@@ -371,6 +415,8 @@ pub trait ProtoReplayer: Send + Sync {
             verdict: verdict.into(),
             verdict_reason: reason,
             notes: Vec::new(),
+            slave_rtus: Vec::new(),
+            master_clients: Vec::new(),
         }
     }
 
@@ -426,6 +472,14 @@ pub trait LoadedPcapView {
     /// `(client_bytes, server_bytes)`. Either can be zero if a
     /// reassembly attempt failed (e.g. mid-flow capture with gaps).
     fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64);
+    /// Reassembled server-side payload bytes for one flow. Used by
+    /// protocols that want to inspect the on-wire data during quick
+    /// viability (IEC 104 builds a CA/IOA inventory from each slave-
+    /// side stream so the upload summary shows point counts). Default
+    /// returns empty so existing impls compile unchanged.
+    fn flow_server_payload(&self, _flow_idx: usize) -> Vec<u8> {
+        Vec::new()
+    }
 }
 
 /// Minimal flow descriptor a viability impl needs.

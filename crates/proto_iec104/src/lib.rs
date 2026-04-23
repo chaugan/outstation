@@ -23,6 +23,29 @@ pub mod apdu;
 pub mod asdu;
 pub mod session;
 
+/// Cheap I-frame counter — walks the APDU stream looking for valid
+/// I-frame APCIs. Used by `quick_viability` to attribute per-RTU
+/// message counts without decoding ASDU bodies.
+fn count_iframes(payload: &[u8]) -> usize {
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + 6 <= payload.len() {
+        if payload[i] != 0x68 {
+            i += 1;
+            continue;
+        }
+        let ln = payload[i + 1] as usize;
+        if ln < 4 || i + 2 + ln > payload.len() {
+            break;
+        }
+        if payload[i + 2] & 0x01 == 0 {
+            n += 1;
+        }
+        i += 2 + ln;
+    }
+    n
+}
+
 pub struct Iec104Replayer;
 
 impl Iec104Replayer {
@@ -129,6 +152,7 @@ impl ProtoReplayer for Iec104Replayer {
         let mut server_payload_bytes: u64 = 0;
         let mut midflow_flows: u64 = 0;
         let mut clean_handshake_flows: u64 = 0;
+        let mut slave_flow_indices: Vec<(usize, std::net::Ipv4Addr)> = Vec::new();
         for f in p.flows() {
             let (server_ip, server_port) = match f.server { Some(x) => x, None => continue };
             if server_port != TARGET_PORT { continue; }
@@ -143,6 +167,7 @@ impl ProtoReplayer for Iec104Replayer {
             let (cb, sb) = p.flow_payload_bytes(f.flow_idx);
             client_payload_bytes += cb;
             server_payload_bytes += sb;
+            slave_flow_indices.push((f.flow_idx, server_ip));
         }
         let sessions_master_mode = client_ips.len() as u64;
         let sessions_slave_mode = server_ips.len() as u64;
@@ -202,6 +227,10 @@ impl ProtoReplayer for Iec104Replayer {
             )
         };
         let mut notes = Vec::new();
+        let mut per_rtu_bytes: std::collections::BTreeMap<std::net::Ipv4Addr, u64> =
+            std::collections::BTreeMap::new();
+        let mut per_rtu_msgs: std::collections::BTreeMap<std::net::Ipv4Addr, u64> =
+            std::collections::BTreeMap::new();
         if max_session_count == 0 {
             notes.push(
                 "no TCP flow with server_port=2404 found - benchmark mode would have nothing to do"
@@ -229,6 +258,75 @@ impl ProtoReplayer for Iec104Replayer {
                     clean_handshake_flows,
                 ));
             }
+
+            // CA / IOA inventory overview — ingest each slave flow's
+            // server-side payload into a per-RTU point database so the
+            // upload summary tells the operator how rich each RTU's
+            // dataset is. This is the same Inventory the slave-replayer
+            // builds at session start to back GI/CI synthesis. We also
+            // record per-RTU bytes + I-frame counts here so the run-
+            // config picker can show a traffic chart per RTU.
+            let mut per_rtu_iao_count: std::collections::BTreeMap<std::net::Ipv4Addr, usize> =
+                std::collections::BTreeMap::new();
+            let mut total_unique_cas: std::collections::BTreeSet<u16> =
+                std::collections::BTreeSet::new();
+            let mut total_ioa_count: usize = 0;
+            let mut type_id_counts: std::collections::BTreeMap<u8, usize> =
+                std::collections::BTreeMap::new();
+            let mut rtus_with_inventory: usize = 0;
+            for (flow_idx, server_ip) in &slave_flow_indices {
+                let payload = p.flow_server_payload(*flow_idx);
+                per_rtu_bytes.insert(*server_ip, payload.len() as u64);
+                per_rtu_msgs.insert(*server_ip, count_iframes(&payload) as u64);
+                if payload.is_empty() {
+                    continue;
+                }
+                let mut inv = inventory::Inventory::default();
+                inv.ingest_payload(&payload);
+                if inv.is_empty() {
+                    continue;
+                }
+                rtus_with_inventory += 1;
+                per_rtu_iao_count.insert(*server_ip, inv.len());
+                for ((ca, _ioa), entry) in &inv.entries {
+                    total_unique_cas.insert(*ca);
+                    total_ioa_count += 1;
+                    *type_id_counts.entry(entry.type_id).or_insert(0) += 1;
+                }
+            }
+            if rtus_with_inventory > 0 {
+                let counts: Vec<usize> = per_rtu_iao_count.values().copied().collect();
+                let min_ioa = *counts.iter().min().unwrap_or(&0);
+                let max_ioa = *counts.iter().max().unwrap_or(&0);
+                let mean_ioa = if counts.is_empty() {
+                    0
+                } else {
+                    counts.iter().sum::<usize>() / counts.len()
+                };
+                notes.push(format!(
+                    "CA/IOA inventory: {} unique (CA, IOA) points across {} common address(es) on {} RTU(s) (per-RTU IOAs: min {}, mean {}, max {})",
+                    total_ioa_count,
+                    total_unique_cas.len(),
+                    rtus_with_inventory,
+                    min_ioa,
+                    mean_ioa,
+                    max_ioa,
+                ));
+                if !type_id_counts.is_empty() {
+                    let mut top: Vec<(u8, usize)> =
+                        type_id_counts.iter().map(|(t, c)| (*t, *c)).collect();
+                    top.sort_by(|a, b| b.1.cmp(&a.1));
+                    let top_str: Vec<String> = top
+                        .iter()
+                        .take(5)
+                        .map(|(t, c)| format!("type {} ({})", t, c))
+                        .collect();
+                    notes.push(format!(
+                        "dominant ASDU types in inventory: {}",
+                        top_str.join(", ")
+                    ));
+                }
+            }
         }
         if file_size_bytes > 1024 * 1024 * 1024 {
             notes.push(
@@ -241,6 +339,28 @@ impl ProtoReplayer for Iec104Replayer {
                 "session count exceeds 256 - ensure `ulimit -n` is large enough for one socket per session".into(),
             );
         }
+        let mut sorted_servers: Vec<std::net::Ipv4Addr> = server_ips.into_iter().collect();
+        sorted_servers.sort();
+        let slave_rtus: Vec<protoplay::RtuTraffic> = sorted_servers
+            .into_iter()
+            .map(|ip| protoplay::RtuTraffic {
+                ip: ip.to_string(),
+                payload_bytes: per_rtu_bytes.get(&ip).copied().unwrap_or(0),
+                messages: per_rtu_msgs.get(&ip).copied().unwrap_or(0),
+                duration_ms: 0,
+            })
+            .collect();
+        let mut sorted_clients: Vec<std::net::Ipv4Addr> = client_ips.into_iter().collect();
+        sorted_clients.sort();
+        let master_clients: Vec<protoplay::RtuTraffic> = sorted_clients
+            .into_iter()
+            .map(|ip| protoplay::RtuTraffic {
+                ip: ip.to_string(),
+                payload_bytes: 0,
+                messages: 0,
+                duration_ms: 0,
+            })
+            .collect();
         ProtoViability {
             client_payload_bytes,
             server_payload_bytes,
@@ -250,6 +370,8 @@ impl ProtoReplayer for Iec104Replayer {
             verdict: verdict.into(),
             verdict_reason,
             notes,
+            slave_rtus,
+            master_clients,
         }
     }
 

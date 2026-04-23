@@ -975,6 +975,12 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     let mut pending: VecDeque<PendingIFrame> = VecDeque::with_capacity(k as usize);
     let mut latency = LatencyReservoir::new(LATENCY_RESERVOIR_CAP);
     let send_start_ns = now_ns();
+    // Pacing reference. With OriginalTiming pacing this is the wall-
+    // clock anchor `frame_times_ns[idx]` is added to before sleeping.
+    // Reset at the top of every script-loop iteration so loop 2/3/...
+    // don't fire instantly because every captured timestamp is in the
+    // past (which would flood the master and collapse the chart).
+    let mut pacing_epoch_ns = send_start_ns;
 
     // Response queue for GI/CI bursts the slave synthesises in reply
     // to incoming master commands. slave_handle_incoming pushes into
@@ -983,17 +989,54 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // blowing past the k-window.
     let mut response_queue: VecDeque<Vec<u8>> = VecDeque::new();
 
-    'outer: for (idx, asdu) in server_iframes.iter().enumerate() {
-        if check_cancel(&progress) {
-            report.error = Some(format!("cancelled at idx {idx}"));
-            break 'outer;
+    // Inner-loop iteration plan: replay the captured script
+    // `cfg.loop_iterations` times within this single TCP session.
+    // 0 = loop forever (until cancel or master disconnect). pending /
+    // my_ns / my_nr / unacked_received persist across loops because
+    // IEC 104 sequence numbers are session-scoped, not script-scoped.
+    let unlimited_loops = cfg.loop_iterations == 0;
+    let inner_loops = if unlimited_loops {
+        u64::MAX
+    } else {
+        cfg.loop_iterations.max(1)
+    };
+    bump(&progress, |p| {
+        p.iter_total.store(
+            if unlimited_loops { 0 } else { inner_loops },
+            Ordering::Relaxed,
+        );
+    });
+    let mut early_break = false;
+    'replay: for loop_idx in 0..inner_loops {
+        // Reset per-iteration UI counters so the bar restarts from 0
+        // each loop. Cumulative totals stay in `report` for the
+        // post-run report.
+        bump(&progress, |p| {
+            p.iter_current
+                .store(loop_idx + 1, Ordering::Relaxed);
+            p.sent.store(0, Ordering::Relaxed);
+            p.bytes_written.store(0, Ordering::Relaxed);
+        });
+        if loop_idx > 0 {
+            // Re-anchor pacing so the next loop's frame_times_ns[0]
+            // means "fire now" rather than "fire at original session
+            // start" (which would already be way in the past, flooding
+            // the master with the entire script in milliseconds).
+            pacing_epoch_ns = now_ns();
+            info!(loop_idx, "slave: starting next within-session iteration");
         }
+        'outer: for (idx, asdu) in server_iframes.iter().enumerate() {
+            if check_cancel(&progress) {
+                report.error = Some(format!("cancelled at idx {idx}"));
+                early_break = true;
+                break 'outer;
+            }
         if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
             // Pace until the next captured send time, but stay
             // responsive to incoming master traffic during the wait —
             // critical for long inter-frame gaps where TESTFR_act
             // would otherwise miss its t1 reply window.
-            let target_abs_ns = send_start_ns.saturating_add(target);
+            let target_abs_ns = pacing_epoch_ns.saturating_add(target);
             'pace: loop {
                 let now = now_ns();
                 if now >= target_abs_ns {
@@ -1001,6 +1044,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 }
                 if check_cancel(&progress) {
                     report.error = Some(format!("cancelled during pace at idx {idx}"));
+                    early_break = true;
                     break 'outer;
                 }
                 let remaining_ns = target_abs_ns.saturating_sub(now);
@@ -1061,6 +1105,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                             "master closed before acking I-frame idx {idx} (pending={})",
                             pending.len()
                         ));
+                        early_break = true;
                         break 'outer;
                     }
                 }
@@ -1070,6 +1115,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                     "t1 timeout at idx {idx}: master never acked {} pending I-frames",
                     pending.len()
                 ));
+                early_break = true;
                 break 'outer;
             }
         }
@@ -1116,6 +1162,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             if let Err(e) = write_apdu(&mut write_stream, &resp_apdu) {
                 warn!(error = %e, "slave: send GI/CI response frame failed");
                 report.error = Some(format!("send GI/CI response: {e}"));
+                early_break = true;
                 break 'outer;
             }
             pending.push_back(PendingIFrame { ns: my_ns, send_ns: resp_send_ns });
@@ -1155,6 +1202,13 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             p.unacked.store(pending.len() as u64, Ordering::Relaxed);
         });
     }
+        // End of one within-session script play. Bail out of the
+        // replay loop if the inner 'outer broke for cancel/error
+        // (no point re-running once the master has gone away).
+        if early_break || check_cancel(&progress) {
+            break 'replay;
+        }
+    }
 
     // 6. Drain remaining server frames so pending clears.
     let final_deadline = Instant::now() + T1_TIMEOUT;
@@ -1182,6 +1236,24 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     bump(&progress, |p| {
         p.unacked.store(pending.len() as u64, Ordering::Relaxed);
     });
+
+    // 6.5 Polite final S-frame flush: ACK every received I-frame
+    // before we go away, even if `unacked_received` never hit `w` and
+    // therefore never triggered the in-loop S-frame send. Spec doesn't
+    // let the slave initiate STOPDT, but a final S-frame with our
+    // current N(R) tells the master "I have received everything you
+    // sent up to this point" — strictly polite, 100% per IEC 104
+    // Annex C. Best-effort: a closed socket here is fine.
+    if unacked_received > 0 {
+        if write_apdu(&mut write_stream, &Apdu::S { nr: my_nr }).is_ok() {
+            report.bytes_written += 6;
+            bump(&progress, |p| {
+                p.bytes_written.fetch_add(6, Ordering::Relaxed);
+            });
+            // No further sends after this; counter intentionally
+            // not zeroed to avoid an unused-write warning.
+        }
+    }
 
     // 7. Wait briefly for STOPDT act from master. If it arrives, reply
     //    STOPDT con. Either way, drop the socket to close.
@@ -1331,6 +1403,7 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
+            loop_iterations: 1,
         };
 
         let report = run_session(cfg);
@@ -1440,6 +1513,7 @@ mod tests {
             listen_port: 0,
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: Vec::new(),
+            loop_iterations: 1,
         };
 
         let report = run_session(cfg);

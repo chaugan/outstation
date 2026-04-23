@@ -95,6 +95,14 @@ pub struct SourceProgress {
     /// (defaults to 0.0.0.0 = any interface). Editable per-slave via
     /// PATCH /api/runs/:id/slaves/:idx before the slave starts.
     pub listen_ip: Arc<Mutex<Ipv4Addr>>,
+    /// Current iteration number (1-based) the session is on. `0`
+    /// before the first iteration starts. Reset/incremented by the
+    /// per-mode iteration loop in sched. Drives the live UI's
+    /// "iter X / Y" counter and the per-iteration progress bar.
+    pub iter_current: Arc<AtomicU64>,
+    /// Total iterations planned (`0` = unlimited / loop until cancel).
+    /// Set once when the iteration loop begins; never decremented.
+    pub iter_total: Arc<AtomicU64>,
 }
 
 impl SourceProgress {
@@ -368,6 +376,8 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
                 cancel: Arc::new(AtomicBool::new(false)),
                 listen_port: 0,
                 listen_ip: Arc::new(Mutex::new(Ipv4Addr::UNSPECIFIED)),
+                iter_current: Arc::new(AtomicU64::new(0)),
+                iter_total: Arc::new(AtomicU64::new(0)),
             });
         }
     }
@@ -657,6 +667,21 @@ pub struct BenchmarkConfig {
     /// segments below this layer; use `ethtool -K <iface>` to fully
     /// observe per-frame timing on the wire.
     pub tcp_nodelay: Option<bool>,
+    /// Optional subset of captured endpoints to actually run. In
+    /// slave-mode this is the set of server IPs that get a listener
+    /// (others are dropped at planning time); in master-mode it's the
+    /// set of client IPs that spawn a session. `None` runs every
+    /// endpoint the pcap exposed for this role. Set by the run-config
+    /// "select RTUs" picker so operators can subset before starting.
+    pub selected_endpoints: Option<std::collections::HashSet<Ipv4Addr>>,
+    /// When `true`, replay the captured script `iterations` times
+    /// inside a *single* TCP session (slave-mode only). The default
+    /// `false` keeps the legacy behaviour: each iteration is a fresh
+    /// accept/handshake/script-play/STOPDT cycle. Real RTUs hold
+    /// their session open indefinitely, so looping within one session
+    /// is closer to spec — and works around polling masters that
+    /// don't auto-reconnect after a STOPDT.
+    pub loop_within_session: bool,
 }
 
 impl Default for BenchmarkConfig {
@@ -683,6 +708,8 @@ impl Default for BenchmarkConfig {
             alias_state_path: None,
             master_bind_ip: None,
             tcp_nodelay: None,
+            selected_endpoints: None,
+            loop_within_session: false,
         }
     }
 }
@@ -820,6 +847,11 @@ pub fn run_benchmark(
         let Some((client_ip, _)) = flow.client else {
             continue;
         };
+        if let Some(set) = &cfg.selected_endpoints {
+            if !set.contains(&client_ip) {
+                continue;
+            }
+        }
         let Some(src_info) = pcap.sources.get(&client_ip) else {
             warn!(%client_ip, "client ip has no MAC in sources table, skipping");
             continue;
@@ -952,6 +984,8 @@ pub fn run_benchmark(
                 cancel: Arc::new(AtomicBool::new(false)),
                 listen_port: 0,
                 listen_ip: Arc::new(Mutex::new(Ipv4Addr::UNSPECIFIED)),
+                iter_current: Arc::new(AtomicU64::new(0)),
+                iter_total: Arc::new(AtomicU64::new(0)),
             });
         }
     }
@@ -1019,6 +1053,8 @@ pub fn run_benchmark(
                 ready: Arc::clone(&entry.ready),
                 state: Arc::clone(&entry.state),
                 cancel: Arc::clone(&entry.cancel),
+                iter_current: Arc::clone(&entry.iter_current),
+                iter_total: Arc::clone(&entry.iter_total),
             }
         };
 
@@ -1068,6 +1104,12 @@ pub fn run_benchmark(
                 let payload_arc = std::sync::Arc::new(payload);
                 let frame_times_arc = std::sync::Arc::new(frame_times_ns);
                 let mut cancelled_mid_run = false;
+                {
+                    let sp = ctx_worker.per_source.lock().unwrap();
+                    if let Some(p) = sp.get(worker_idx) {
+                        p.iter_total.store(cfg_cloned.iterations, Ordering::Relaxed);
+                    }
+                }
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
@@ -1076,6 +1118,16 @@ pub fn run_benchmark(
                     if ctx_worker.is_cancelled() || session_cancelled {
                         cancelled_mid_run = true;
                         break;
+                    }
+                    {
+                        let sp = ctx_worker.per_source.lock().unwrap();
+                        if let Some(p) = sp.get(worker_idx) {
+                            p.iter_current.store(iter_idx + 1, Ordering::Relaxed);
+                            p.sent.store(0, Ordering::Relaxed);
+                            p.received.store(0, Ordering::Relaxed);
+                            p.bytes.store(0, Ordering::Relaxed);
+                            p.unacked.store(0, Ordering::Relaxed);
+                        }
                     }
                     let run_cfg = ProtoRunCfg {
                         bind_ip: src_ip,
@@ -1099,6 +1151,7 @@ pub fn run_benchmark(
                         listen_port: 0,
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
+                        loop_iterations: 1,
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();
@@ -1116,9 +1169,12 @@ pub fn run_benchmark(
                 // session state so the UI stops showing it as ACTIVE.
                 let sp = ctx_worker.per_source.lock().unwrap();
                 if let Some(p) = sp.get(worker_idx) {
-                    p.sent.store(pr.messages_sent, Ordering::Relaxed);
-                    p.bytes.store(pr.bytes_written, Ordering::Relaxed);
-                    p.received.store(pr.messages_received, Ordering::Relaxed);
+                    // Leave sent/received/bytes at the LAST iteration's
+                    // live counts so the per-iter progress bar lands at
+                    // ~100% instead of the cumulative cross-iter total
+                    // (which would overshoot). The cumulative figures
+                    // live in `pr.messages_*` and surface via the final
+                    // report. Still snap unacked to its real end value.
                     p.unacked.store(pr.unacked_at_end, Ordering::Relaxed);
                     let final_state = if cancelled_mid_run {
                         protoplay::session_state::CANCELLED
@@ -1244,6 +1300,11 @@ fn run_benchmark_slave(
         if !seen.insert(server_ip) {
             continue;
         }
+        if let Some(set) = &cfg.selected_endpoints {
+            if !set.contains(&server_ip) {
+                continue;
+            }
+        }
         let server_mac = pcap
             .sources
             .get(&server_ip)
@@ -1307,6 +1368,8 @@ fn run_benchmark_slave(
                 cancel: Arc::new(AtomicBool::new(false)),
                 listen_port,
                 listen_ip: Arc::new(Mutex::new(p.server_ip)),
+                iter_current: Arc::new(AtomicU64::new(0)),
+                iter_total: Arc::new(AtomicU64::new(0)),
             });
         }
     }
@@ -1387,6 +1450,8 @@ fn run_benchmark_slave(
                 ready: Arc::clone(&entry.ready),
                 state: Arc::clone(&entry.state),
                 cancel: Arc::clone(&entry.cancel),
+                iter_current: Arc::clone(&entry.iter_current),
+                iter_total: Arc::clone(&entry.iter_total),
             }
         };
 
@@ -1504,12 +1569,28 @@ fn run_benchmark_slave(
                 );
                 // Loop the listen/accept/handshake/send/close cycle
                 // across iterations. Same merge semantics as master.
-                let target_iters = effective_iterations(cfg_cloned.iterations);
+                // When `loop_within_session` is on, the outer accept
+                // cycle runs ONCE and the script-play loop inside the
+                // session repeats `iterations` times (0 = forever).
+                let (target_iters, run_loop_iterations) = if cfg_cloned.loop_within_session {
+                    (1u64, cfg_cloned.iterations)
+                } else {
+                    (effective_iterations(cfg_cloned.iterations), 1u64)
+                };
                 let mut pr = protoplay::ProtoReport::default();
                 let session_progress_arc = std::sync::Arc::new(session_progress);
                 let payload_arc = std::sync::Arc::new(payload);
                 let frame_times_arc = std::sync::Arc::new(frame_times_ns);
                 let mut cancelled_mid_run = false;
+                // Pin the iteration plan onto the per-source progress
+                // so the live UI can render "iter X / Y" (or "iter X
+                // looping" when Y=0).
+                {
+                    let sp = ctx_worker.per_source.lock().unwrap();
+                    if let Some(p) = sp.get(worker_idx) {
+                        p.iter_total.store(cfg_cloned.iterations, Ordering::Relaxed);
+                    }
+                }
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
@@ -1518,6 +1599,20 @@ fn run_benchmark_slave(
                     if ctx_worker.is_cancelled() || session_cancelled {
                         cancelled_mid_run = true;
                         break;
+                    }
+                    // Reset per-iteration counters so the bar restarts
+                    // from 0 each iteration. Cumulative totals live in
+                    // `pr` (merged via merge_proto_report) and surface
+                    // in the final report.
+                    {
+                        let sp = ctx_worker.per_source.lock().unwrap();
+                        if let Some(p) = sp.get(worker_idx) {
+                            p.iter_current.store(iter_idx + 1, Ordering::Relaxed);
+                            p.sent.store(0, Ordering::Relaxed);
+                            p.received.store(0, Ordering::Relaxed);
+                            p.bytes.store(0, Ordering::Relaxed);
+                            p.unacked.store(0, Ordering::Relaxed);
+                        }
                     }
                     let run_cfg = ProtoRunCfg {
                         bind_ip: listen_ip,
@@ -1541,6 +1636,7 @@ fn run_benchmark_slave(
                         listen_port,
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
+                        loop_iterations: run_loop_iterations,
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();
@@ -1562,9 +1658,12 @@ fn run_benchmark_slave(
 
                 let sp = ctx_worker.per_source.lock().unwrap();
                 if let Some(p) = sp.get(worker_idx) {
-                    p.sent.store(pr.messages_sent, Ordering::Relaxed);
-                    p.bytes.store(pr.bytes_written, Ordering::Relaxed);
-                    p.received.store(pr.messages_received, Ordering::Relaxed);
+                    // Leave sent/received/bytes at the LAST iteration's
+                    // live counts so the per-iter progress bar lands at
+                    // ~100% instead of the cumulative cross-iter total
+                    // (which would overshoot). The cumulative figures
+                    // live in `pr.messages_*` and surface via the final
+                    // report. Still snap unacked to its real end value.
                     p.unacked.store(pr.unacked_at_end, Ordering::Relaxed);
                     let final_state = if cancelled_mid_run {
                         protoplay::session_state::CANCELLED

@@ -159,6 +159,14 @@ pub struct SourceProgressJson {
     /// True once this session has been individually cancelled.
     #[serde(default)]
     pub cancelled: bool,
+    /// Current iteration number (1-based) the session is on. `0`
+    /// before the first iteration starts; equal to `iter_total` once
+    /// the run is complete.
+    #[serde(default)]
+    pub iter_current: u64,
+    /// Total iterations planned. `0` = unbounded (loop until cancel).
+    #[serde(default)]
+    pub iter_total: u64,
 }
 
 fn runstate_to_stored(rs: &RunState) -> StoredRun {
@@ -550,6 +558,8 @@ fn refresh_progress(rs: &mut RunState) {
                 state: state_to_str(p.snapshot_state()).to_string(),
                 ready: p.is_ready(),
                 cancelled: p.is_cancelled(),
+                iter_current: p.iter_current.load(Ordering::Relaxed),
+                iter_total: p.iter_total.load(Ordering::Relaxed),
             }
         })
         .collect();
@@ -758,6 +768,17 @@ struct RunReq {
     skip_non_ip: bool,
     #[serde(default)]
     only_src: Vec<Ipv4Addr>,
+    /// Pre-run RTU subset. In slave-mode this filters which captured
+    /// server IPs get a listener; in master-mode it filters which
+    /// client IPs spawn a session. Empty = all (run all).
+    #[serde(default)]
+    selected_rtus: Vec<Ipv4Addr>,
+    /// Slave-mode only. When `true`, the slave replays the captured
+    /// script `iterations` times *within one TCP session* (no STOPDT
+    /// between loops). Default `false` keeps the legacy
+    /// "fresh handshake per iteration" behaviour.
+    #[serde(default)]
+    loop_within_session: bool,
     #[serde(default = "default_warmup")]
     warmup_secs: u64,
     /// "raw" (default) or "benchmark".
@@ -995,6 +1016,12 @@ async fn api_run(
             alias_state_path: Some(alias_state_path()),
             master_bind_ip: req.master_bind_ip,
             tcp_nodelay: req.tcp_nodelay,
+            selected_endpoints: if req.selected_rtus.is_empty() {
+                None
+            } else {
+                Some(req.selected_rtus.iter().copied().collect())
+            },
+            loop_within_session: req.loop_within_session,
         };
         let db_bench = state.db.clone();
         thread::Builder::new()
@@ -1278,6 +1305,8 @@ async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocket) {
                         listen_port: p.listen_port,
                         pps_sent: pps_s,
                         pps_recv: pps_r,
+                        iter_current: p.iter_current,
+                        iter_total: p.iter_total,
                     }
                 })
                 .collect();
@@ -1346,6 +1375,10 @@ struct LivePerSession {
     /// Per-session downlink rate (messages/s received from the live
     /// target since the last WS tick).
     pps_recv: u64,
+    /// Current iteration this session is on (1-based, 0 before start).
+    iter_current: u64,
+    /// Total iterations planned (0 = unbounded).
+    iter_total: u64,
 }
 
 async fn api_run_delete(
@@ -2179,6 +2212,32 @@ struct Viability {
     verdict_reason: String,
     /// Extra observations the UI can render as bullet notes.
     notes: Vec<String>,
+    /// Per-RTU breakdown for slave-mode (one entry per server IP).
+    /// Drives the run-config "select RTUs" picker + traffic chart.
+    #[serde(default)]
+    slave_rtus: Vec<RtuTraffic>,
+    /// Same shape per master client (master-mode picker).
+    #[serde(default)]
+    master_clients: Vec<RtuTraffic>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RtuTraffic {
+    ip: String,
+    payload_bytes: u64,
+    messages: u64,
+    duration_ms: u64,
+}
+
+impl From<protoplay::RtuTraffic> for RtuTraffic {
+    fn from(p: protoplay::RtuTraffic) -> Self {
+        Self {
+            ip: p.ip,
+            payload_bytes: p.payload_bytes,
+            messages: p.messages,
+            duration_ms: p.duration_ms,
+        }
+    }
 }
 
 fn library_entry_id_valid(id: &str) -> bool {
@@ -2295,6 +2354,12 @@ impl<'a> protoplay::LoadedPcapView for LoadedPcapAdapter<'a> {
             .unwrap_or(0);
         (cb, sb)
     }
+    fn flow_server_payload(&self, flow_idx: usize) -> Vec<u8> {
+        self.inner
+            .reassemble_server_payload(flow_idx)
+            .map(|rf| rf.payload.to_vec())
+            .unwrap_or_default()
+    }
 }
 
 /// Convert a generic [`protoplay::ProtoViability`] into the
@@ -2310,6 +2375,8 @@ fn viability_from_proto(p: protoplay::ProtoViability) -> Viability {
         verdict: p.verdict,
         verdict_reason: p.verdict_reason,
         notes: p.notes,
+        slave_rtus: p.slave_rtus.into_iter().map(Into::into).collect(),
+        master_clients: p.master_clients.into_iter().map(Into::into).collect(),
     }
 }
 
@@ -2469,6 +2536,8 @@ async fn api_library_upload(
                         verdict: "not_recommended".into(),
                         verdict_reason: "background parse failed — file may be truncated or use an unsupported link type".into(),
                         notes: vec![],
+                        slave_rtus: vec![],
+                        master_clients: vec![],
                     }),
                 };
                 let _ = save_library_entry(&dir_owned, &stub);

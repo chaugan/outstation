@@ -26,6 +26,7 @@
 //! interrogation: the response is just ActCon → ActTerm with no data
 //! frames in between. This builder handles that case.
 
+use crate::apdu::{APCI_LEN, MAX_APDU_LEN};
 use crate::asdu::{element_len, write_ioa, DUI_LEN, IOA_LEN};
 use crate::inventory::Inventory;
 
@@ -39,10 +40,28 @@ pub const COT_INROGEN_STATION: u8 = 20;
 pub const COT_REQCOGEN: u8 = 37;
 pub const COT_REQCO_GROUP_BASE: u8 = 38;
 
-/// Maximum Information Object count per ASDU. The 7-bit N field in
-/// the VSQ caps any one frame at 127 elements, so the builder chunks
-/// long inventory responses across multiple ASDUs.
+/// Hard upper bound on Information Object count per ASDU from the
+/// 7-bit N field in the VSQ (IEC 60870-5-101 §7.2.2). The actual cap
+/// is per-type, computed from `MAX_APDU_LEN` so the resulting APCI
+/// fits the 1-byte APDU length field — see [`max_elements_for`].
 pub const MAX_ELEMENTS_PER_ASDU: usize = 127;
+
+/// Largest element count of `type_id` that fits in a single APCI
+/// (after the 6-byte DUI). Returns 0 if `type_id` has no known
+/// element layout. The IEC 104 APDU length octet caps the body at
+/// `MAX_APDU_LEN` (253) bytes including the 4 control-field bytes,
+/// so the ASDU itself can use at most `MAX_APDU_LEN - APCI_LEN = 249`
+/// bytes. After the 6-byte DUI we have `249 - 6 = 243` bytes for
+/// `n × (IOA_LEN + element_len)` (SQ=0 case).
+pub fn max_elements_for(type_id: u8) -> usize {
+    let Some(elem) = element_len(type_id) else {
+        return 0;
+    };
+    let body_budget = MAX_APDU_LEN - APCI_LEN - DUI_LEN; // 243
+    let stride = IOA_LEN + elem;
+    let by_bytes = body_budget / stride;
+    by_bytes.min(MAX_ELEMENTS_PER_ASDU)
+}
 
 /// Per-request bits the responder needs to echo on every reply ASDU.
 #[derive(Debug, Clone, Copy)]
@@ -166,9 +185,15 @@ fn build_ci_control(echo: RequestEcho, cot: u8, qcc: u8) -> Vec<u8> {
 
 /// Build the data frames for an interrogation response. Groups
 /// consecutive entries with the same `type_id` into a single ASDU
-/// (`SQ=0`, `N=k`) up to `MAX_ELEMENTS_PER_ASDU` per ASDU. Mixed
-/// types start new ASDUs. Returns one `Vec<u8>` per ASDU in the
-/// order they should hit the wire.
+/// (`SQ=0`, `N=k`) sized to fit a single APCI (≤ `MAX_APDU_LEN`).
+/// Mixed types start new ASDUs. Returns one `Vec<u8>` per ASDU in
+/// the order they should hit the wire.
+///
+/// Per-type element cap matters: a type-36 (M_ME_TF_1, 12 B/elem)
+/// fits at most 16 IOAs per ASDU, while a type-1 (M_SP_NA_1, 1 B/elem)
+/// fits 60. Without per-type capping the responder emits frames whose
+/// declared APCI length wraps the 1-byte length field and the receiver
+/// sees garbage.
 fn build_data_frames(
     echo: RequestEcho,
     cot: u8,
@@ -187,12 +212,17 @@ fn build_data_frames(
                 continue;
             }
         };
+        let cap = max_elements_for(type_id);
+        if cap == 0 {
+            i += 1;
+            continue;
+        }
         // Find the run of consecutive same-type entries (capped to
-        // MAX_ELEMENTS_PER_ASDU).
+        // the per-type byte budget).
         let mut j = i + 1;
         while j < entries.len()
             && entries[j].1.type_id == type_id
-            && (j - i) < MAX_ELEMENTS_PER_ASDU
+            && (j - i) < cap
         {
             j += 1;
         }
@@ -285,16 +315,62 @@ mod tests {
     }
 
     #[test]
-    fn chunks_when_more_than_127_points() {
+    fn chunks_by_per_type_byte_budget() {
+        // type 13 = M_ME_NC_1 (4 B float + 1 B QDS = 5 B/elem).
+        // Stride per IOA = 3 + 5 = 8 B, so max-per-ASDU = floor(243/8) = 30.
         let mut inv = Inventory::default();
         for i in 0..200u32 {
             inv.ingest_asdu(&synth_point(1, 1000 + i, i as u8));
         }
         let resp = build_gi_response(&inv, echo_for(1), 20);
-        // ActCon + 2 data frames (127 + 73) + ActTerm.
-        assert_eq!(resp.len(), 4);
-        assert_eq!(resp[1][1] & 0x7f, 127);
-        assert_eq!(resp[2][1] & 0x7f, 73);
+        // 200 / 30 = 6 frames of 30 + 1 frame of 20  → ActCon + 7 + ActTerm.
+        assert_eq!(resp.len(), 9);
+        for f in &resp[1..resp.len() - 1] {
+            // No ASDU exceeds the APCI byte budget.
+            assert!(f.len() <= MAX_APDU_LEN - APCI_LEN, "frame too big: {}", f.len());
+        }
+        assert_eq!(resp[1][1] & 0x7f, 30);
+        assert_eq!(resp[7][1] & 0x7f, 20);
+    }
+
+    /// Regression for a real bug: type 36 (M_ME_TF_1, 12 B/elem) was
+    /// being packed at 127 IOAs/ASDU, producing a 1911-byte ASDU whose
+    /// declared APCI length wrapped the 1-byte length field. The
+    /// receiver then saw the next valid APCI offset by ~1.9 KB and
+    /// reported "ERR prefix N bytes" for everything in between.
+    #[test]
+    fn type36_response_fits_apdu_length_field() {
+        let mut inv = Inventory::default();
+        // Synthesize 200 type-36 entries (4 B float + 1 B QDS + 7 B
+        // CP56Time2a = 12 B/elem). Stride per IOA = 3 + 12 = 15 B.
+        // max-per-ASDU = floor(243/15) = 16.
+        for i in 0..200u32 {
+            let elem = element_len(36).unwrap();
+            let mut a = vec![0u8; DUI_LEN + IOA_LEN + elem];
+            a[0] = 36;
+            a[1] = 0x01; // SQ=0, N=1
+            a[2] = 20; // station Inrogen → eligible
+            a[3] = 0;
+            a[4] = 1;
+            a[5] = 0;
+            write_ioa(&mut a, DUI_LEN, 1000 + i);
+            inv.ingest_asdu(&a);
+        }
+        let resp = build_gi_response(&inv, echo_for(1), 20);
+        for f in &resp[1..resp.len() - 1] {
+            assert!(
+                f.len() <= MAX_APDU_LEN - APCI_LEN,
+                "type-36 frame would overflow APCI length field: {} bytes",
+                f.len()
+            );
+            assert!((f[1] & 0x7f) as usize <= 16, "type-36 N capped at 16");
+        }
+        // Total elements add up across frames.
+        let total: usize = resp[1..resp.len() - 1]
+            .iter()
+            .map(|f| (f[1] & 0x7f) as usize)
+            .sum();
+        assert_eq!(total, 200);
     }
 
     #[test]

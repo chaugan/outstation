@@ -1575,6 +1575,12 @@
         <label>iterations <span class="opt">(0 = unlimited)</span></label>
         <input id="run-iterations" type="number" step="1" min="0" value="1">
       </div>
+      <div class="field span-2" data-proto="iec104">
+        <label class="check-row" title="Slave-mode only. When on, the slave replays the captured script N times within ONE TCP session — no STOPDT between iterations. More spec-realistic (real RTUs hold their session open) and works around polling masters that don't auto-reconnect after a STOPDT.">
+          <input id="run-loop-within-session" type="checkbox">
+          loop iterations within one session <span class="opt">(slave-mode · no STOPDT between loops)</span>
+        </label>
+      </div>
 
       <div class="field span-2">
         <label>egress nic <span class="opt">(optional)</span></label>
@@ -1955,13 +1961,81 @@ function updateSelectedLabel() {
         for (const n of v.notes) {
           card += `<div class="note">&middot; ${esc(n)}</div>`;
         }
+        card += renderRtuPicker(v);
         card += `</div>`;
         box.insertAdjacentHTML('afterend', card);
+        wireRtuPicker();
       }
     }
   } else {
     box.innerHTML = '<span class="empty">no pcap selected &mdash; pick one from the library above</span>';
   }
+}
+
+// Pre-run RTU picker: shows the captured slave/master endpoints with
+// per-RTU traffic bars and a checkbox per row. The bar width is
+// proportional to that RTU's payload bytes (relative to the heaviest
+// in the set), so the operator can spot which slaves are talkative
+// vs. silent before committing to a run. "Select all / none" toggles
+// flip every checkbox at once. Selection is read at run-start time
+// (see collectSelectedRtus), so the user can flip the role/proto
+// without losing their checks.
+function renderRtuPicker(v) {
+  const slaves = v.slave_rtus || [];
+  if (slaves.length === 0) return '';
+  const maxBytes = slaves.reduce((m, r) => Math.max(m, r.payload_bytes || 0), 0) || 1;
+  let h = `<div class="rtu-picker" id="rtu-picker" style="margin-top:10px;border-top:1px solid var(--rule);padding-top:10px">`;
+  h += `<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px">`;
+  h += `<div style="font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:0.08em;color:var(--ink)">RTUs TO SIMULATE (${slaves.length})</div>`;
+  h += `<button type="button" class="ghost" style="font-size:11px;padding:2px 8px" onclick="toggleAllRtus(true)">Select all</button>`;
+  h += `<button type="button" class="ghost" style="font-size:11px;padding:2px 8px" onclick="toggleAllRtus(false)">Select none</button>`;
+  h += `<span class="muted" id="rtu-picker-count" style="font-size:11px;margin-left:auto"></span>`;
+  h += `</div>`;
+  h += `<div style="max-height:260px;overflow-y:auto;font-family:var(--mono);font-size:11px;border:1px solid var(--rule);border-radius:2px">`;
+  for (const r of slaves) {
+    const pct = ((r.payload_bytes || 0) / maxBytes) * 100;
+    const sizeStr = (r.payload_bytes || 0) >= 1024
+      ? ((r.payload_bytes / 1024).toFixed(1) + ' KiB')
+      : ((r.payload_bytes || 0) + ' B');
+    h += `<label style="display:grid;grid-template-columns:24px 110px 1fr 90px 80px;gap:10px;align-items:center;padding:3px 8px;border-bottom:1px solid var(--rule);cursor:pointer">`;
+    h += `<input type="checkbox" class="rtu-cb" data-ip="${esc(r.ip)}" checked onchange="updateRtuPickerCount()">`;
+    h += `<code style="font-family:var(--mono);font-size:11px;color:var(--ink)">${esc(r.ip)}</code>`;
+    h += `<div style="position:relative;background:var(--surface-2);height:10px;border-radius:1px;overflow:hidden">`;
+    h += `<div style="position:absolute;left:0;top:0;bottom:0;width:${pct.toFixed(1)}%;background:var(--blue,#39c)"></div>`;
+    h += `</div>`;
+    h += `<div style="text-align:right">${sizeStr}</div>`;
+    h += `<div style="text-align:right" class="muted">${(r.messages||0)} msg</div>`;
+    h += `</label>`;
+  }
+  h += `</div></div>`;
+  return h;
+}
+
+function wireRtuPicker() {
+  updateRtuPickerCount();
+}
+
+function toggleAllRtus(check) {
+  document.querySelectorAll('#rtu-picker .rtu-cb').forEach(cb => { cb.checked = !!check; });
+  updateRtuPickerCount();
+}
+
+function updateRtuPickerCount() {
+  const cbs = document.querySelectorAll('#rtu-picker .rtu-cb');
+  if (!cbs.length) return;
+  const checked = Array.from(cbs).filter(c => c.checked).length;
+  const lbl = document.getElementById('rtu-picker-count');
+  if (lbl) lbl.textContent = `${checked} of ${cbs.length} selected (run all = ${checked === cbs.length ? 'yes' : 'no'})`;
+}
+
+function collectSelectedRtus() {
+  const cbs = Array.from(document.querySelectorAll('#rtu-picker .rtu-cb'));
+  if (!cbs.length) return [];
+  const all = cbs.length;
+  const checked = cbs.filter(c => c.checked).map(c => c.dataset.ip);
+  // "Run all" = empty list = backend default (no filter).
+  if (checked.length === all) return [];
+  return checked;
 }
 
 async function deletePcap(id) {
@@ -2224,6 +2298,7 @@ async function startRun() {
       if (v === 'off') return false;
       return null;  // role-default
     })(),
+    loop_within_session: el('run-loop-within-session')?.checked || false,
   };
   if (isBench && el('run-scada-gw-enable').checked) {
     const gw = el('run-scada-gw-ip').value.trim();
@@ -2239,6 +2314,8 @@ async function startRun() {
   }
   if (selectedPcapId) body.pcap_id = selectedPcapId;
   else body.pcap = selectedRawPath;
+  const sel = collectSelectedRtus();
+  if (sel.length > 0) body.selected_rtus = sel;
 
   const btn = el('start-btn');
   btn.disabled = true;
@@ -2287,10 +2364,22 @@ function renderSlaveRow(r, p, idx) {
     failed:     'var(--err)',
   }[p.state] || 'var(--dim)';
   const stateLabel = (p.state || 'pending').toUpperCase();
-  const frac = p.planned ? (p.sent / p.planned) : 0;
+  // Per-iteration progress: backend resets `sent` to 0 at the top of
+  // every iteration, so this fraction tracks the CURRENT iteration only.
+  // Clamp to 100% defensively in case a tick races past the reset.
+  const frac = p.planned ? Math.min(1.0, p.sent / p.planned) : 0;
   const pct = Math.round(frac * 100);
   const nm = p.src_ip || p.src_mac;
   const rowId = `slave-${r.id}-${idx}`;
+  // Iter counter chip: shown only when the run is multi-iteration
+  // (iter_total > 1) or unbounded (iter_total === 0 with iter_current > 0).
+  let iterChip = '';
+  if (p.iter_current > 0 && (p.iter_total === 0 || p.iter_total > 1)) {
+    const label = (p.iter_total === 0)
+      ? `iter ${p.iter_current} (looping until stopped)`
+      : `iter ${p.iter_current} / ${p.iter_total}`;
+    iterChip = `<span class="slave-iter" style="font-family:var(--mono);font-size:11px;color:var(--dim);margin-right:8px">${label}</span>`;
+  }
 
   // The IP input and verify button are only editable while PENDING.
   let ipField;
@@ -2324,11 +2413,11 @@ function renderSlaveRow(r, p, idx) {
     `;
   } else if (p.state === 'connected' || p.state === 'active') {
     right = `
-      <span class="slave-count">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>
+      ${iterChip}<span class="slave-count">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>
       <button class="slave-btn abort" onclick="stopSlave(${r.id}, ${idx})">STOP</button>
     `;
   } else if (p.state === 'completed') {
-    right = `<span class="slave-count" style="color:var(--ok)">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>`;
+    right = `${iterChip}<span class="slave-count" style="color:var(--ok)">${p.sent.toLocaleString()} / ${p.planned.toLocaleString()}</span>`;
   } else if (p.state === 'failed') {
     right = `<span class="slave-count" style="color:var(--err)">failed</span>`;
   }
@@ -2447,7 +2536,7 @@ async function refreshRuns() {
   }
   let h = '';
   for (const r of runs) {
-    const frac = r.planned ? (r.sent / r.planned) : (r.report ? 1 : 0);
+    const frac = r.planned ? Math.min(1.0, r.sent / r.planned) : (r.report ? 1 : 0);
     const pct = Math.round(frac * 100);
     const cur = r.report ? r.report.total_packets : r.sent;
     const total = r.planned || (r.report ? r.report.total_packets : 0);
@@ -3378,6 +3467,12 @@ function renderAnalysis(r) {
   const out = el('an-result');
   let h = `<div class="an-card">`;
   h += renderFleetHeader(r);
+  // Per-protocol fleet-level extras (e.g. IEC 104 GI/CI rollup bars).
+  // Optional renderer hook on `PROTOCOL_RENDERERS[proto].renderFleetExtras(r)`.
+  const _fleetRenderer = (window.PROTOCOL_RENDERERS || {})[r.protocol];
+  if (_fleetRenderer && typeof _fleetRenderer.renderFleetExtras === "function") {
+    h += _fleetRenderer.renderFleetExtras(r);
+  }
   h += renderFleetPacingChart(r);
   h += renderFleetDriftChart(r);
   h += renderRunContext(r);
