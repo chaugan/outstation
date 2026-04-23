@@ -28,9 +28,11 @@ use crate::apdu::{
     U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
-    load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone, Iec104ProtoConfig,
-    RewriteMap,
+    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone,
+    Iec104ProtoConfig, RewriteMap, DUI_LEN, IOA_LEN,
 };
+use crate::inventory::Inventory;
+use crate::responder::{build_ci_response, build_gi_response, RequestEcho};
 
 #[inline]
 fn wall_clock_unix_ns() -> u64 {
@@ -579,6 +581,87 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
 
 /// Process one incoming APDU: advance `my_nr` for I-frames, retire
 /// pending I-frames against `n(r)` in S/I frames, auto-ack TESTFR, and
+/// Slave-mode wrapper around [`handle_incoming`]. Detects master
+/// commands the slave is expected to answer (currently `C_IC_NA_1`
+/// general interrogation and `C_CI_NA_1` counter interrogation) and
+/// queues the spec-correct response ASDUs into `response_queue`. The
+/// main slave send-loop drains that queue between captured-payload
+/// frames so responses go out interleaved with spontaneous data,
+/// preserving k-window ordering.
+///
+/// All other APDUs (S-frames, U-frames, spontaneous I-frames the master
+/// happens to echo) are forwarded verbatim to [`handle_incoming`] for
+/// the existing receive-side accounting.
+fn slave_handle_incoming(
+    apdu: Apdu,
+    writer: &mut TcpStream,
+    my_nr: &mut u16,
+    unacked_received: &mut u16,
+    w: u16,
+    pending: &mut VecDeque<PendingIFrame>,
+    report: &mut ProtoReport,
+    progress: &Option<MessageProgress>,
+    latency: &mut LatencyReservoir,
+    inventory: &Inventory,
+    response_queue: &mut VecDeque<Vec<u8>>,
+) {
+    if let Apdu::I { ref asdu, .. } = apdu {
+        try_queue_master_command_response(asdu, inventory, response_queue);
+    }
+    handle_incoming(
+        apdu,
+        writer,
+        my_nr,
+        unacked_received,
+        w,
+        pending,
+        report,
+        progress,
+        latency,
+    );
+}
+
+/// Inspect an incoming I-frame ASDU; if it is a recognised master
+/// command (currently `C_IC_NA_1` type 100 or `C_CI_NA_1` type 101,
+/// COT=6 = Activation), build the spec-correct response sequence
+/// (ActCon → data frames → ActTerm) using [`crate::responder`] and
+/// push the resulting ASDUs into `queue`. Other ASDUs are no-ops.
+fn try_queue_master_command_response(
+    asdu: &[u8],
+    inventory: &Inventory,
+    queue: &mut VecDeque<Vec<u8>>,
+) {
+    if asdu.len() < DUI_LEN + IOA_LEN + 1 {
+        return;
+    }
+    let type_id = asdu[0];
+    if !matches!(type_id, 100 | 101) {
+        return;
+    }
+    let cot_low = asdu[2] & 0x3f;
+    if cot_low != 6 {
+        // Activation only. ActCon (7) and ActTerm (10) shouldn't come
+        // from master; ignore. Other COTs (negative ack etc.) we don't
+        // synthesise replies for.
+        return;
+    }
+    let echo = RequestEcho {
+        ca: common_address(asdu),
+        oa: asdu[3],
+        test: asdu[2] & 0x80 != 0,
+        negative: false,
+    };
+    let element_byte = asdu[DUI_LEN + IOA_LEN]; // QOI for type 100, QCC for 101
+    let frames = match type_id {
+        100 => build_gi_response(inventory, echo, element_byte),
+        101 => build_ci_response(inventory, echo, element_byte),
+        _ => return,
+    };
+    for f in frames {
+        queue.push_back(f);
+    }
+}
+
 /// emit an S-frame when our receive window hits `w`.
 fn handle_incoming(
     apdu: Apdu,
@@ -724,6 +807,26 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         count = server_iframes.len(),
         port = cfg.listen_port,
         "slave: extracted server-originated I-frame ASDUs"
+    );
+
+    // Build the per-RTU point database from the same captured payload
+    // we will replay. Used to answer GI/CI commands the live master
+    // sends (C_IC_NA_1, C_CI_NA_1) with spec-correct Inrogen/Reqcogen
+    // sequences carrying the most recently seen value per (CA, IOA).
+    // Spec-strict: see crate::responder for the per-IEC-60870-5-101
+    // semantics (ActCon -> values -> ActTerm, QOI/QCC echo, group
+    // filtering, k-window aware chunking).
+    let mut inventory = crate::inventory::Inventory::default();
+    {
+        let mut full = Vec::new();
+        for seg in &cfg.client_segments {
+            full.extend_from_slice(&seg.bytes);
+        }
+        inventory.ingest_payload(&full);
+    }
+    info!(
+        points = inventory.len(),
+        "slave: built point inventory for GI/CI responses"
     );
     bump(&progress, |p| {
         p.planned.store(server_iframes.len() as u64, Ordering::Relaxed);
@@ -873,6 +976,13 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     let mut latency = LatencyReservoir::new(LATENCY_RESERVOIR_CAP);
     let send_start_ns = now_ns();
 
+    // Response queue for GI/CI bursts the slave synthesises in reply
+    // to incoming master commands. slave_handle_incoming pushes into
+    // this; the loop below drains a few entries between every
+    // captured-payload frame so responses go out promptly without
+    // blowing past the k-window.
+    let mut response_queue: VecDeque<Vec<u8>> = VecDeque::new();
+
     'outer: for (idx, asdu) in server_iframes.iter().enumerate() {
         if check_cancel(&progress) {
             report.error = Some(format!("cancelled at idx {idx}"));
@@ -896,7 +1006,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 let remaining_ns = target_abs_ns.saturating_sub(now);
                 let slice = Duration::from_nanos(remaining_ns.min(IDLE_POLL.as_nanos() as u64));
                 match rx.recv_timeout(slice) {
-                    Ok(apdu) => handle_incoming(
+                    Ok(apdu) => slave_handle_incoming(
                         apdu,
                         &mut write_stream,
                         &mut my_nr,
@@ -906,6 +1016,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                         &mut report,
                         &progress,
                         &mut latency,
+                        &inventory,
+                        &mut response_queue,
                     ),
                     Err(RecvTimeoutError::Timeout) => {}
                     Err(RecvTimeoutError::Disconnected) => {
@@ -925,7 +1037,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 match rx.recv_timeout(remaining.min(IDLE_POLL)) {
                     Ok(apdu) => {
-                        handle_incoming(
+                        slave_handle_incoming(
                             apdu,
                             &mut write_stream,
                             &mut my_nr,
@@ -935,6 +1047,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                             &mut report,
                             &progress,
                             &mut latency,
+                            &inventory,
+                            &mut response_queue,
                         );
                         if (pending.len() as u16) < k {
                             freed = true;
@@ -961,7 +1075,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         }
 
         while let Ok(apdu) = rx.try_recv() {
-            handle_incoming(
+            slave_handle_incoming(
                 apdu,
                 &mut write_stream,
                 &mut my_nr,
@@ -971,7 +1085,48 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 &mut report,
                 &progress,
                 &mut latency,
+                &inventory,
+                &mut response_queue,
             );
+        }
+
+        // Drain any queued GI/CI response frames first so a master
+        // command that arrived during the pacing wait gets answered
+        // before we resume captured-payload replay. Bounded by the
+        // remaining k-window slot count so we never overrun the
+        // master's receive window.
+        while !response_queue.is_empty() && (pending.len() as u16) < k {
+            let mut resp_asdu = response_queue
+                .pop_front()
+                .expect("len > 0 just checked");
+            if cp56_cfg.rewrite_to_now {
+                rewrite_cp56time2a_to_now_zoned(
+                    &mut resp_asdu,
+                    wall_clock_unix_ns(),
+                    cp56_zone,
+                );
+            }
+            let resp_apdu = Apdu::I {
+                ns: my_ns,
+                nr: my_nr,
+                asdu: resp_asdu,
+            };
+            let resp_send_ns = now_ns();
+            let resp_wire_len = resp_apdu.serialize().len() as u64;
+            if let Err(e) = write_apdu(&mut write_stream, &resp_apdu) {
+                warn!(error = %e, "slave: send GI/CI response frame failed");
+                report.error = Some(format!("send GI/CI response: {e}"));
+                break 'outer;
+            }
+            pending.push_back(PendingIFrame { ns: my_ns, send_ns: resp_send_ns });
+            my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
+            report.messages_sent += 1;
+            report.bytes_written += resp_wire_len;
+            bump(&progress, |p| {
+                p.sent.fetch_add(1, Ordering::Relaxed);
+                p.bytes_written.fetch_add(resp_wire_len, Ordering::Relaxed);
+                p.unacked.store(pending.len() as u64, Ordering::Relaxed);
+            });
         }
 
         let mut patched = asdu.clone();
@@ -1006,7 +1161,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     while !pending.is_empty() && Instant::now() < final_deadline {
         let remaining = final_deadline.saturating_duration_since(Instant::now());
         match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-            Ok(apdu) => handle_incoming(
+            Ok(apdu) => slave_handle_incoming(
                 apdu,
                 &mut write_stream,
                 &mut my_nr,
@@ -1016,6 +1171,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 &mut report,
                 &progress,
                 &mut latency,
+                &inventory,
+                &mut response_queue,
             ),
             Err(RecvTimeoutError::Timeout) => continue,
             Err(RecvTimeoutError::Disconnected) => break,

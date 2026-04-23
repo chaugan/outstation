@@ -17,6 +17,8 @@ use protoplay::{
 };
 
 pub mod analysis;
+pub mod inventory;
+pub mod responder;
 pub mod apdu;
 pub mod asdu;
 pub mod session;
