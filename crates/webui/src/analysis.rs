@@ -301,14 +301,33 @@ pub fn analyze(
         ));
     }
 
-    let mut slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&original, target_port);
-    let captured_slave_ips = list_slave_ips(&captured, target_port);
-    for ip in &captured_slave_ips {
-        slave_ips.insert(*ip);
-    }
+    // Slave list strategy: prefer the captured pcap's slave set
+    // (those are the RTUs the run actually attempted — matches the
+    // run-config "select RTUs" picker subset). Fall back to the
+    // source-pcap set only when the captured pcap has no slave-side
+    // traffic at all (e.g. capture started after the run finished or
+    // every session bailed pre-handshake) — in that case we still
+    // want to see what the source expected so the analysis isn't
+    // empty.
+    let source_slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&original, target_port);
+    let captured_slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&captured, target_port);
+    let slave_ips: BTreeSet<Ipv4Addr> = if !captured_slave_ips.is_empty() {
+        captured_slave_ips.clone()
+    } else {
+        source_slave_ips.clone()
+    };
     if slave_ips.is_empty() {
         return Err(anyhow::anyhow!(
             "no flow in source pcap with server_port={target_port}; nothing to compare against"
+        ));
+    }
+    let dropped = source_slave_ips.len().saturating_sub(slave_ips.len());
+    if dropped > 0 {
+        fleet_notes.push(format!(
+            "{} of {} captured-pcap RTUs not attempted in this run; only the {} replayed RTU(s) are listed below",
+            dropped,
+            source_slave_ips.len(),
+            slave_ips.len()
         ));
     }
 
