@@ -179,7 +179,8 @@ impl ProtoReplayer for Iec104Replayer {
         let sessions_master_mode = client_ips.len() as u64;
         let sessions_slave_mode = server_ips.len() as u64;
         let mb = |b: u64| b.div_ceil(1024 * 1024);
-        let parsed_store_mb = mb(file_size_bytes);
+        // pcapload holds the file plus ~90 B of metadata per packet: ~2x for IEC 104-sized frames.
+        let parsed_store_mb = mb(file_size_bytes.saturating_mul(2));
         let max_session_count = sessions_master_mode.max(sessions_slave_mode);
         let session_payload_mb = mb(client_payload_bytes.max(server_payload_bytes));
         let reservoir_mb = mb(max_session_count * 80 * 1024);
