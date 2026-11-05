@@ -483,6 +483,55 @@ impl Db {
         Ok(out)
     }
 
+    /// One page of runs with `id < before`, newest first, optionally of
+    /// one status (F054). Undecodable rows are skipped and logged.
+    pub fn load_page(
+        &self,
+        before: u64,
+        status: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<StoredRun>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT {RUN_COLUMNS} FROM runs
+             WHERE id < ?1 AND (?2 IS NULL OR status = ?2)
+             ORDER BY id DESC LIMIT ?3"
+        ))?;
+        let before = i64::try_from(before).unwrap_or(i64::MAX);
+        let mut rows = stmt.query(params![before, status, limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            match decode_row(row) {
+                Ok(r) => out.push(r),
+                Err(e) => {
+                    let id: Option<i64> = row.get(0).ok();
+                    warn!(?id, error = %e, "skipping unreadable run row");
+                }
+            }
+        }
+        Ok(out)
+    }
+
+    /// One run by id, if it exists and decodes.
+    pub fn load_one(&self, id: u64) -> Result<Option<StoredRun>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(&format!("SELECT {RUN_COLUMNS} FROM runs WHERE id = ?1"))?;
+        Ok(stmt.query_row(params![id as i64], decode_row).optional()?)
+    }
+
+    /// Ids of runs whose source is library entry `pcap_id` or `pcap`.
+    pub fn run_ids_using_pcap(&self, pcap_id: &str, pcap: &str) -> Result<Vec<u64>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT id FROM runs WHERE pcap_id = ?1 OR pcap = ?2 ORDER BY id")?;
+        let rows = stmt.query_map(params![pcap_id, pcap], |r| r.get::<_, i64>(0))?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .map(|i| i as u64)
+            .collect())
+    }
+
     /// Delete a run and every analysis stored for it.
     pub fn delete(&self, id: u64) -> Result<usize> {
         let mut conn = self.conn.lock_safe();
@@ -665,6 +714,30 @@ impl Db {
             .optional()?)
     }
 
+    /// The index row of one stored analysis.
+    pub fn analysis_row(&self, id: u64) -> Result<Option<StoredAnalysis>> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT id, run_id, created_at, verdict, score_pct, source FROM analyses
+                 WHERE id = ?1",
+                params![id as i64],
+                decode_analysis,
+            )
+            .optional()?)
+    }
+
+    /// Every endpoint detail of a stored analysis, `(endpoint, json)`.
+    pub fn analysis_details_all(&self, id: u64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT endpoint, detail_json FROM analysis_details
+             WHERE analysis_id = ?1 ORDER BY endpoint",
+        )?;
+        let rows = stmt.query_map(params![id as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// One endpoint's detail JSON of a stored analysis.
     pub fn analysis_detail(&self, id: u64, endpoint: &str) -> Result<Option<String>> {
         let conn = self.conn.lock_safe();
@@ -728,6 +801,13 @@ fn decode_profile(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredProfile> {
         updated_at: r.get::<_, i64>(4)? as u64,
     })
 }
+
+/// The columns [`decode_row`] reads, in its order.
+const RUN_COLUMNS: &str = "id, started_at, status, pcap, target_ip, target_mac, mode, role,
+                    target_port, speed, top_speed, realtime, planned, sent, bytes,
+                    error, report_json, benchmark_json, per_source_json, throughput_json,
+                    proto_config, rewrite_cp56_to_now, cp56_zone, proto, finished_at,
+                    started_by, pcap_id, request_json, rerun_of";
 
 fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun> {
     let proto_config_raw: Option<String> = row.get(20)?;

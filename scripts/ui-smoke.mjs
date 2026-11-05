@@ -32,6 +32,11 @@
 // state on cards, the health chip and /metrics link, and the Compare
 // view: hash-kept selection and thresholds, analysis_missing → Analyze
 // → automatic retry, fleet and per-RTU tables, sort and filter.
+// T17 (fx2): verdict/outcome colouring (N14), the phone chrome not
+// covering the RTU picker (N24), neutral selection (N26), the running
+// card fed by the WebSocket with thinned polling (F105), /api/runs
+// pagination and "Load older runs" (F054) and the HTML report export
+// (F131).
 // Exits non-zero when any check fails. Runs it starts are stopped and
 // deleted at the end; the uploaded pcap is left in the library.
 
@@ -72,6 +77,7 @@ function check(cond, msg) {
   return false;
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
+const MASTER_TARGET = '192.0.2.10';
 
 async function apiGet(p) {
   const r = await fetch(BASE + p);
@@ -279,6 +285,7 @@ async function engineWalk(browser, name, viewport, deep) {
   await page.click('label[for="mode-benchmark"]');
   await page.waitForSelector('#rtu-tbody tr');
   await audit(page, 'configure', 'configure');
+  await chromeChecks(page, viewport);
   const missCfg = await tabWalk(page, 600, ['#cfg-pcap', '#cfg-target-ip', '#start-btn']);
   check(!missCfg.length, `keyboard reaches pcap, target and start${missCfg.length ? ' — missing ' + missCfg : ''}`);
 
@@ -335,6 +342,10 @@ async function engineWalk(browser, name, viewport, deep) {
   await audit(page, 'runs', 'runs');
   await go(page, 'analysis');
   await audit(page, 'analysis', 'analysis');
+  await colourChecks(page);
+  await go(page, 'library');
+  const selBg = await page.evaluate(() => { const r = document.querySelector('.pcap-row.selected'); return r ? getComputedStyle(r).backgroundColor : null; });
+  if (selBg) check(/\b31, 74, 120\b/.test(selBg), `selected pcap row is tinted neutral blue, not the error family (${selBg})`);
   if (flow.cmpA && flow.cmpB) {
     await go(page, `compare/${flow.cmpA}/${flow.cmpB}`);
     await page.waitForSelector('#cmp-tbody tr', { timeout: 15000 }).catch(() => {});
@@ -349,6 +360,96 @@ async function engineWalk(browser, name, viewport, deep) {
   check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
   await ctx.close();
   return pcapId;
+}
+
+
+// N24: on a phone the sticky top bar stays one compact block with a
+// single scrolling nav row, the start bar is not sticky, and the RTU
+// picker is not covered by either.
+async function chromeChecks(page, viewport) {
+  if (viewport.width > 600) return;
+  const m = await page.evaluate(() => {
+    const top = document.querySelector('.topbar').getBoundingClientRect().height;
+    const nav = document.querySelector('.nav');
+    const navH = nav.getBoundingClientRect().height;
+    const sb = getComputedStyle(document.querySelector('.start-bar')).position;
+    const row = document.querySelector('#rtu-tbody tr');
+    let covered = null;
+    if (row) {
+      row.scrollIntoView({ block: 'center' });
+      const r = row.getBoundingClientRect();
+      const hit = document.elementFromPoint(Math.min(r.left + 30, innerWidth - 5), r.top + r.height / 2);
+      covered = !(hit && row.contains(hit));
+    }
+    return { top, navH, sb, covered, navScroll: nav.scrollWidth > nav.clientWidth };
+  });
+  check(m.top <= 110, `phone top bar is compact (${Math.round(m.top)}px)`);
+  check(m.navH <= 40, `phone nav is one row (${Math.round(m.navH)}px${m.navScroll ? ', scrolls' : ''})`);
+  check(m.sb !== 'sticky' && m.sb !== 'fixed', `phone start bar is not sticky (${m.sb})`);
+  check(m.covered === false, `RTU picker row is not covered by the sticky bars (${m.covered === null ? 'no picker row' : m.covered ? 'covered' : 'visible'})`);
+}
+
+// N14: colour follows the verdict/outcome, never the score. A synthetic
+// report: a failing (degraded) endpoint scoring 100 and a stopped run.
+async function colourChecks(page) {
+  const c = await page.evaluate(() => {
+    an.report = {
+      run_id: 999999, verdict: 'stopped_clean', score_pct: 100, verdict_reason: 'synthetic', protocol: 'iec104', role: 'slave', mode: 'generic',
+      run_warning: 'the run being analysed was STOPPED before it finished', notes: [],
+      fleet: { slave_count: 2, fully_correct: 1, partial: 0, failed: 1, not_attempted: 0 },
+      slaves: [
+        { slave_ip: '10.250.0.1', outcome: 'fail', verdict: 'degraded', score_pct: 100, packets: 10, delivered_iframes: 8, expected_iframes: 8, startdt_handshake_ok: true, sessions: 1 },
+        { slave_ip: '10.250.0.2', outcome: 'pass', verdict: 'good_delivery', score_pct: 100, packets: 10, delivered_iframes: 8, expected_iframes: 8, startdt_handshake_ok: true, sessions: 1 },
+      ],
+    };
+    an.analysisId = null;
+    an.details = new Map();
+    renderAnalysis();
+    const cls = ip => { const row = document.querySelector(`.an-slave-row[data-ip="${ip}"] summary`); return row ? row.children[5].className : null; };
+    const out = { fleet: document.querySelector('.an-summary .an-score').className, bad: cls('10.250.0.1'), good: cls('10.250.0.2') };
+    document.querySelector('#an-result').innerHTML = '';
+    an.report = null;
+    return out;
+  });
+  check(c.bad && !/\bok\b/.test(c.bad), `failing endpoint with score 100 is not green (${c.bad})`);
+  check(/\bok\b/.test(c.good || ''), `passing endpoint is green (${c.good})`);
+  check(!/\bok\b/.test(c.fleet), `stopped run is not shown as a plain pass (${c.fleet})`);
+}
+
+// F054: /api/runs pages; the Runs view loads older pages on demand.
+async function paginationFlow(browser) {
+  current = 'pagination';
+  console.log('\n== runs pagination ==');
+  const all = await apiGet('/api/runs?limit=1000');
+  const total = all.length;
+  const r1 = await fetch(`${BASE}/api/runs?limit=1`);
+  const next = r1.headers.get('x-next-before');
+  if (total >= 2) check(next === String(all[0].id), `/api/runs?limit=1 says where the next page starts (X-Next-Before ${next})`);
+  if (next) {
+    const p2 = await (await fetch(`${BASE}/api/runs?limit=1&before=${next}`)).json();
+    check(p2.length === 1 && p2[0].id === all[1].id, `the next page continues the list (${p2.map(r => r.id)})`);
+  }
+  if (total < 3) { notes.push(`pagination UI not exercised: only ${total} runs`); return; }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  await ctx.addInitScript(INIT);
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await page.goto(`${BASE}/?runs_page=2#/runs`);
+  await page.waitForSelector('#runs-list > li');
+  const n1 = await page.locator('#runs-list > li').count();
+  check(n1 === 2, `the first page shows page-size runs (${n1})`);
+  const btn = '[data-fk="runs-older"]';
+  check(await page.isVisible(btn), '"Load older runs" is offered');
+  await page.click(btn);
+  await page.waitForFunction(n => document.querySelectorAll('#runs-list > li').length > n, n1, { timeout: 10000 }).catch(() => {});
+  const n2 = await page.locator('#runs-list > li').count();
+  check(n2 === Math.min(4, total), `older runs are appended (${n1} → ${n2})`);
+  await page.waitForTimeout(4500);
+  const n3 = await page.locator('#runs-list > li').count();
+  check(n3 === n2, `loaded older runs survive the next poll (${n3})`);
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
 }
 
 async function runFlows(browser, pcapId) {
@@ -372,7 +473,9 @@ async function runFlows(browser, pcapId) {
   await a.selectOption('#cfg-pcap', pcapId);
   await a.click('label[for="mode-benchmark"]');
   await a.click('label[for="role-master"]');
-  await a.fill('#cfg-target-ip', '127.0.0.1');
+  // TEST-NET-1: unicast (the server refuses loopback targets, N9) and
+  // never reachable, so an unprivileged server fails the run at setup.
+  await a.fill('#cfg-target-ip', MASTER_TARGET);
   await a.fill('#cfg-warmup', '0');
   await a.click('#start-btn');
   await a.waitForFunction(() => /Run #\d+/.test(document.querySelector('#run-result').textContent) || document.querySelector('#run-error').textContent.trim(), null, { timeout: 15000 });
@@ -426,6 +529,17 @@ async function runFlows(browser, pcapId) {
     return { created: window.__ws.length - n0, live: window.__ws.filter(s => s.readyState <= 1).length };
   }, slaveId);
   check(created.created === 0 && created.live === 1, `repeated connects keep one live WebSocket (created ${created.created}, live ${created.live})`);
+  // F103/F105: while the stream is live the list is polled slowly and
+  // carries no per-session rows; the card's rows come from the frames.
+  const listPolls = [];
+  const onReq = r => { if (/\/api\/runs\?limit=/.test(r.url())) listPolls.push(Date.now()); };
+  b.on('request', onReq);
+  await b.waitForTimeout(8500);
+  b.off('request', onReq);
+  check(listPolls.length <= 4, `run list polled slowly while the live stream is up (${listPolls.length} in 8.5 s)`);
+  const slim = (await apiGet('/api/runs?status=running'))[0] || {};
+  check(Array.isArray(slim.per_source_progress) && slim.per_source_progress.length === 0 && slim.source_states && Object.keys(slim.source_states).length > 0,
+    `run list carries state counts, not per-session rows (${JSON.stringify(slim.source_states)})`);
   const rows = await b.locator(`#runs-list > li[data-key="${slaveId}"] .sess-table tbody tr`).count();
   check(rows > 0 && rows <= 25, `session rows are paged (${rows} rows shown)`);
   // Focus survives polling (F121): focus the Stop button, wait for polls.
@@ -447,6 +561,12 @@ async function runFlows(browser, pcapId) {
   await b.setViewportSize({ width: 390, height: 844 });
   await b.waitForTimeout(1200);
   await audit(b, 'runs (live, 390px)', 'runs-live-390');
+  // F119: compact session rows on a phone.
+  const rowH = await b.evaluate(id => {
+    const hs = [...document.querySelectorAll(`#runs-list > li[data-key="${id}"] .sess-table tbody tr`)].slice(0, 5).map(r => r.getBoundingClientRect().height);
+    return hs.length ? Math.max(...hs) : null;
+  }, slaveId);
+  check(rowH !== null && rowH <= 90, `phone session rows are compact (${rowH && Math.round(rowH)}px)`);
   await b.setViewportSize({ width: 1440, height: 900 });
 
   // 5. Stop from B through the UI.
@@ -489,6 +609,18 @@ async function runFlows(browser, pcapId) {
     await a.waitForFunction(() => document.querySelector('#an-result .an-slave-row .an-slave-detail').textContent.trim().length > 0, null, { timeout: 10000 }).catch(() => {});
     const filled = await a.evaluate(() => [...document.querySelectorAll('#an-result .an-slave-detail')].filter(d => d.textContent.trim()).length);
     check(filled === 1, `endpoint drill-down rendered only for the opened row (${filled})`);
+  }
+  // F131: the stored analysis exports as one self-contained HTML page.
+  const rep = await a.getAttribute('#an-report-html', 'href').catch(() => null);
+  check(!!rep, 'analysis offers "Download HTML report"');
+  if (rep) {
+    const r = await fetch(BASE + rep);
+    const html = await r.text();
+    check(r.ok && /text\/html/.test(r.headers.get('content-type') || '') && /attachment/.test(r.headers.get('content-disposition') || ''),
+      `report export is an HTML attachment (${r.status} ${r.headers.get('content-type')})`);
+    check(html.includes('Replay fidelity report') && /<h2>Endpoints/.test(html), 'report has the verdict and the endpoint table');
+    check(!/<script|\bsrc=|https?:\/\//i.test(html), 'report is self-contained (no scripts or external assets)');
+    check(/default-src 'none'/.test(r.headers.get('content-security-policy') || ''), 'report is served with a no-load CSP');
   }
   current = 'runs-flow';
   await audit(a, 'analysis (result)', 'analysis-result');
@@ -718,7 +850,7 @@ async function rerunFlow(browser) {
   await page.click(`[data-fk="run-${id}-card-rerun"]`);
   await page.waitForSelector('#dlg[open]');
   const dlgText = await page.textContent('#dlg');
-  check(new RegExp(`Re-run #${id}`).test(dlgText) && /127\.0\.0\.1/.test(dlgText), `re-run asks for confirmation with the settings (${dlgText.trim().replace(/\s+/g, ' ').slice(0, 100)})`);
+  check(new RegExp(`Re-run #${id}`).test(dlgText) && dlgText.includes(MASTER_TARGET), `re-run asks for confirmation with the settings (${dlgText.trim().replace(/\s+/g, ' ').slice(0, 100)})`);
   await page.click('#dlg-ok');
   await page.waitForFunction(sel => /Re-run RUN·\d+ (failed|completed|stopped|partial)|refused/.test((document.querySelector(sel + ' .run-msg') || {}).textContent || ''), card, { timeout: 40000 }).catch(() => {});
   const msg = await page.textContent(`${card} .run-msg`).catch(() => '');
@@ -744,7 +876,7 @@ async function rerunFlow(browser) {
   const ip = await page.inputValue('#cfg-target-ip');
   const role = await page.evaluate(() => radio('role'));
   const status = await page.textContent('#prof-status');
-  check(ip === '127.0.0.1' && role === 'master' && new RegExp(`run #${id}`).test(status), `Load into Configure fills the form (${ip}, ${role}; ${status.trim()})`);
+  check(ip === MASTER_TARGET && role === 'master' && new RegExp(`run #${id}`).test(status), `Load into Configure fills the form (${ip}, ${role}; ${status.trim()})`);
   check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
   await ctx.close();
 }
@@ -915,6 +1047,7 @@ async function cleanup() {
       if (!NO_RUNS) {
         await rerunFlow(cr);
         await compareFlow(cr, pcapId);
+        await paginationFlow(cr);
       }
     }
     await cr.close();

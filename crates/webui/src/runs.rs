@@ -286,30 +286,38 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
         client_ip: l.client_ip.clone(),
         started_at,
     });
-    state
-        .runs
-        .lock_safe()
-        .insert(id, Arc::new(std::sync::Mutex::new(rs)));
-    drop(active);
 
+    let cap_max = (state.cfg.capture_run_max_bytes > 0).then_some(state.cfg.capture_run_max_bytes);
     let job = match l.job {
         RunJob::Raw(mut cfg) => {
             cfg.run_id = id;
             cfg.capture_path = Some(capture.clone());
+            cfg.capture_max_bytes = cap_max;
             RunJob::Raw(cfg)
         }
         RunJob::Benchmark(mut cfg, rep) => {
             cfg.run_id = id;
             cfg.capture_path = Some(capture.clone());
+            cfg.capture_max_bytes = cap_max;
             RunJob::Benchmark(cfg, rep)
         }
     };
+    // The worker is spawned and registered in `workers` *before* the
+    // run becomes visible in `runs` and before `active` is released, so
+    // a stop or delete can never see a running run without a live
+    // worker and finalise it as abandoned while the worker still runs
+    // (N6). The worker waits for `go` so it cannot finalise a run that
+    // is not registered yet.
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let st = state.clone();
     let pcap = l.pcap;
     let worker_ctx = ctx.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("webui-run-{id}"))
         .spawn(move || {
+            // Err means launch gave up on the run; finalize still runs
+            // and is idempotent.
+            let _ = go_rx.recv();
             let span = info_span!("run", id);
             let _enter = span.enter();
             info!("run worker started");
@@ -323,19 +331,27 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
             .unwrap_or_else(|p| RunOutcome::Panicked(panic_message(&*p)));
             finalize(&st, id, outcome);
         });
-    match spawned {
+    let spawn_err = match spawned {
         Ok(h) => {
             state.workers.lock_safe().insert(id, h);
+            None
         }
-        Err(e) => {
-            finalize(
-                state,
-                id,
-                RunOutcome::Panicked(format!("could not spawn run thread: {e}")),
-            );
-            return Err(AppError::Internal(format!("spawn run thread: {e}")));
-        }
+        Err(e) => Some(e),
+    };
+    state
+        .runs
+        .lock_safe()
+        .insert(id, Arc::new(std::sync::Mutex::new(rs)));
+    drop(active);
+    if let Some(e) = spawn_err {
+        finalize(
+            state,
+            id,
+            RunOutcome::Panicked(format!("could not spawn run thread: {e}")),
+        );
+        return Err(AppError::Internal(format!("spawn run thread: {e}")));
     }
+    let _ = go_tx.send(());
     spawn_sampler(state.clone(), id, ctx);
     state.emit("run_started", id, &l.client_ip, l.client_id, "running");
     info!(id, client = %l.client_ip, "run started");
@@ -386,18 +402,88 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
         }
         (status, rs.started_by.clone().unwrap_or_default())
     };
-    let keep = state
-        .active_run()
-        .map(|a| captures::capture_path(&state.cfg.captures_dir(), a.run_id));
+    state.emit("run_finished", id, &started_by, None, status.as_str());
+    info!(id, status = status.as_str(), "run finished");
+    // Queue the analysis first, then enforce retention with this run's
+    // capture and every capture still waiting for its analysis
+    // protected, so a run's own capture is never evicted before it is
+    // analysed (N13).
+    crate::analysis_run::spawn_auto_analysis(state, id);
+    trim_resident(state);
+    let keep = retention_keep(state, id);
     captures::enforce_retention(
         &state.cfg.captures_dir(),
         state.cfg.capture_max_total_bytes,
         state.cfg.capture_max_count,
-        keep.as_deref(),
+        &keep,
     );
-    state.emit("run_finished", id, &started_by, None, status.as_str());
-    info!(id, status = status.as_str(), "run finished");
-    crate::analysis_run::spawn_auto_analysis(state, id);
+}
+
+/// Keep at most `runs_in_memory` finished runs in memory (F054): the
+/// oldest finished runs leave the map (they stay in the database and
+/// are served from it on demand) and their totals are folded into the
+/// metrics. Eviction stops at the first run that is still busy (live
+/// worker or pending analysis), so every run left only in the database
+/// is older than every run in memory.
+pub(crate) fn trim_resident(state: &AppState) {
+    let cap = state.cfg.runs_in_memory.max(1);
+    let mut folded = state.metrics.folded.lock_safe();
+    let mut map = state.runs.lock_safe();
+    let finished = map
+        .values()
+        .filter(|e| e.lock_safe().status.is_terminal())
+        .count();
+    if finished <= cap {
+        return;
+    }
+    let mut ids: Vec<u64> = map.keys().copied().collect();
+    ids.sort_unstable();
+    let mut over = finished - cap;
+    for id in ids {
+        if over == 0 {
+            break;
+        }
+        let Some(e) = map.get(&id).cloned() else {
+            continue;
+        };
+        let rs = e.lock_safe();
+        let busy = !rs.status.is_terminal()
+            || state.worker_alive(id)
+            || rs
+                .auto_analysis
+                .as_ref()
+                .is_some_and(|a| matches!(a.state, "queued" | "running"));
+        if busy {
+            break;
+        }
+        crate::metrics::fold_evicted(&mut folded, &rs);
+        drop(rs);
+        map.remove(&id);
+        over -= 1;
+    }
+}
+
+/// Captures retention must not evict: the active run's, run `just_finished`'s
+/// and those of runs whose auto-analysis is queued or running.
+pub(crate) fn retention_keep(state: &AppState, just_finished: u64) -> Vec<PathBuf> {
+    let dir = state.cfg.captures_dir();
+    let mut keep = vec![captures::capture_path(&dir, just_finished)];
+    if let Some(a) = state.active_run() {
+        keep.push(captures::capture_path(&dir, a.run_id));
+    }
+    for e in state.all_runs() {
+        let rs = e.lock_safe();
+        let pending = rs
+            .auto_analysis
+            .as_ref()
+            .is_some_and(|a| matches!(a.state, "queued" | "running"));
+        if pending {
+            if let Some(p) = &rs.capture_file {
+                keep.push(p.clone());
+            }
+        }
+    }
+    keep
 }
 
 fn release_active(state: &AppState, id: u64) {
@@ -437,7 +523,9 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
                 };
                 let now = live_sent_total(&ctx);
                 let delta = throughput_delta(last, now);
-                last = now;
+                // Keep the high-water mark across a dip, so the count
+                // coming back is not counted twice.
+                last = last.max(now);
                 {
                     let mut rs = entry.lock_safe();
                     if rs.status.is_terminal() {
@@ -464,14 +552,12 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
         });
 }
 
-/// Frames sent since the previous sample. Per-source counters may reset
-/// at an iteration boundary; a drop counts as a fresh start.
+/// Frames sent since the previous sample. The summed counters only
+/// grow; a reading below the previous one is a momentary dip while a
+/// session rolls its count into the finished iterations (N5), and
+/// counts as 0, never as the whole cumulative count.
 pub(crate) fn throughput_delta(last: u64, now: u64) -> u64 {
-    if now >= last {
-        now - last
-    } else {
-        now
-    }
+    now.saturating_sub(last)
 }
 
 /// Request cancellation of every running run (graceful shutdown).
@@ -656,10 +742,10 @@ mod tests {
             Some("no master connected within 600s")
         );
         let v = serde_json::to_value(rs.summary()).unwrap();
-        assert_eq!(
-            v["per_source_progress"][0]["error"],
-            "no master connected within 600s"
-        );
+        // The list carries counts only; rows are in the detail and the
+        // live stream (F103).
+        assert_eq!(v["per_source_progress"], serde_json::json!([]));
+        assert_eq!(v["source_states"]["failed"], 1);
         assert_eq!(v["sources_failed"], 1);
         assert_eq!(v["sources_cancelled"], 0);
     }
@@ -667,7 +753,7 @@ mod tests {
     #[test]
     fn throughput_tolerates_counter_reset() {
         assert_eq!(throughput_delta(100, 150), 50);
-        assert_eq!(throughput_delta(150, 20), 20);
+        assert_eq!(throughput_delta(150, 20), 0, "a dip is not a sample");
     }
 
     #[test]

@@ -67,6 +67,12 @@ RestrictNamespaces=yes
 # AF_UNIX for the journal and the resolver.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET AF_UNIX
 SystemCallArchitectures=native
+# No writable+executable mappings (nothing here JIT-compiles).
+MemoryDenyWriteExecute=yes
+# No SystemCallFilter: the service runs helper programs (ip, tc,
+# iptables-legacy/nft, sysctl, ethtool, arping) whose system calls vary
+# by distribution and version, and a filter cannot be validated without
+# a live privileged run. See doc/operations.md for a drop-in to try.
 UMask=0027
 RestrictRealtime=no
 
@@ -76,6 +82,10 @@ RestrictRealtime=no
 StateDirectory=outstation
 StateDirectoryMode=0750
 ReadWritePaths=/var/lib/outstation
+# iptables-legacy takes its lock at /run/xtables.lock, which
+# ProtectSystem=strict would make read-only. iptables-nft does not use
+# it; the leading "-" ignores the path when it does not exist.
+ReadWritePaths=-/run/xtables.lock
 
 [Install]
 WantedBy=multi-user.target

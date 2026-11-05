@@ -8,6 +8,24 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ApiJson, AppError};
 use crate::netprobe::*;
 
+/// The probe binary. Tests substitute a missing one.
+const ARPING: &str = "arping";
+
+/// `arping` could not be run: 503 `arping_unavailable` instead of a 200
+/// that only carries an `error` field (F056).
+fn arping_unavailable(e: &std::io::Error) -> AppError {
+    let hint = if e.kind() == std::io::ErrorKind::NotFound {
+        " Install it (Debian/Ubuntu: apt install iputils-arping)."
+    } else {
+        ""
+    };
+    AppError::new(
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "arping_unavailable",
+        format!("arping could not be run: {e}.{hint}"),
+    )
+}
+
 #[derive(Deserialize)]
 pub(crate) struct VerifyIpReq {
     pub(crate) ip: String,
@@ -44,13 +62,13 @@ pub(crate) async fn api_verify_ip(
     }
     // arping/ip are blocking subprocesses (2 s worst case): keep them
     // off the async workers (F053).
-    tokio::task::spawn_blocking(move || verify_ip_blocking(req))
+    tokio::task::spawn_blocking(move || verify_ip_blocking(req, ARPING))
         .await
         .map_err(|e| AppError::Internal(format!("verify task: {e}")))?
         .map(Json)
 }
 
-fn verify_ip_blocking(req: VerifyIpReq) -> Result<VerifyIpResp, AppError> {
+fn verify_ip_blocking(req: VerifyIpReq, arping: &str) -> Result<VerifyIpResp, AppError> {
     // 0.0.0.0 is the "any" sentinel — always valid, skip probing.
     if req.ip.trim() == "0.0.0.0" {
         return Ok(VerifyIpResp {
@@ -85,24 +103,10 @@ fn verify_ip_blocking(req: VerifyIpReq) -> Result<VerifyIpResp, AppError> {
     }
 
     // arping -D -c 2 -w 2 -I <iface> <ip>
-    let out = std::process::Command::new("arping")
+    let out = std::process::Command::new(arping)
         .args(["-D", "-c", "2", "-w", "2", "-I", &iface, &ip.to_string()])
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => {
-            return Ok(VerifyIpResp {
-                ip: ip.to_string(),
-                iface,
-                in_use: false,
-                locally_assigned: false,
-                mac: None,
-                error: Some(format!(
-                    "arping not available: {e}. apt install iputils-arping"
-                )),
-            });
-        }
-    };
+        .output()
+        .map_err(|e| arping_unavailable(&e))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     // arping -D with iputils semantics: exit 1 means "someone replied
@@ -178,13 +182,13 @@ pub(crate) async fn api_arp(ApiJson(req): ApiJson<ArpReq>) -> Result<Json<ArpRes
     if let Some(i) = req.iface.as_deref().filter(|s| !s.is_empty()) {
         crate::routes::runs::validate_ifname("iface", i, 15)?;
     }
-    tokio::task::spawn_blocking(move || arp_blocking(req))
+    tokio::task::spawn_blocking(move || arp_blocking(req, ARPING))
         .await
         .map_err(|e| AppError::Internal(format!("arp task: {e}")))?
         .map(Json)
 }
 
-fn arp_blocking(req: ArpReq) -> Result<ArpResp, AppError> {
+fn arp_blocking(req: ArpReq, arping: &str) -> Result<ArpResp, AppError> {
     let ip: Ipv4Addr = req
         .ip
         .parse()
@@ -210,22 +214,10 @@ fn arp_blocking(req: ArpReq) -> Result<ArpResp, AppError> {
         });
     }
 
-    let out = std::process::Command::new("arping")
+    let out = std::process::Command::new(arping)
         .args(["-c", "2", "-w", "2", "-I", &iface, &ip.to_string()])
-        .output();
-    let out = match out {
-        Ok(o) => o,
-        Err(e) => {
-            return Ok(ArpResp {
-                ip: ip.to_string(),
-                iface,
-                mac: None,
-                error: Some(format!(
-                    "arping not available: {e}. apt install iputils-arping"
-                )),
-            });
-        }
-    };
+        .output()
+        .map_err(|e| arping_unavailable(&e))?;
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     let mac = extract_mac(&stdout).or_else(|| extract_mac(&stderr));
@@ -246,4 +238,38 @@ fn arp_blocking(req: ArpReq) -> Result<ArpResp, AppError> {
         mac,
         error: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_arping_is_a_503_not_a_200() {
+        let missing = "/nonexistent/outstation-test-arping";
+        // TEST-NET-1: never one of this host's own addresses.
+        let e = arp_blocking(
+            ArpReq {
+                ip: "192.0.2.77".into(),
+                iface: Some("lo".into()),
+            },
+            missing,
+        )
+        .err()
+        .expect("arp must fail");
+        assert_eq!(e.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.code, "arping_unavailable");
+        assert!(e.message.contains("iputils-arping"), "{}", e.message);
+        let e = verify_ip_blocking(
+            VerifyIpReq {
+                ip: "192.0.2.77".into(),
+                iface: Some("lo".into()),
+            },
+            missing,
+        )
+        .err()
+        .expect("verify must fail");
+        assert_eq!(e.status, axum::http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(e.code, "arping_unavailable");
+    }
 }

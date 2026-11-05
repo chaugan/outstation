@@ -94,7 +94,7 @@ Unknown keys and other zones are errors. With rewriting on, the analyzer accepts
 | `t3` | 20 | > 0, ≤ 86400 s | After t3 without receiving anything we send TESTFR act |
 | `idle_serve_secs` | 30 | ≥ 0 | Slave role: keep serving the master (GI/CI, commands, TESTFR, acks) this long after the script ends, unless the master closes first or the run is stopped |
 
-Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3).
+Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3). `w` and `t2` here govern how fast *we* acknowledge; the latency we measure depends on the *peer's* `w` and `t2` ([Session report fields](#session-report-fields)).
 
 **t0 default.** When `t0` is absent the run's connect timeout is used, which is **5 s**, not the IEC default of 30 s. Set `t0` explicitly for slow targets. In slave role t0 is not used: an armed listener waits up to 600 s for the master to connect, then up to 60 s for STARTDT act. Both limits are fixed.
 
@@ -225,6 +225,8 @@ The engine also records, per session, per-command-type round trips (`commands[]`
 
 Latency (`latency_*_us`) is the time from sending an I-frame to the peer acknowledging it (the S-frame or I-frame N(R) that covers it, timestamped on receipt). It is not a command round trip.
 
+**Ack latency is bounded by the peer's w and t2, not the network.** The peer acknowledges on its own schedule: after it has received `w` I-frames, or `t2` after the first unacknowledged one, whichever comes first (the `w` and `t2` that matter are the peer's, not the ones in `session` above). In slave role the live master sends few or no I-frames of its own, so it acknowledges with S-frames by that rule: with sparse telemetry the latency approaches the master's t2 (often 10 s), with dense telemetry it is the time `w` frames take to go out. Read slave-role latency as the master's acknowledgement policy, and compare runs only against the same master settings. In master role an RTU that sends data carries N(R) in its own I-frames and so usually acknowledges sooner.
+
 ## Analysis report
 
 The analyzer compares a capture of a run against the run's source pcap, endpoint by endpoint. It runs automatically after every benchmark run with a capture, on demand, or on an uploaded capture (see [the API](api.md#analysis)).
@@ -245,7 +247,8 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 
 | Fleet verdict | When |
 |---|---|
-| `all_correct` | Every judged endpoint passed |
+| `all_correct` | Every judged endpoint passed, and the run was not stopped |
+| `stopped_clean` | The run was stopped before it finished, and everything it sent before the stop was clean. `run_warning` says it was stopped. A stopped run is never `all_correct` |
 | `partial` | Some passed, some failed |
 | `failed` | Every judged endpoint failed with score 0 |
 | `inconclusive` | Nothing failed, but some endpoints could not be verified |
@@ -261,7 +264,7 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 |---|---|---|
 | `good_delivery` | pass | Everything passes (generic mode) |
 | `identical` | pass | Everything passes, including the target's script (correct mode) |
-| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean |
+| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean. An endpoint whose own session failed is never excused by the stop: its missing frames count as a failure |
 | `no_iframes_expected` | pass | The source carries no I-frames and none were delivered |
 | `degraded` | fail | Content is fine, but time tags, the GI/CI audit or timing failed |
 | `partial_delivery` | fail | Modified, missing, extra or reordered frames, or time tags changed with CP56 rewriting off |

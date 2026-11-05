@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 
 use tracing::{info, warn};
 
-use crate::analysis::{self, analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, analyze, AnalysisMode, RoleHint};
 use crate::db::{Db, StoredAnalysis};
 use crate::dto::*;
 use crate::error::{AppError, LockExt};
@@ -71,6 +71,11 @@ pub(crate) fn run_info_of(rs: &RunState) -> analysis::RunInfo {
             .as_ref()
             .map(|b| b.captured_dropped)
             .unwrap_or(0),
+        capture_truncated: rs
+            .benchmark
+            .as_ref()
+            .and_then(|b| b.capture_truncated)
+            .unwrap_or(false),
     }
 }
 
@@ -106,6 +111,54 @@ pub(crate) fn check_analyzable(rs: &RunState) -> Result<(), AppError> {
         )));
     }
     Ok(())
+}
+
+/// Size of a classic pcap file with a global header and no packets.
+const PCAP_HEADER_ONLY: u64 = 24;
+
+/// Why the run's own capture cannot be trusted for an analysis, if it
+/// cannot (N15): the scheduler said the capture failed, a capture
+/// warning says it never started, or the file holds no frames although
+/// the run sent some. Analysing such a capture would report a false
+/// `no_delivery`.
+pub(crate) fn capture_problem(rs: &RunState, capture: &Path) -> Option<String> {
+    let (ok, warnings, sent, packets) = match (&rs.benchmark, &rs.report) {
+        (Some(b), _) => (
+            b.capture_ok,
+            b.warnings.as_slice(),
+            b.total_messages_sent,
+            b.captured_packets,
+        ),
+        (None, Some(r)) => (
+            r.capture_ok,
+            r.warnings.as_slice(),
+            r.total_packets,
+            r.captured_packets,
+        ),
+        (None, None) => return None,
+    };
+    let capture_warning = warnings.iter().find(|w| {
+        let w = w.to_ascii_lowercase();
+        w.contains("capture failed")
+            || w.contains("capture disabled")
+            || w.contains("capture mirror")
+            || (w.contains("capture") && w.contains("failed"))
+    });
+    if ok == Some(false) {
+        return Some(
+            capture_warning
+                .cloned()
+                .unwrap_or_else(|| "the run's capture failed".into()),
+        );
+    }
+    let len = std::fs::metadata(capture).map(|m| m.len()).unwrap_or(0);
+    if sent > 0 && packets == 0 && len <= PCAP_HEADER_ONLY {
+        return Some(match capture_warning {
+            Some(w) => format!("the capture holds no frames although {sent} were sent ({w})"),
+            None => format!("the capture holds no frames although {sent} were sent"),
+        });
+    }
+    None
 }
 
 /// The run's own capture, if it is still on disk inside `captures_dir`.
@@ -190,18 +243,14 @@ pub(crate) async fn analyze_and_store(
     rs: RunState,
     capture: PathBuf,
     source: AnalysisSource,
+    cp56_tolerance_ms: f64,
 ) -> Result<(StoredAnalysis, analysis::AnalysisReport), AppError> {
     let db = state.db.clone();
     let m = state.metrics.clone();
     m.analyses_running.fetch_add(1, Ordering::Relaxed);
     let res = tokio::task::spawn_blocking(move || {
-        let report = analyze_run(
-            &rs,
-            &capture,
-            AnalysisMode::Generic,
-            DEFAULT_CP56_TOLERANCE_MS,
-        )
-        .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
+        let report = analyze_run(&rs, &capture, AnalysisMode::Generic, cp56_tolerance_ms)
+            .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
         let stored = store_blocking(&db, report.clone(), source)
             .map_err(|e| AppError::Internal(format!("store analysis: {e:#}")))?;
         Ok::<_, AppError>((stored, report))
@@ -251,6 +300,11 @@ pub(crate) fn spawn_auto_analysis(state: &AppState, id: u64) {
             skip(&mut rs, "the run left no capture".into());
             return;
         };
+        if let Some(why) = capture_problem(&rs, &capture) {
+            warn!(id, reason = %why, "auto-analysis skipped: capture unavailable");
+            skip(&mut rs, format!("capture unavailable: {why}"));
+            return;
+        }
         if let Err(e) = check_analyzable(&rs) {
             skip(&mut rs, e.message);
             return;
@@ -299,7 +353,8 @@ pub(crate) fn spawn_auto_analysis(state: &AppState, id: u64) {
                 analysis_id: None,
             },
         );
-        match analyze_and_store(&st, rs, capture, AnalysisSource::Auto).await {
+        let tol = st.cfg.cp56_tolerance_ms;
+        match analyze_and_store(&st, rs, capture, AnalysisSource::Auto, tol).await {
             Ok((a, report)) => {
                 info!(
                     id,
@@ -464,5 +519,45 @@ mod tests {
         rs.mode = "benchmark";
         rs.status = RunStatus::Running;
         assert_eq!(check_analyzable(&rs).unwrap_err().code, "run_running");
+    }
+
+    #[test]
+    fn capture_problems_are_detected() {
+        let d = tempfile::tempdir().unwrap();
+        let header_only = d.path().join("h.pcap");
+        std::fs::write(&header_only, [0u8; 24]).unwrap();
+        let full = d.path().join("f.pcap");
+        std::fs::write(&full, [0u8; 200]).unwrap();
+        let mut rs = run(None);
+        assert_eq!(
+            capture_problem(&rs, &header_only),
+            None,
+            "no report: unknown"
+        );
+        rs.benchmark = Some(BenchmarkReportJson {
+            total_messages_sent: 10,
+            ..Default::default()
+        });
+        // Header only although 10 messages were sent.
+        let why = capture_problem(&rs, &header_only).unwrap();
+        assert!(why.contains("no frames although 10"), "{why}");
+        // Frames on disk: fine.
+        rs.benchmark.as_mut().unwrap().captured_packets = 12;
+        assert_eq!(capture_problem(&rs, &full), None);
+        // The scheduler says the capture failed: never trusted.
+        let b = rs.benchmark.as_mut().unwrap();
+        b.capture_ok = Some(false);
+        b.warnings = vec!["capture failed to start: EPERM".into()];
+        assert_eq!(
+            capture_problem(&rs, &full).as_deref(),
+            Some("capture failed to start: EPERM")
+        );
+        // Nothing sent and nothing captured: an honest empty capture.
+        let b = rs.benchmark.as_mut().unwrap();
+        b.capture_ok = None;
+        b.warnings.clear();
+        b.total_messages_sent = 0;
+        b.captured_packets = 0;
+        assert_eq!(capture_problem(&rs, &header_only), None);
     }
 }

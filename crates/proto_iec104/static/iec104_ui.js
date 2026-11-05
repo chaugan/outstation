@@ -296,7 +296,7 @@
       h += `</div>`;
     }
     if (drift.samples_truncated) {
-      h += `<div class="ctx" style="margin-top:6px">note: per-frame samples were capped at the analyzer's safety limit; aggregate stats above remain accurate.</div>`;
+      h += `<div class="ctx ctx-note">note: per-frame samples were capped at the analyzer's safety limit; aggregate stats above remain accurate.</div>`;
     }
     node.innerHTML = h;
   }
@@ -354,7 +354,7 @@
       if (pb.fault_duplicates_excluded) faultParts.push(`${pb.fault_duplicates_excluded} duplicates excluded (sent on purpose)`);
       if (faultParts.length) h += `<div class="k">fault effects</div><div class="v warn">${esc(faultParts.join(' · '))}</div>`;
       if (pb.iterations_observed != null) {
-        h += `<div class="k">iterations</div><div class="v">${pb.iterations_observed} observed${pb.iterations_configured ? ' of ' + pb.iterations_configured : ''} · ${pb.iterations_complete || 0} complete · ${pb.iterations_clean || 0} clean${pb.stopped_tail ? ` · stopped in iteration ${pb.stopped_tail.iteration} after ${pb.stopped_tail.sent}/${pb.stopped_tail.script_iframes} frames${pb.stopped_tail.clean ? ' (clean)' : ''}` : ''}</div>`;
+        h += `<div class="k">iterations</div><div class="v">${pb.iterations_observed} observed${pb.iterations_configured ? ' of ' + pb.iterations_configured : ''} · ${pb.iterations_complete || 0} complete · ${pb.iterations_clean || 0} clean${pb.extra_passes ? ` · <span class="bad">${pb.extra_passes} extra pass${pb.extra_passes === 1 ? '' : 'es'} beyond the configured count</span>` : ''}${pb.stopped_tail ? ` · stopped in iteration ${pb.stopped_tail.iteration} after ${pb.stopped_tail.sent}/${pb.stopped_tail.script_iframes} frames${pb.stopped_tail.clean ? ' (clean)' : ''}` : ''}</div>`;
       }
       const delivOk = pb.delivered_iframes === pb.expected_iframes;
       h += `<div class="k">delivered</div><div class="v ${delivOk?'ok':'bad'}">${pb.delivered_iframes}</div>`;
@@ -408,7 +408,7 @@
       if ((tg.target_type_ids || []).length) {
         h += `<div class="an-chart-caption">Target's I-frame types</div>`;
         const hist = tidHist(tg.target_type_ids);
-        h += `<div class="an-tid-hist" style="grid-template-columns:1fr">`;
+        h += `<div class="an-tid-hist one-col">`;
         h += `<div class="hd">${tg.target_type_ids.length} frames sent by target</div>`;
         for (const [tid, ct] of hist) {
           h += `<div class="row"><span class="nm">${esc(tidName(tid))} <span class="ct">[${tid}]</span></span><span class="ct">${ct}</span></div>`;
@@ -425,12 +425,12 @@
           divergent: 'TARGET RAN ITS OWN SCRIPT',
           silent: 'TARGET SENT NO I-FRAMES',
         }[c.target_script_kind] || c.target_script_kind.toUpperCase();
-        const kindColor = {
-          same_script: 'var(--ok)',
-          subset: 'var(--blue)',
-          divergent: 'var(--blue)',
-          silent: 'var(--warn)',
-        }[c.target_script_kind] || 'var(--dim)';
+        const kindTone = {
+          same_script: 'ok',
+          subset: 'blue',
+          divergent: 'blue',
+          silent: 'warn',
+        }[c.target_script_kind] || 'dim';
         const kindHelp = {
           same_script: "the live target produced the same iec 104 command sequence as the captured master. if the target is a separate piece of software, this is a strong positive signal.",
           subset: "the live target produced a prefix/subset of the captured script. probably a truncated run or a simpler master that only issues a few commands.",
@@ -439,9 +439,9 @@
         }[c.target_script_kind] || '';
 
         h += `<div class="an-h">Target script comparison (correct mode)</div>`;
-        h += `<div style="padding:10px 12px;background:var(--surface-2);border:1px solid var(--rule);border-left:3px solid ${kindColor};margin:6px 0 10px">`;
-        h += `  <div style="font-size:12px;font-weight:700;color:${kindColor};margin-bottom:6px">${esc(kindLabel)}</div>`;
-        h += `  <div style="font-size:12px;color:var(--ink-2);line-height:1.5">${esc(kindHelp)}</div>`;
+        h += `<div class="script-kind tone-${kindTone}">`;
+        h += `  <div class="script-kind-label">${esc(kindLabel)}</div>`;
+        h += `  <div class="script-kind-help">${esc(kindHelp)}</div>`;
         h += `</div>`;
         h += `<div class="an-kv">`;
         h += `<div class="k">original sent</div><div class="v">${c.expected_iframes} i-frames</div>`;
@@ -492,20 +492,30 @@
     if (haveDriftSamples || haveGapData) {
       h += `<div class="an-h">Anomaly detection</div>`;
       h += `<p class="hint">Scroll inside a chart to zoom, drag to pan, or use the toolbox icons at the top right.</p>`;
+      // Each chart is a figure: caption and axes describe it, and the
+      // canvas has role="img" with the key numbers (F126).
+      const fig = (id, caption, axes, label) =>
+        `<figure class="an-figure"><figcaption id="${id}-cap"><div class="an-chart-caption">${caption}</div>` +
+        `<div class="an-chart-axes">${axes}</div></figcaption>` +
+        `<div id="${id}" class="an-chart" role="img" aria-label="${esc(label)}" aria-describedby="${id}-cap"></div></figure>`;
+      const driftLabel = cp
+        ? `${cp.samples} CP56 drift samples: median ${Number(cp.p50_ms).toFixed(1)} ms, p99 ${Number(cp.p99_ms).toFixed(1)} ms, ` +
+          `largest ${Number(cp.max_ms).toFixed(1)} ms; ${cp.out_of_tolerance} outside ±${Number(cp.tolerance_ms).toFixed(0)} ms.`
+        : '';
       if (haveDriftSamples) {
-        h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
-        h += `<div class="an-chart-axes">X: frame index &middot; Y: drift (ms, signed)</div>`;
-        h += `<div id="an-chart-drift-${slug}" class="an-chart"></div>`;
+        h += fig(`an-chart-drift-${slug}`, 'CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)',
+          'X: frame index &middot; Y: drift (ms, signed)', `CP56 drift over time. ${driftLabel}`);
       }
       if (haveGapData) {
-        h += `<div class="an-chart-caption">inter-frame gap timing &middot; original (dashed) vs. captured (solid)</div>`;
-        h += `<div class="an-chart-axes">X: inter-frame gap index &middot; Y: gap duration (ms)</div>`;
-        h += `<div id="an-chart-gap-${slug}" class="an-chart"></div>`;
+        const gapLabel = `Inter-frame gaps, original against captured: mean ${Number(t.original_mean_gap_ms || 0).toFixed(1)} against ` +
+          `${Number(t.captured_mean_gap_ms || 0).toFixed(1)} ms, p99 ${Number(t.original_p99_gap_ms || 0).toFixed(1)} against ` +
+          `${Number(t.captured_p99_gap_ms || 0).toFixed(1)} ms.`;
+        h += fig(`an-chart-gap-${slug}`, 'inter-frame gap timing &middot; original (dashed) vs. captured (solid)',
+          'X: inter-frame gap index &middot; Y: gap duration (ms)', gapLabel);
       }
       if (haveDriftSamples) {
-        h += `<div class="an-chart-caption">drift distribution &middot; bars beyond the dashed line are out-of-tolerance</div>`;
-        h += `<div class="an-chart-axes">X: |drift| bucket (ms) &middot; Y: sample count</div>`;
-        h += `<div id="an-chart-hist-${slug}" class="an-chart"></div>`;
+        h += fig(`an-chart-hist-${slug}`, 'drift distribution &middot; bars beyond the dashed line are out-of-tolerance',
+          'X: |drift| bucket (ms) &middot; Y: sample count', `Distribution of CP56 drift. ${driftLabel}`);
         h += `<div class="an-chart-caption">worst CP56 drifts (top 10)</div>`;
         h += `<div id="an-anomalies-${slug}" class="an-anomaly-list"></div>`;
       }
@@ -518,13 +528,13 @@
         : '0.00';
       h += `<div class="an-h">Embedded timestamp accuracy <span class="opt">(fresh-timestamps mode)</span></div>`;
       h += `<div class="an-kv">`;
-      h += `<div class="k">verdict</div><div class="v" style="color:${passed ? 'var(--ok,#6a0)' : 'var(--err,#c33)'}">` +
+      h += `<div class="k">verdict</div><div class="v ${passed ? 'ok' : 'bad'}">` +
            `${withinPct}% of ${cp.samples} CP56Time2a fields within ±${cp.tolerance_ms.toFixed(0)} ms of wire time</div>`;
       h += `<div class="k">frames with CP56</div><div class="v">${cp.iframes_with_cp56}</div>`;
       h += `<div class="k">mean drift</div><div class="v">${cp.mean_ms.toFixed(2)} ms (signed ${cp.mean_signed_ms.toFixed(2)})</div>`;
       h += `<div class="k">p50 / p99 / max</div><div class="v">${cp.p50_ms.toFixed(2)} / ${cp.p99_ms.toFixed(2)} / ${cp.max_ms.toFixed(2)} ms</div>`;
       if (cp.out_of_tolerance > 0) {
-        h += `<div class="k">out of tolerance</div><div class="v" style="color:var(--err,#c33)">${cp.out_of_tolerance} / ${cp.samples}</div>`;
+        h += `<div class="k">out of tolerance</div><div class="v bad">${cp.out_of_tolerance} / ${cp.samples}</div>`;
       }
       if (cp.invalid_flag_count > 0 || cp.summer_flag_count > 0) {
         h += `<div class="k">flags observed</div><div class="v">IV=${cp.invalid_flag_count} · SU=${cp.summer_flag_count}</div>`;
@@ -621,14 +631,14 @@
     //   COT?   — every data frame in the expected COT bucket
     //   bytes? — byte-for-byte match vs inventory-derived expected
     //   verdict
-    s += `<div style="overflow-x:auto;margin:6px 0 10px">`;
+    s += `<div class="table-scroll audit-scroll">`;
     s += `<table class="t an-tbl">`;
     s += `<thead><tr>`;
     s += `<th scope="col">t (ms)</th><th scope="col">kind</th><th scope="col">qual</th><th scope="col">CA</th>`;
     s += `<th scope="col">ActCon Δ (ms)</th><th scope="col">data (frames / elements)</th><th scope="col">ActTerm Δ (ms)</th>`;
     s += `<th scope="col">COT ok</th><th scope="col">bytes ok</th><th scope="col">verdict</th>`;
     s += `</tr></thead><tbody>`;
-    const rowColor = (v) => v === 'compliant' ? '' : (v === 'partial' ? 'background:rgba(255,200,0,0.06)' : 'background:rgba(255,80,80,0.06)');
+    const rowClass = (v) => v === 'compliant' ? 'ev-ok' : (v === 'partial' ? 'ev-partial' : 'ev-bad');
     const tickClass = (b) => b ? 'ok' : 'bad';
     const tick = (b) => b ? '✓' : '✗';
     for (const ev of a.events.slice(0, 200)) {
@@ -637,9 +647,9 @@
       const expected = ev.expected_data_element_count;
       const dataCell = `${ev.data_frame_count} / ${ev.data_element_count}` +
         (expected !== ev.data_element_count ? ` <span class="muted" title="inventory-derived expected element count">(exp ${expected})</span>` : '');
-      const verdictColor = ev.verdict === 'compliant' ? 'var(--ok)' : (ev.verdict === 'partial' ? 'var(--warn)' : 'var(--err,#c33)');
-      s += `<tr style="border-top:1px solid var(--rule);${rowColor(ev.verdict)}">`;
-      s += `<td style="padding:4px 8px">${ev.request_ts_ms.toFixed(0)}</td>`;
+      const verdictTone = ev.verdict === 'compliant' ? 'ok' : (ev.verdict === 'partial' ? 'warn' : 'bad');
+      s += `<tr class="${rowClass(ev.verdict)}">`;
+      s += `<td>${ev.request_ts_ms.toFixed(0)}</td>`;
       s += `<td>${esc(ev.kind)}</td>`;
       s += `<td>${ev.qualifier}</td>`;
       s += `<td>${ev.ca}</td>`;
@@ -648,10 +658,10 @@
       s += `<td class="${ev.actterm_present ? '' : 'bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
       s += `<td class="${tickClass(ev.all_cots_match_bucket)}">${tick(ev.all_cots_match_bucket)}</td>`;
       s += `<td class="${tickClass(ev.bytewise_matches_inventory)}">${tick(ev.bytewise_matches_inventory)}</td>`;
-      s += `<td style="color:${verdictColor};font-weight:600">${esc(ev.verdict)}</td>`;
+      s += `<td class="${verdictTone} strong">${esc(ev.verdict)}</td>`;
       s += `</tr>`;
       if (ev.notes && ev.notes.length) {
-        s += `<tr style="${rowColor(ev.verdict)}"><td></td><td colspan="9" class="muted">${ev.notes.map(esc).join(' · ')}</td></tr>`;
+        s += `<tr class="${rowClass(ev.verdict)}"><td></td><td colspan="9" class="muted">${ev.notes.map(esc).join(' · ')}</td></tr>`;
       }
     }
     s += `</tbody></table>`;
@@ -680,15 +690,22 @@
     }
   }
 
-  // Fleet-level rollup of GI/CI events across every slave. Walks
-  // `r.details_by_ip[*].protocol_specific.gi_ci_audit` so the backend
-  // doesn't need a parallel aggregator. Renders headline counts plus
-  // two stacked bars (GI / CI) split by verdict bucket.
+  // Fleet-level rollup of GI/CI events across every slave. The summary
+  // carries the summed counters (`fleet_gi_ci_audit`, F067), so no
+  // endpoint detail has to be fetched; older replies with
+  // `details_by_ip` are summed here. Renders headline counts plus two
+  // stacked bars (GI / CI) split by verdict bucket.
   function renderFleetExtras(r) {
-    const details = r.details_by_ip || {};
     let giOk = 0, giPt = 0, giNc = 0, giTot = 0;
     let ciOk = 0, ciPt = 0, ciNc = 0, ciTot = 0;
     let slavesWithEvents = 0;
+    const fa = r.fleet_gi_ci_audit;
+    if (fa) {
+      giOk = fa.gi_compliant || 0; giPt = fa.gi_partial || 0; giNc = fa.gi_non_compliant || 0; giTot = fa.gi_total || 0;
+      ciOk = fa.ci_compliant || 0; ciPt = fa.ci_partial || 0; ciNc = fa.ci_non_compliant || 0; ciTot = fa.ci_total || 0;
+      slavesWithEvents = fa.endpoints_with_events || 0;
+    }
+    const details = fa ? {} : (r.details_by_ip || {});
     for (const ip of Object.keys(details)) {
       const a = ((details[ip] || {}).protocol_specific || {}).gi_ci_audit;
       if (!a) continue;
@@ -707,29 +724,30 @@
       return ``; // no GI/CI activity in this run; suppress the panel.
     }
 
-    const seg = (count, color, title) => count > 0
-      ? `<div title="${title}: ${count}" style="flex:${count};background:${color};color:#fff;padding:6px 8px;font-size:12px;text-align:center;min-width:24px">${count}</div>`
+    // `flex` carries the count, so it stays an inline value.
+    const seg = (count, tone, title) => count > 0
+      ? `<div class="audit-seg tone-${tone}" title="${title}: ${count}" style="flex:${count}">${count}</div>`
       : '';
 
     let h = `<div class="an-h">Fleet interrogation audit &middot; ${slavesWithEvents} endpoint${slavesWithEvents===1?'':'s'} with GI/CI activity</div>`;
     h += `<div class="hint">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
-    h += `<div style="display:grid;grid-template-columns:minmax(0,120px) minmax(0,1fr);gap:8px;align-items:center;font-size:12px;margin:8px 0">`;
+    h += `<div class="audit-grid">`;
     if (giTot > 0) {
       h += `<div>general (GI)</div>`;
-      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
-      h += seg(giOk, 'var(--ok,#3a3)',  'compliant');
-      h += seg(giPt, 'var(--warn,#fa0)', 'partial');
-      h += seg(giNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-size:12px;color:var(--dim)">${giTot} total</div>`;
+      h += `<div class="audit-bar">`;
+      h += seg(giOk, 'ok', 'compliant');
+      h += seg(giPt, 'warn', 'partial');
+      h += seg(giNc, 'bad', 'non-compliant');
+      h += `<div class="audit-total">${giTot} total</div>`;
       h += `</div>`;
     }
     if (ciTot > 0) {
       h += `<div>counter (CI)</div>`;
-      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
-      h += seg(ciOk, 'var(--ok,#3a3)',  'compliant');
-      h += seg(ciPt, 'var(--warn,#fa0)', 'partial');
-      h += seg(ciNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-size:12px;color:var(--dim)">${ciTot} total</div>`;
+      h += `<div class="audit-bar">`;
+      h += seg(ciOk, 'ok', 'compliant');
+      h += seg(ciPt, 'warn', 'partial');
+      h += seg(ciNc, 'bad', 'non-compliant');
+      h += `<div class="audit-total">${ciTot} total</div>`;
       h += `</div>`;
     }
     h += `</div>`;

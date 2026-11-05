@@ -28,4 +28,5 @@ futures-util = { version = "0.3", default-features = false, features = ["std"] }
 tempfile = "3"
 
 [dev-dependencies]
+tokio-tungstenite = "0.24"
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
