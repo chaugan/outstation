@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
-"""Syntax-check every inline <script> in the SPA and every protocol UI module with `node --check`.
+"""Syntax-check the SPA's JavaScript with `node --check`.
 
-The SPA is a single HTML file spliced together by crates/webui/build.rs, so a JS syntax error
-only shows up at runtime in the browser. This catches it in CI instead.
+The SPA is spliced together by crates/webui/build.rs from
+crates/webui/src/index.html, crates/webui/src/ui/*.{css,js} and
+crates/proto_*/static/*.js, so a JS syntax error would only show up at
+runtime in the browser. This catches it in CI instead.
+
+Checks:
+  1. every inline <script> left in index.html;
+  2. every ui/*.js and proto static *.js file on its own;
+  3. all of them concatenated in the order build.rs splices them. The
+     files are classic scripts sharing one global scope, so a top-level
+     `const`/`let`/`function` declared in two files is a SyntaxError in
+     the browser that check 2 cannot see.
 """
 import pathlib
 import re
@@ -11,27 +21,39 @@ import sys
 import tempfile
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-sources = [ROOT / "crates/webui/src/index.html"]
-sources += sorted(ROOT.glob("crates/*/static/*.js"))
-sources += sorted((ROOT / "crates/webui/src/ui").glob("*.js")) if (ROOT / "crates/webui/src/ui").is_dir() else []
+UI = ROOT / "crates/webui/src/ui"
+index = ROOT / "crates/webui/src/index.html"
+ui_js = sorted(UI.glob("*.js")) if UI.is_dir() else []
+proto_js = sorted(ROOT.glob("crates/proto_*/static/*.js"))
 
 failed = False
+
+
+def check(label, code, tmp, name):
+    global failed
+    out = pathlib.Path(tmp) / name
+    out.write_text(code, encoding="utf-8")
+    r = subprocess.run(["node", "--check", str(out)], capture_output=True, text=True)
+    if r.returncode != 0:
+        failed = True
+        print(f"FAIL {label}\n{r.stderr}")
+    else:
+        print(f"ok   {label}")
+
+
 with tempfile.TemporaryDirectory() as tmp:
-    for src in sources:
-        text = src.read_text(encoding="utf-8")
-        if src.suffix == ".html":
-            blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", text, re.S)
-            # build.rs placeholder is replaced at build time; neutralise it for the check.
-            blocks = [b.replace("@@PROTO_STATIC_JS@@", "") for b in blocks]
-        else:
-            blocks = [text]
-        for i, block in enumerate(blocks):
-            out = pathlib.Path(tmp) / f"{src.stem}_{i}.js"
-            out.write_text(block, encoding="utf-8")
-            r = subprocess.run(["node", "--check", str(out)], capture_output=True, text=True)
-            if r.returncode != 0:
-                failed = True
-                print(f"FAIL {src.relative_to(ROOT)} script #{i}\n{r.stderr}")
-            else:
-                print(f"ok   {src.relative_to(ROOT)} script #{i}")
+    text = index.read_text(encoding="utf-8")
+    blocks = re.findall(r"<script(?![^>]*\bsrc=)[^>]*>(.*?)</script>", text, re.S)
+    for i, block in enumerate(blocks):
+        check(f"{index.relative_to(ROOT)} script #{i}", block, tmp, f"index_{i}.js")
+    for src in ui_js + proto_js:
+        check(str(src.relative_to(ROOT)), src.read_text(encoding="utf-8"), tmp, f"{src.stem}.js")
+    if not ui_js:
+        failed = True
+        print(f"FAIL no JS files found under {UI.relative_to(ROOT)}")
+    # Same order as build.rs: app scripts, then protocol scripts. The
+    # protocol bundle is one IIFE-wrapped script per file.
+    combined = "\n;\n".join(s.read_text(encoding="utf-8") for s in ui_js + proto_js)
+    check("all ui/*.js + proto static JS as one global scope", combined, tmp, "combined.js")
+
 sys.exit(1 if failed else 0)

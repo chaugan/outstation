@@ -1,25 +1,34 @@
 //! Build-time template step for the web UI.
 //!
-//! Scans every sibling `crates/proto_*/static/*.js` file, concatenates
-//! them into a single `<script>` block, and substitutes the result into
-//! a `<!-- @@PROTO_STATIC_JS@@ -->` placeholder in `src/index.html`.
-//! The expanded HTML lands at `$OUT_DIR/index.html`, which `lib.rs`
-//! pulls in via `include_str!`.
+//! The SPA source lives in several files so it can be read, reviewed
+//! and syntax-checked in pieces, but the binary serves one
+//! self-contained HTML page (no extra requests, works air-gapped).
+//! This script splices the pieces into `src/index.html`:
 //!
-//! This keeps protocol-specific UI code (ASDU type names, CP56 drift
-//! charts, …) in the same crate that implements the protocol. Adding a
-//! new protocol is a matter of dropping a new `static/<name>_ui.js`
-//! file next to the crate's trait impl — no webui edits needed.
+//! - `<!-- @@APP_CSS@@ -->` becomes a `<style>` block with
+//!   `src/ui/*.css` (sorted by file name).
+//! - `<!-- @@APP_JS@@ -->` becomes one `<script>` block per
+//!   `src/ui/*.js` file, in file-name order. The files are classic
+//!   scripts that share the page's global scope; the numeric prefixes
+//!   (`00-core.js`, `10-…`) fix the load order.
+//! - `<!-- @@PROTO_STATIC_JS@@ -->` becomes a `<script>` block with
+//!   every sibling `crates/proto_*/static/*.js` file, so protocol UI
+//!   code (ASDU names, CP56 drift charts, …) stays in the crate that
+//!   implements the protocol.
 //!
-//! Files are sorted alphabetically so the bundle order is stable across
-//! builds. Each file is wrapped in a small delimiter comment to make
-//! any browser-side stack trace easy to map back to its source.
+//! The expanded HTML lands at `$OUT_DIR/index.html`, which the
+//! router pulls in via `include_str!`. Each spliced file is preceded
+//! by a delimiter comment so a browser stack trace maps back to its
+//! source. A missing placeholder, or one left over after expansion, is
+//! a build error.
 
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
-const PLACEHOLDER: &str = "<!-- @@PROTO_STATIC_JS@@ -->";
+const CSS_PLACEHOLDER: &str = "<!-- @@APP_CSS@@ -->";
+const APP_JS_PLACEHOLDER: &str = "<!-- @@APP_JS@@ -->";
+const PROTO_PLACEHOLDER: &str = "<!-- @@PROTO_STATIC_JS@@ -->";
 
 fn main() {
     let manifest_dir = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
@@ -30,59 +39,79 @@ fn main() {
 
     let index_src = manifest_dir.join("src").join("index.html");
     println!("cargo:rerun-if-changed={}", index_src.display());
-
     let raw = fs::read_to_string(&index_src).expect("read src/index.html");
 
-    // Locate every sibling proto_* crate's static/ dir, then every .js
-    // file inside. We rely on directory convention (`crates/proto_*`) so
-    // the registry and the UI bundle stay in lockstep without a central
-    // list to keep in sync.
-    let mut js_files: Vec<PathBuf> = Vec::new();
+    let ui_dir = manifest_dir.join("src").join("ui");
+    println!("cargo:rerun-if-changed={}", ui_dir.display());
+    let css_files = files_with_ext(&ui_dir, "css");
+    let app_js_files = files_with_ext(&ui_dir, "js");
+
+    // Every sibling proto_* crate's static/*.js. Directory convention
+    // keeps the registry and the UI bundle in lockstep without a
+    // central list.
+    let mut proto_js: Vec<PathBuf> = Vec::new();
     for entry in fs::read_dir(workspace_crates)
         .expect("read crates/")
         .flatten()
     {
         let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
         let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
             continue;
         };
-        if !name.starts_with("proto_") {
+        if !path.is_dir() || !name.starts_with("proto_") {
             continue;
         }
         let static_dir = path.join("static");
-        if !static_dir.is_dir() {
-            continue;
-        }
-        // rerun on any addition/removal under this proto's static dir
-        println!("cargo:rerun-if-changed={}", static_dir.display());
-        for f in fs::read_dir(&static_dir)
-            .unwrap_or_else(|_| panic!("read {:?}", static_dir))
-            .flatten()
-        {
-            let p = f.path();
-            if p.extension().and_then(|s| s.to_str()) == Some("js") {
-                println!("cargo:rerun-if-changed={}", p.display());
-                js_files.push(p);
-            }
+        if static_dir.is_dir() {
+            println!("cargo:rerun-if-changed={}", static_dir.display());
+            proto_js.extend(files_with_ext(&static_dir, "js"));
         }
     }
-    js_files.sort();
+    proto_js.sort();
 
-    let bundle = build_bundle(&js_files);
-    let expanded = raw.replace(PLACEHOLDER, &bundle);
-    if !raw.contains(PLACEHOLDER) {
-        // Missing placeholder is a hard error in dev — would otherwise
-        // silently fall back to the un-expanded HTML and every UI
-        // bug would be a mystery until someone grepped for "@@PROTO".
-        panic!(
-            "src/index.html is missing the `{}` placeholder — the build can't \
-             splice per-protocol static JS into the served page.",
-            PLACEHOLDER,
-        );
+    for ph in [CSS_PLACEHOLDER, APP_JS_PLACEHOLDER, PROTO_PLACEHOLDER] {
+        if !raw.contains(ph) {
+            panic!(
+                "src/index.html is missing the `{ph}` placeholder; the build can't \
+                 splice the UI sources into the served page."
+            );
+        }
     }
+
+    let mut css = String::from("<style>\n");
+    for p in &css_files {
+        css.push_str(&format!("/* ── {} ── */\n", rel(p)));
+        push_file(&mut css, p);
+    }
+    css.push_str("</style>");
+
+    let mut app_js = String::new();
+    for p in &app_js_files {
+        app_js.push_str("<script>\n");
+        app_js.push_str(&format!("// ── {} ──\n", rel(p)));
+        push_file(&mut app_js, p);
+        app_js.push_str("</script>\n");
+    }
+
+    let mut proto = String::from("<script>\n");
+    proto.push_str("// ─── per-protocol static JS bundled by crates/webui/build.rs ───\n");
+    proto.push_str("// (sources live at crates/proto_*/static/*.js — edit there, not here)\n\n");
+    for p in &proto_js {
+        proto.push_str(&format!("// ── {} ──\n", rel(p)));
+        push_file(&mut proto, p);
+        proto.push('\n');
+    }
+    proto.push_str("</script>\n");
+
+    // Splice in a fixed order, the HTML shell first, so a placeholder
+    // string inside a spliced file is never itself expanded.
+    let (a, rest) = raw.split_once(CSS_PLACEHOLDER).unwrap();
+    let (b, rest) = rest.split_once(APP_JS_PLACEHOLDER).unwrap();
+    let (c, d) = rest.split_once(PROTO_PLACEHOLDER).unwrap();
+    if [a, b, c, d].iter().any(|s| s.contains("<!-- @@")) {
+        panic!("src/index.html has a duplicate or out-of-order @@ placeholder");
+    }
+    let expanded = format!("{a}{css}{b}{app_js}{c}{proto}{d}");
 
     let out_path = out_dir.join("index.html");
     let mut f = fs::File::create(&out_path).expect("create OUT_DIR/index.html");
@@ -90,34 +119,41 @@ fn main() {
         .expect("write expanded html");
 }
 
-/// Assemble the substituted `<script>` fragment. Emits one wrapped
-/// block per file so browser-side errors point at a named source.
-fn build_bundle(js_files: &[PathBuf]) -> String {
-    let mut out = String::new();
-    out.push_str("<script>\n");
-    out.push_str("// ─── per-protocol static JS bundled by crates/webui/build.rs ───\n");
-    out.push_str("// (sources live at crates/proto_*/static/*.js — edit there, not here)\n\n");
-    for p in js_files {
-        let rel = p
-            .components()
-            .rev()
-            .take(3)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/");
-        let body = fs::read_to_string(p).unwrap_or_else(|e| panic!("read {:?}: {}", p, e));
-        out.push_str(&format!("// ── {} ──\n", rel));
-        out.push_str(&body);
-        if !body.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push('\n');
+/// Sorted list of `dir/*.<ext>`, each registered for rebuilds.
+fn files_with_ext(dir: &Path, ext: &str) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = fs::read_dir(dir)
+        .unwrap_or_else(|e| panic!("read {dir:?}: {e}"))
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some(ext))
+        .collect();
+    out.sort();
+    for p in &out {
+        println!("cargo:rerun-if-changed={}", p.display());
     }
-    out.push_str("</script>\n");
     out
 }
 
-fn _suppress_unused_warn(_: &Path) {}
+/// Last three path components, for the delimiter comments.
+fn rel(p: &Path) -> String {
+    let parts: Vec<String> = p
+        .components()
+        .rev()
+        .take(3)
+        .map(|c| c.as_os_str().to_string_lossy().into_owned())
+        .collect();
+    parts.into_iter().rev().collect::<Vec<_>>().join("/")
+}
+
+fn push_file(out: &mut String, p: &Path) {
+    let body = fs::read_to_string(p).unwrap_or_else(|e| panic!("read {p:?}: {e}"));
+    // A literal `</script>` or `</style>` inside a spliced file would end
+    // the block early.
+    if body.contains("</script") || body.contains("</style") {
+        panic!("{p:?} contains a closing </script> or </style> tag");
+    }
+    out.push_str(&body);
+    if !body.ends_with('\n') {
+        out.push('\n');
+    }
+}
