@@ -1,6 +1,6 @@
-//! Top-level `outstation` binary — the user-facing CLI. For now it
-//! exposes only the synchronous `run` path; the web UI will eventually
-//! live beside it as `outstation serve`.
+//! Top-level `outstation` binary — the user-facing CLI: pcap
+//! inspection, a synchronous `run`, the web UI (`serve`) and host
+//! cleanup (`cleanup`).
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -34,11 +34,46 @@ enum Cmd {
     /// NIC for real egress.
     Run(RunArgs),
     /// Start the web UI (axum backend + embedded SPA).
-    Serve {
-        /// Address to bind, e.g. 127.0.0.1:8080
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        bind: std::net::SocketAddr,
+    Serve(ServeArgs),
+    /// Undo host network changes left by runs (IP aliases, bridges,
+    /// veths and, once available, iptables/sysctl state). Safe to run
+    /// at any time; used as the systemd unit's ExecStopPost.
+    Cleanup {
+        /// State directory (default: parent of OUTSTATION_LIBRARY_DIR,
+        /// i.e. /var/lib/outstation).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
     },
+}
+
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Address to bind, e.g. 127.0.0.1:8080. The systemd unit binds
+    /// 0.0.0.0:8080 for LAN access.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: std::net::SocketAddr,
+
+    /// Extra Host header names to accept (repeatable or
+    /// comma-separated), on top of IP literals, localhost and this
+    /// machine's host names. Also read from OUTSTATION_ALLOW_HOSTS.
+    #[arg(long = "allow-host", value_name = "HOST")]
+    allow_host: Vec<String>,
+
+    /// Keep run history in memory only. Without this flag the server
+    /// refuses to start when the run database cannot be opened.
+    #[arg(long)]
+    ephemeral: bool,
+
+    /// Largest accepted upload (library and analysis), in MiB.
+    /// Default 1024 or OUTSTATION_MAX_UPLOAD_MB.
+    #[arg(long, value_name = "MIB")]
+    max_upload_mb: Option<u64>,
+
+    /// Total size cap for stored replay captures, in MiB. Oldest
+    /// captures are evicted first. Default 10240 or
+    /// OUTSTATION_CAPTURE_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    capture_max_mb: Option<u64>,
 }
 
 #[derive(clap::Args)]
@@ -95,11 +130,21 @@ struct RunArgs {
     warmup: u64,
 }
 
+/// ANSI colours only on an interactive terminal, never under journald
+/// (F079).
+fn use_ansi() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("JOURNAL_STREAM").is_none()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::io::stdout().is_terminal()
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(use_ansi())
         .init();
     let cli = Cli::parse();
     match cli.cmd {
@@ -146,11 +191,26 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Run(args) => run_cmd(args)?,
-        Cmd::Serve { bind } => {
+        Cmd::Serve(args) => {
+            let mut cfg = webui::ServeConfig::from_env(args.bind);
+            for h in &args.allow_host {
+                cfg.allow_hosts.extend(webui::split_hosts(h));
+            }
+            cfg.ephemeral = args.ephemeral;
+            if let Some(mb) = args.max_upload_mb {
+                cfg.max_upload_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(mb) = args.capture_max_mb {
+                cfg.capture_max_total_bytes = mb.saturating_mul(1024 * 1024);
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(async move { webui::serve(bind).await })?;
+            rt.block_on(async move { webui::serve(cfg).await })?;
+        }
+        Cmd::Cleanup { state_dir } => {
+            let dir = state_dir.unwrap_or_else(webui::default_state_dir);
+            webui::host_cleanup(&dir)?;
         }
     }
     Ok(())
@@ -214,4 +274,55 @@ fn run_cmd(args: RunArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn serve_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "outstation",
+            "serve",
+            "--bind",
+            "0.0.0.0:8080",
+            "--allow-host",
+            "a.lan,b.lan",
+            "--allow-host",
+            "c.lan",
+            "--ephemeral",
+            "--max-upload-mb",
+            "10",
+        ])
+        .unwrap();
+        let Cmd::Serve(a) = cli.cmd else {
+            panic!("not serve")
+        };
+        assert_eq!(a.bind.port(), 8080);
+        assert!(a.ephemeral);
+        let hosts: Vec<String> = a
+            .allow_host
+            .iter()
+            .flat_map(|h| webui::split_hosts(h))
+            .collect();
+        assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
+        assert_eq!(a.max_upload_mb, Some(10));
+    }
+
+    #[test]
+    fn serve_defaults_to_loopback_and_cleanup_parses() {
+        let Cmd::Serve(a) = Cli::try_parse_from(["outstation", "serve"]).unwrap().cmd else {
+            panic!("not serve")
+        };
+        assert_eq!(a.bind.to_string(), "127.0.0.1:8080");
+        let Cmd::Cleanup { state_dir } =
+            Cli::try_parse_from(["outstation", "cleanup", "--state-dir", "/x"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("not cleanup")
+        };
+        assert_eq!(state_dir, Some(PathBuf::from("/x")));
+    }
 }

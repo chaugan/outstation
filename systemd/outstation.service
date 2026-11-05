@@ -10,7 +10,25 @@ Type=simple
 # ethtool offload, and installs/removes iptables rules around runs.
 # It needs CAP_NET_ADMIN, CAP_NET_RAW, CAP_NET_BIND_SERVICE, and
 # CAP_SYS_NICE for SCHED_FIFO timing.
+#
+# The UI binds 0.0.0.0 so it is reachable from the LAN by IP or host
+# name. There is no authentication. The server does refuse requests
+# whose Host header is not an IP literal, localhost or this machine's
+# host name (DNS-rebinding protection), and state-changing requests
+# whose Origin is not the UI itself (CSRF protection). If you reach the
+# UI through another name (a reverse proxy, a DNS alias), add it with
+# --allow-host NAME or Environment=OUTSTATION_ALLOW_HOSTS=name1,name2.
+# Only one run can be active at a time.
 ExecStart=/usr/local/bin/outstation serve --bind 0.0.0.0:8080
+# Undo host network changes even if the process died without its own
+# cleanup (crash, SIGKILL after TimeoutStopSec). Also runs after a
+# normal stop, where it is a no-op. The leading "-" keeps a cleanup
+# failure from marking the unit failed.
+ExecStopPost=-/usr/local/bin/outstation cleanup
+# SIGTERM makes the server cancel runs and join their workers (up to
+# ~25 s) so every RAII guard restores host state before exit.
+TimeoutStopSec=30
+KillMode=mixed
 Restart=on-failure
 RestartSec=2
 
@@ -28,18 +46,36 @@ CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NIC
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes
+# The service has a private /tmp. Nothing the operator needs lives
+# there: library, run database, captures and temp files are all under
+# /var/lib/outstation.
 PrivateTmp=yes
+# Only pseudo devices; the tool needs no hardware device nodes
+# (/dev/net/tun is not used: interfaces are veth pairs and bridges).
+PrivateDevices=yes
 ProtectKernelTunables=no
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+LockPersonality=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+# AF_NETLINK for rtnetlink (links, addresses), AF_PACKET for raw
+# replay and capture, AF_INET/AF_INET6 for sessions and the UI,
+# AF_UNIX for the journal and the resolver.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET AF_UNIX
+SystemCallArchitectures=native
+UMask=0027
 RestrictRealtime=no
-# Library uploads + replay capture pcaps live under /var/lib/outstation.
-StateDirectory=outstation
-ReadWritePaths=/var/lib/outstation
 
-# UI binds on 0.0.0.0 so it's reachable from the LAN. There's no
-# authentication on the backend — restrict at the network layer or
-# put a reverse proxy with auth in front.
+# Library uploads, the run database, replay captures
+# (/var/lib/outstation/captures) and analysis temp files
+# (/var/lib/outstation/tmp) all live under the state directory.
+StateDirectory=outstation
+StateDirectoryMode=0750
+ReadWritePaths=/var/lib/outstation
 
 [Install]
 WantedBy=multi-user.target
