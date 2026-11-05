@@ -536,7 +536,7 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
                         rs.throughput_history.remove(0);
                     }
                     if tick % 5 == 0 && !ctx.is_cancelled() {
-                        if let Some(free) = crate::sysinfo::free_bytes(&state.cfg.state_dir) {
+                        if let Some(free) = state.cfg.free_space.free_bytes(&state.cfg.state_dir) {
                             if free < state.cfg.min_free_bytes / 2 {
                                 warn!(id, free, "free disk critically low; stopping run");
                                 rs.error = Some(format!(
@@ -596,13 +596,13 @@ pub(crate) fn join_workers(state: &AppState, timeout: Duration) -> Vec<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
     use std::sync::Mutex;
 
-    fn source(sent: u64, planned: u64) -> sched::SourceProgress {
+    pub(crate) fn source(sent: u64, planned: u64) -> sched::SourceProgress {
         sched::SourceProgress {
             src_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
             src_mac: [0; 6],
@@ -623,6 +623,7 @@ mod tests {
             bytes_done_iters: Arc::new(AtomicU64::new(0)),
             fold_seq: Arc::new(AtomicU64::new(0)),
             error: Arc::new(Mutex::new(None)),
+            ack_latency: Default::default(),
         }
     }
 

@@ -45,6 +45,9 @@
 // at 1440x900, 800 endpoints fast, charts on the page theme); the live
 // dashboard strip; run-card status line; delete with Undo for profiles
 // and finished runs; the theme toggle and keyboard shortcuts.
+// T20b: live ack-latency p50 / p99 in the live strip and the diagram's
+// session table; friendly regression labels and ms in Compare; the
+// SCADA-gateway section disabled (and never sent) in master role.
 // Exits non-zero when any check fails. Runs it starts are stopped and
 // deleted at the end; the uploaded pcap is left in the library.
 
@@ -552,6 +555,34 @@ async function runFlows(browser, pcapId) {
     `live dashboard strip shows throughput, in-flight, ack latency and the session-state bar (${strip ? strip.text.replace(/\s+/g, ' ').slice(0, 90) : 'hidden'})`);
   const legend = await b.textContent('#diagram-legend');
   check(/pending/.test(legend), `diagram legend has state counts (${legend.trim().slice(0, 60)})`);
+  // T20b: live ack latency. Pending slaves have no acks yet; the tile
+  // says so. Then a frame carrying the server's ack_latency fields
+  // (as a privileged run streams them) renders p50 / p99 in the strip
+  // and per session in the diagram's table.
+  const lat = await b.evaluate(() => {
+    const tileText = () => [...document.querySelectorAll('#live-strip .ls-tile')].map(t => t.textContent).find(t => /Ack latency/.test(t)) || '';
+    const before = { tile: tileText(), frameHas: !!(diag.latest && 'ack_latency' in diag.latest) };
+    const f = JSON.parse(JSON.stringify(diag.latest));
+    f.ack_latency = { p50_us: 2345, p99_us: 6012, samples: 12345, histogram: { log10_min_us: 1, log10_max_us: 7, counts: new Array(24).fill(0), underflow: 0, overflow: 0, total: 12345 } };
+    f.per_session = f.per_session.map((p, i) => (i === 0 ? { ...p, ack_p50_us: 1500, ack_p99_us: 4200 } : p));
+    diag.latest = f;
+    diag.latestAt = Date.now();
+    renderLiveStrip();
+    const after = tileText();
+    el('diagram-table-wrap').open = true;
+    diag.tableAt = 0;
+    renderDiagramText(f, f.per_session);
+    const head = document.querySelector('#diagram-table thead').textContent;
+    const row = document.querySelector('#diagram-table tbody tr').textContent;
+    el('diagram-table-wrap').open = false;
+    return { before, after, head, row };
+  });
+  check(/waiting for the first acknowledgement/.test(lat.before.tile) && !lat.before.frameHas,
+    `ack latency waits for the first acknowledgement while slaves are pending (${lat.before.tile.replace(/\s+/g, ' ').slice(0, 80)})`);
+  check(/2\.3 ms \/ 6\.0 ms/.test(lat.after) && /12,345 acks so far/.test(lat.after) && !/when the run ends/.test(lat.after),
+    `live strip shows live ack p50 / p99 (${lat.after.replace(/\s+/g, ' ').slice(0, 80)})`);
+  check(/Ack p50/.test(lat.head) && /Ack p99/.test(lat.head) && /1\.5 ms/.test(lat.row) && /4\.2 ms/.test(lat.row),
+    `diagram session table has per-session ack p50 / p99 (${lat.row.replace(/\s+/g, ' ').slice(0, 90)})`);
   const created = await b.evaluate(async id => {
     const n0 = window.__ws.length;
     for (let i = 0; i < 5; i++) connectDiagram(id);
@@ -707,6 +738,44 @@ async function configureChecks(page, viewport) {
   if (viewport.width >= 1100) check(sm.pos === 'sticky' && sm.open, `summary is sticky beside the form (${sm.pos})`);
   else check(sm.pos !== 'sticky' && !sm.open, `summary is collapsed and not sticky on a narrow screen (${sm.pos}, open ${sm.open})`);
   check(!sm.keys.length, `summary lists role, target, pacing, iterations, link and faults${sm.keys.length ? ' — missing ' + sm.keys : ''}`);
+  await gatewayRoleChecks(page);
+}
+
+// T20b: SCADA-gateway mode is slave-only (the server answers 400
+// gateway_requires_slave). In master role the section is disabled with
+// a note and the request carries no gateway field, also after a preset
+// or a profile set them; in slave role they are sent.
+async function gatewayRoleChecks(page) {
+  const r = await page.evaluate(() => {
+    const keys = b => ['scada_gateway_ip', 'scada_gateway_iface', 'upstream_nat_iface'].filter(k => k in b);
+    const look = () => ({ note: !el('scada-gw-note').hidden, disabled: el('scada-gw-fields').disabled, sent: keys(buildBody(false)) });
+    el('cfg-scada-gw').checked = true;
+    el('cfg-scada-gw-ip').value = '10.0.0.1';
+    const nic = [...el('cfg-scada-gw-iface').options].find(o => o.value);
+    if (nic) el('cfg-scada-gw-iface').value = nic.value;
+    applyPreset('rtu');
+    const master = look();
+    const presetMsg = el('preset-status').textContent;
+    const errs = Object.keys(validators()).filter(k => /scada-gw/.test(k));
+    applyPreset('scada');
+    const slave = look();
+    const notes = applyRequestToForm({ mode: 'benchmark', role: 'master', target_ip: '192.0.2.10', scada_gateway_ip: '10.0.0.1' });
+    const profile = { ...look(), notes };
+    // Leave the form as it was: gateway off.
+    el('cfg-scada-gw').checked = false;
+    el('cfg-scada-gw-ip').value = '';
+    applyPreset('rtu');
+    return { master, presetMsg, errs, slave, profile, hasNic: !!nic };
+  }).catch(e => ({ error: String(e) }));
+  if (r.error) { check(false, `gateway role checks ran (${r.error})`); return; }
+  check(r.master.note && r.master.disabled && !r.master.sent.length,
+    `master role: gateway section disabled with a note, nothing sent (${JSON.stringify(r.master)})`);
+  check(/slave role only/.test(r.presetMsg), `the RTU preset says gateway mode is slave-only (${r.presetMsg.slice(-70)})`);
+  check(!r.errs.length, `master role does not validate the gateway fields (${r.errs})`);
+  check(!r.slave.note && !r.slave.disabled && r.slave.sent.includes('scada_gateway_ip'),
+    `slave role: gateway section enabled and sent (${JSON.stringify(r.slave)})`);
+  check(r.profile.disabled && !r.profile.sent.length && r.profile.notes.some(n => /slave role only/.test(n)),
+    `a master-role profile with gateway fields loads them disabled, unsent, with a note (${JSON.stringify(r.profile.notes)})`);
 }
 
 // A synthetic report of N endpoints with mixed outcomes and timelines.
@@ -1217,6 +1286,7 @@ async function compareFlow(browser, pcapId) {
     check(await pageA.isVisible('.cmp-fleet'), 'with auto-analysis on, the comparison renders without an Analyze step');
     check(await pageA.inputValue('#cmp-th-score_drop') === '2', 'threshold from the hash fills its input');
     await audit(pageA, 'compare (auto-analysed)', 'compare-auto');
+    if (await pageA.isVisible('.cmp-fleet')) await compareLabelChecks(pageA, A, B);
     check(!errsA.length, `no console errors${errsA.length ? ': ' + errsA.slice(0, 3).join(' | ') : ''}`);
     notes.push('compare: analysis_missing/Analyze path not exercised (server has auto-analysis on; rerun against a --no-auto-analyze server to cover it)');
     await ctxA.close();
@@ -1285,6 +1355,7 @@ async function compareFlow(browser, pcapId) {
   check(/score drop &gt; 2|score drop > 2/.test(used), `the threshold reached the server (${used.trim().slice(0, 60)})`);
   const verdictBox = await page.textContent('.cmp-verdict');
   check(/regression/i.test(verdictBox), `regressed / not regressed is stated (${verdictBox.trim()})`);
+  await compareLabelChecks(page, A, B);
   // Sort and filter.
   await page.click('[data-act="cmp-sort"][data-key="rtu"]');
   const sorted = await page.getAttribute('#cmp-thead th:first-child', 'aria-sort');
@@ -1321,6 +1392,51 @@ async function compareFlow(browser, pcapId) {
   check(/analysed:/.test(optText), `analysis run picker shows latest_analysis (${optText.trim().slice(-40)})`);
   check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
   await ctx.close();
+}
+
+// T20b: regressions read "Ack p99 rose from 245.2 ms to 396.8 ms", not
+// "p99_us rose from 245242 µs": the server's own regressions (if any)
+// carry a label and no raw ids, and the list, the per-RTU headers and
+// the Regressed column show friendly names and ms.
+async function compareLabelChecks(page, A, B) {
+  const real = await apiGet(`/api/runs/${A}/compare/${B}?score_drop=0&delivered_drop=0`).catch(() => ({}));
+  const regs = real.regressions || [];
+  check(regs.every(r => r.label && !/_us\b|_pct\b| µs/.test(r.message)), `server regressions carry labels and no raw ids (${regs.length} regression(s))`);
+  // A response with the latency regressions of the bug report, fleet
+  // and per RTU, rendered by the real client.
+  await page.route(`**/api/runs/${A}/compare/${B}**`, async route => {
+    const resp = await route.fetch();
+    const body = await resp.json();
+    if (Array.isArray(body.rtus) && body.rtus.length) {
+      const ip = body.rtus[0].rtu;
+      body.regressions = [
+        { scope: 'fleet', rtu: null, metric: 'p99_us', label: 'Ack p99', a: 245242, b: 396787, threshold: 20, message: 'Ack p99 rose from 245.2 ms to 396.8 ms (more than 20%)' },
+        { scope: 'rtu', rtu: ip, metric: 'p50_us', label: 'Ack p50', a: 1000, b: 9000, threshold: 20, message: `RTU ${ip}: Ack p50 rose from 1.0 ms to 9.0 ms (more than 20%)` },
+      ];
+      body.regressed = true;
+      body.rtus[0].regressions = ['p50_us', 'delivered_pct'];
+      body.rtus[0].a.p50_us = 1000;
+      body.rtus[0].b.p50_us = 9000;
+      body.rtus[0].delta.p50_us = 8000;
+    }
+    await route.fulfill({ response: resp, json: body }).catch(() => {});
+  });
+  await page.click('#cmp-btn');
+  // The real result may already list regressions: wait for these.
+  await page.waitForFunction(() => /245\.2 ms/.test((document.querySelector('.cmp-regs') || {}).textContent || ''), null, { timeout: 15000 }).catch(() => {});
+  const v = await page.evaluate(() => ({
+    list: (document.querySelector('.cmp-regs') || {}).textContent || '',
+    head: document.querySelector('#cmp-thead').textContent,
+    row: (document.querySelector('#cmp-tbody tr .reg-tag') || {}).textContent || '',
+    cell: [...document.querySelectorAll('#cmp-tbody tr')].map(r => r.textContent).join(' '),
+  }));
+  await page.unroute(`**/api/runs/${A}/compare/${B}**`);
+  check(/Ack p99 rose from 245\.2 ms to 396\.8 ms/.test(v.list) && !/p99[ _]us|µs/.test(v.list), `regression list uses labels and ms (${v.list.replace(/\s+/g, ' ').slice(0, 100)})`);
+  check(/Ack p50/.test(v.head) && /Ack p99/.test(v.head) && !/_us|µs/.test(v.head), `per-RTU headers are friendly (${v.head.replace(/\s+/g, ' ').slice(0, 100)})`);
+  check(/Ack p50/.test(v.row) && /Delivered/.test(v.row) && !/_/.test(v.row), `Regressed column names metrics (${v.row})`);
+  check(/1\.0 ms → 9\.0 ms/.test(v.cell), `per-RTU latency cells in ms with one decimal`);
+  await page.click('#cmp-btn');
+  await page.waitForTimeout(500);
 }
 
 async function cleanup() {

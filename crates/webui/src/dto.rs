@@ -287,10 +287,11 @@ pub struct LatencyHistogramJson {
     pub total: u64,
 }
 
-/// 10 µs .. 10 s, four bins per decade.
-pub(crate) const HIST_LOG_MIN: f64 = 1.0;
-pub(crate) const HIST_LOG_MAX: f64 = 7.0;
-pub(crate) const HIST_BINS: usize = 24;
+/// 10 µs .. 10 s, four bins per decade: the layout of protoplay's
+/// live ack-latency histogram, so live and final histograms match.
+pub(crate) const HIST_LOG_MIN: f64 = protoplay::LATENCY_HIST_LOG10_MIN_US;
+pub(crate) const HIST_LOG_MAX: f64 = protoplay::LATENCY_HIST_LOG10_MAX_US;
+pub(crate) const HIST_BINS: usize = protoplay::LATENCY_HIST_BINS;
 
 impl Default for LatencyHistogramJson {
     fn default() -> Self {
@@ -301,6 +302,19 @@ impl Default for LatencyHistogramJson {
             underflow: 0,
             overflow: 0,
             total: 0,
+        }
+    }
+}
+
+impl From<&protoplay::LatencyHistSnapshot> for LatencyHistogramJson {
+    fn from(h: &protoplay::LatencyHistSnapshot) -> Self {
+        Self {
+            log10_min_us: HIST_LOG_MIN,
+            log10_max_us: HIST_LOG_MAX,
+            counts: h.bins().to_vec(),
+            underflow: h.underflow(),
+            overflow: h.overflow(),
+            total: h.total(),
         }
     }
 }

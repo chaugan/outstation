@@ -62,6 +62,18 @@ if (mode === 'live') {
   await open(`#/runs/${run}`);
   await page.waitForSelector('#diagram-section:not([hidden])', { timeout: 30000 });
   await page.waitForTimeout(4000); // a few diagram frames
+  // The strip's ack-latency tile shows live p50 / p99 once the
+  // sessions have acknowledgements (T20b).
+  await page.waitForFunction(() => {
+    const t = [...document.querySelectorAll('#live-strip .ls-tile')].find(n => /Ack latency/.test(n.textContent));
+    return t && /acks so far/.test(t.textContent);
+  }, null, { timeout: 60000 }).catch(() => {});
+  const latTile = await page.evaluate(() => ([...document.querySelectorAll('#live-strip .ls-tile')].find(n => /Ack latency/.test(n.textContent)) || {}).textContent || '');
+  console.log(`live ack latency tile: ${latTile.replace(/\s+/g, ' ').trim()}`);
+  if (!/acks so far/.test(latTile)) {
+    console.error('the live strip shows no live ack latency');
+    process.exitCode = 1;
+  }
   // The live dashboard strip and the diagram below it.
   await page.evaluate(() => (document.querySelector('#live-strip:not([hidden])') || document.getElementById('diagram-section')).scrollIntoView({ block: 'start' }));
   await page.evaluate(() => window.scrollBy(0, -64));

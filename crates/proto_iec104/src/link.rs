@@ -1346,8 +1346,11 @@ impl Link {
             }
             self.pending.pop_front();
             if !front.dropped {
-                self.latency
-                    .push(recv_ns.saturating_sub(front.send_ns) / 1_000);
+                let us = recv_ns.saturating_sub(front.send_ns) / 1_000;
+                self.latency.push(us);
+                if let Some(p) = &self.progress {
+                    p.ack_latency.record_us(us);
+                }
             }
         }
     }

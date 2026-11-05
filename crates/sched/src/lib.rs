@@ -193,6 +193,10 @@ pub struct SourceProgress {
     /// Why the session failed; set together with the `FAILED` state.
     /// `None` while running and for completed or cancelled sessions.
     pub error: Arc<Mutex<Option<String>>>,
+    /// Benchmark-only: ack latency of every acknowledged message so
+    /// far (all iterations), shared with the protocol module's
+    /// [`protoplay::MessageProgress::ack_latency`].
+    pub ack_latency: Arc<protoplay::LiveLatencyHist>,
 }
 
 impl SourceProgress {
@@ -223,6 +227,7 @@ impl SourceProgress {
             iter_current: Default::default(),
             iter_total: Default::default(),
             error: Default::default(),
+            ack_latency: Default::default(),
         }
     }
 
@@ -261,6 +266,10 @@ impl SourceProgress {
     }
     pub fn snapshot_listen_ip(&self) -> Ipv4Addr {
         *self.listen_ip.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// Ack-latency histogram so far (benchmark sessions).
+    pub fn snapshot_ack_latency(&self) -> protoplay::LatencyHistSnapshot {
+        self.ack_latency.snapshot()
     }
     /// The session's failure reason, if it failed.
     pub fn snapshot_error(&self) -> Option<String> {
@@ -312,6 +321,7 @@ impl SourceProgress {
             iter_current: Arc::clone(&self.iter_current),
             iter_total: Arc::clone(&self.iter_total),
             run_cancel: Arc::clone(run_cancel),
+            ack_latency: Arc::clone(&self.ack_latency),
         }
     }
 }

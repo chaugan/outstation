@@ -5,7 +5,7 @@
 use serde::Serialize;
 
 use crate::state::AppState;
-use crate::sysinfo::{capabilities, free_bytes, Capabilities};
+use crate::sysinfo::{capabilities, Capabilities};
 
 /// One reason the service is degraded. `code` is stable for the UI;
 /// `message` is for humans.
@@ -136,7 +136,7 @@ pub(crate) async fn gather(state: &AppState) -> Health {
     let (db, free, caps, journal) = tokio::task::spawn_blocking(move || {
         (
             st.db.check_writable().map_err(|e| format!("{e:#}")),
-            free_bytes(&st.cfg.state_dir),
+            st.cfg.free_space.free_bytes(&st.cfg.state_dir),
             capabilities(),
             journal_pending(&st.cfg.state_dir),
         )

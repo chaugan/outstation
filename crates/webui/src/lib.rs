@@ -80,6 +80,7 @@ pub use events::RunEvent;
 pub use state::{
     default_library_dir, default_state_dir, env_flag, split_hosts, ActiveRun, AppState, ServeConfig,
 };
+pub use sysinfo::FreeSpace;
 
 use error::LockExt;
 use routes::analyze::*;

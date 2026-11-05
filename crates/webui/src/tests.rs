@@ -221,6 +221,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         allow_hosts: vec!["outstation.lan".into()],
         max_upload_bytes: 64 * 1024,
         min_free_bytes: 0,
+        free_space: Default::default(),
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
         library_max_bytes: 0,
@@ -2154,6 +2155,94 @@ async fn live_stream_ends_on_client_close() {
     h.wait_status(1, "stopped").await;
 }
 
+// T20b: live ack latency in the WebSocket frames.
+
+#[test]
+fn live_ack_latency_sums_the_sessions() {
+    use crate::routes::live::live_ack_latency;
+    assert!(live_ack_latency(&[]).is_none());
+    let a = protoplay::LiveLatencyHist::default();
+    let b = protoplay::LiveLatencyHist::default();
+    assert!(live_ack_latency(&[a.snapshot(), b.snapshot()]).is_none());
+    for _ in 0..98 {
+        a.record_us(2_000);
+    }
+    b.record_us(300_000);
+    b.record_us(300_000);
+    let l = live_ack_latency(&[a.snapshot(), b.snapshot()]).unwrap();
+    assert_eq!(l.samples, 100);
+    assert!((1_779..3_163).contains(&l.p50_us), "{}", l.p50_us);
+    assert!((177_828..316_228).contains(&l.p99_us), "{}", l.p99_us);
+    // The histogram has the report layout.
+    let d = crate::dto::LatencyHistogramJson::default();
+    assert_eq!(
+        (l.histogram.log10_min_us, l.histogram.log10_max_us),
+        (d.log10_min_us, d.log10_max_us)
+    );
+    assert_eq!(l.histogram.counts.len(), d.counts.len());
+    assert_eq!(l.histogram.total, 100);
+    assert_eq!(l.histogram.counts.iter().sum::<u64>(), 100);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_stream_carries_ack_latency() {
+    use futures_util::StreamExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (s, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    h.wait_status(1, "running").await;
+    // Two sessions: one with acks, one still waiting for its first.
+    let acked = crate::runs::tests::source(10, 10);
+    for _ in 0..10 {
+        acked.ack_latency.record_us(4_000);
+    }
+    {
+        let entry = h.state.get_run(1).unwrap();
+        let rs = entry.lock_safe();
+        let mut sp = rs.ctx.per_source.lock_safe();
+        sp.push(acked);
+        sp.push(crate::runs::tests::source(0, 10));
+    }
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = crate::router(h.state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::security::ConnAddrs>(),
+        )
+        .await
+        .unwrap();
+    });
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let mut req = format!("ws://{addr}/api/runs/1/live")
+        .into_client_request()
+        .unwrap();
+    req.headers_mut()
+        .insert("origin", format!("http://{addr}").parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let Message::Text(t) = ws.next().await.unwrap().unwrap() else {
+        panic!("not a text frame");
+    };
+    let f: Value = serde_json::from_str(&t).unwrap();
+    let lat = &f["ack_latency"];
+    assert_eq!(lat["samples"], 10, "{f}");
+    let p50 = lat["p50_us"].as_u64().unwrap();
+    assert!((3_163..5_624).contains(&p50), "{f}");
+    assert_eq!(lat["histogram"]["total"], 10, "{f}");
+    let ses = f["per_session"].as_array().unwrap();
+    assert_eq!(ses.len(), 2, "{f}");
+    assert!(ses[0]["ack_p99_us"].as_u64().is_some(), "{f}");
+    assert!(ses[1].get("ack_p50_us").is_none(), "{f}");
+    drop(ws);
+    h.call(Method::POST, "/api/runs/1/stop", None).await;
+    h.wait_status(1, "stopped").await;
+}
+
 /// F053: pcap loads for inspect and run start wait for a heavy-work
 /// permit like analyses and uploads do.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -2192,11 +2281,14 @@ async fn pcap_loads_wait_for_a_heavy_permit() {
 #[tokio::test]
 async fn uploads_respect_disk_reserve_and_library_quota() {
     let dir = tempfile::tempdir().unwrap();
-    let free = crate::sysinfo::free_bytes(dir.path()).unwrap();
-    // Leave ~200 KiB of budget above the reserve.
+    // A fixed free-space figure, so other tests writing to the same
+    // disk cannot change the outcome. Leave 200 KiB of budget above
+    // the reserve.
+    let free = 50 * 1024 * 1024 * 1024u64;
     let h = harness_cfg(dir, Behaviour::BlockUntilCancel, |c| {
         c.max_upload_bytes = 8 * 1024 * 1024;
-        c.min_free_bytes = free.saturating_sub(200 * 1024);
+        c.free_space = crate::sysinfo::FreeSpace::from_fn(move |_| Some(free));
+        c.min_free_bytes = free - 200 * 1024;
     });
     let mut big = tiny_pcap(1);
     big.resize(4 * 1024 * 1024, 0);

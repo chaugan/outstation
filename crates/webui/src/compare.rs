@@ -168,6 +168,8 @@ pub(crate) struct Regression {
     pub(crate) scope: &'static str,
     pub(crate) rtu: Option<String>,
     pub(crate) metric: &'static str,
+    /// Human-readable name of `metric` ("Ack p99", "Throughput").
+    pub(crate) label: &'static str,
     pub(crate) a: Value,
     pub(crate) b: Value,
     pub(crate) threshold: Option<f64>,
@@ -183,6 +185,43 @@ pub(crate) struct Comparison {
     pub(crate) regressions: Vec<Regression>,
     pub(crate) regressed: bool,
     pub(crate) thresholds: Thresholds,
+}
+
+/// Display name of a regression metric id.
+pub(crate) fn metric_label(metric: &str) -> &'static str {
+    match metric {
+        "score" => "Score",
+        "delivered_pct" => "Delivered",
+        "p50_us" => "Ack p50",
+        "p99_us" => "Ack p99",
+        "throughput" => "Throughput",
+        "sessions_failed" | "errors" => "Failed sessions",
+        "verdict" => "Verdict",
+        "missing_in_b" => "Missing in B",
+        _ => "Other",
+    }
+}
+
+/// Latency in ms with one decimal ("245.2 ms").
+pub(crate) fn ms(us: u64) -> String {
+    format!("{:.1} ms", us as f64 / 1000.0)
+}
+
+/// Message rate: whole msg/s with thousands separators from 100 up,
+/// one decimal below ("716,169 msg/s", "12.5 msg/s").
+pub(crate) fn rate(x: f64) -> String {
+    if x.abs() < 100.0 {
+        return format!("{x:.1} msg/s");
+    }
+    let digits = format!("{:.0}", x.abs());
+    let mut out = String::new();
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    format!("{}{out} msg/s", if x < 0.0 { "-" } else { "" })
 }
 
 fn f(v: &Value, k: &str) -> Option<f64> {
@@ -322,6 +361,7 @@ impl Flags<'_> {
             scope: if rtu.is_some() { "rtu" } else { "fleet" },
             rtu: rtu.map(str::to_string),
             metric,
+            label: metric_label(metric),
             a,
             b,
             threshold,
@@ -349,7 +389,10 @@ impl Flags<'_> {
                 a.into(),
                 b.into(),
                 Some(th),
-                format!("{who}{metric} fell from {a:.2} to {b:.2} (more than {th} points)"),
+                format!(
+                    "{who}{} fell from {a:.2}% to {b:.2}% (more than {th} pt)",
+                    metric_label(metric)
+                ),
             );
             return true;
         }
@@ -380,7 +423,12 @@ impl Flags<'_> {
                 a.into(),
                 b.into(),
                 Some(pct),
-                format!("{who}{metric} rose from {a} µs to {b} µs (more than {pct}%)"),
+                format!(
+                    "{who}{} rose from {} to {} (more than {pct}%)",
+                    metric_label(metric),
+                    ms(a),
+                    ms(b)
+                ),
             );
             return true;
         }
@@ -419,7 +467,9 @@ pub(crate) fn compare(a: &Side<'_>, b: &Side<'_>, th: &Thresholds) -> Comparison
                 y.into(),
                 Some(th.throughput_drop_pct),
                 format!(
-                    "throughput fell from {x:.1} to {y:.1} msg/s (more than {}%)",
+                    "Throughput fell from {} to {} (more than {}%)",
+                    rate(x),
+                    rate(y),
                     th.throughput_drop_pct
                 ),
             );
@@ -433,7 +483,7 @@ pub(crate) fn compare(a: &Side<'_>, b: &Side<'_>, th: &Thresholds) -> Comparison
                 x.into(),
                 y.into(),
                 None,
-                format!("failed sessions rose from {x} to {y}"),
+                format!("Failed sessions rose from {x} to {y}"),
             );
         }
     }
@@ -445,7 +495,7 @@ pub(crate) fn compare(a: &Side<'_>, b: &Side<'_>, th: &Thresholds) -> Comparison
                 x.as_str().into(),
                 y.as_str().into(),
                 None,
-                format!("fleet verdict went from {x} to {y}"),
+                format!("Fleet verdict went from {x} to {y}"),
             );
         }
     }
@@ -627,6 +677,52 @@ mod tests {
         assert_eq!(c.rtus[0].delta.p99_us, Some(0));
         assert!(c.only_in_a.is_empty() && c.only_in_b.is_empty());
         assert_eq!(c.fleet.delta.delivered_pct, Some(0.0));
+    }
+
+    #[test]
+    fn regression_messages_use_labels_and_units() {
+        assert_eq!(ms(245_242), "245.2 ms");
+        assert_eq!(ms(400), "0.4 ms");
+        assert_eq!(rate(716_169.4), "716,169 msg/s");
+        assert_eq!(rate(1_000.0), "1,000 msg/s");
+        assert_eq!(rate(12.54), "12.5 msg/s");
+        let mut flags = Flags {
+            th: &Thresholds::default(),
+            out: Vec::new(),
+        };
+        assert!(flags.latency_up(None, "p99_us", Some(245_242), Some(396_787), 20.0));
+        assert!(flags.drop_pp(
+            Some("10.0.0.2"),
+            "delivered_pct",
+            Some(100.0),
+            Some(50.0),
+            1.0
+        ));
+        let m: Vec<(&str, &str)> = flags
+            .out
+            .iter()
+            .map(|r| (r.label, r.message.as_str()))
+            .collect();
+        assert_eq!(
+            m,
+            [
+                (
+                    "Ack p99",
+                    "Ack p99 rose from 245.2 ms to 396.8 ms (more than 20%)"
+                ),
+                (
+                    "Delivered",
+                    "RTU 10.0.0.2: Delivered fell from 100.00% to 50.00% (more than 1 pt)"
+                ),
+            ]
+        );
+        for r in &flags.out {
+            assert!(
+                !r.message.contains("_us") && !r.message.contains("µs"),
+                "{}",
+                r.message
+            );
+        }
     }
 
     #[test]

@@ -708,7 +708,7 @@ function renderDetail(box, r, expanded) {
     h += `<dt>Sessions</dt><dd>${fmtInt((b.per_session || []).length)}</dd>`;
     h += `<dt>Messages</dt><dd>${fmtInt(b.total_messages_sent)} sent · ${fmtInt(b.total_messages_received)} received</dd>`;
     h += `<dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd>`;
-    h += `<dt>Ack latency</dt><dd>min ${fmtInt(b.aggregate_latency_min_us)} µs · p50 ${fmtInt(b.aggregate_latency_p50_us)} µs · p90 ${fmtInt(b.aggregate_latency_p90_us)} µs · p99 ${fmtInt(b.aggregate_latency_p99_us)} µs · max ${fmtInt(b.aggregate_latency_max_us)} µs</dd>`;
+    h += `<dt>Ack latency</dt><dd>min ${usFmt(b.aggregate_latency_min_us || 0)} · p50 ${usFmt(b.aggregate_latency_p50_us || 0)} · p90 ${usFmt(b.aggregate_latency_p90_us || 0)} · p99 ${usFmt(b.aggregate_latency_p99_us || 0)} · max ${usFmt(b.aggregate_latency_max_us || 0)}</dd>`;
     h += `<dt>Protocol violations</dt><dd class="${violations ? 'bad' : 'ok'}">${fmtInt(violations)}</dd>`;
     h += commandFaultTotals(b.per_session || []);
     if (b.capture_path) h += `<dt>Capture</dt><dd>${fmtInt(b.captured_packets)} frames · ${fmtBytes(b.captured_bytes)}</dd>`;
@@ -752,7 +752,7 @@ function benchSessionsHtml(runId, sessions, proto) {
   const page = rows.slice(u.benchPage * ROWS_PER_PAGE, (u.benchPage + 1) * ROWS_PER_PAGE);
   let h = '<h4>Per-session results</h4><p class="hint">Sessions with errors or protocol violations are listed first.</p>';
   h += '<div class="table-scroll"><table class="t"><thead><tr><th scope="col">Source IP</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Received</th>' +
-    '<th scope="col" class="num">Ack p50 (µs)</th><th scope="col" class="num">Ack p99 (µs)</th><th scope="col" class="num">Ack max (µs)</th><th scope="col" class="num">msg/s</th>' +
+    '<th scope="col" class="num">Ack p50 (ms)</th><th scope="col" class="num">Ack p99 (ms)</th><th scope="col" class="num">Ack max (ms)</th><th scope="col" class="num">msg/s</th>' +
     '<th scope="col" class="num">Window stalls</th><th scope="col" class="num">Violations</th><th scope="col">Status</th><th scope="col"><span class="sr-only">More</span></th></tr></thead><tbody>';
   for (const { s, i, v } of page) {
     const pf = s.protocol || {};
@@ -762,7 +762,7 @@ function benchSessionsHtml(runId, sessions, proto) {
     const status = (s.error ? '<span class="bad">error</span>' : (s.connected ? '<span class="ok">ok</span>' : 'not connected')) + (flags.length ? ' ' + flags.join(' ') : '');
     const open = u.open.has(i);
     h += `<tr${s.error || v ? ' class="row-problem"' : ''}><td><code>${esc(s.src_ip)}</code></td><td class="num">${fmtInt(s.messages_sent)}</td><td class="num">${fmtInt(s.messages_received)}</td>` +
-      `<td class="num">${fmtInt(s.latency_p50_us)}</td><td class="num">${fmtInt(s.latency_p99_us)}</td><td class="num">${fmtInt(s.latency_max_us)}</td>` +
+      `<td class="num">${msNum(s.latency_p50_us)}</td><td class="num">${msNum(s.latency_p99_us)}</td><td class="num">${msNum(s.latency_max_us)}</td>` +
       `<td class="num">${fmt(s.throughput_msgs_per_sec)}</td><td class="num">${fmtInt(s.window_stalls)}</td>` +
       `<td class="num ${v ? 'bad' : ''}">${fmtInt(v)}</td><td>${status}</td>` +
       `<td><button type="button" class="btn btn-text" data-act="bench-row" data-id="${runId}" data-idx="${i}" data-fk="bench-${runId}-${i}" aria-expanded="${open}">${open ? 'Less' : 'More'}</button></td></tr>`;
@@ -881,7 +881,7 @@ function protoStatsHtml(s, proto) {
     h += `<dt>Keep-alives (TESTFR)</dt><dd>${fmtInt(p.keepalives_sent)}</dd>`;
     h += `<dt>Synthesized frames</dt><dd>${fmtInt(p.synthesized_frames)} (captured frames stripped: ${fmtInt(p.stripped_capture_frames)})</dd>`;
     if (p.command_response_count) {
-      h += `<dt>Command response</dt><dd>${fmtInt(p.command_response_count)} commands · p50 ${fmtInt(p.command_response_p50_us)} µs · max ${fmtInt(p.command_response_max_us)} µs</dd>`;
+      h += `<dt>Command response</dt><dd>${fmtInt(p.command_response_count)} commands · p50 ${usFmt(p.command_response_p50_us || 0)} · max ${usFmt(p.command_response_max_us || 0)}</dd>`;
     }
     h += `<dt>Idle serve</dt><dd>${fmtDuration(p.idle_serve_ms)}</dd>`;
     h += `<dt>Capture gaps</dt><dd>${fmtInt(p.capture_gaps)} · ${fmtInt(p.script_skipped_bytes)} bytes skipped · ${fmtInt(p.script_dropped_frames)} frames dropped</dd>`;
@@ -1023,6 +1023,12 @@ function nsRange(lo, hi) {
   const f = ns => (ns < 1000 ? ns.toFixed(0) + ' ns' : ns < 1e6 ? (ns / 1000).toFixed(0) + ' µs' : ns < 1e9 ? (ns / 1e6).toFixed(0) + ' ms' : (ns / 1e9).toFixed(1) + ' s');
   return `${f(lo)} – ${f(hi)}`;
 }
+// µs as a bare ms number for "(ms)" columns: one decimal, two below 1 ms.
+function msNum(us) {
+  if (typeof us !== 'number' || isNaN(us)) return '—';
+  const d = us < 1000 ? 2 : 1;
+  return (us / 1000).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
+}
 function usFmt(us) {
   if (us < 1000) return us.toFixed(0) + ' µs';
   if (us < 1e6) return (us / 1000).toFixed(1) + ' ms';
@@ -1139,9 +1145,10 @@ document.addEventListener('mouseout', e => { if (e.target.classList && e.target.
 // ---------------------------------------------------------------------------
 // Live dashboard strip: throughput sparkline (uplink and downlink),
 // messages in flight, ack latency and the session-state bar, fed by
-// the running run's WebSocket frames (see 50-diagram.js). Ack latency
-// percentiles are computed by the sessions when they finish, so they
-// appear for finished runs; while running the strip says so.
+// the running run's WebSocket frames (see 50-diagram.js). The live ack
+// latency comes from the sessions' log-scale histograms (four bins per
+// decade), so it is an estimate; the finished run's card shows the
+// exact percentiles.
 
 const liveHist = { runId: null, up: [], down: [], lastAt: 0 };
 const LIVE_HIST_N = 120;
@@ -1180,6 +1187,19 @@ function stateBarFromRows(rows) {
   return bar + `</div><p class="state-line">${words.join('')}</p>`;
 }
 
+// Live ack-latency tile: p50 / p99 over every acknowledgement so far.
+function liveLatencyTile(running, f, tile) {
+  const k = 'Ack latency p50 / p99';
+  const lat = f && f.ack_latency;
+  if (lat) {
+    return tile(k, `<span class="ls-lat">${usFmt(lat.p50_us)} <span class="u">/</span> ${usFmt(lat.p99_us)}</span>`,
+      `${fmtInt(lat.samples)} acks so far · estimate, ±1 bin`);
+  }
+  const mode = (f && f.mode) || running.mode;
+  if (mode && mode !== 'benchmark') return tile(k, '—', 'raw replay has no acknowledgements', 'muted');
+  return tile(k, '—', f ? 'waiting for the first acknowledgement' : 'connecting…', 'muted');
+}
+
 function renderLiveStrip() {
   const box = el('live-strip');
   const running = S.runs.find(r => r.status === 'running');
@@ -1199,7 +1219,7 @@ function renderLiveStrip() {
   h += `<div class="ls-tile ls-tp"><span class="k">Throughput <span class="ls-key"><span class="lk-up"></span>sent <span class="lk-down"></span>received</span></span>` +
     `<span class="v">${fmtInt(up)} <span class="u">msg/s</span> <span class="ls-down">↓ ${fmtInt(down)}</span></span>${dualSparkSvg(hist.up, hist.down)}<span class="sub">peak ${fmtInt(peak)} msg/s, last ${hist.up.length} s</span></div>`;
   h += tile('In flight', fmtInt(inflight), 'sent, not yet acknowledged');
-  h += tile('Ack latency p50 / p99', '—', 'measured per session; shown when the run ends', 'muted');
+  h += liveLatencyTile(running, f, tile);
   h += `<div class="ls-tile ls-states"><span class="k">Sessions · ${fmtInt(rows.length || running.sources || 0)}</span>${rows.length ? stateBarFromRows(rows) : '<span class="sub">no session data yet</span>'}</div>`;
   h += '</div>';
   setHTML(el('ls-grid'), h);

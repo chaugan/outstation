@@ -20,6 +20,40 @@ pub(crate) fn free_bytes(path: &Path) -> Option<u64> {
     }
 }
 
+/// Where the disk checks (upload limits, health, the run guard) read
+/// free space from. The default reads
+/// [`free_bytes`] (statvfs); tests substitute a fixed figure so their
+/// result does not depend on what else is writing to the disk.
+#[derive(Clone)]
+pub struct FreeSpace(std::sync::Arc<FreeBytesFn>);
+
+/// Free bytes on the filesystem holding a path.
+type FreeBytesFn = dyn Fn(&Path) -> Option<u64> + Send + Sync;
+
+impl FreeSpace {
+    /// A provider backed by `f`.
+    pub fn from_fn(f: impl Fn(&Path) -> Option<u64> + Send + Sync + 'static) -> Self {
+        Self(std::sync::Arc::new(f))
+    }
+
+    /// Free bytes on the filesystem holding `path`, if known.
+    pub fn free_bytes(&self, path: &Path) -> Option<u64> {
+        (self.0)(path)
+    }
+}
+
+impl Default for FreeSpace {
+    fn default() -> Self {
+        Self::from_fn(free_bytes)
+    }
+}
+
+impl std::fmt::Debug for FreeSpace {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FreeSpace(..)")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Capabilities {
     /// Raw `CapEff` mask from /proc/self/status, hex.

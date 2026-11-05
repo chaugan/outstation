@@ -402,7 +402,10 @@
     </div>
 
     <details class="card collapsible" data-mode="benchmark" id="scada-gw-card">
-      <summary><h3 class="card-title">SCADA gateway <span class="opt">optional, isolated lab switch setups</span></h3></summary>
+      <summary><h3 class="card-title">SCADA gateway <span class="opt">optional, slave role, isolated lab switch setups</span></h3></summary>
+      <p class="warn-box gw-note" id="scada-gw-note" hidden>Gateway mode works in slave role only: in master role each session's replies must come back through its own bridge port, which a gateway address cannot provide. These settings are kept but not sent.</p>
+      <fieldset id="scada-gw-fields">
+      <legend class="sr-only">SCADA gateway settings</legend>
       <div class="grid">
         <div class="field span-4 checks">
           <label class="check"><input id="cfg-scada-gw" type="checkbox"> Act as the SCADA side's gateway (see doc/scada-lab.md)</label>
@@ -422,6 +425,7 @@
           <select id="cfg-scada-upstream"></select>
         </div>
       </div>
+      </fieldset>
     </details>
 
     <div class="card" data-mode="benchmark" id="rtu-card">
@@ -488,7 +492,7 @@
       <details class="diagram-table" id="diagram-table-wrap">
         <summary>Session table (text view of the diagram)</summary>
         <div class="table-scroll"><table class="t" id="diagram-table">
-          <thead><tr><th scope="col">RTU</th><th scope="col">State</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Received</th><th scope="col" class="num">Up msg/s</th><th scope="col" class="num">Down msg/s</th></tr></thead>
+          <thead><tr><th scope="col">RTU</th><th scope="col">State</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Received</th><th scope="col" class="num">Up msg/s</th><th scope="col" class="num">Down msg/s</th><th scope="col" class="num">Ack p50</th><th scope="col" class="num">Ack p99</th></tr></thead>
           <tbody></tbody>
         </table></div>
       </details>

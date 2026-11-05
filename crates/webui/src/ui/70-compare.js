@@ -277,8 +277,15 @@ actions({
 
 const isNum = v => typeof v === 'number' && isFinite(v);
 const fmtPct = v => (isNum(v) ? v.toFixed(1) + '%' : '—');
-const fmtLat = v => (isNum(v) ? usFmt(v) : '—');
-const fmtRate = v => (isNum(v) ? fmt(v) + ' msg/s' : '—');
+// Latency in ms with one decimal (µs below 0.1 ms, where that rounds to 0).
+const msFmt = us => (Math.abs(us) < 100 ? fmtInt(us) + ' µs' : (us / 1000).toLocaleString(undefined, { minimumFractionDigits: 1, maximumFractionDigits: 1 }) + ' ms');
+const fmtLat = v => (isNum(v) ? msFmt(v) : '—');
+// Display names of the regression metric ids (the server sends `label`
+// too; this covers older responses).
+const METRIC_LABELS = { score: 'Score', delivered_pct: 'Delivered', p50_us: 'Ack p50', p99_us: 'Ack p99', throughput: 'Throughput', sessions_failed: 'Failed sessions', errors: 'Failed sessions', verdict: 'Verdict', missing_in_b: 'Missing in B' };
+const metricLabel = m => METRIC_LABELS[m] || String(m).replace(/_/g, ' ');
+const rateNum = v => (Math.abs(v) >= 100 ? fmtInt(v) : fmt(v));
+const fmtRate = v => (isNum(v) ? rateNum(v) + ' msg/s' : '—');
 
 // Signed delta with a better/worse cue that does not rely on colour.
 function deltaHtml(dv, better, fmtFn) {
@@ -307,11 +314,11 @@ const FLEET_ROWS = [
   ['sessions_failed', 'Failed sessions', 'down', fmtInt, fmtInt, 'sessions_failed'],
   ['msgs_sent', 'Messages sent', null, fmtInt, fmtInt],
   ['msgs_received', 'Messages received', null, fmtInt, fmtInt],
-  ['p50_us', 'Ack latency p50', 'down', fmtLat, usFmt, 'p50_us'],
-  ['p90_us', 'Ack latency p90', 'down', fmtLat, usFmt],
-  ['p99_us', 'Ack latency p99', 'down', fmtLat, usFmt, 'p99_us'],
-  ['max_us', 'Ack latency max', 'down', fmtLat, usFmt],
-  ['throughput', 'Throughput', 'up', fmtRate, v => fmt(v) + ' msg/s', 'throughput'],
+  ['p50_us', 'Ack latency p50', 'down', fmtLat, msFmt, 'p50_us'],
+  ['p90_us', 'Ack latency p90', 'down', fmtLat, msFmt],
+  ['p99_us', 'Ack latency p99', 'down', fmtLat, msFmt, 'p99_us'],
+  ['max_us', 'Ack latency max', 'down', fmtLat, msFmt],
+  ['throughput', 'Throughput', 'up', fmtRate, v => rateNum(v) + ' msg/s', 'throughput'],
 ];
 
 function sideHtml(label, s, run) {
@@ -363,7 +370,8 @@ function renderCmpResult() {
   // Regressions.
   if (regs.length) {
     const head = regs.slice(0, 20);
-    const item = r => `<li><span class="reg-metric">${esc(r.metric.replace(/_/g, ' '))}</span> ${esc(r.message)}` +
+    // RTU messages start with "RTU <ip>:"; fleet ones get a tag.
+    const item = r => `<li>${r.rtu ? '' : '<span class="reg-metric">Fleet</span> '}${esc(r.message)}` +
       (r.rtu ? ` <button type="button" class="btn btn-text" data-act="cmp-show-rtu" data-rtu="${esc(r.rtu)}" aria-label="Show RTU ${esc(r.rtu)} in the table">show</button>` : '') + '</li>';
     h += `<h3 class="card-title cmp-h">Regressions (${regs.length})</h3><ol class="cmp-regs">${head.map(item).join('')}</ol>`;
     if (regs.length > head.length) {
@@ -446,10 +454,10 @@ function renderCmpRows() {
       `<td class="cmp-vd${reg.has('verdict') ? ' reg' : ''}">${vcell}</td>` +
       cmpCell(a.score, b.score, x.delta.score, 'up', fmtPct, pts, reg.has('score')) +
       cmpCell(a.delivered_pct, b.delivered_pct, x.delta.delivered_pct, 'up', fmtPct, pts, reg.has('delivered_pct')) +
-      cmpCell(a.p50_us, b.p50_us, x.delta.p50_us, 'down', fmtLat, usFmt, reg.has('p50_us')) +
-      cmpCell(a.p99_us, b.p99_us, x.delta.p99_us, 'down', fmtLat, usFmt, reg.has('p99_us')) +
+      cmpCell(a.p50_us, b.p50_us, x.delta.p50_us, 'down', fmtLat, msFmt, reg.has('p50_us')) +
+      cmpCell(a.p99_us, b.p99_us, x.delta.p99_us, 'down', fmtLat, msFmt, reg.has('p99_us')) +
       `<td class="num${reg.has('errors') ? ' reg' : ''}" title="${esc(b.error || a.error || '')}">${fmtInt(a.errors || 0)} → ${fmtInt(b.errors || 0)}</td>` +
-      `<td class="num">${reg.size ? `<span class="reg-tag">${esc([...reg].map(m => m.replace(/_/g, ' ')).join(', '))}</span>` : '<span class="muted">—</span>'}</td></tr>`;
+      `<td class="num">${reg.size ? `<span class="reg-tag">${esc([...new Set([...reg].map(metricLabel))].join(', '))}</span>` : '<span class="muted">—</span>'}</td></tr>`;
   }
   if (!page.length) h = `<tr><td colspan="${CMP_COLS.length}" class="empty-cell">${all.length ? 'No RTU matches the filter.' : 'No RTU appears in both runs.'}</td></tr>`;
   setHTML(tbody, h, { force: true });

@@ -190,7 +190,7 @@ pub(crate) fn render(
             dd(
                 "Ack latency",
                 format!(
-                    "p50 {:.3} ms · p90 {:.3} ms · p99 {:.3} ms · max {:.3} ms",
+                    "p50 {:.1} ms · p90 {:.1} ms · p99 {:.1} ms · max {:.1} ms",
                     b.aggregate_latency_p50_us as f64 / 1e3,
                     b.aggregate_latency_p90_us as f64 / 1e3,
                     b.aggregate_latency_p99_us as f64 / 1e3,
