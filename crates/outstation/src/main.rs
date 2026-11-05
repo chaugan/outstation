@@ -85,6 +85,12 @@ struct ServeArgs {
     #[arg(long, value_name = "MIB")]
     capture_max_mb: Option<u64>,
 
+    /// Per-run capture size cap, in MiB (0 = none): a capture that
+    /// reaches it stops recording and the run is marked
+    /// capture_truncated. Default 4096 or OUTSTATION_CAPTURE_RUN_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    capture_run_max_mb: Option<u64>,
+
     /// Finished runs kept in memory; older ones are read from the
     /// database when asked for. Default 500 or OUTSTATION_RUNS_IN_MEMORY.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
@@ -286,6 +292,9 @@ fn main() -> Result<()> {
             if let Some(ms) = args.cp56_tolerance_ms {
                 cfg.cp56_tolerance_ms = ms;
             }
+            if let Some(mb) = args.capture_run_max_mb {
+                cfg.capture_run_max_bytes = mb.saturating_mul(1024 * 1024);
+            }
             if let Some(n) = args.runs_in_memory {
                 cfg.runs_in_memory = n as usize;
             }
@@ -445,6 +454,8 @@ mod tests {
             "250",
             "--runs-in-memory",
             "50",
+            "--capture-run-max-mb",
+            "100",
         ])
         .unwrap();
         let Cmd::Serve(a) = cli.cmd else {
@@ -462,6 +473,7 @@ mod tests {
         assert_eq!(a.library_max_mb, Some(2048));
         assert_eq!(a.cp56_tolerance_ms, Some(250.0));
         assert_eq!(a.runs_in_memory, Some(50));
+        assert_eq!(a.capture_run_max_mb, Some(100));
         assert!(Cli::try_parse_from(["outstation", "serve", "--cp56-tolerance-ms", "-5"]).is_err());
     }
 

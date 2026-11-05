@@ -228,7 +228,8 @@ Slim summaries, newest first, one page at a time. `S` is one of `running`, `comp
 - progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s), `per_source_progress` (only while running);
 - counts: `sources, sources_failed, sources_cancelled, has_capture`;
 - `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes, captured_dropped}`;
-- `report` and `benchmark` both also carry `warnings[]` (non-fatal problems: capture failures, guard restore or teardown errors) and, when the scheduler reports it, `capture_ok`;
+- `report` and `benchmark` both also carry `warnings[]` (non-fatal problems: capture failures, a truncated capture, guard restore or teardown errors) and `capture_ok` (false when a requested capture failed or holds no frame although frames were sent; absent in rows that predate it); the detail also has `capture_truncated`;
+- `source_states`: session count by state (`pending`, `listening`, `active`, `failed`, …). `per_source_progress` is always empty in the list: live rows come from `GET /api/runs/:id` and the run's WebSocket;
 - `benchmark` (benchmark runs): `{total_messages_sent, total_messages_received, aggregate_latency_{min,p50,p90,p99,max}_us, aggregate_throughput_msgs_per_sec, capture_path, captured_packets, captured_bytes, captured_dropped, sessions, sessions_failed, sessions_cancelled, protocol_violations}`. `captured_dropped` counts frames the kernel dropped from the capture socket (it should be 0; non-zero adds a run warning and an analysis note that "missing" frames may be capture loss);
 - `rerun_of`, `latest_analysis` (`{id, verdict, score, source, created_at}` or `null`), `auto_analysis` (`{state, error, analysis_id}` or `null`; `state` is `queued`, `running`, `done`, `failed` or `skipped`).
 

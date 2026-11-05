@@ -47,13 +47,15 @@ fn fixture() -> PathBuf {
 }
 
 /// Host-safety fields of the last job handed to the executor:
-/// (run_id, protected_addrs, force, bridge_name, tap_prefix).
+/// (run_id, protected_addrs, force, bridge_name, tap_prefix,
+/// capture_max_bytes).
 type SeenCfg = (
     u64,
     Vec<std::net::IpAddr>,
     bool,
     Option<String>,
     Option<String>,
+    Option<u64>,
 );
 
 struct Fake {
@@ -70,7 +72,10 @@ impl Fake {
                 while !ctx.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Ok(BenchmarkReport::default())
+                Ok(BenchmarkReport {
+                    capture_ok: true,
+                    ..Default::default()
+                })
             }
             Behaviour::Panic => panic!("boom in sched"),
             Behaviour::FailedCapture => Ok(BenchmarkReport {
@@ -90,6 +95,7 @@ impl Fake {
                 warnings: vec![
                     "capture failed to start: socket(AF_PACKET): Operation not permitted".into(),
                 ],
+                capture_ok: false,
                 ..Default::default()
             }),
             Behaviour::Sessions(s) | Behaviour::SessionsWithCapture(s) => Ok(BenchmarkReport {
@@ -112,6 +118,7 @@ impl Fake {
                     })
                     .collect(),
                 total_messages_sent: 10 * s.len() as u64,
+                capture_ok: true,
                 ..Default::default()
             }),
         }
@@ -126,6 +133,7 @@ impl RunExecutor for Fake {
             c.force_protected_nic,
             c.bridge_name.clone(),
             c.tap_prefix.clone(),
+            c.capture_max_bytes,
         ));
         self.bench(&ctx).map(|_| RunReport::default())
     }
@@ -142,6 +150,7 @@ impl RunExecutor for Fake {
             c.force_protected_nic,
             c.bridge_name.clone(),
             c.tap_prefix.clone(),
+            c.capture_max_bytes,
         ));
         if let (Behaviour::SessionsWithCapture(_), Some(cap)) = (self.behaviour, &c.capture_path) {
             std::fs::copy(fixture(), cap).unwrap();
@@ -215,6 +224,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
         library_max_bytes: 0,
+        capture_run_max_bytes: 0,
         runs_in_memory: crate::state::DEFAULT_RUNS_IN_MEMORY,
         heavy_concurrency: 2,
         cp56_tolerance_ms: crate::analysis::DEFAULT_CP56_TOLERANCE_MS,
@@ -1187,7 +1197,11 @@ async fn event_stream_starts_with_hello() {
 
 #[tokio::test]
 async fn run_protects_ui_address_and_derives_names_from_run_id() {
-    let h = harness(Behaviour::BlockUntilCancel);
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| c.capture_run_max_bytes = 5 * 1024 * 1024,
+    );
     h.add_pcap("pcr_1");
     // Request-supplied bridge/tap names are ignored; `force` is threaded.
     let mut req = bench_req("pcr_1");
@@ -1205,7 +1219,12 @@ async fn run_protects_ui_address_and_derives_names_from_run_id() {
         assert!(std::time::Instant::now() < deadline, "executor never ran");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     };
-    let (run_id, protected, force, bridge, tap) = seen;
+    let (run_id, protected, force, bridge, tap, cap_max) = seen;
+    assert_eq!(
+        cap_max,
+        Some(5 * 1024 * 1024),
+        "per-run capture cap reaches sched"
+    );
     assert_eq!(run_id, id, "sched gets the allocated run id");
     // MockConnectInfo's local address is 10.0.0.1: the address the UI
     // was reached on must be protected.
@@ -2391,4 +2410,31 @@ async fn analysis_exports_as_self_contained_html() {
         .starts_with("attachment"));
     let (s, _, _) = h.send(get("/api/analyses/999/report.html".into())).await;
     assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// A re-run whose stored proto_config no longer parses (strict keys)
+/// is a clear 400, not a failed run.
+#[tokio::test]
+async fn rerun_of_a_stale_config_is_a_clear_400() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let id = h.run_to(bench_req("pcr_1"), "completed").await;
+    {
+        let e = h.state.get_run(id).unwrap();
+        let mut rs = e.lock_safe();
+        let req = rs.request.as_mut().unwrap();
+        req["proto_config"] = json!(r#"{"no_such_section": {"x": 1}}"#);
+    }
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "invalid_proto_config", "{v}");
+    let msg = v["error"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!("run {id} are no longer accepted")),
+        "{msg}"
+    );
+    assert!(msg.contains("no_such_section"), "{msg}");
+    assert_eq!(h.state.all_runs().len(), 1, "no run was started");
 }

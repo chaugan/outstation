@@ -128,6 +128,10 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
                     let (pps_s, pps_r) = session_wins[i].pps();
                     LivePerSession {
                         src_ip: p.src_ip.clone(),
+                        src_mac: p.src_mac.clone(),
+                        listen_ip: p.listen_ip.clone(),
+                        cancelled: p.cancelled,
+                        error: p.error.clone(),
                         state: p.state.clone(),
                         planned: p.planned,
                         sent: p.sent,
@@ -206,6 +210,14 @@ pub(crate) struct LiveFrame {
 #[derive(Serialize)]
 pub(crate) struct LivePerSession {
     pub(crate) src_ip: Option<String>,
+    pub(crate) src_mac: String,
+    /// Slave role: the address the session listens on.
+    pub(crate) listen_ip: String,
+    /// Stopped before it started (a cancelled pending slave).
+    pub(crate) cancelled: bool,
+    /// Why the session failed, once it has.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) error: Option<String>,
     pub(crate) state: String,
     pub(crate) planned: u64,
     pub(crate) sent: u64,

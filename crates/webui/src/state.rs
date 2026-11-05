@@ -76,6 +76,11 @@ pub struct ServeConfig {
     pub capture_max_total_bytes: u64,
     /// Maximum number of capture files kept.
     pub capture_max_count: usize,
+    /// Per-run capture size cap in bytes; a capture that reaches it
+    /// stops recording and the run says `capture_truncated` (F055,
+    /// F072). 0 = no cap. `--capture-run-max-mb` or
+    /// `OUTSTATION_CAPTURE_RUN_MAX_MB`; default 4096 MiB.
+    pub capture_run_max_bytes: u64,
     /// Finished runs kept in memory; older ones are served from the
     /// database on demand (F054). `--runs-in-memory` or
     /// `OUTSTATION_RUNS_IN_MEMORY`; default 500.
@@ -139,6 +144,9 @@ impl ServeConfig {
             runs_in_memory: env_u64("OUTSTATION_RUNS_IN_MEMORY")
                 .map(|v| (v as usize).max(1))
                 .unwrap_or(DEFAULT_RUNS_IN_MEMORY),
+            capture_run_max_bytes: env_u64("OUTSTATION_CAPTURE_RUN_MAX_MB")
+                .map(|v| v * MIB)
+                .unwrap_or(4 * GIB),
             library_max_bytes: env_u64("OUTSTATION_LIBRARY_MAX_MB")
                 .map(|v| v * MIB)
                 .unwrap_or(0),

@@ -233,7 +233,20 @@ pub(crate) async fn api_run_rerun(
     let mut req = runbuild::from_json(stored).map_err(AppError::from)?;
     req.force = q.force.unwrap_or(false);
     let request = runbuild::canonical_json(&req);
-    let new_id = start_run(&state, client_ip, local_ip, &headers, req, Some(id)).await?;
+    let new_id = start_run(&state, client_ip, local_ip, &headers, req, Some(id))
+        .await
+        .map_err(|mut e| {
+            // A stored request that today's validation refuses (e.g. a
+            // proto_config key that strict parsing now rejects) says so.
+            if e.status == StatusCode::BAD_REQUEST {
+                e.message = format!(
+                    "the stored settings of run {id} are no longer accepted: {}. \
+                     Load them into Configure, fix them and start a new run",
+                    e.message
+                );
+            }
+            e
+        })?;
     Ok(Json(RerunResp {
         id: new_id,
         rerun_of: id,

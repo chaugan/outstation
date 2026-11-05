@@ -287,15 +287,18 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
         started_at,
     });
 
+    let cap_max = (state.cfg.capture_run_max_bytes > 0).then_some(state.cfg.capture_run_max_bytes);
     let job = match l.job {
         RunJob::Raw(mut cfg) => {
             cfg.run_id = id;
             cfg.capture_path = Some(capture.clone());
+            cfg.capture_max_bytes = cap_max;
             RunJob::Raw(cfg)
         }
         RunJob::Benchmark(mut cfg, rep) => {
             cfg.run_id = id;
             cfg.capture_path = Some(capture.clone());
+            cfg.capture_max_bytes = cap_max;
             RunJob::Benchmark(cfg, rep)
         }
     };
@@ -520,7 +523,9 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
                 };
                 let now = live_sent_total(&ctx);
                 let delta = throughput_delta(last, now);
-                last = now;
+                // Keep the high-water mark across a dip, so the count
+                // coming back is not counted twice.
+                last = last.max(now);
                 {
                     let mut rs = entry.lock_safe();
                     if rs.status.is_terminal() {
@@ -547,14 +552,12 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
         });
 }
 
-/// Frames sent since the previous sample. Per-source counters may reset
-/// at an iteration boundary; a drop counts as a fresh start.
+/// Frames sent since the previous sample. The summed counters only
+/// grow; a reading below the previous one is a momentary dip while a
+/// session rolls its count into the finished iterations (N5), and
+/// counts as 0, never as the whole cumulative count.
 pub(crate) fn throughput_delta(last: u64, now: u64) -> u64 {
-    if now >= last {
-        now - last
-    } else {
-        now
-    }
+    now.saturating_sub(last)
 }
 
 /// Request cancellation of every running run (graceful shutdown).
@@ -739,10 +742,10 @@ mod tests {
             Some("no master connected within 600s")
         );
         let v = serde_json::to_value(rs.summary()).unwrap();
-        assert_eq!(
-            v["per_source_progress"][0]["error"],
-            "no master connected within 600s"
-        );
+        // The list carries counts only; rows are in the detail and the
+        // live stream (F103).
+        assert_eq!(v["per_source_progress"], serde_json::json!([]));
+        assert_eq!(v["source_states"]["failed"], 1);
         assert_eq!(v["sources_failed"], 1);
         assert_eq!(v["sources_cancelled"], 0);
     }
@@ -750,7 +753,7 @@ mod tests {
     #[test]
     fn throughput_tolerates_counter_reset() {
         assert_eq!(throughput_delta(100, 150), 50);
-        assert_eq!(throughput_delta(150, 20), 20);
+        assert_eq!(throughput_delta(150, 20), 0, "a dip is not a sample");
     }
 
     #[test]

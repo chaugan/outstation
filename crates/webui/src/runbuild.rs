@@ -402,7 +402,7 @@ pub fn benchmark_config(
         startup_delay_secs: req.warmup_secs,
         capture_path: None,
         capture_max_bytes: None,
-        realtime: false,
+        realtime: req.realtime,
         proto_config: req.proto_config.clone(),
         role: match req.role {
             RoleReq::Slave => protoplay::Role::Slave,

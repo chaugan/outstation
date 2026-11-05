@@ -88,6 +88,7 @@ Otherwise restrict port 8080 at the network layer. The Host and Origin checks ([
 | | `OUTSTATION_MIN_FREE_MB` | 512 | Free-space reserve in the state directory |
 | `--library-max-mb N` | `OUTSTATION_LIBRARY_MAX_MB` | none | Total size quota of the pcap library; an upload that would exceed it is refused with 507 `quota_exceeded` |
 | `--no-auto-analyze` | `OUTSTATION_AUTO_ANALYZE=0` | on | Do not analyse finished benchmark runs automatically |
+| `--capture-run-max-mb N` | `OUTSTATION_CAPTURE_RUN_MAX_MB` | 4096 | Size cap of one run's capture (0 = none) |
 | `--runs-in-memory N` | `OUTSTATION_RUNS_IN_MEMORY` | 500 | Finished runs kept in memory. Older runs stay in the database and are read from it on demand (`GET /api/runs` pages through them) |
 | `--cp56-tolerance-ms N` | `OUTSTATION_CP56_TOLERANCE_MS` | 50 | CP56Time2a drift tolerance of automatic and on-demand analyses (`outstation bench` takes the same flag) |
 | | `OUTSTATION_LIBRARY_DIR` | `/var/lib/outstation/library` | Library directory. The state directory is its parent |
@@ -101,7 +102,7 @@ Environment=OUTSTATION_ALLOW_HOSTS=outstation.lab.example
 Environment=OUTSTATION_CAPTURE_MAX_MB=20480
 ```
 
-**Disk limits.** An upload is refused (507 `disk_full`) when free space would drop below the reserve. The check runs before the upload and again while its bytes arrive, so a chunked upload without `Content-Length` is stopped as soon as it would cross the reserve. With a library quota, concurrent uploads reserve their share of it as they stream, so together they never exceed it (507 `quota_exceeded`). While a run is active, the server checks free space every 5 s and stops the run when it falls below half the reserve; the run's `error` says so. Captures are evicted after each run until both the size and the count cap hold; the active run's capture is never evicted. There is no per-run size cap yet, so one long run can still write a large capture.
+**Disk limits.** An upload is refused (507 `disk_full`) when free space would drop below the reserve. The check runs before the upload and again while its bytes arrive, so a chunked upload without `Content-Length` is stopped as soon as it would cross the reserve. With a library quota, concurrent uploads reserve their share of it as they stream, so together they never exceed it (507 `quota_exceeded`). While a run is active, the server checks free space every 5 s and stops the run when it falls below half the reserve; the run's `error` says so. Captures are evicted after each run until both the size and the count cap hold; the active run's capture is never evicted. One run's capture is capped by `--capture-run-max-mb` (default 4096 MiB): at the cap the capture stops recording, the run gets a warning and `capture_truncated`, and its analysis notes that frames after that point are missing from the capture, not from the wire.
 
 Logs go to stdout. Under journald (`journalctl -u outstation`) they are plain text without colour; every line of a run carries `run{id=N}`.
 
