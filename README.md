@@ -16,6 +16,7 @@ You drive it from a browser UI (upload a pcap, configure a run, watch it live, r
 - [What makes it different](#what-makes-it-different)
 - [How it works](#how-it-works)
 - [Features](#features)
+- [Screenshots](#screenshots)
 - [Protocol support](#protocol-support)
 - [IEC 104 conformance](#iec-104-conformance)
 - [Scale](#scale)
@@ -41,7 +42,7 @@ outstation does this from a single binary, and it is designed to run against a S
 Most pcap replay tools treat a capture as bytes to retransmit. outstation treats a capture as *behaviour to impersonate*. `tcpreplay` streams L2 packets at an interface with optional address rewrite; `tcpliveplay` drives exactly one live TCP flow without application-layer knowledge; Scapy scripts and `bittwist` work one flow at a time. None of them stand in for 200 RTUs, measure per-message latency under load, or tell you afterwards whether the replay was faithful.
 
 - **Protocol participant, not a packet blaster.** In benchmark mode outstation opens real TCP sessions and runs the IEC 104 link layer: APCI framing, live N(S)/N(R), k/w windows, t1/t2/t3 timers, STARTDT/STOPDT and TESTFR (see [conformance](#iec-104-conformance)). The live peer gets a counterpart it can talk to.
-- **Both sides, many sessions, one host.** Play the RTUs (slave role, for testing a SCADA master) or the master (master role, for testing an RTU or front end). One run impersonates many endpoints (165 in the largest measured run) on standard port 2404, told apart only by IP. Slave role adds and removes /32 aliases for the RTU IPs; master role builds one veth port per session on a private bridge, so each session binds its captured source address.
+- **Both sides, many sessions, one host.** Play the RTUs (slave role, for testing a SCADA master) or the master (master role, for testing an RTU or front end). One run impersonates many endpoints (800 RTUs in the largest measured run, see [Scale](#scale)) on standard port 2404, told apart only by IP. Slave role adds and removes /32 aliases for the RTU IPs; master role builds one veth port per session on a private bridge, so each session binds its captured source address.
 - **A replayed RTU that answers.** In slave role the replayer answers the live master's General and Counter Interrogations from a point inventory learned from the capture, echoes control commands (select/execute, set-points, clock sync, read) with confirmations and optional return information, and keeps serving after the script ends.
 - **Built-in fidelity analysis.** After a run the analyzer compares the run's own capture against the source pcap endpoint by endpoint: delivered vs expected frames aligned by content, byte-identical counts, time-tag drift, pacing drift, a GI/CI compliance audit and a verdict per RTU and for the fleet. Runs are analysed automatically and can be compared run against run.
 - **Timing-preserving pacing.** Original-timing pacing sends each I-frame at its captured offset (scaled by a speed factor), so the shape of the telemetry feed survives: the pauses, the bursts, the outliers. As-fast-as-possible pacing is there for throughput tests.
@@ -120,6 +121,33 @@ Every host change a run makes is journaled before it is made and undone when the
 
 The UI covers the whole lifecycle: library, configure (with saved profiles), runs (re-run, load settings back into the form, live auto-analysis state), analysis and run-to-run compare. Everything is also available through the [HTTP API](doc/api.md) and the `bench` CLI.
 
+## Screenshots
+
+Taken from a real `outstation serve` with real runs ([`scripts/netns-screenshots.sh`](scripts/netns-screenshots.sh)): the 200-RTU example capture in slave role, at original timing, against a master peer.
+
+**Runs**: a 200-RTU slave run while it is live, every session active and both directions animated.
+
+![Live diagram of a 200-RTU slave run](doc/images/ui-runs-live.jpg)
+
+**Analysis**: the same run's automatic analysis, `all_correct` for all 200 RTUs, with the GI audit and the pacing drift.
+
+![Analysis of the 200-RTU run](doc/images/ui-analysis.jpg)
+
+**Compare**: that run against a re-run at twice the speed, fleet deltas and per-RTU regressions.
+
+![Comparing two runs](doc/images/ui-compare.jpg)
+
+<details>
+<summary>Library, Configure and the finished run</summary>
+
+![Pcap library](doc/images/ui-library.jpg)
+
+![Configure, slave role](doc/images/ui-configure.jpg)
+
+![Finished run with per-session results](doc/images/ui-runs.jpg)
+
+</details>
+
 ## Protocol support
 
 | Protocol | Crate | Status |
@@ -168,13 +196,23 @@ Not implemented: IEC 62351 security (TLS, authentication), Edition 2 redundancy 
 
 ## Scale
 
-Measured so far:
+Measured on one 12-thread desktop (Ryzen 5 3600, 64 GB RAM, Linux 7.0) with outstation, its IEC 104 peers and the network all in namespaces on the same host; medians of 3 runs, as fast as possible ([report](reports/2026-11-05-scale-benchmark.md), [`scripts/netns-scale.sh`](scripts/netns-scale.sh)):
 
-- **165 RTUs in slave role, original timing**, against a vendor IEC 104 master: 151,068 I-frames in 3 min 43 s, about **680 I-frames/s** (about 1,230 packets/s on the wire), on a 12 vCPU / 12 GB VM ([report](reports/2026-04-17-fleet-replay-showcase.md)). That rate is the pace of the captured traffic, not a throughput ceiling. The report predates the current link engine and analyzer; see the caveats in [reports/](reports/README.md).
+| | master role, 200 sessions | master, 400 | slave role, 200 RTUs | slave, 400 RTUs |
+|---|---|---|---|---|
+| I-frames/s | 704 k | 641 k | 238 k | 255 k |
+| ack latency p50 / p99 | 2.6 / 5.9 ms | 4.4 / 7.1 ms | 0.4 / 2.7 ms | 0.4 / 2.2 ms |
+| outstation CPU while sending | 4.9 cores | 5.1 cores | 2.3 cores | 2.3 cores |
+| RSS while sending / peak with the analysis | 199 / 566 MB | 382 / 1,127 MB | 135 / 620 MB | 242 / 1,181 MB |
+| threads / open fds | 403 / 414 | 804 / 814 | 277 / 713 | 485 / 1,571 |
+| setup before traffic | 11 s | 27 s | 7 s | 13 s |
 
-Not measured yet: as-fast-as-possible throughput, CPU and memory per session, and runs above 165 sessions with the current engine. Until then, treat a few hundred sessions per host as the tested range.
-
-Setup cost grows with the number of sessions. In master role each session gets its own veth port, per-interface sysctls and an iptables ACCEPT rule, set up one after another before traffic starts, each through `ip`, `sysctl` and `iptables` subprocesses and a journal write. In slave role each listen IP that is not local gets an `ip addr add` and a journal entry when its listener starts. The upload viability check estimates peak memory for a pcap before you run it.
+- **CPU follows the message rate, not the number of sessions**: about 7-10 µs per I-frame at full speed; 200 RTUs at 10× their captured pace (9,000 I-frames/s) use a third of a core. The 165-RTU production capture of the [April report](reports/2026-04-17-fleet-replay-showcase.md) ran at about 680 I-frames/s.
+- **Memory**: about 0.4-0.65 MB per session while sending, plus the loaded capture (roughly its file size). The automatic analysis needs 2-5 times that for a few seconds after the run.
+- **Setup is serial and costs per session**: in master role 54 ms per session at 200 and 95 ms at 800 (a veth port, per-interface sysctls and an iptables rule each), and teardown takes almost as long again; in slave role 30-45 ms per listener (alias, journal entry, capture filter update), overlapping with traffic.
+- **Fidelity verdicts need paced runs.** At original timing (up to 41 k I-frames/s with 200 RTUs) the analysis scores `all_correct`. At full speed every session completes, but the slave-role capture drops frames (`captured_dropped`, and the analysis says so) and a few master sessions are misjudged because of capture ordering; set `realtime` to give the slave capture RT priority.
+- **800 sessions**: slave role runs (800 of 800). In master role the test host's kernel neighbour table overflowed (both ends shared one kernel); outstation's host needs one neighbour entry per master session, so above about 1,000 sessions raise `net.ipv4.neigh.default.gc_thresh3`.
+- Each session holds about 2 (master) to 4 (slave) file descriptors; outstation raises its soft open-file limit to the hard limit at startup.
 
 ## Quick start
 
