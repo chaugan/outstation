@@ -20,7 +20,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 1: parallel lanes, disjoint files
 
-- [~] **T01 pcap ingestion** (`crates/pcapload`, `crates/tcp_session`). Refs: P01–P12.
+- [x] **T01 pcap ingestion** (`crates/pcapload`, `crates/tcp_session`). Refs: P01–P12.
   - Sequence-number wraparound (P01).
   - Gap-tolerant reassembly that reports gaps instead of bailing (P02, library part).
   - Strip 802.1Q/ad/QinQ tags; normalise SLL, SLL2 and raw-IP link types; count and report IPv6 and ignored packets (P03).
@@ -82,7 +82,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 2: depends on wave 1
 
-- [ ] **T05 IEC 104 session state machine** (`proto_iec104/src/session.rs`). Refs: F000, F001, F002, F003, F004, F005, F006, F008, F009, F010, F013, F017, F018, F023, F024, F025, F140, F141, F142, F143, F144, F145, F147, F150.
+- [~] **T05 IEC 104 session state machine** (`proto_iec104/src/session.rs`). Refs: F000, F001, F002, F003, F004, F005, F006, F008, F009, F010, F013, F017, F018, F023, F024, F025, F140, F141, F142, F143, F144, F145, F147, F150.
   - One `wait_until(deadline)` helper that services rx, t1, t2 (S-frame) and t3 (TESTFR).
   - Configurable k/w/t0–t3 via `proto_config`.
   - Started/Stopped/PendingStop states with STARTDT/STOPDT con replies and gated sends; S-flush before STOPDT.
@@ -168,3 +168,7 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Added a shared `apci` frame walker, fixed the element sizes, made GI/CI CA-aware, added negative ActCon and FRZ handling, and made CP56 decode TZ-correct.
   - One T05 item was done early: the session builds its inventory from rewritten, resynced frames (F017). Without it, the new CA filter would reject every GI when a CA rewrite map is set.
   - Remaining for others: T06 adopts `apci` and `respond_*().per_ca` in analysis.rs; T05 needs the frame-boundary check on the live `ApduReader`.
+- 2026-11-05: T01 merged. Workspace tests: 149 passed.
+  - P01–P12 fixed, except that P07 is partly fixed: RSS went from 2.9× to about 2× the file size, and the remainder is per-packet metadata.
+  - Removed the dead `tcp_session` crate.
+  - Gap-tolerant reassembly records gaps (`StreamGap`). Consumers must reframe at gap offsets; T05 does this for the session replay path.
