@@ -36,8 +36,8 @@ fn main() -> Result<()> {
     println!();
 
     println!(
-        "{:<17} {:<17} {:>10} {:>12} {:>6} {}",
-        "src ip", "src mac", "packets", "bytes", "flows", "mac_collision"
+        "{:<17} {:<17} {:>10} {:>12} {:>6} mac_collision",
+        "src ip", "src mac", "packets", "bytes", "flows"
     );
     for (ip, s) in &p.sources {
         println!(
@@ -54,8 +54,8 @@ fn main() -> Result<()> {
     if !p.flows.is_empty() {
         println!();
         println!(
-            "{:<4} {:<21} {:<21} {:>8} {}",
-            "idx", "client", "server", "packets", "state"
+            "{:<4} {:<21} {:<21} {:>8} state",
+            "idx", "client", "server", "packets"
         );
         for (i, f) in p.flows.iter().enumerate() {
             let client = f
@@ -94,7 +94,9 @@ fn main() -> Result<()> {
         println!();
         for (i, pkt) in p.packets.iter().enumerate() {
             let kind = match &pkt.kind {
-                PacketKind::Tcp { role, flags, .. } => format!("TCP {:?} flags={:02x}", role, flags),
+                PacketKind::Tcp { role, flags, .. } => {
+                    format!("TCP {:?} flags={:02x}", role, flags)
+                }
                 PacketKind::Udp => "UDP".into(),
                 PacketKind::Icmp => "ICMP".into(),
                 PacketKind::IpOther { proto } => format!("IP proto={}", proto),

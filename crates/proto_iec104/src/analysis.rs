@@ -21,9 +21,7 @@
 
 use std::collections::BTreeMap;
 
-use protoplay::{
-    AnalyzeCtx, FleetDriftTimeline, FlowSnapshot, ProtoSlaveAnalysis, Role,
-};
+use protoplay::{AnalyzeCtx, FleetDriftTimeline, FlowSnapshot, ProtoSlaveAnalysis, Role};
 use serde::Serialize;
 use serde_json::json;
 
@@ -269,12 +267,10 @@ pub fn analyze_iec104_flow(
     // "every expected frame had its delivered counterpart" check.
     let sequence_match = real_mismatch_count == 0
         && matched_type_ids > 0
-        && (
-            (observed_iterations >= 1 && trailing_partial == 0)
+        && ((observed_iterations >= 1 && trailing_partial == 0)
             || (observed_iterations == 0
                 && matched_type_ids == expected_tids.len()
-                && matched_type_ids == delivered_tids.len())
-        );
+                && matched_type_ids == delivered_tids.len()));
 
     if observed_iterations > 1 {
         notes.push(format!(
@@ -464,7 +460,12 @@ pub fn analyze_iec104_flow(
     // --- CP56Time2a drift (only meaningful when rewrite_to_now was on) ---
     let cp56_drift = if rewrite_cp56_was_on {
         cap_playback.as_ref().and_then(|rf| {
-            compute_cp56_drift(rf, ctx.captured_first_ts_ns, cp56_zone, ctx.cp56_tolerance_ms)
+            compute_cp56_drift(
+                rf,
+                ctx.captured_first_ts_ns,
+                cp56_zone,
+                ctx.cp56_tolerance_ms,
+            )
         })
     } else {
         None
@@ -527,7 +528,9 @@ pub fn aggregate_iec104_fleet_drift(
 ) -> Option<FleetDriftTimeline> {
     let mut all: Vec<(f64, f64)> = Vec::new();
     for v in per_slave.values() {
-        let Some(dr) = v.get("cp56_drift") else { continue };
+        let Some(dr) = v.get("cp56_drift") else {
+            continue;
+        };
         if dr.is_null() {
             continue;
         }
@@ -551,7 +554,7 @@ pub fn aggregate_iec104_fleet_drift(
 
     let decimated = total_samples > MAX_FLEET_TIMELINE_POINTS;
     let kept: Vec<[f64; 2]> = if decimated {
-        let stride = (total_samples + MAX_FLEET_TIMELINE_POINTS - 1) / MAX_FLEET_TIMELINE_POINTS;
+        let stride = total_samples.div_ceil(MAX_FLEET_TIMELINE_POINTS);
         all.iter().step_by(stride).map(|&(t, d)| [t, d]).collect()
     } else {
         all.iter().map(|&(t, d)| [t, d]).collect()
@@ -1426,7 +1429,9 @@ pub fn audit_master_commands(
         });
 
         let Some(ac_idx) = actcon_idx else {
-            event.notes.push("no matching ActCon found in slave-side stream".into());
+            event
+                .notes
+                .push("no matching ActCon found in slave-side stream".into());
             push_event(&mut audit, event);
             continue;
         };
@@ -1438,8 +1443,7 @@ pub fn audit_master_commands(
         // (type, ca) — whichever comes first bounds the event window.
         let mut term_idx: Option<usize> = None;
         let mut window_end = slave_frames.len();
-        for j in (ac_idx + 1)..slave_frames.len() {
-            let f = &slave_frames[j];
+        for (j, f) in slave_frames.iter().enumerate().skip(ac_idx + 1) {
             if f.ca == req.ca && f.type_id == req.type_id {
                 if f.cot_low == COT_ACT_TERM {
                     term_idx = Some(j);
@@ -1456,8 +1460,7 @@ pub fn audit_master_commands(
         let expected_cot = expected_data_cot_for_request(req);
         let mut last_data_ts: Option<f64> = None;
         let mut data_frames: Vec<&SlaveFrame> = Vec::new();
-        for j in (ac_idx + 1)..window_end {
-            let f = &slave_frames[j];
+        for f in &slave_frames[(ac_idx + 1)..window_end] {
             if f.ca != req.ca {
                 continue;
             }
@@ -1483,7 +1486,9 @@ pub fn audit_master_commands(
             let basis = last_data_ts.unwrap_or(actcon.ts_ms);
             event.actterm_delay_ms = Some(slave_frames[ti].ts_ms - basis);
         } else {
-            event.notes.push("no matching ActTerm found in slave-side stream".into());
+            event
+                .notes
+                .push("no matching ActTerm found in slave-side stream".into());
         }
 
         // Bytewise verification against the source-inventory expected
@@ -1505,15 +1510,17 @@ pub fn audit_master_commands(
         } else {
             &[]
         };
-        event.expected_data_element_count =
-            expected_data.iter().map(|a| count_elements(a)).sum();
+        event.expected_data_element_count = expected_data.iter().map(|a| count_elements(a)).sum();
         event.bytewise_matches_inventory = expected_data.len() == data_frames.len()
-            && expected_data.iter().zip(data_frames.iter()).all(|(exp, got)| {
-                matches!(
-                    compare_asdu(exp, &got.asdu),
-                    AsduCmp::Identical | AsduCmp::Cp56Only
-                )
-            });
+            && expected_data
+                .iter()
+                .zip(data_frames.iter())
+                .all(|(exp, got)| {
+                    matches!(
+                        compare_asdu(exp, &got.asdu),
+                        AsduCmp::Identical | AsduCmp::Cp56Only
+                    )
+                });
 
         let actcon_ok = event
             .actcon_delay_ms
@@ -1550,10 +1557,7 @@ pub fn audit_master_commands(
             // so the UI / JSON consumer can see exactly what differs.
             // Capped to keep payloads manageable (≤256 hex chars per side).
             for (i, (exp, got)) in expected_data.iter().zip(data_frames.iter()).enumerate() {
-                if matches!(
-                    compare_asdu(exp, &got.asdu),
-                    AsduCmp::Different
-                ) {
+                if matches!(compare_asdu(exp, &got.asdu), AsduCmp::Different) {
                     let cap = |b: &[u8]| -> String {
                         let n = b.len().min(128);
                         let mut s = String::with_capacity(n * 2);
@@ -1561,13 +1565,16 @@ pub fn audit_master_commands(
                             s.push_str(&format!("{:02x}", x));
                         }
                         if b.len() > n {
-                            s.push_str("…");
+                            s.push('…');
                         }
                         s
                     };
-                    event
-                        .notes
-                        .push(format!("diverging frame #{}: expected={} actual={}", i, cap(exp), cap(&got.asdu)));
+                    event.notes.push(format!(
+                        "diverging frame #{}: expected={} actual={}",
+                        i,
+                        cap(exp),
+                        cap(&got.asdu)
+                    ));
                     break;
                 }
             }
@@ -1655,7 +1662,9 @@ mod tests {
 
     #[test]
     fn classify_divergent() {
-        let orig = vec![45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46];
+        let orig = vec![
+            45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46, 45, 46,
+        ];
         let actual = vec![100, 101];
         let lcs = lcs_length(&orig, &actual);
         assert_eq!(classify_script(&orig, &actual, lcs, 0), "divergent");
@@ -1670,10 +1679,7 @@ mod tests {
 
     fn build_type36_iframe(stamp_ns: u64) -> Vec<u8> {
         let mut asdu = vec![
-            36, 0x01, 0x03, 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00,
-            0x00,
+            36, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         asdu.extend_from_slice(&encode_cp56time2a(stamp_ns, false, false));
         let mut frame = vec![0x68, (asdu.len() + 4) as u8, 0x00, 0x00, 0x00, 0x00];
@@ -1738,9 +1744,7 @@ mod tests {
     #[test]
     fn compare_asdu_cp56_only_diff_classified() {
         let mut a = vec![
-            36, 0x01, 0x03, 0, 0x01, 0,
-            0x01, 0, 0,
-            0xde, 0xad, 0xbe, 0xef, 0x00,
+            36, 0x01, 0x03, 0, 0x01, 0, 0x01, 0, 0, 0xde, 0xad, 0xbe, 0xef, 0x00,
         ];
         let mut b = a.clone();
         a.extend_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x04, 0x18]);
@@ -1751,9 +1755,7 @@ mod tests {
     #[test]
     fn compare_asdu_real_diff_in_payload_classified() {
         let mut a = vec![
-            36, 0x01, 0x03, 0, 0x01, 0,
-            0x01, 0, 0,
-            0xde, 0xad, 0xbe, 0xef, 0x00,
+            36, 0x01, 0x03, 0, 0x01, 0, 0x01, 0, 0, 0xde, 0xad, 0xbe, 0xef, 0x00,
         ];
         let mut b = a.clone();
         b[12] = 0xff;
@@ -1765,9 +1767,7 @@ mod tests {
     #[test]
     fn compare_asdu_no_cp56_field_is_real_diff() {
         let a = vec![
-            13, 0x01, 0x03, 0, 0x01, 0,
-            0x01, 0, 0,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            13, 0x01, 0x03, 0, 0x01, 0, 0x01, 0, 0, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let mut b = a.clone();
         b[12] = 0xff;
@@ -1784,8 +1784,7 @@ mod tests {
     #[test]
     fn cp56_drift_none_when_no_cp56_types() {
         let asdu = vec![
-            13, 0x01, 0x03, 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            13, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let mut frame = vec![0x68, (asdu.len() + 4) as u8, 0x00, 0x00, 0x00, 0x00];
         frame.extend_from_slice(&asdu);
@@ -1840,7 +1839,12 @@ mod tests {
 
         // Build the spec-correct response via the responder, then stitch
         // the three ASDUs into a slave-side payload at known wall times.
-        let echo = RequestEcho { ca: 1, oa: 42, test: false, negative: false };
+        let echo = RequestEcho {
+            ca: 1,
+            oa: 42,
+            test: false,
+            negative: false,
+        };
         let resp = build_gi_response(&inv, echo, 20);
         assert_eq!(resp.len(), 3);
 
@@ -1905,7 +1909,12 @@ mod tests {
         req_asdu[DUI_LEN + IOA_LEN] = 20;
         let req_frame = wrap_iframe(&req_asdu, 0, 0);
 
-        let echo = RequestEcho { ca: 1, oa: 0, test: false, negative: false };
+        let echo = RequestEcho {
+            ca: 1,
+            oa: 0,
+            test: false,
+            negative: false,
+        };
         let resp = build_gi_response(&inv, echo, 20);
         // Drop the ActTerm to simulate a misbehaving slave.
         let mut slave_payload = Vec::new();

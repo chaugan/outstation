@@ -24,8 +24,8 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
 use crate::apdu::{
-    write_apdu, Apdu, ApduReader, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT,
-    U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
+    write_apdu, Apdu, ApduReader, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT, U_STARTDT_CON,
+    U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
     common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone,
@@ -250,10 +250,10 @@ pub(crate) fn find_apci_resync(stream: &[u8]) -> usize {
     while i + 2 + APCI_LEN <= stream.len() {
         if stream[i] == START_BYTE {
             let len = stream[i + 1] as usize;
-            if len >= APCI_LEN && len <= MAX_APDU_LEN {
+            if (APCI_LEN..=MAX_APDU_LEN).contains(&len) {
                 let next = i + 2 + len;
-                let boundary_ok = next == stream.len()
-                    || (next < stream.len() && stream[next] == START_BYTE);
+                let boundary_ok =
+                    next == stream.len() || (next < stream.len() && stream[next] == START_BYTE);
                 if boundary_ok && Apdu::parse(&stream[i + 2..i + 2 + APCI_LEN]).is_ok() {
                     return i;
                 }
@@ -298,7 +298,8 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         "extracted client I-frame ASDUs from pcap"
     );
     bump(&progress, |p| {
-        p.planned.store(client_iframes.len() as u64, Ordering::Relaxed);
+        p.planned
+            .store(client_iframes.len() as u64, Ordering::Relaxed);
     });
 
     // 1. Connect.
@@ -557,12 +558,7 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
 
     // 5. STOPDT close (best effort). Plumbing frame — bytes only, no
     //    messages_sent bump.
-    if let Err(e) = write_apdu(
-        &mut write_stream,
-        &Apdu::U {
-            code: U_STOPDT_ACT,
-        },
-    ) {
+    if let Err(e) = write_apdu(&mut write_stream, &Apdu::U { code: U_STOPDT_ACT }) {
         debug!(error = %e, "STOPDT act failed");
     } else {
         report.bytes_written += 6;
@@ -697,12 +693,7 @@ fn handle_incoming(
             });
         }
         Apdu::U { code: U_TESTFR_ACT } => {
-            let _ = write_apdu(
-                writer,
-                &Apdu::U {
-                    code: U_TESTFR_CON,
-                },
-            );
+            let _ = write_apdu(writer, &Apdu::U { code: U_TESTFR_CON });
             // TESTFR con is plumbing — bandwidth only, no data counter.
             report.bytes_written += 6;
             report.bytes_read += 6;
@@ -829,7 +820,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         "slave: built point inventory for GI/CI responses"
     );
     bump(&progress, |p| {
-        p.planned.store(server_iframes.len() as u64, Ordering::Relaxed);
+        p.planned
+            .store(server_iframes.len() as u64, Ordering::Relaxed);
     });
 
     // Note: the ready-gate and user-editable listen-IP snapshot live
@@ -1012,8 +1004,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         // each loop. Cumulative totals stay in `report` for the
         // post-run report.
         bump(&progress, |p| {
-            p.iter_current
-                .store(loop_idx + 1, Ordering::Relaxed);
+            p.iter_current.store(loop_idx + 1, Ordering::Relaxed);
             p.sent.store(0, Ordering::Relaxed);
             p.bytes_written.store(0, Ordering::Relaxed);
         });
@@ -1031,57 +1022,26 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                 early_break = true;
                 break 'outer;
             }
-        if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
-            // Pace until the next captured send time, but stay
-            // responsive to incoming master traffic during the wait —
-            // critical for long inter-frame gaps where TESTFR_act
-            // would otherwise miss its t1 reply window.
-            let target_abs_ns = pacing_epoch_ns.saturating_add(target);
-            'pace: loop {
-                let now = now_ns();
-                if now >= target_abs_ns {
-                    break 'pace;
-                }
-                if check_cancel(&progress) {
-                    report.error = Some(format!("cancelled during pace at idx {idx}"));
-                    early_break = true;
-                    break 'outer;
-                }
-                let remaining_ns = target_abs_ns.saturating_sub(now);
-                let slice = Duration::from_nanos(remaining_ns.min(IDLE_POLL.as_nanos() as u64));
-                match rx.recv_timeout(slice) {
-                    Ok(apdu) => slave_handle_incoming(
-                        apdu,
-                        &mut write_stream,
-                        &mut my_nr,
-                        &mut unacked_received,
-                        w,
-                        &mut pending,
-                        &mut report,
-                        &progress,
-                        &mut latency,
-                        &inventory,
-                        &mut response_queue,
-                    ),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        // Master tore down during the gap; let the
-                        // next write fail naturally so the existing
-                        // error path runs.
+            if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
+                // Pace until the next captured send time, but stay
+                // responsive to incoming master traffic during the wait —
+                // critical for long inter-frame gaps where TESTFR_act
+                // would otherwise miss its t1 reply window.
+                let target_abs_ns = pacing_epoch_ns.saturating_add(target);
+                'pace: loop {
+                    let now = now_ns();
+                    if now >= target_abs_ns {
                         break 'pace;
                     }
-                }
-            }
-        }
-        while pending.len() as u16 >= k {
-            report.window_stalls += 1;
-            let deadline = Instant::now() + T1_TIMEOUT;
-            let mut freed = false;
-            while Instant::now() < deadline {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match rx.recv_timeout(remaining.min(IDLE_POLL)) {
-                    Ok(apdu) => {
-                        slave_handle_incoming(
+                    if check_cancel(&progress) {
+                        report.error = Some(format!("cancelled during pace at idx {idx}"));
+                        early_break = true;
+                        break 'outer;
+                    }
+                    let remaining_ns = target_abs_ns.saturating_sub(now);
+                    let slice = Duration::from_nanos(remaining_ns.min(IDLE_POLL.as_nanos() as u64));
+                    match rx.recv_timeout(slice) {
+                        Ok(apdu) => slave_handle_incoming(
                             apdu,
                             &mut write_stream,
                             &mut my_nr,
@@ -1093,115 +1053,147 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
                             &mut latency,
                             &inventory,
                             &mut response_queue,
-                        );
-                        if (pending.len() as u16) < k {
-                            freed = true;
-                            break;
+                        ),
+                        Err(RecvTimeoutError::Timeout) => {}
+                        Err(RecvTimeoutError::Disconnected) => {
+                            // Master tore down during the gap; let the
+                            // next write fail naturally so the existing
+                            // error path runs.
+                            break 'pace;
                         }
-                    }
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        report.error = Some(format!(
-                            "master closed before acking I-frame idx {idx} (pending={})",
-                            pending.len()
-                        ));
-                        early_break = true;
-                        break 'outer;
                     }
                 }
             }
-            if !freed {
-                report.error = Some(format!(
-                    "t1 timeout at idx {idx}: master never acked {} pending I-frames",
-                    pending.len()
-                ));
-                early_break = true;
-                break 'outer;
+            while pending.len() as u16 >= k {
+                report.window_stalls += 1;
+                let deadline = Instant::now() + T1_TIMEOUT;
+                let mut freed = false;
+                while Instant::now() < deadline {
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    match rx.recv_timeout(remaining.min(IDLE_POLL)) {
+                        Ok(apdu) => {
+                            slave_handle_incoming(
+                                apdu,
+                                &mut write_stream,
+                                &mut my_nr,
+                                &mut unacked_received,
+                                w,
+                                &mut pending,
+                                &mut report,
+                                &progress,
+                                &mut latency,
+                                &inventory,
+                                &mut response_queue,
+                            );
+                            if (pending.len() as u16) < k {
+                                freed = true;
+                                break;
+                            }
+                        }
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => {
+                            report.error = Some(format!(
+                                "master closed before acking I-frame idx {idx} (pending={})",
+                                pending.len()
+                            ));
+                            early_break = true;
+                            break 'outer;
+                        }
+                    }
+                }
+                if !freed {
+                    report.error = Some(format!(
+                        "t1 timeout at idx {idx}: master never acked {} pending I-frames",
+                        pending.len()
+                    ));
+                    early_break = true;
+                    break 'outer;
+                }
             }
-        }
 
-        while let Ok(apdu) = rx.try_recv() {
-            slave_handle_incoming(
-                apdu,
-                &mut write_stream,
-                &mut my_nr,
-                &mut unacked_received,
-                w,
-                &mut pending,
-                &mut report,
-                &progress,
-                &mut latency,
-                &inventory,
-                &mut response_queue,
-            );
-        }
-
-        // Drain any queued GI/CI response frames first so a master
-        // command that arrived during the pacing wait gets answered
-        // before we resume captured-payload replay. Bounded by the
-        // remaining k-window slot count so we never overrun the
-        // master's receive window.
-        while !response_queue.is_empty() && (pending.len() as u16) < k {
-            let mut resp_asdu = response_queue
-                .pop_front()
-                .expect("len > 0 just checked");
-            if cp56_cfg.rewrite_to_now {
-                rewrite_cp56time2a_to_now_zoned(
-                    &mut resp_asdu,
-                    wall_clock_unix_ns(),
-                    cp56_zone,
+            while let Ok(apdu) = rx.try_recv() {
+                slave_handle_incoming(
+                    apdu,
+                    &mut write_stream,
+                    &mut my_nr,
+                    &mut unacked_received,
+                    w,
+                    &mut pending,
+                    &mut report,
+                    &progress,
+                    &mut latency,
+                    &inventory,
+                    &mut response_queue,
                 );
             }
-            let resp_apdu = Apdu::I {
+
+            // Drain any queued GI/CI response frames first so a master
+            // command that arrived during the pacing wait gets answered
+            // before we resume captured-payload replay. Bounded by the
+            // remaining k-window slot count so we never overrun the
+            // master's receive window.
+            while !response_queue.is_empty() && (pending.len() as u16) < k {
+                let mut resp_asdu = response_queue.pop_front().expect("len > 0 just checked");
+                if cp56_cfg.rewrite_to_now {
+                    rewrite_cp56time2a_to_now_zoned(
+                        &mut resp_asdu,
+                        wall_clock_unix_ns(),
+                        cp56_zone,
+                    );
+                }
+                let resp_apdu = Apdu::I {
+                    ns: my_ns,
+                    nr: my_nr,
+                    asdu: resp_asdu,
+                };
+                let resp_send_ns = now_ns();
+                let resp_wire_len = resp_apdu.serialize().len() as u64;
+                if let Err(e) = write_apdu(&mut write_stream, &resp_apdu) {
+                    warn!(error = %e, "slave: send GI/CI response frame failed");
+                    report.error = Some(format!("send GI/CI response: {e}"));
+                    early_break = true;
+                    break 'outer;
+                }
+                pending.push_back(PendingIFrame {
+                    ns: my_ns,
+                    send_ns: resp_send_ns,
+                });
+                my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
+                report.messages_sent += 1;
+                report.bytes_written += resp_wire_len;
+                bump(&progress, |p| {
+                    p.sent.fetch_add(1, Ordering::Relaxed);
+                    p.bytes_written.fetch_add(resp_wire_len, Ordering::Relaxed);
+                    p.unacked.store(pending.len() as u64, Ordering::Relaxed);
+                });
+            }
+
+            let mut patched = asdu.clone();
+            if cp56_cfg.rewrite_to_now {
+                rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
+            }
+            let apdu = Apdu::I {
                 ns: my_ns,
                 nr: my_nr,
-                asdu: resp_asdu,
+                asdu: patched,
             };
-            let resp_send_ns = now_ns();
-            let resp_wire_len = resp_apdu.serialize().len() as u64;
-            if let Err(e) = write_apdu(&mut write_stream, &resp_apdu) {
-                warn!(error = %e, "slave: send GI/CI response frame failed");
-                report.error = Some(format!("send GI/CI response: {e}"));
-                early_break = true;
-                break 'outer;
+            let send_ns = now_ns();
+            let wire_len = apdu.serialize().len() as u64;
+            if let Err(e) = write_apdu(&mut write_stream, &apdu) {
+                warn!(error = %e, "slave: send I-frame failed");
+                report.error = Some(format!("send I-frame at idx {idx}: {e}"));
+                break;
             }
-            pending.push_back(PendingIFrame { ns: my_ns, send_ns: resp_send_ns });
+            pending.push_back(PendingIFrame { ns: my_ns, send_ns });
             my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
             report.messages_sent += 1;
-            report.bytes_written += resp_wire_len;
+            report.bytes_written += wire_len;
             bump(&progress, |p| {
                 p.sent.fetch_add(1, Ordering::Relaxed);
-                p.bytes_written.fetch_add(resp_wire_len, Ordering::Relaxed);
+                p.bytes_written.fetch_add(wire_len, Ordering::Relaxed);
                 p.unacked.store(pending.len() as u64, Ordering::Relaxed);
             });
         }
-
-        let mut patched = asdu.clone();
-        if cp56_cfg.rewrite_to_now {
-            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
-        }
-        let apdu = Apdu::I {
-            ns: my_ns,
-            nr: my_nr,
-            asdu: patched,
-        };
-        let send_ns = now_ns();
-        let wire_len = apdu.serialize().len() as u64;
-        if let Err(e) = write_apdu(&mut write_stream, &apdu) {
-            warn!(error = %e, "slave: send I-frame failed");
-            report.error = Some(format!("send I-frame at idx {idx}: {e}"));
-            break;
-        }
-        pending.push_back(PendingIFrame { ns: my_ns, send_ns });
-        my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
-        report.messages_sent += 1;
-        report.bytes_written += wire_len;
-        bump(&progress, |p| {
-            p.sent.fetch_add(1, Ordering::Relaxed);
-            p.bytes_written.fetch_add(wire_len, Ordering::Relaxed);
-            p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-        });
-    }
         // End of one within-session script play. Bail out of the
         // replay loop if the inner 'outer broke for cancel/error
         // (no point re-running once the master has gone away).
@@ -1244,34 +1236,25 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // current N(R) tells the master "I have received everything you
     // sent up to this point" — strictly polite, 100% per IEC 104
     // Annex C. Best-effort: a closed socket here is fine.
-    if unacked_received > 0 {
-        if write_apdu(&mut write_stream, &Apdu::S { nr: my_nr }).is_ok() {
-            report.bytes_written += 6;
-            bump(&progress, |p| {
-                p.bytes_written.fetch_add(6, Ordering::Relaxed);
-            });
-            // No further sends after this; counter intentionally
-            // not zeroed to avoid an unused-write warning.
-        }
+    if unacked_received > 0 && write_apdu(&mut write_stream, &Apdu::S { nr: my_nr }).is_ok() {
+        report.bytes_written += 6;
+        bump(&progress, |p| {
+            p.bytes_written.fetch_add(6, Ordering::Relaxed);
+        });
+        // No further sends after this; counter intentionally
+        // not zeroed to avoid an unused-write warning.
     }
 
     // 7. Wait briefly for STOPDT act from master. If it arrives, reply
     //    STOPDT con. Either way, drop the socket to close.
-    if wait_for_u(&rx, U_STOPDT_ACT, Duration::from_secs(2)) {
-        if write_apdu(
-            &mut write_stream,
-            &Apdu::U {
-                code: U_STOPDT_CON,
-            },
-        )
-        .is_ok()
-        {
-            // STOPDT con is plumbing.
-            report.bytes_written += 6;
-            bump(&progress, |p| {
-                p.bytes_written.fetch_add(6, Ordering::Relaxed);
-            });
-        }
+    if wait_for_u(&rx, U_STOPDT_ACT, Duration::from_secs(2))
+        && write_apdu(&mut write_stream, &Apdu::U { code: U_STOPDT_CON }).is_ok()
+    {
+        // STOPDT con is plumbing.
+        report.bytes_written += 6;
+        bump(&progress, |p| {
+            p.bytes_written.fetch_add(6, Ordering::Relaxed);
+        });
     }
 
     let _ = send_start_ns; // currently unused; reserved for per-session throughput refinement
@@ -1314,14 +1297,7 @@ mod tests {
                 0x00,
                 0x00,
             ];
-            bytes.extend_from_slice(
-                &Apdu::I {
-                    ns: i,
-                    nr: 0,
-                    asdu,
-                }
-                .serialize(),
-            );
+            bytes.extend_from_slice(&Apdu::I { ns: i, nr: 0, asdu }.serialize());
         }
         bytes
     }
@@ -1438,7 +1414,7 @@ mod tests {
         // Those 12 I-frames waited roughly 120 ms for the S-frame.
         let min = *report.latency_samples_us.iter().min().unwrap();
         assert!(
-            min >= 80_000 && min <= 400_000,
+            (80_000..=400_000).contains(&min),
             "min latency out of expected window: {min} µs"
         );
         // The last 3 I-frames are sent but never acked (no more
@@ -1478,7 +1454,10 @@ mod tests {
                 }
                 received.extend_from_slice(&buf[..n]);
                 // If we just saw STOPDT act (0x13), reply con and bail.
-                if received.windows(6).any(|w| w == [0x68, 4, U_STOPDT_ACT, 0, 0, 0]) {
+                if received
+                    .windows(6)
+                    .any(|w| w == [0x68, 4, U_STOPDT_ACT, 0, 0, 0])
+                {
                     sock.write_all(&[0x68, 4, U_STOPDT_CON, 0, 0, 0]).ok();
                     break;
                 }
@@ -1490,9 +1469,7 @@ mod tests {
         let i_frame = Apdu::I {
             ns: 0,
             nr: 0,
-            asdu: vec![
-                0x65, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ],
+            asdu: vec![0x65, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00],
         }
         .serialize();
         let cfg = ProtoRunCfg {
@@ -1530,7 +1507,9 @@ mod tests {
         let received = server.join().unwrap();
         // Confirm the I-frame reached the server.
         assert!(
-            received.windows(3).any(|w| w[0] == 0x68 && w[2] & 0x01 == 0),
+            received
+                .windows(3)
+                .any(|w| w[0] == 0x68 && w[2] & 0x01 == 0),
             "did not see an I-frame in server receive buffer"
         );
     }
@@ -1546,7 +1525,9 @@ mod tests {
                 &Apdu::I {
                     ns,
                     nr: 0,
-                    asdu: vec![0x65, 0x01, 0x06, 0x00, 0x01, 0x00, ns as u8, 0x00, 0x00, 0x00],
+                    asdu: vec![
+                        0x65, 0x01, 0x06, 0x00, 0x01, 0x00, ns as u8, 0x00, 0x00, 0x00,
+                    ],
                 }
                 .serialize(),
             );
@@ -1589,4 +1570,3 @@ mod tests {
         assert_eq!(super::find_apci_resync(&garbage), garbage.len());
     }
 }
-

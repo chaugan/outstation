@@ -23,9 +23,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::apdu::{Apdu, ApduReader};
-use crate::asdu::{
-    common_address, cot_value, element_len, read_ioa, vsq, DUI_LEN, IOA_LEN,
-};
+use crate::asdu::{common_address, cot_value, element_len, read_ioa, vsq, DUI_LEN, IOA_LEN};
 
 /// One point in the per-slave database.
 #[derive(Debug, Clone)]

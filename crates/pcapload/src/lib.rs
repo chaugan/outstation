@@ -67,11 +67,19 @@ pub enum FlowRole {
 
 #[derive(Debug, Clone)]
 pub enum PacketKind {
-    Tcp { flow_idx: usize, role: FlowRole, flags: u8 },
+    Tcp {
+        flow_idx: usize,
+        role: FlowRole,
+        flags: u8,
+    },
     Udp,
     Icmp,
-    IpOther { proto: u8 },
-    NonIp { ethertype: u16 },
+    IpOther {
+        proto: u8,
+    },
+    NonIp {
+        ethertype: u16,
+    },
     Malformed,
 }
 
@@ -173,7 +181,7 @@ pub fn load_bytes(bytes: &[u8], path: PathBuf) -> Result<LoadedPcap> {
     // Dispatch on file format. Classic pcap starts with one of four
     // 4-byte magic sequences; pcapng starts with a Section Header
     // Block (block type 0x0A0D0D0A).
-    if bytes.len() >= 4 && &bytes[..4] == [0x0a, 0x0d, 0x0d, 0x0a] {
+    if bytes.len() >= 4 && bytes[..4] == [0x0a, 0x0d, 0x0d, 0x0a] {
         return load_pcapng(bytes, path);
     }
     load_classic_pcap(bytes, path)
@@ -201,8 +209,8 @@ fn load_pcapng(bytes: &[u8], path: PathBuf) -> Result<LoadedPcap> {
     use pcap_file::DataLink;
     use std::io::Cursor;
 
-    let mut reader = PcapNgReader::new(Cursor::new(bytes))
-        .context("open pcapng (wireshark-native format)")?;
+    let mut reader =
+        PcapNgReader::new(Cursor::new(bytes)).context("open pcapng (wireshark-native format)")?;
 
     // pcapng allows multiple interfaces each with its own link type
     // and timestamp resolution. pcap-file v2 hands back EPB.timestamp
@@ -257,7 +265,10 @@ fn load_pcapng(bytes: &[u8], path: PathBuf) -> Result<LoadedPcap> {
             }
             Block::EnhancedPacket(epb) => {
                 let iface = epb.interface_id as usize;
-                let link = iface_links.get(iface).copied().unwrap_or(DataLink::ETHERNET);
+                let link = iface_links
+                    .get(iface)
+                    .copied()
+                    .unwrap_or(DataLink::ETHERNET);
                 if !matches!(link, DataLink::ETHERNET) {
                     continue;
                 }
@@ -340,8 +351,7 @@ impl IngestBuilder {
                     entry.flow_indices.push(*flow_idx);
                 }
             }
-        } else if let (Some(mac), None, PacketKind::NonIp { ethertype }) =
-            (src_mac, src_ip, &kind)
+        } else if let (Some(mac), None, PacketKind::NonIp { ethertype }) = (src_mac, src_ip, &kind)
         {
             let entry = self
                 .non_ip_sources
@@ -394,7 +404,6 @@ impl IngestBuilder {
         }
     }
 }
-
 
 struct NonIpSourceInfoBuilder {
     src_mac: MacAddr,
@@ -600,9 +609,7 @@ fn classify(
                 Some(_) => FlowRole::Server,
                 None => FlowRole::Unknown,
             };
-            debug!(
-                ?canon, flags, ?role, "classified TCP packet"
-            );
+            debug!(?canon, flags, ?role, "classified TCP packet");
             (
                 PacketKind::Tcp {
                     flow_idx,
@@ -615,7 +622,11 @@ fn classify(
         }
         IPPROTO_UDP => (PacketKind::Udp, Some(src_mac), Some(src_ip)),
         IPPROTO_ICMP => (PacketKind::Icmp, Some(src_mac), Some(src_ip)),
-        other => (PacketKind::IpOther { proto: other }, Some(src_mac), Some(src_ip)),
+        other => (
+            PacketKind::IpOther { proto: other },
+            Some(src_mac),
+            Some(src_ip),
+        ),
     }
 }
 
@@ -654,11 +665,7 @@ impl ReassembledFlow {
             }
         }
         if lo == 0 {
-            return self
-                .packet_offsets
-                .first()
-                .map(|p| p.0)
-                .unwrap_or(0);
+            return self.packet_offsets.first().map(|p| p.0).unwrap_or(0);
         }
         self.packet_offsets[lo - 1].0
     }
@@ -715,7 +722,11 @@ impl LoadedPcap {
             if payload_start >= ip_payload_end {
                 continue;
             }
-            segments.push((seq, data[payload_start..ip_payload_end].to_vec(), pkt.rel_ts_ns));
+            segments.push((
+                seq,
+                data[payload_start..ip_payload_end].to_vec(),
+                pkt.rel_ts_ns,
+            ));
         }
         if segments.is_empty() {
             bail!("flow {flow_idx} has no client payload bytes");
@@ -744,9 +755,7 @@ impl LoadedPcap {
                 out.extend_from_slice(&payload[skip..]);
                 expected = expected.wrapping_add((payload.len() - skip) as u32);
             } else {
-                bail!(
-                    "gap in client stream: expected seq {expected}, got {seq} (flow {flow_idx})"
-                );
+                bail!("gap in client stream: expected seq {expected}, got {seq} (flow {flow_idx})");
             }
         }
         Ok(ReassembledFlow {
@@ -809,7 +818,11 @@ impl LoadedPcap {
             if payload_start >= ip_payload_end {
                 continue;
             }
-            segments.push((seq, data[payload_start..ip_payload_end].to_vec(), pkt.rel_ts_ns));
+            segments.push((
+                seq,
+                data[payload_start..ip_payload_end].to_vec(),
+                pkt.rel_ts_ns,
+            ));
         }
         if segments.is_empty() {
             bail!("flow {flow_idx} has no server payload bytes");
@@ -838,9 +851,7 @@ impl LoadedPcap {
                 out.extend_from_slice(&payload[skip..]);
                 expected = expected.wrapping_add((payload.len() - skip) as u32);
             } else {
-                bail!(
-                    "gap in server stream: expected seq {expected}, got {seq} (flow {flow_idx})"
-                );
+                bail!("gap in server stream: expected seq {expected}, got {seq} (flow {flow_idx})");
             }
         }
         Ok(ReassembledFlow {

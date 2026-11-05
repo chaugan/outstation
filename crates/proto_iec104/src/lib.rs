@@ -17,10 +17,10 @@ use protoplay::{
 };
 
 pub mod analysis;
-pub mod inventory;
-pub mod responder;
 pub mod apdu;
 pub mod asdu;
+pub mod inventory;
+pub mod responder;
 pub mod session;
 
 /// Cheap I-frame counter — walks the APDU stream looking for valid
@@ -130,7 +130,10 @@ impl ProtoReplayer for Iec104Replayer {
             }
         };
         let t0 = ts_for(starts[0]);
-        starts.iter().map(|&b| ts_for(b).saturating_sub(t0)).collect()
+        starts
+            .iter()
+            .map(|&b| ts_for(b).saturating_sub(t0))
+            .collect()
     }
 
     /// IEC 104-aware pcap viability analysis. Counts unique
@@ -139,11 +142,7 @@ impl ProtoReplayer for Iec104Replayer {
     /// distinguishes mid-flow vs clean-handshake flows in the
     /// notes — surfaced in the UI so users know when to expect
     /// the replayer's mid-flow synthesis to fire.
-    fn quick_viability(
-        &self,
-        p: &dyn LoadedPcapView,
-        file_size_bytes: u64,
-    ) -> ProtoViability {
+    fn quick_viability(&self, p: &dyn LoadedPcapView, file_size_bytes: u64) -> ProtoViability {
         use std::collections::HashSet;
         const TARGET_PORT: u16 = 2404;
         let mut client_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
@@ -154,9 +153,17 @@ impl ProtoReplayer for Iec104Replayer {
         let mut clean_handshake_flows: u64 = 0;
         let mut slave_flow_indices: Vec<(usize, std::net::Ipv4Addr)> = Vec::new();
         for f in p.flows() {
-            let (server_ip, server_port) = match f.server { Some(x) => x, None => continue };
-            if server_port != TARGET_PORT { continue; }
-            let (client_ip, _) = match f.client { Some(x) => x, None => continue };
+            let (server_ip, server_port) = match f.server {
+                Some(x) => x,
+                None => continue,
+            };
+            if server_port != TARGET_PORT {
+                continue;
+            }
+            let (client_ip, _) = match f.client {
+                Some(x) => x,
+                None => continue,
+            };
             client_ips.insert(client_ip);
             server_ips.insert(server_ip);
             if f.saw_syn {
@@ -171,16 +178,14 @@ impl ProtoReplayer for Iec104Replayer {
         }
         let sessions_master_mode = client_ips.len() as u64;
         let sessions_slave_mode = server_ips.len() as u64;
-        let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
+        let mb = |b: u64| b.div_ceil(1024 * 1024);
         let parsed_store_mb = mb(file_size_bytes);
         let max_session_count = sessions_master_mode.max(sessions_slave_mode);
         let session_payload_mb = mb(client_payload_bytes.max(server_payload_bytes));
         let reservoir_mb = mb(max_session_count * 80 * 1024);
         let stack_mb = max_session_count * 2;
-        let estimated_peak_mb =
-            parsed_store_mb + session_payload_mb + reservoir_mb + stack_mb + 32;
-        let (verdict, verdict_reason): (&str, String) = if file_size_bytes
-            > 8 * 1024 * 1024 * 1024
+        let estimated_peak_mb = parsed_store_mb + session_payload_mb + reservoir_mb + stack_mb + 32;
+        let (verdict, verdict_reason): (&str, String) = if file_size_bytes > 8 * 1024 * 1024 * 1024
             || max_session_count > 1500
         {
             (
@@ -315,7 +320,7 @@ impl ProtoReplayer for Iec104Replayer {
                 if !type_id_counts.is_empty() {
                     let mut top: Vec<(u8, usize)> =
                         type_id_counts.iter().map(|(t, c)| (*t, *c)).collect();
-                    top.sort_by(|a, b| b.1.cmp(&a.1));
+                    top.sort_by_key(|t| std::cmp::Reverse(t.1));
                     let top_str: Vec<String> = top
                         .iter()
                         .take(5)

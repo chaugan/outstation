@@ -1,7 +1,7 @@
 # outstation
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
-[![Rust](https://img.shields.io/badge/rust-1.75%2B-orange.svg)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/rust-1.85%2B-orange.svg)](https://www.rust-lang.org)
 [![Linux](https://img.shields.io/badge/platform-linux-informational.svg)](#requirements)
 
 A stateful SCADA traffic simulator for Linux that replays captured IEC 60870-5-104 traces as live TCP sessions on the wire — one session per captured RTU — with per-message latency metrics and post-run fidelity verification. Built for benchmarking and regression-testing SCADA systems with real captured RTU traffic.
@@ -598,7 +598,7 @@ outstation/
 
 - Linux 5.10+ with `veth`, `AF_PACKET`, and `bridge-nf` available.
 - Root or `CAP_NET_ADMIN + CAP_NET_RAW` ambient capabilities.
-- Rust 1.75+ (stable).
+- Rust 1.85+ (stable).
 - `iproute2` (`ip` command), `iptables`, `ethtool` in `$PATH`.
 
 ## Safety and scope

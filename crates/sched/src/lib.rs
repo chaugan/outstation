@@ -381,10 +381,7 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
             });
         }
     }
-    let total_planned: u64 = workers
-        .iter()
-        .map(|w| w.packet_indices.len() as u64)
-        .sum();
+    let total_planned: u64 = workers.iter().map(|w| w.packet_indices.len() as u64).sum();
     ctx.planned.store(total_planned, Ordering::Relaxed);
 
     if cfg.startup_delay_secs > 0 {
@@ -433,10 +430,7 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         let pcap = Arc::clone(&pcap);
         let thread_name = match ip {
             Some(i) => format!("replay-{i}"),
-            None => format!(
-                "replay-l2-{:02x}{:02x}{:02x}",
-                mac[3], mac[4], mac[5]
-            ),
+            None => format!("replay-l2-{:02x}{:02x}{:02x}", mac[3], mac[4], mac[5]),
         };
         let cancel_flag = Arc::clone(&ctx.cancel);
         let global_sent = Arc::clone(&ctx.sent);
@@ -790,7 +784,10 @@ pub fn run_benchmark(
     //    killed run so bridge/veth create calls don't trip on conflict.
     let reclaimed = reclaim_stale(&cfg.bridge_name, &cfg.tap_prefix).unwrap_or(0);
     if reclaimed > 0 {
-        info!(count = reclaimed, "reclaimed stale interfaces before benchmark");
+        info!(
+            count = reclaimed,
+            "reclaimed stale interfaces before benchmark"
+        );
     }
     let mut topo = Topology::new(&cfg.bridge_name);
     topo.create_bridge().context("create bridge")?;
@@ -806,10 +803,9 @@ pub fn run_benchmark(
     // SCADA-gateway mode: claim the gateway IP on the inner NIC (the
     // one facing the isolated vSwitch SCADA sits on) and optionally
     // enable upstream NAT. Held until the run ends; Drop undoes it.
-    let _gateway_guard = if let (Some(gw_ip), Some(inner)) = (
-        cfg.scada_gateway_ip,
-        cfg.scada_gateway_iface.as_deref(),
-    ) {
+    let _gateway_guard = if let (Some(gw_ip), Some(inner)) =
+        (cfg.scada_gateway_ip, cfg.scada_gateway_iface.as_deref())
+    {
         let state_path = cfg
             .alias_state_path
             .clone()
@@ -922,18 +918,15 @@ pub fn run_benchmark(
     for (i, p) in picks.iter().enumerate() {
         let effective_src_ip = master_override.unwrap_or(p.client_ip);
         let bridge_side = format!("{}b{}", cfg.tap_prefix, i);
-        let inject_side = match topo.add_port_with_ip(
-            &bridge_side,
-            Some(p.client_mac),
-            Some(effective_src_ip),
-        ) {
-            Ok(inj) => inj,
-            Err(e) => {
-                warn!(error = %e, iface = %bridge_side, "add_port_with_ip failed");
-                topo.teardown().ok();
-                return Err(e);
-            }
-        };
+        let inject_side =
+            match topo.add_port_with_ip(&bridge_side, Some(p.client_mac), Some(effective_src_ip)) {
+                Ok(inj) => inj,
+                Err(e) => {
+                    warn!(error = %e, iface = %bridge_side, "add_port_with_ip failed");
+                    topo.teardown().ok();
+                    return Err(e);
+                }
+            };
         bindings.push(SessionBinding {
             pick_idx: i,
             src_ip: effective_src_ip,
@@ -1062,8 +1055,10 @@ pub fn run_benchmark(
             .name(format!("bench-{src_ip}"))
             .spawn(move || {
                 // Stagger start if requested.
-                if matches!(cfg_cloned.concurrency, ConcurrencyModel::StaggeredPcapTiming)
-                    && first_pkt_rel_ns > 0
+                if matches!(
+                    cfg_cloned.concurrency,
+                    ConcurrencyModel::StaggeredPcapTiming
+                ) && first_pkt_rel_ns > 0
                 {
                     let wait = Duration::from_nanos(first_pkt_rel_ns);
                     sleep_interruptible(wait, &ctx_worker.cancel);
@@ -1072,10 +1067,8 @@ pub fn run_benchmark(
                     {
                         let sp = ctx_worker.per_source.lock().unwrap();
                         if let Some(p) = sp.get(worker_idx) {
-                            p.state.store(
-                                protoplay::session_state::CANCELLED,
-                                Ordering::Relaxed,
-                            );
+                            p.state
+                                .store(protoplay::session_state::CANCELLED, Ordering::Relaxed);
                         }
                     }
                     return SessionReport {
@@ -1113,7 +1106,9 @@ pub fn run_benchmark(
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
-                        sp.get(worker_idx).map(|p| p.is_cancelled()).unwrap_or(false)
+                        sp.get(worker_idx)
+                            .map(|p| p.is_cancelled())
+                            .unwrap_or(false)
                     };
                     if ctx_worker.is_cancelled() || session_cancelled {
                         cancelled_mid_run = true;
@@ -1348,7 +1343,7 @@ fn run_benchmark_slave(
     {
         let mut sp = ctx.per_source.lock().unwrap();
         sp.clear();
-        for (_i, p) in picks.iter().enumerate() {
+        for p in picks.iter() {
             // All listeners share the same port; the RTU IP is the
             // discriminator. Binds don't collide because listen_ip is
             // unique per session.
@@ -1379,10 +1374,9 @@ fn run_benchmark_slave(
     // gateway IP so SCADA's SYNs to off-subnet slave IPs land on us
     // instead of being routed into the void, and optionally NAT
     // SCADA's non-capture egress out a second NIC.
-    let _gateway_guard = if let (Some(gw_ip), Some(inner)) = (
-        cfg.scada_gateway_ip,
-        cfg.scada_gateway_iface.as_deref(),
-    ) {
+    let _gateway_guard = if let (Some(gw_ip), Some(inner)) =
+        (cfg.scada_gateway_ip, cfg.scada_gateway_iface.as_deref())
+    {
         let state_path = cfg
             .alias_state_path
             .clone()
@@ -1475,14 +1469,14 @@ fn run_benchmark_slave(
                         } else {
                             "slave cancelled before start"
                         };
-                        let mut pr = protoplay::ProtoReport::default();
-                        pr.error = Some(msg.into());
+                        let pr = protoplay::ProtoReport {
+                            error: Some(msg.into()),
+                            ..Default::default()
+                        };
                         let sp = ctx_worker.per_source.lock().unwrap();
                         if let Some(p) = sp.get(worker_idx) {
-                            p.state.store(
-                                protoplay::session_state::CANCELLED,
-                                Ordering::Relaxed,
-                            );
+                            p.state
+                                .store(protoplay::session_state::CANCELLED, Ordering::Relaxed);
                         }
                         drop(sp);
                         return SessionReport {
@@ -1594,7 +1588,9 @@ fn run_benchmark_slave(
                 for iter_idx in 0..target_iters {
                     let session_cancelled = {
                         let sp = ctx_worker.per_source.lock().unwrap();
-                        sp.get(worker_idx).map(|p| p.is_cancelled()).unwrap_or(false)
+                        sp.get(worker_idx)
+                            .map(|p| p.is_cancelled())
+                            .unwrap_or(false)
                     };
                     if ctx_worker.is_cancelled() || session_cancelled {
                         cancelled_mid_run = true;

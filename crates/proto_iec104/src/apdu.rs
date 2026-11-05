@@ -29,19 +29,11 @@ pub const U_TESTFR_CON: u8 = 0x83;
 pub enum Apdu {
     /// Information frame: carries an ASDU. Sequence numbers N(S) and
     /// N(R) are owned by the live session, not the pcap.
-    I {
-        ns: u16,
-        nr: u16,
-        asdu: Vec<u8>,
-    },
+    I { ns: u16, nr: u16, asdu: Vec<u8> },
     /// Supervisory frame: pure ACK for received I-frames.
-    S {
-        nr: u16,
-    },
+    S { nr: u16 },
     /// Unnumbered frame: STARTDT/STOPDT/TESTFR in either act or con.
-    U {
-        code: u8,
-    },
+    U { code: u8 },
 }
 
 impl Apdu {
@@ -137,7 +129,7 @@ impl<R: Read> ApduReader<R> {
             }
             if self.buf.len() >= 2 {
                 let need = 2 + self.buf[1] as usize;
-                if need < 2 + APCI_LEN || need > 2 + MAX_APDU_LEN {
+                if !(2 + APCI_LEN..=2 + MAX_APDU_LEN).contains(&need) {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("bad APDU length {}", self.buf[1]),
@@ -198,12 +190,19 @@ mod tests {
 
     #[test]
     fn roundtrip_u_startdt() {
-        let a = Apdu::U { code: U_STARTDT_ACT };
+        let a = Apdu::U {
+            code: U_STARTDT_ACT,
+        };
         let bytes = a.serialize();
         // IEC 104 STARTDT act APCI: 07 00 00 00
         assert_eq!(&bytes, &[START_BYTE, 4, U_STARTDT_ACT, 0, 0, 0]);
         let parsed = Apdu::parse(&bytes[2..]).unwrap();
-        assert!(matches!(parsed, Apdu::U { code: U_STARTDT_ACT }));
+        assert!(matches!(
+            parsed,
+            Apdu::U {
+                code: U_STARTDT_ACT
+            }
+        ));
     }
 
     #[test]
@@ -220,7 +219,12 @@ mod tests {
     #[test]
     fn reader_frames_multiple_apdus() {
         let mut stream = Vec::new();
-        stream.extend_from_slice(&Apdu::U { code: U_STARTDT_CON }.serialize());
+        stream.extend_from_slice(
+            &Apdu::U {
+                code: U_STARTDT_CON,
+            }
+            .serialize(),
+        );
         stream.extend_from_slice(
             &Apdu::I {
                 ns: 1,
@@ -232,7 +236,12 @@ mod tests {
         stream.extend_from_slice(&Apdu::S { nr: 3 }.serialize());
         let mut r = ApduReader::new(&stream[..]);
         let a = r.next_apdu().unwrap().unwrap();
-        assert!(matches!(a, Apdu::U { code: U_STARTDT_CON }));
+        assert!(matches!(
+            a,
+            Apdu::U {
+                code: U_STARTDT_CON
+            }
+        ));
         let a = r.next_apdu().unwrap().unwrap();
         assert!(matches!(a, Apdu::I { ns: 1, nr: 2, .. }));
         let a = r.next_apdu().unwrap().unwrap();

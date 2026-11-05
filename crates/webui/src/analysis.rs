@@ -193,12 +193,14 @@ fn find_busiest_captured_flow(
 ) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (idx, flow) in captured.flows.iter().enumerate() {
-        let Some((ip, sp)) = flow.server else { continue };
+        let Some((ip, sp)) = flow.server else {
+            continue;
+        };
         if sp != target_port || ip != server_ip {
             continue;
         }
         let pkts = flow.packet_indices.len();
-        if best.map_or(true, |(_, p)| pkts > p) {
+        if best.is_none_or(|(_, p)| pkts > p) {
             best = Some((idx, pkts));
         }
     }
@@ -241,12 +243,14 @@ fn find_original_flow_for_slave(
 ) -> Option<usize> {
     let mut best: Option<(usize, usize)> = None;
     for (idx, flow) in original.flows.iter().enumerate() {
-        let Some((ip, sp)) = flow.server else { continue };
+        let Some((ip, sp)) = flow.server else {
+            continue;
+        };
         if sp != target_port || ip != slave_ip {
             continue;
         }
         let pkts = flow.packet_indices.len();
-        if best.map_or(true, |(_, p)| pkts > p) {
+        if best.is_none_or(|(_, p)| pkts > p) {
             best = Some((idx, pkts));
         }
     }
@@ -363,8 +367,7 @@ pub fn analyze(
 
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
 
-    let iteration_starts_ms =
-        detect_iteration_starts(&captured, target_port, fleet.slave_count);
+    let iteration_starts_ms = detect_iteration_starts(&captured, target_port, fleet.slave_count);
 
     // Fleet-wide drift timeline is protocol-driven: the replayer pulls
     // whatever drift series it cares about from each slave's
@@ -376,8 +379,7 @@ pub fn analyze(
     let fleet_drift_timeline =
         replayer.aggregate_fleet_drift(&per_slave_proto, &iteration_starts_ms);
 
-    let fleet_pacing_timeline =
-        build_fleet_pacing_timeline(&details, &iteration_starts_ms);
+    let fleet_pacing_timeline = build_fleet_pacing_timeline(&details, &iteration_starts_ms);
 
     Ok(AnalysisReport {
         run_id,
@@ -421,7 +423,7 @@ fn build_fleet_pacing_timeline(
 
     let decimated = total_samples > MAX_FLEET_TIMELINE_POINTS;
     let kept: Vec<[f64; 2]> = if decimated {
-        let stride = (total_samples + MAX_FLEET_TIMELINE_POINTS - 1) / MAX_FLEET_TIMELINE_POINTS;
+        let stride = total_samples.div_ceil(MAX_FLEET_TIMELINE_POINTS);
         all.iter().step_by(stride).map(|&(t, d)| [t, d]).collect()
     } else {
         all.iter().map(|&(t, d)| [t, d]).collect()
@@ -550,7 +552,8 @@ fn analyze_one_slave(
             // protocol's impl will produce a "not_attempted"-shaped
             // report. Passing original lets it at least record the
             // expected message count.
-            let (orig_pb, orig_tg) = pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
+            let (orig_pb, orig_tg) =
+                pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
             let analysis = replayer.analyze_flow(
                 orig_pb.map(snapshot),
                 None,
@@ -558,9 +561,8 @@ fn analyze_one_slave(
                 None,
                 ctx,
             );
-            let verdict_reason = format!(
-                "no TCP flow on port {target_port} for slave {slave_ip} in captured pcap"
-            );
+            let verdict_reason =
+                format!("no TCP flow on port {target_port} for slave {slave_ip} in captured pcap");
             let detail = SlaveDetail {
                 tcp_flow: None,
                 protocol_specific: analysis.protocol_specific,
@@ -654,9 +656,7 @@ fn pick_playback_target<'a>(
     }
 }
 
-fn roll_up_fleet(
-    slaves: &[SlaveSummary],
-) -> (FleetSummary, &'static str, String, f64) {
+fn roll_up_fleet(slaves: &[SlaveSummary]) -> (FleetSummary, &'static str, String, f64) {
     let slave_count = slaves.len();
     let attempted = slaves.iter().filter(|s| s.packets > 0).count();
     let not_attempted = slave_count.saturating_sub(attempted);
@@ -735,10 +735,7 @@ fn roll_up_fleet(
     } else if failed == attempted {
         (
             "failed",
-            format!(
-                "all {} attempted slaves produced 0 messages",
-                attempted
-            ),
+            format!("all {} attempted slaves produced 0 messages", attempted),
         )
     } else {
         let na_tail = if not_attempted > 0 {

@@ -16,7 +16,10 @@ use raw_replay::{plan_for_source, run_plan, try_set_realtime, Pace, RawReplayer}
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
-#[command(name = "replay", about = "Replay one source from a pcap onto an interface")]
+#[command(
+    name = "replay",
+    about = "Replay one source from a pcap onto an interface"
+)]
 struct Cli {
     /// Pcap file to read.
     #[arg(long)]

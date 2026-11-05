@@ -57,6 +57,12 @@ pub struct AppState {
     db: Db,
 }
 
+impl Default for AppState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl AppState {
     pub fn new() -> Self {
         let library_dir = std::env::var("OUTSTATION_LIBRARY_DIR")
@@ -189,7 +195,10 @@ fn runstate_to_stored(rs: &RunState) -> StoredRun {
         sent: rs.sent,
         bytes: rs.bytes_progress,
         error: rs.error.clone(),
-        report_json: rs.report.as_ref().and_then(|r| serde_json::to_string(r).ok()),
+        report_json: rs
+            .report
+            .as_ref()
+            .and_then(|r| serde_json::to_string(r).ok()),
         benchmark_json: rs
             .benchmark
             .as_ref()
@@ -244,10 +253,7 @@ fn stored_to_runstate(s: &StoredRun) -> Option<RunState> {
         mode,
         role,
         target_port: s.target_port,
-        proto: s
-            .proto
-            .clone()
-            .unwrap_or_else(default_proto_name),
+        proto: s.proto.clone().unwrap_or_else(default_proto_name),
         proto_config: s.proto_config.clone(),
         planned: s.planned,
         sent: s.sent,
@@ -485,7 +491,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/:id/slaves/:idx/start", post(api_run_start_slave))
         .route("/api/runs/:id/slaves/:idx/stop", post(api_run_stop_slave))
         .route("/api/runs/:id/slaves/:idx", patch(api_run_patch_slave))
-        .route("/api/runs/:id/slaves/start_all", post(api_run_start_all_slaves))
+        .route(
+            "/api/runs/:id/slaves/start_all",
+            post(api_run_start_all_slaves),
+        )
         .route("/api/verify-ip", post(api_verify_ip))
         .route("/api/nics", get(api_nics))
         .route("/api/arp", post(api_arp))
@@ -1274,17 +1283,10 @@ async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocket) {
             // Resize the per-session window vec to match the current
             // session count (may grow as workers spawn).
             if session_wins.len() != rs.per_source_progress.len() {
-                session_wins.resize_with(
-                    rs.per_source_progress.len(),
-                    SessionRateWindow::default,
-                );
+                session_wins.resize_with(rs.per_source_progress.len(), SessionRateWindow::default);
             }
 
-            let total_recv: u64 = rs
-                .per_source_progress
-                .iter()
-                .map(|p| p.received)
-                .sum();
+            let total_recv: u64 = rs.per_source_progress.iter().map(|p| p.received).sum();
             global_win.push(now, rs.sent, total_recv);
             let (pps_sent, pps_recv) = global_win.pps();
 
@@ -1476,7 +1478,9 @@ async fn api_run_start_all_slaves(
     let total = sp.len() as u64;
     drop(sp);
     info!(id, started, total, "slave start-all requested");
-    Ok(Json(serde_json::json!({ "started": started, "total": total })))
+    Ok(Json(
+        serde_json::json!({ "started": started, "total": total }),
+    ))
 }
 
 async fn api_run_stop_slave(
@@ -1597,9 +1601,7 @@ async fn api_verify_ip(Json(req): Json<VerifyIpReq>) -> Result<Json<VerifyIpResp
 
     // arping -D -c 2 -w 2 -I <iface> <ip>
     let out = std::process::Command::new("arping")
-        .args([
-            "-D", "-c", "2", "-w", "2", "-I", &iface, &ip.to_string(),
-        ])
+        .args(["-D", "-c", "2", "-w", "2", "-I", &iface, &ip.to_string()])
         .output();
     let out = match out {
         Ok(o) => o,
@@ -1610,7 +1612,9 @@ async fn api_verify_ip(Json(req): Json<VerifyIpReq>) -> Result<Json<VerifyIpResp
                 in_use: false,
                 locally_assigned: false,
                 mac: None,
-                error: Some(format!("arping not available: {e}. apt install iputils-arping")),
+                error: Some(format!(
+                    "arping not available: {e}. apt install iputils-arping"
+                )),
             }));
         }
     };
@@ -1619,9 +1623,8 @@ async fn api_verify_ip(Json(req): Json<VerifyIpReq>) -> Result<Json<VerifyIpResp
     // arping -D with iputils semantics: exit 1 means "someone replied
     // (conflict)", exit 0 means "no reply". Also parse the stdout —
     // presence of "Unicast reply" or "reply from" is a strong signal.
-    let in_use = !out.status.success()
-        || stdout.contains("reply from")
-        || stdout.contains("Unicast reply");
+    let in_use =
+        !out.status.success() || stdout.contains("reply from") || stdout.contains("Unicast reply");
     let mac = extract_mac(&stdout).or_else(|| extract_mac(&stderr));
     Ok(Json(VerifyIpResp {
         ip: ip.to_string(),
@@ -1715,7 +1718,8 @@ async fn api_analyze(
             vs.into_iter().next()
         }
     };
-    let rs = picked.ok_or_else(|| AppError::NotFound("no completed run to analyze against".into()))?;
+    let rs =
+        picked.ok_or_else(|| AppError::NotFound("no completed run to analyze against".into()))?;
 
     if rs.mode != "benchmark" {
         return Err(AppError::BadRequest(
@@ -1735,8 +1739,7 @@ async fn api_analyze(
     std::fs::create_dir_all(&tmp_dir)
         .map_err(|e| AppError::Internal(format!("create tmp: {e}")))?;
     let tmp_path = tmp_dir.join(format!("capt_{}.pcap", rs.id));
-    std::fs::write(&tmp_path, &bytes)
-        .map_err(|e| AppError::Internal(format!("write tmp: {e}")))?;
+    std::fs::write(&tmp_path, &bytes).map_err(|e| AppError::Internal(format!("write tmp: {e}")))?;
 
     // Look up the replayer for this run's protocol. The analyzer
     // dispatches CP56 / ASDU / handshake logic through the replayer's
@@ -1782,13 +1785,12 @@ struct NicJson {
 }
 
 async fn api_nics() -> Result<Json<Vec<NicJson>>, AppError> {
-    let nics =
-        netctl::list_nics().map_err(|e| AppError::Internal(format!("list nics: {e}")))?;
+    let nics = netctl::list_nics().map_err(|e| AppError::Internal(format!("list nics: {e}")))?;
     let out = nics
         .into_iter()
         .map(|n| NicJson {
             name: n.name,
-            mac: n.mac.map(|m| netctl::format_mac(m)),
+            mac: n.mac.map(netctl::format_mac),
             ipv4: n.ipv4.into_iter().map(|ip| ip.to_string()).collect(),
             up: n.up,
             loopback: n.loopback,
@@ -1829,13 +1831,11 @@ async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, AppError> {
 
     // If the IP is one of our own local addresses, return the local MAC immediately.
     if let Some(local_iface) = find_local_ip_iface(&ip) {
-        let mac = netctl::list_nics()
-            .ok()
-            .and_then(|nics| {
-                nics.into_iter()
-                    .find(|n| n.name == local_iface)
-                    .and_then(|n| n.mac.map(netctl::format_mac))
-            });
+        let mac = netctl::list_nics().ok().and_then(|nics| {
+            nics.into_iter()
+                .find(|n| n.name == local_iface)
+                .and_then(|n| n.mac.map(netctl::format_mac))
+        });
         return Ok(Json(ArpResp {
             ip: ip.to_string(),
             iface: local_iface,
@@ -1854,7 +1854,9 @@ async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, AppError> {
                 ip: ip.to_string(),
                 iface,
                 mac: None,
-                error: Some(format!("arping not available: {e}. apt install iputils-arping")),
+                error: Some(format!(
+                    "arping not available: {e}. apt install iputils-arping"
+                )),
             }));
         }
     };
@@ -1899,7 +1901,10 @@ fn find_local_ip_iface(ip: &Ipv4Addr) -> Option<String> {
         let Some(addr_cidr) = it.next() else {
             continue;
         };
-        let addr = addr_cidr.split_once('/').map(|(a, _)| a).unwrap_or(addr_cidr);
+        let addr = addr_cidr
+            .split_once('/')
+            .map(|(a, _)| a)
+            .unwrap_or(addr_cidr);
         if addr == target {
             return Some(iface.trim_end_matches(':').to_string());
         }
@@ -1912,15 +1917,11 @@ fn extract_mac(s: &str) -> Option<String> {
     let bytes = s.as_bytes();
     for i in 0..bytes.len().saturating_sub(16) {
         let slice = &s[i..i + 17];
-        if slice
-            .chars()
-            .enumerate()
-            .all(|(j, c)| match j % 3 {
-                0 | 1 => c.is_ascii_hexdigit(),
-                2 => c == ':',
-                _ => false,
-            })
-        {
+        if slice.chars().enumerate().all(|(j, c)| match j % 3 {
+            0 | 1 => c.is_ascii_hexdigit(),
+            2 => c == ':',
+            _ => false,
+        }) {
             return Some(slice.to_lowercase());
         }
     }
@@ -1967,7 +1968,7 @@ fn bucket_gaps(packets: &[pcapload::Packet]) -> Vec<u64> {
     if packets.len() < 2 {
         return buckets;
     }
-    let min_log = (1_000f64).log10();        // 1 µs  = 10^3 ns
+    let min_log = (1_000f64).log10(); // 1 µs  = 10^3 ns
     let max_log = (10_000_000_000f64).log10(); // 10 s = 10^10 ns
     for pair in packets.windows(2) {
         let gap = pair[1].ts_ns.saturating_sub(pair[0].ts_ns);
@@ -2038,8 +2039,8 @@ async fn api_run_download(
             .and_then(|r| r.report.as_ref().and_then(|rep| rep.capture_path.clone()))
             .ok_or_else(|| AppError::NotFound(format!("no capture for run {id}")))?
     };
-    let bytes = std::fs::read(&path)
-        .map_err(|e| AppError::Internal(format!("read {path:?}: {e}")))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| AppError::Internal(format!("read {path:?}: {e}")))?;
     let fname = std::path::Path::new(&path)
         .file_name()
         .and_then(|s| s.to_str())
@@ -2092,7 +2093,10 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
         Err(e) => warn!(error = %e, "reclaim_recorded_aliases failed"),
     }
     match netctl::reclaim_stale("pcr_br0", "pcr_") {
-        Ok(n) if n > 0 => warn!(count = n, "reclaimed {n} stale pcr_* interface(s) at startup"),
+        Ok(n) if n > 0 => warn!(
+            count = n,
+            "reclaimed {n} stale pcr_* interface(s) at startup"
+        ),
         Ok(_) => {}
         Err(e) => warn!(error = %e, "reclaim_stale failed"),
     }
@@ -2102,7 +2106,10 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
     // Any rows left in status=running are from a process that died
     // without updating them. Mark them failed so the UI doesn't think
     // they're still in flight, then reload everything.
-    match state.db.mark_orphans_failed("interrupted by server restart") {
+    match state
+        .db
+        .mark_orphans_failed("interrupted by server restart")
+    {
         Ok(n) if n > 0 => warn!(count = n, "marked {n} orphaned run(s) as failed at startup"),
         Ok(_) => {}
         Err(e) => warn!(error = %e, "mark_orphans_failed failed"),
@@ -2120,9 +2127,7 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
                 }
             }
             drop(map);
-            state
-                .next_id
-                .store(max_id + 1, Ordering::SeqCst);
+            state.next_id.store(max_id + 1, Ordering::SeqCst);
             info!(count = stored.len(), "restored runs from sqlite");
         }
         Err(e) => warn!(error = %e, "load_all failed"),
@@ -2296,8 +2301,8 @@ fn quick_inspect(path: &StdPath) -> QuickInspect {
                 non_ip_sources: p.non_ip_sources.len() as u64,
                 tcp_flows: p.flows.len() as u64,
                 duration_ms: (p.last_ts_ns.saturating_sub(p.first_ts_ns)) as f64 / 1e6,
-                pcap_start_unix_ms: (p.first_ts_ns > 0).then(|| p.first_ts_ns / 1_000_000),
-                pcap_end_unix_ms: (p.last_ts_ns > 0).then(|| p.last_ts_ns / 1_000_000),
+                pcap_start_unix_ms: (p.first_ts_ns > 0).then_some(p.first_ts_ns / 1_000_000),
+                pcap_end_unix_ms: (p.last_ts_ns > 0).then_some(p.last_ts_ns / 1_000_000),
                 mac_collisions,
                 viability: Some(viability),
             }
@@ -2332,14 +2337,18 @@ struct LoadedPcapAdapter<'a> {
 
 impl<'a> protoplay::LoadedPcapView for LoadedPcapAdapter<'a> {
     fn flows(&self) -> Box<dyn Iterator<Item = protoplay::FlowView> + '_> {
-        Box::new(self.inner.flows.iter().enumerate().map(|(idx, f)| {
-            protoplay::FlowView {
-                flow_idx: idx,
-                client: f.client,
-                server: f.server,
-                saw_syn: f.saw_syn,
-            }
-        }))
+        Box::new(
+            self.inner
+                .flows
+                .iter()
+                .enumerate()
+                .map(|(idx, f)| protoplay::FlowView {
+                    flow_idx: idx,
+                    client: f.client,
+                    server: f.server,
+                    saw_syn: f.saw_syn,
+                }),
+        )
     }
     fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64) {
         let cb = self
@@ -2386,13 +2395,10 @@ fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
     // Today only IEC 104 is wired in. When a future caller supplies
     // the protocol name (e.g. taken from the upload metadata), look
     // it up via proto_registry::lookup(name) instead and dispatch.
-    let replayer = proto_registry::lookup("iec104")
-        .expect("iec104 replayer always registered");
+    let replayer = proto_registry::lookup("iec104").expect("iec104 replayer always registered");
     let proto = replayer.quick_viability(&view, file_size);
     viability_from_proto(proto)
 }
-
-#[allow(dead_code)]
 
 #[allow(dead_code)]
 async fn api_library_list(State(state): State<AppState>) -> Json<Vec<LibraryEntry>> {
@@ -2413,7 +2419,7 @@ async fn api_library_list(State(state): State<AppState>) -> Json<Vec<LibraryEntr
             out.push(e);
         }
     }
-    out.sort_by(|a, b| b.uploaded_at_ms.cmp(&a.uploaded_at_ms));
+    out.sort_by_key(|e| std::cmp::Reverse(e.uploaded_at_ms));
     Json(out)
 }
 
@@ -2494,8 +2500,7 @@ async fn api_library_upload(
         mac_collisions: 0,
         viability: None,
     };
-    save_library_entry(dir, &pending)
-        .map_err(|e| AppError::Internal(format!("sidecar: {e}")))?;
+    save_library_entry(dir, &pending).map_err(|e| AppError::Internal(format!("sidecar: {e}")))?;
     info!(id = %pending.id, name = %pending.name, size_bytes, "pcap uploaded, analysis spawning");
 
     // Spawn the analyzer. Cheap pcaps finish before the user
@@ -2617,8 +2622,8 @@ async fn api_library_download(
     let dir: &StdPath = state.library_dir.as_ref();
     let path = library_pcap_path(dir, &id)?;
     let entry = load_library_entry(dir, &id);
-    let bytes = std::fs::read(&path)
-        .map_err(|e| AppError::Internal(format!("read {path:?}: {e}")))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| AppError::Internal(format!("read {path:?}: {e}")))?;
     let fname = entry
         .map(|e| e.name)
         .unwrap_or_else(|| format!("{id}.pcap"));

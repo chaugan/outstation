@@ -13,9 +13,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// Create a Linux bridge and bring it up.
-    CreateBridge {
-        name: String,
-    },
+    CreateBridge { name: String },
     /// Create a persistent TAP, optionally set its MAC, enslave to a bridge, and bring it up.
     AddTap {
         name: String,
@@ -25,18 +23,11 @@ enum Cmd {
         mac: Option<String>,
     },
     /// Set the MAC of an existing interface.
-    SetMac {
-        iface: String,
-        mac: String,
-    },
+    SetMac { iface: String, mac: String },
     /// Delete an interface.
-    Delete {
-        name: String,
-    },
+    Delete { name: String },
     /// List interfaces whose name starts with PREFIX.
-    ListPrefix {
-        prefix: String,
-    },
+    ListPrefix { prefix: String },
     /// End-to-end sanity check: create a bridge + N taps, show state, tear down.
     Demo {
         #[arg(long, default_value = "prtest_br0")]

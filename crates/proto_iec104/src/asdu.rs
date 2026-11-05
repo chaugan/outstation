@@ -67,15 +67,21 @@ impl RewriteMap {
         let raw: RawRewriteMap = serde_json::from_str(json)?;
         let mut out = Self::default();
         for (k, v) in raw.common_address {
-            let k: u16 = k.parse().map_err(|e| anyhow::anyhow!("bad common_address key {k}: {e}"))?;
+            let k: u16 = k
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad common_address key {k}: {e}"))?;
             out.common_address.insert(k, v);
         }
         for (k, v) in raw.cot {
-            let k: u8 = k.parse().map_err(|e| anyhow::anyhow!("bad cot key {k}: {e}"))?;
+            let k: u8 = k
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad cot key {k}: {e}"))?;
             out.cot.insert(k, v);
         }
         for (k, v) in raw.ioa {
-            let k: u32 = k.parse().map_err(|e| anyhow::anyhow!("bad ioa key {k}: {e}"))?;
+            let k: u32 = k
+                .parse()
+                .map_err(|e| anyhow::anyhow!("bad ioa key {k}: {e}"))?;
             out.ioa.insert(k, v);
         }
         Ok(out)
@@ -121,45 +127,45 @@ pub fn write_ioa(asdu: &mut [u8], offset: usize, ioa: u32) {
 pub fn element_len(type_id: u8) -> Option<usize> {
     // Only the types we can walk safely. Names are from IEC 60870-5-101.
     Some(match type_id {
-        1   => 1,        // M_SP_NA_1 — SIQ
-        2   => 1 + 3,    // M_SP_TA_1 — SIQ + CP24Time2a
-        3   => 1,        // M_DP_NA_1 — DIQ
-        4   => 1 + 3,    // M_DP_TA_1 — DIQ + CP24
-        5   => 1 + 1,    // M_ST_NA_1 — VTI + QDS
-        6   => 1 + 1 + 3,// M_ST_TA_1 — VTI + QDS + CP24
-        7   => 4 + 1,    // M_BO_NA_1 — BSI + QDS
-        8   => 4 + 1 + 3,// M_BO_TA_1 — BSI + QDS + CP24
-        9   => 2 + 1,    // M_ME_NA_1 — NVA + QDS
-        10  => 2 + 1 + 3,// M_ME_TA_1 — NVA + QDS + CP24
-        11  => 2 + 1,    // M_ME_NB_1 — SVA + QDS
-        12  => 2 + 1 + 3,// M_ME_TB_1 — SVA + QDS + CP24
-        13  => 4 + 1,    // M_ME_NC_1 — float + QDS
-        14  => 4 + 1 + 3,// M_ME_TC_1 — float + QDS + CP24
-        15  => 4 + 1,    // M_IT_NA_1 — BCR
-        16  => 4 + 1 + 3,// M_IT_TA_1 — BCR + CP24
-        30  => 1 + 7,    // M_SP_TB_1 — SIQ + CP56Time2a
-        31  => 1 + 7,    // M_DP_TB_1 — DIQ + CP56
-        32  => 1 + 1 + 7,// M_ST_TB_1 — VTI + QDS + CP56
-        33  => 4 + 1 + 7,// M_BO_TB_1 — BSI + QDS + CP56
-        34  => 2 + 1 + 7,// M_ME_TD_1 — NVA + QDS + CP56
-        35  => 2 + 1 + 7,// M_ME_TE_1 — SVA + QDS + CP56
-        36  => 4 + 1 + 7,// M_ME_TF_1 — float + QDS + CP56
-        37  => 4 + 1 + 7,// M_IT_TB_1 — BCR + CP56
-        45  => 1,        // C_SC_NA_1 — SCO
-        46  => 1,        // C_DC_NA_1 — DCO
-        47  => 1,        // C_RC_NA_1 — RCO
-        48  => 2 + 1,    // C_SE_NA_1 — NVA + QOS
-        49  => 2 + 1,    // C_SE_NB_1 — SVA + QOS
-        50  => 4 + 1,    // C_SE_NC_1 — float + QOS
-        51  => 4,        // C_BO_NA_1 — BSI
-        58  => 1 + 7,    // C_SC_TA_1 — SCO + CP56
-        59  => 1 + 7,    // C_DC_TA_1 — DCO + CP56
-        60  => 1 + 7,    // C_RC_TA_1 — RCO + CP56
-        61  => 2 + 1 + 7,// C_SE_TA_1 — NVA + QOS + CP56
-        62  => 2 + 1 + 7,// C_SE_TB_1 — SVA + QOS + CP56
-        63  => 4 + 1 + 7,// C_SE_TC_1 — float + QOS + CP56
-        64  => 4 + 7,    // C_BO_TA_1 — BSI + CP56
-        70  => 1,        // M_EI_NA_1 — COI
+        1 => 1,          // M_SP_NA_1 — SIQ
+        2 => 1 + 3,      // M_SP_TA_1 — SIQ + CP24Time2a
+        3 => 1,          // M_DP_NA_1 — DIQ
+        4 => 1 + 3,      // M_DP_TA_1 — DIQ + CP24
+        5 => 1 + 1,      // M_ST_NA_1 — VTI + QDS
+        6 => 1 + 1 + 3,  // M_ST_TA_1 — VTI + QDS + CP24
+        7 => 4 + 1,      // M_BO_NA_1 — BSI + QDS
+        8 => 4 + 1 + 3,  // M_BO_TA_1 — BSI + QDS + CP24
+        9 => 2 + 1,      // M_ME_NA_1 — NVA + QDS
+        10 => 2 + 1 + 3, // M_ME_TA_1 — NVA + QDS + CP24
+        11 => 2 + 1,     // M_ME_NB_1 — SVA + QDS
+        12 => 2 + 1 + 3, // M_ME_TB_1 — SVA + QDS + CP24
+        13 => 4 + 1,     // M_ME_NC_1 — float + QDS
+        14 => 4 + 1 + 3, // M_ME_TC_1 — float + QDS + CP24
+        15 => 4 + 1,     // M_IT_NA_1 — BCR
+        16 => 4 + 1 + 3, // M_IT_TA_1 — BCR + CP24
+        30 => 1 + 7,     // M_SP_TB_1 — SIQ + CP56Time2a
+        31 => 1 + 7,     // M_DP_TB_1 — DIQ + CP56
+        32 => 1 + 1 + 7, // M_ST_TB_1 — VTI + QDS + CP56
+        33 => 4 + 1 + 7, // M_BO_TB_1 — BSI + QDS + CP56
+        34 => 2 + 1 + 7, // M_ME_TD_1 — NVA + QDS + CP56
+        35 => 2 + 1 + 7, // M_ME_TE_1 — SVA + QDS + CP56
+        36 => 4 + 1 + 7, // M_ME_TF_1 — float + QDS + CP56
+        37 => 4 + 1 + 7, // M_IT_TB_1 — BCR + CP56
+        45 => 1,         // C_SC_NA_1 — SCO
+        46 => 1,         // C_DC_NA_1 — DCO
+        47 => 1,         // C_RC_NA_1 — RCO
+        48 => 2 + 1,     // C_SE_NA_1 — NVA + QOS
+        49 => 2 + 1,     // C_SE_NB_1 — SVA + QOS
+        50 => 4 + 1,     // C_SE_NC_1 — float + QOS
+        51 => 4,         // C_BO_NA_1 — BSI
+        58 => 1 + 7,     // C_SC_TA_1 — SCO + CP56
+        59 => 1 + 7,     // C_DC_TA_1 — DCO + CP56
+        60 => 1 + 7,     // C_RC_TA_1 — RCO + CP56
+        61 => 2 + 1 + 7, // C_SE_TA_1 — NVA + QOS + CP56
+        62 => 2 + 1 + 7, // C_SE_TB_1 — SVA + QOS + CP56
+        63 => 4 + 1 + 7, // C_SE_TC_1 — float + QOS + CP56
+        64 => 4 + 7,     // C_BO_TA_1 — BSI + CP56
+        70 => 1,         // M_EI_NA_1 — COI
         100 => 1,        // C_IC_NA_1 — QOI
         101 => 1,        // C_CI_NA_1 — QCC
         102 => 0,        // C_RD_NA_1 — no element
@@ -259,9 +265,9 @@ pub fn cp56_offset_in_element(type_id: u8) -> Option<usize> {
     // Every CP56-bearing type in the table above ends its element with
     // 7 bytes of CP56Time2a, so the offset is element_len - 7.
     match type_id {
-        30 | 31 | 32 | 33 | 34 | 35 | 36 | 37
-        | 58 | 59 | 60 | 61 | 62 | 63 | 64
-        | 103 | 107 => element_len(type_id).map(|e| e - 7),
+        30 | 31 | 32 | 33 | 34 | 35 | 36 | 37 | 58 | 59 | 60 | 61 | 62 | 63 | 64 | 103 | 107 => {
+            element_len(type_id).map(|e| e - 7)
+        }
         _ => None,
     }
 }
@@ -323,7 +329,15 @@ fn break_local(unix_secs: i64) -> (u32, u32, u32, u32, u32, u32, bool) {
 /// SU (DST) flag and return the Unix epoch seconds they represent.
 /// Uses `libc::mktime`, which respects the server's local timezone
 /// and `tm_isdst` when resolving ambiguous times at DST boundaries.
-fn assemble_local(year: u32, month: u32, day: u32, hour: u32, minute: u32, second: u32, su: bool) -> i64 {
+fn assemble_local(
+    year: u32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+    second: u32,
+    su: bool,
+) -> i64 {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = year as i32 - 1900;
     tm.tm_mon = month as i32 - 1;
@@ -425,14 +439,14 @@ fn dow_from_ymd(year: u32, month: u32, day: u32) -> u8 {
     // Adapted from days_from_civil.
     let y = if month <= 2 { year - 1 } else { year } as i64;
     let era = y.div_euclid(400);
-    let yoe = (y - era * 400) as i64;
+    let yoe = y - era * 400;
     let m_adj = if month > 2 { month - 3 } else { month + 9 } as i64;
     let doy = (153 * m_adj + 2) / 5 + day as i64 - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     let days = era * 146_097 + doe - 719_468;
     // 1970-01-01 was a Thursday (4 in ISO). Mon=1..Sun=7.
-    let d = ((days + 3).rem_euclid(7) + 1) as u8;
-    d
+
+    ((days + 3).rem_euclid(7) + 1) as u8
 }
 
 /// Decode a CP56Time2a field back to (unix_ns, iv, su). Used by the
@@ -559,11 +573,7 @@ pub fn rewrite_cp56time2a_to_now(asdu: &mut [u8], now_unix_ns: u64) -> usize {
 ///
 /// IV (invalid) is always preserved from the source ASDU so
 /// data-quality semantics survive the rewrite regardless of zone.
-pub fn rewrite_cp56time2a_to_now_zoned(
-    asdu: &mut [u8],
-    now_unix_ns: u64,
-    zone: Cp56Zone,
-) -> usize {
+pub fn rewrite_cp56time2a_to_now_zoned(asdu: &mut [u8], now_unix_ns: u64, zone: Cp56Zone) -> usize {
     if asdu.len() < DUI_LEN {
         return 0;
     }
@@ -686,7 +696,9 @@ impl Iec104ProtoConfig {
     /// `"null"`, `"{}"`, missing `cp56` sub-object — all default to
     /// a no-rewrite local-zone config.
     pub fn parse(proto_config: Option<&str>) -> Self {
-        let Some(s) = proto_config else { return Self::default() };
+        let Some(s) = proto_config else {
+            return Self::default();
+        };
         let trimmed = s.trim();
         if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
             return Self::default();
@@ -696,7 +708,7 @@ impl Iec104ProtoConfig {
 }
 
 /// Convenience for tests and callers that already hold a map in memory.
-pub fn rewrite_or_skip(asdu: &mut Vec<u8>, map: &RewriteMap) -> Result<usize> {
+pub fn rewrite_or_skip(asdu: &mut [u8], map: &RewriteMap) -> Result<usize> {
     if asdu.len() < DUI_LEN {
         bail!("asdu too short: {} bytes", asdu.len());
     }
@@ -709,7 +721,9 @@ mod tests {
 
     #[test]
     fn rewrite_empty_map_is_noop() {
-        let mut asdu = vec![0x0d, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut asdu = vec![
+            0x0d, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        ];
         let orig = asdu.clone();
         let map = RewriteMap::default();
         assert_eq!(rewrite_asdu(&mut asdu, &map), 0);
@@ -736,10 +750,15 @@ mod tests {
     #[test]
     fn rewrite_cot_preserves_flags() {
         let mut asdu = vec![
-            1, 0x01,
-            0xC0 | 6, 0x00, // COT=6 with both P/N and T flags set
-            0x01, 0x00,
-            0x02, 0x00, 0x00,
+            1,
+            0x01,
+            0xC0 | 6,
+            0x00, // COT=6 with both P/N and T flags set
+            0x01,
+            0x00,
+            0x02,
+            0x00,
+            0x00,
             0x00,
         ];
         let mut map = RewriteMap::default();
@@ -778,12 +797,10 @@ mod tests {
             13,   // type
             0x84, // SQ=1, N=4
             0x03, 0x00, 0x01, 0x00, // COT=3, CA=1
-            0x0a, 0x00, 0x00,       // base IOA=10
+            0x0a, 0x00, 0x00, // base IOA=10
             // 4 elements × 5 bytes each
-            0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
         ];
         let mut map = RewriteMap::default();
         map.ioa.insert(10, 500);
@@ -873,7 +890,12 @@ mod tests {
         let b = encode_cp56time2a_local(PI_DAY_2024_NS, false);
         let (ns, iv) = decode_cp56time2a_local(&b);
         let diff_ms = (ns as i128 - PI_DAY_2024_NS as i128).abs() / 1_000_000;
-        assert!(diff_ms < 2, "round-trip diff = {} ms (bytes={:x?})", diff_ms, b);
+        assert!(
+            diff_ms < 2,
+            "round-trip diff = {} ms (bytes={:x?})",
+            diff_ms,
+            b
+        );
         assert!(!iv);
         // SU byte reflects whatever the server TZ thinks about DST
         // for 2024-03-14; we don't assert a specific value because the
@@ -893,9 +915,7 @@ mod tests {
         // In Utc mode rewrite_cp56time2a_to_now_zoned must produce the
         // same bytes as the plain rewriter when the source SU bit is 0.
         let mut a = vec![
-            103, 0x01, 0x06, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x00,
-            0, 0, 0, 0, 0, 0, 0,
+            103, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0, 0, 0, 0, 0, 0, 0,
         ];
         let mut b = a.clone();
         let n1 = rewrite_cp56time2a_to_now(&mut a, PI_DAY_2024_NS);
@@ -910,8 +930,7 @@ mod tests {
         // derive SU from the current timezone's DST state for the
         // encoded moment.
         let mut asdu = vec![
-            103, 0x01, 0x06, 0x00, 0x01, 0x00,
-            0x00, 0x00, 0x00,
+            103, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
             // Source CP56 with SU=1 and garbage time
             0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00,
         ];
@@ -951,7 +970,7 @@ mod tests {
         assert_eq!(cp56_offset_in_element(58), Some(1)); // SCO + CP56
         assert_eq!(cp56_offset_in_element(64), Some(4)); // BSI + CP56
         assert_eq!(cp56_offset_in_element(103), Some(0)); // bare CP56
-        // CP24 types intentionally not touched.
+                                                          // CP24 types intentionally not touched.
         assert_eq!(cp56_offset_in_element(2), None);
         assert_eq!(cp56_offset_in_element(14), None);
         // Untimed types
@@ -964,8 +983,8 @@ mod tests {
         // Type 36 (M_ME_TF_1): float (4) + QDS (1) + CP56 (7) per element.
         // SQ=0, N=3 → 3 separate (IOA + element) groups.
         let mut asdu = vec![
-            36,    // type
-            0x03,  // VSQ: SQ=0, N=3
+            36,   // type
+            0x03, // VSQ: SQ=0, N=3
             0x03, 0x00, // COT
             0x01, 0x00, // CA
         ];
@@ -974,7 +993,7 @@ mod tests {
             asdu.extend_from_slice(&[(i as u8 + 1), 0, 0]); // IOA
             asdu.extend_from_slice(&[0u8; 4]); // float
             asdu.push(0x00); // QDS
-            // CP56 stamp: pre-fill with marker so we can prove it changed
+                             // CP56 stamp: pre-fill with marker so we can prove it changed
             asdu.extend_from_slice(&[0xFF; 7]);
         }
         let pre = asdu.clone();
@@ -984,14 +1003,20 @@ mod tests {
         for (idx, off_in_obj) in [(0, 6), (1, 21), (2, 36)].iter() {
             // first 8 bytes of each object (IOA + float + QDS) untouched
             for k in 0..8usize {
-                assert_eq!(asdu[off_in_obj + k], pre[off_in_obj + k],
-                    "object {idx}: byte {k} changed");
+                assert_eq!(
+                    asdu[off_in_obj + k],
+                    pre[off_in_obj + k],
+                    "object {idx}: byte {k} changed"
+                );
             }
             // last 7 bytes (CP56) replaced
             let cp_start = off_in_obj + 8;
             let stamp: [u8; 7] = asdu[cp_start..cp_start + 7].try_into().unwrap();
             let (ns, _, _) = decode_cp56time2a(&stamp);
-            assert_eq!(ns, PI_DAY_2024_NS, "object {idx} CP56 not equal to expected");
+            assert_eq!(
+                ns, PI_DAY_2024_NS,
+                "object {idx} CP56 not equal to expected"
+            );
         }
     }
 
@@ -1000,8 +1025,7 @@ mod tests {
         // Type 30 (M_SP_TB_1): SIQ (1) + CP56 (7) = 8 bytes per element.
         // SQ=1, N=4 → one IOA, then 4 elements back-to-back.
         let mut asdu = vec![
-            30,
-            0x84, // SQ=1, N=4
+            30, 0x84, // SQ=1, N=4
             0x03, 0x00, // COT
             0x01, 0x00, // CA
             0x10, 0x00, 0x00, // base IOA = 16
@@ -1026,8 +1050,7 @@ mod tests {
     fn rewrite_cp56_type103_clock_sync() {
         // Type 103 (C_CS_NA_1): just CP56, no other fields.
         let mut asdu = vec![
-            103,
-            0x01, // SQ=0, N=1
+            103, 0x01, // SQ=0, N=1
             0x06, 0x00, // COT
             0x01, 0x00, // CA
             0x00, 0x00, 0x00, // IOA = 0
@@ -1045,12 +1068,9 @@ mod tests {
     fn rewrite_cp56_type58_command_with_time() {
         // Type 58 (C_SC_TA_1): SCO (1) + CP56 (7).
         let mut asdu = vec![
-            58,
-            0x01, // SQ=0, N=1
-            0x06, 0x00,
-            0x01, 0x00,
-            0x05, 0x00, 0x00, // IOA
-            0x81,             // SCO
+            58, 0x01, // SQ=0, N=1
+            0x06, 0x00, 0x01, 0x00, 0x05, 0x00, 0x00, // IOA
+            0x81, // SCO
             0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
         ];
         let rewrites = rewrite_cp56time2a_to_now(&mut asdu, PI_DAY_2024_NS);
@@ -1064,15 +1084,12 @@ mod tests {
     #[test]
     fn rewrite_cp56_preserves_iv_and_su_per_element() {
         // Type 36, SQ=0, N=2: first element IV=1, second element SU=1.
-        let mut asdu = vec![
-            36, 0x02,
-            0x03, 0x00, 0x01, 0x00,
-        ];
+        let mut asdu = vec![36, 0x02, 0x03, 0x00, 0x01, 0x00];
         // Object 1: IOA + payload + CP56 with IV=1
         asdu.extend_from_slice(&[0x01, 0x00, 0x00]);
         asdu.extend_from_slice(&[0u8; 5]); // float + QDS
         asdu.extend_from_slice(&[0x00, 0x00, 0x80, 0x00, 0x00, 0x00, 0x00]); // CP56 with IV bit set
-        // Object 2: IOA + payload + CP56 with SU=1
+                                                                             // Object 2: IOA + payload + CP56 with SU=1
         asdu.extend_from_slice(&[0x02, 0x00, 0x00]);
         asdu.extend_from_slice(&[0u8; 5]);
         asdu.extend_from_slice(&[0x00, 0x00, 0x00, 0x80, 0x00, 0x00, 0x00]); // CP56 with SU bit set
@@ -1101,10 +1118,8 @@ mod tests {
     fn rewrite_cp56_skips_cp24_types() {
         // Type 2 (M_SP_TA_1): SIQ + CP24Time2a — should NOT be touched.
         let mut asdu = vec![
-            2, 0x01,
-            0x03, 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x00, // IOA
-            0x42,             // SIQ
+            2, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, // IOA
+            0x42, // SIQ
             0xAA, 0xBB, 0xCC, // CP24
         ];
         let pre = asdu.clone();
@@ -1116,12 +1131,7 @@ mod tests {
     #[test]
     fn rewrite_cp56_untimed_type_is_noop() {
         // Type 1 (M_SP_NA_1): no time tag at all.
-        let mut asdu = vec![
-            1, 0x01,
-            0x03, 0x00, 0x01, 0x00,
-            0x01, 0x00, 0x00,
-            0x42,
-        ];
+        let mut asdu = vec![1, 0x01, 0x03, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x42];
         let pre = asdu.clone();
         let rewrites = rewrite_cp56time2a_to_now(&mut asdu, PI_DAY_2024_NS);
         assert_eq!(rewrites, 0);
@@ -1132,14 +1142,9 @@ mod tests {
     fn unknown_type_rewrites_first_ioa_only() {
         // Type 200 is not in the table. SQ=0, N=2.
         let mut asdu = vec![
-            200,
-            0x02,
-            0x03, 0x00, 0x01, 0x00,
-            0x0a, 0x00, 0x00,
+            200, 0x02, 0x03, 0x00, 0x01, 0x00, 0x0a, 0x00, 0x00,
             // unknown-length body — we don't touch this
-            0xff, 0xff,
-            0x0b, 0x00, 0x00,
-            0xff, 0xff,
+            0xff, 0xff, 0x0b, 0x00, 0x00, 0xff, 0xff,
         ];
         let mut map = RewriteMap::default();
         map.ioa.insert(10, 999);

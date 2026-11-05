@@ -38,7 +38,10 @@ fn main() {
     // the registry and the UI bundle stay in lockstep without a central
     // list to keep in sync.
     let mut js_files: Vec<PathBuf> = Vec::new();
-    for entry in fs::read_dir(workspace_crates).expect("read crates/").flatten() {
+    for entry in fs::read_dir(workspace_crates)
+        .expect("read crates/")
+        .flatten()
+    {
         let path = entry.path();
         if !path.is_dir() {
             continue;
@@ -55,7 +58,10 @@ fn main() {
         }
         // rerun on any addition/removal under this proto's static dir
         println!("cargo:rerun-if-changed={}", static_dir.display());
-        for f in fs::read_dir(&static_dir).unwrap_or_else(|_| panic!("read {:?}", static_dir)).flatten() {
+        for f in fs::read_dir(&static_dir)
+            .unwrap_or_else(|_| panic!("read {:?}", static_dir))
+            .flatten()
+        {
             let p = f.path();
             if p.extension().and_then(|s| s.to_str()) == Some("js") {
                 println!("cargo:rerun-if-changed={}", p.display());
@@ -80,7 +86,8 @@ fn main() {
 
     let out_path = out_dir.join("index.html");
     let mut f = fs::File::create(&out_path).expect("create OUT_DIR/index.html");
-    f.write_all(expanded.as_bytes()).expect("write expanded html");
+    f.write_all(expanded.as_bytes())
+        .expect("write expanded html");
 }
 
 /// Assemble the substituted `<script>` fragment. Emits one wrapped
@@ -107,7 +114,7 @@ fn build_bundle(js_files: &[PathBuf]) -> String {
         if !body.ends_with('\n') {
             out.push('\n');
         }
-        out.push_str("\n");
+        out.push('\n');
     }
     out.push_str("</script>\n");
     out

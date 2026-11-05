@@ -110,8 +110,7 @@ impl RawReplayer {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error())
-                .context("socket(AF_PACKET, SOCK_RAW)");
+            return Err(io::Error::last_os_error()).context("socket(AF_PACKET, SOCK_RAW)");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
@@ -128,8 +127,7 @@ impl RawReplayer {
             )
         };
         if rc < 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("bind to {iface}"));
+            return Err(io::Error::last_os_error()).with_context(|| format!("bind to {iface}"));
         }
         debug!(iface, ifindex, "AF_PACKET bound");
         Ok(Self {
@@ -173,8 +171,7 @@ fn if_nametoindex(iface: &str) -> Result<i32> {
     let c = CString::new(iface).context("iface name contains nul byte")?;
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
-        return Err(anyhow!(io::Error::last_os_error())
-            .context(format!("if_nametoindex({iface})")));
+        return Err(anyhow!(io::Error::last_os_error()).context(format!("if_nametoindex({iface})")));
     }
     Ok(idx as i32)
 }
@@ -335,10 +332,7 @@ pub fn try_set_realtime(priority: i32) {
 
 /// Build a [`Plan`] from a loaded pcap filtered to one source IP.
 /// Returns the plan plus the number of frames it contains.
-pub fn plan_for_source(
-    pcap: &pcapload::LoadedPcap,
-    src_ip: std::net::Ipv4Addr,
-) -> Result<Plan> {
+pub fn plan_for_source(pcap: &pcapload::LoadedPcap, src_ip: std::net::Ipv4Addr) -> Result<Plan> {
     let src = pcap
         .sources
         .get(&src_ip)

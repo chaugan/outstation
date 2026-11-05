@@ -26,9 +26,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// List the sources and TCP flows found in a pcap.
-    ListSources {
-        pcap: PathBuf,
-    },
+    ListSources { pcap: PathBuf },
     /// List all registered protocol-aware replayer modules.
     ListProtocols,
     /// Replay a pcap. Every IPv4 source gets its own TAP on an
@@ -42,8 +40,6 @@ enum Cmd {
         bind: std::net::SocketAddr,
     },
 }
-
-
 
 #[derive(clap::Args)]
 struct RunArgs {
@@ -109,36 +105,43 @@ fn main() -> Result<()> {
     match cli.cmd {
         Cmd::ListSources { pcap } => {
             let p = load(&pcap)?;
-            println!("{} sources, {} flows, {} packets, {} non-ip",
-                p.sources.len(), p.flows.len(), p.packets.len(), p.non_ip_count);
+            println!(
+                "{} sources, {} flows, {} packets, {} non-ip",
+                p.sources.len(),
+                p.flows.len(),
+                p.packets.len(),
+                p.non_ip_count
+            );
             for (ip, s) in &p.sources {
                 println!(
                     "  {:<15} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  {:>8} pkts  {:>3} flows{}",
                     ip,
-                    s.src_mac[0], s.src_mac[1], s.src_mac[2],
-                    s.src_mac[3], s.src_mac[4], s.src_mac[5],
+                    s.src_mac[0],
+                    s.src_mac[1],
+                    s.src_mac[2],
+                    s.src_mac[3],
+                    s.src_mac[4],
+                    s.src_mac[5],
                     s.packet_count,
                     s.flow_indices.len(),
-                    if s.mac_collision { "  MAC collision" } else { "" }
+                    if s.mac_collision {
+                        "  MAC collision"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
         Cmd::ListProtocols => {
             let registry = proto_registry::build();
-            println!(
-                "{:<20} {:<8} {}",
-                "name", "status", "well-known ports"
-            );
+            println!("{:<20} {:<8} well-known ports", "name", "status");
             for m in &registry {
                 let status = match m.readiness() {
                     protoplay::Readiness::Ready => "ready",
                     protoplay::Readiness::Stub => "stub",
                 };
-                let ports: Vec<String> = m
-                    .well_known_ports()
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect();
+                let ports: Vec<String> =
+                    m.well_known_ports().iter().map(|p| p.to_string()).collect();
                 println!("{:<20} {:<8} {}", m.name(), status, ports.join(","));
             }
         }
@@ -147,9 +150,7 @@ fn main() -> Result<()> {
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(async move {
-                webui::serve(bind).await
-            })?;
+            rt.block_on(async move { webui::serve(bind).await })?;
         }
     }
     Ok(())

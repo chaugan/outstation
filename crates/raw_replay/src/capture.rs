@@ -79,8 +79,7 @@ impl Capture {
             );
         }
 
-        let file = File::create(&path)
-            .with_context(|| format!("create capture file {path:?}"))?;
+        let file = File::create(&path).with_context(|| format!("create capture file {path:?}"))?;
         let mut writer = BufWriter::with_capacity(64 * 1024, file);
         write_global_header(&mut writer)?;
         writer.flush().ok();
@@ -165,8 +164,7 @@ fn if_nametoindex(iface: &str) -> Result<i32> {
     let c = CString::new(iface).context("iface name contains nul byte")?;
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
-        return Err(anyhow!(io::Error::last_os_error())
-            .context(format!("if_nametoindex({iface})")));
+        return Err(anyhow!(io::Error::last_os_error()).context(format!("if_nametoindex({iface})")));
     }
     Ok(idx as i32)
 }

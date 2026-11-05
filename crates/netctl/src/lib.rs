@@ -108,7 +108,14 @@ impl Topology {
             bail!("interface {bridge_side} already exists");
         }
         ip([
-            "link", "add", &bridge_side, "type", "veth", "peer", "name", &inject_side,
+            "link",
+            "add",
+            &bridge_side,
+            "type",
+            "veth",
+            "peer",
+            "name",
+            &inject_side,
         ])?;
         if let Some(mac) = mac {
             set_mac(&bridge_side, mac)?;
@@ -288,7 +295,9 @@ pub fn default_route_iface() -> Result<String> {
 /// subnet (e.g., /24 if the iface is already /24).
 pub fn find_iface_prefix(iface: &str) -> Option<u8> {
     let list = list_local_ipv4().ok()?;
-    list.into_iter().find(|x| x.iface == iface).map(|x| x.prefix)
+    list.into_iter()
+        .find(|x| x.iface == iface)
+        .map(|x| x.prefix)
 }
 
 // ---------------------------------------------------------------------------
@@ -459,13 +468,11 @@ pub fn list_nics() -> Result<Vec<NicSummary>> {
         // detect bridge or veth from the link/<type>
         let is_bridge = after_name.contains("link/ether") && after_name.contains("bridge");
         // mac after `link/ether `
-        let mac = after_name
-            .find("link/ether ")
-            .and_then(|i| {
-                let s = &after_name[i + "link/ether ".len()..];
-                let mac_str: String = s.chars().take(17).collect();
-                parse_mac(&mac_str).ok()
-            });
+        let mac = after_name.find("link/ether ").and_then(|i| {
+            let s = &after_name[i + "link/ether ".len()..];
+            let mac_str: String = s.chars().take(17).collect();
+            parse_mac(&mac_str).ok()
+        });
         let ipv4: Vec<std::net::Ipv4Addr> = local_ipv4
             .iter()
             .filter(|x| x.iface == name)
@@ -658,7 +665,17 @@ fn set_tx_checksum(nic: &str, on: bool) -> Result<()> {
 
 fn install_iptables_drop(bridge: &str) -> Result<()> {
     let out = Command::new("iptables")
-        .args(["-t", "raw", "-I", "PREROUTING", "1", "-i", bridge, "-j", "DROP"])
+        .args([
+            "-t",
+            "raw",
+            "-I",
+            "PREROUTING",
+            "1",
+            "-i",
+            bridge,
+            "-j",
+            "DROP",
+        ])
         .output()
         .context("spawn iptables")?;
     if !out.status.success() {
@@ -974,8 +991,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args: Vec<std::ffi::OsString> =
-        args.into_iter().map(|s| s.as_ref().to_os_string()).collect();
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|s| s.as_ref().to_os_string())
+        .collect();
     let pretty: Vec<String> = args
         .iter()
         .map(|s| s.to_string_lossy().into_owned())

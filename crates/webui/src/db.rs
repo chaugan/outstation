@@ -253,11 +253,8 @@ impl Db {
             let proto: Option<String> = row.get::<_, Option<String>>(23).ok().flatten();
             // Legacy IEC 104 columns. Optional because future schemas
             // may drop them entirely; tolerate absence by mapping to None.
-            let legacy_rewrite: Option<bool> = row
-                .get::<_, Option<i64>>(21)
-                .ok()
-                .flatten()
-                .map(|v| v != 0);
+            let legacy_rewrite: Option<bool> =
+                row.get::<_, Option<i64>>(21).ok().flatten().map(|v| v != 0);
             let legacy_zone: Option<String> = row.get::<_, Option<String>>(22).ok().flatten();
             // Migration: if proto_config is unset but the legacy
             // CP56 columns hold non-default values, synthesise a tiny
@@ -314,10 +311,12 @@ impl Db {
 
     /// Highest existing run id, used to seed the in-memory next-id
     /// counter so new runs don't collide with restored ones.
+    #[allow(dead_code)] // wired up in T04 (next_id seeding, F073)
     pub fn max_id(&self) -> Result<u64> {
         let conn = self.conn.lock().unwrap();
-        let id: i64 = conn
-            .query_row("SELECT COALESCE(MAX(id), 0) FROM runs", [], |row| row.get(0))?;
+        let id: i64 = conn.query_row("SELECT COALESCE(MAX(id), 0) FROM runs", [], |row| {
+            row.get(0)
+        })?;
         Ok(id as u64)
     }
 }

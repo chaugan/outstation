@@ -103,11 +103,7 @@ impl RequestEcho {
 /// a General Interrogation. Returns the ASDUs in the exact order the
 /// slave must put them on the wire. Each ASDU is a `Vec<u8>` ready to
 /// hand to `Apdu::I { asdu, .. }`.
-pub fn build_gi_response(
-    inv: &Inventory,
-    echo: RequestEcho,
-    qoi: u8,
-) -> Vec<Vec<u8>> {
+pub fn build_gi_response(inv: &Inventory, echo: RequestEcho, qoi: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     out.push(build_ic_control(echo, COT_ACT_CON, qoi));
     let cot_data = inrogen_cot_for_qoi(qoi);
@@ -118,11 +114,7 @@ pub fn build_gi_response(
 }
 
 /// Build the full response burst for a Counter Interrogation.
-pub fn build_ci_response(
-    inv: &Inventory,
-    echo: RequestEcho,
-    qcc: u8,
-) -> Vec<Vec<u8>> {
+pub fn build_ci_response(inv: &Inventory, echo: RequestEcho, qcc: u8) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     out.push(build_ci_control(echo, COT_ACT_CON, qcc));
     let cot_data = reqcogen_cot_for_qcc(qcc);
@@ -220,10 +212,7 @@ fn build_data_frames(
         // Find the run of consecutive same-type entries (capped to
         // the per-type byte budget).
         let mut j = i + 1;
-        while j < entries.len()
-            && entries[j].1.type_id == type_id
-            && (j - i) < cap
-        {
+        while j < entries.len() && entries[j].1.type_id == type_id && (j - i) < cap {
             j += 1;
         }
         let n = j - i;
@@ -234,8 +223,7 @@ fn build_data_frames(
         a.push(echo.oa);
         a.push((echo.ca & 0xff) as u8);
         a.push(((echo.ca >> 8) & 0xff) as u8);
-        for k in i..j {
-            let ((_, ioa), entry) = entries[k];
+        for &((_, ioa), entry) in &entries[i..j] {
             let mut ioa_buf = [0u8; IOA_LEN];
             write_ioa(&mut ioa_buf, 0, ioa);
             a.extend_from_slice(&ioa_buf);
@@ -253,7 +241,12 @@ mod tests {
     use crate::inventory::Inventory;
 
     fn echo_for(ca: u16) -> RequestEcho {
-        RequestEcho { ca, oa: 0, test: false, negative: false }
+        RequestEcho {
+            ca,
+            oa: 0,
+            test: false,
+            negative: false,
+        }
     }
 
     /// Build a synthetic ASDU containing one M_ME_NC_1 (type 13)
@@ -327,7 +320,11 @@ mod tests {
         assert_eq!(resp.len(), 9);
         for f in &resp[1..resp.len() - 1] {
             // No ASDU exceeds the APCI byte budget.
-            assert!(f.len() <= MAX_APDU_LEN - APCI_LEN, "frame too big: {}", f.len());
+            assert!(
+                f.len() <= MAX_APDU_LEN - APCI_LEN,
+                "frame too big: {}",
+                f.len()
+            );
         }
         assert_eq!(resp[1][1] & 0x7f, 30);
         assert_eq!(resp[7][1] & 0x7f, 20);
@@ -395,7 +392,12 @@ mod tests {
     #[test]
     fn echoes_ca_oa_and_test_bit() {
         let inv = Inventory::default();
-        let echo = RequestEcho { ca: 0xbeef, oa: 0x42, test: true, negative: false };
+        let echo = RequestEcho {
+            ca: 0xbeef,
+            oa: 0x42,
+            test: true,
+            negative: false,
+        };
         let resp = build_gi_response(&inv, echo, 20);
         let act_con = &resp[0];
         assert_eq!(act_con[3], 0x42); // OA echoed

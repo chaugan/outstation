@@ -107,21 +107,16 @@ pub struct MessageProgress {
 /// defaults to firing as fast as the protocol's flow control allows
 /// (`AsFastAsPossible`); the other variant waits between sends to
 /// match the original pcap's inter-frame cadence.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Pacing {
     /// Pipelined as fast as possible, limited only by the protocol's
     /// own window (e.g., IEC 104 k=12).
+    #[default]
     AsFastAsPossible,
     /// Sleep before each send so frame `i` is emitted at
     /// `session_epoch + frame_times_ns[i] / speed`. Requires the
     /// caller to populate `ProtoRunCfg::frame_times_ns`.
     OriginalTiming { speed: f64 },
-}
-
-impl Default for Pacing {
-    fn default() -> Self {
-        Self::AsFastAsPossible
-    }
 }
 
 /// Which side of the captured conversation the replayer will act as.
@@ -375,11 +370,7 @@ pub trait ProtoReplayer: Send + Sync {
     /// matches any of those ports and produces a verdict from raw
     /// session counts. Protocols that need richer analysis (e.g.
     /// IEC 104's mid-flow vs handshake breakdown) override this.
-    fn quick_viability(
-        &self,
-        p: &dyn LoadedPcapView,
-        file_size_bytes: u64,
-    ) -> ProtoViability {
+    fn quick_viability(&self, p: &dyn LoadedPcapView, file_size_bytes: u64) -> ProtoViability {
         use std::collections::HashSet;
         let ports: &[u16] = self.well_known_ports();
         let mut client_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
@@ -387,9 +378,17 @@ pub trait ProtoReplayer: Send + Sync {
         let mut client_bytes = 0u64;
         let mut server_bytes = 0u64;
         for f in p.flows() {
-            let (sip, sp) = match f.server { Some(x) => x, None => continue };
-            if !ports.contains(&sp) { continue; }
-            let (cip, _) = match f.client { Some(x) => x, None => continue };
+            let (sip, sp) = match f.server {
+                Some(x) => x,
+                None => continue,
+            };
+            if !ports.contains(&sp) {
+                continue;
+            }
+            let (cip, _) = match f.client {
+                Some(x) => x,
+                None => continue,
+            };
             client_ips.insert(cip);
             server_ips.insert(sip);
             let (cb, sb) = p.flow_payload_bytes(f.flow_idx);
@@ -399,12 +398,18 @@ pub trait ProtoReplayer: Send + Sync {
         let m = client_ips.len() as u64;
         let s = server_ips.len() as u64;
         let max_sess = m.max(s);
-        let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
+        let mb = |b: u64| b.div_ceil(1024 * 1024);
         let est = mb(file_size_bytes) + mb(client_bytes.max(server_bytes)) + max_sess * 2 + 32;
         let (verdict, reason): (&str, String) = if max_sess == 0 {
-            ("ok", format!("no flows for protocol {} on ports {:?}", self.name(), ports))
+            (
+                "ok",
+                format!("no flows for protocol {} on ports {:?}", self.name(), ports),
+            )
         } else {
-            ("ok", format!("{} session(s) detected for {}", max_sess, self.name()))
+            (
+                "ok",
+                format!("{} session(s) detected for {}", max_sess, self.name()),
+            )
         };
         ProtoViability {
             client_payload_bytes: client_bytes,
@@ -628,11 +633,12 @@ pub struct FleetDriftTimeline {
 
 /// Boilerplate helper for stub implementations.
 pub fn stub_report(name: &str) -> ProtoReport {
-    let mut r = ProtoReport::default();
-    r.error = Some(format!(
-        "proto_{name} is a v1 stub — fall back to raw or generic TCP session"
-    ));
-    r
+    ProtoReport {
+        error: Some(format!(
+            "proto_{name} is a v1 stub — fall back to raw or generic TCP session"
+        )),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -641,16 +647,22 @@ mod tests {
 
     #[test]
     fn finalize_latency_basic() {
-        let mut r = ProtoReport::default();
-        r.latency_samples_us = (1..=100).collect(); // 1..100 µs uniform
-        r.messages_sent = 100;
-        r.elapsed_ms = 100;
+        let mut r = ProtoReport {
+            latency_samples_us: (1..=100).collect(), // 1..100 µs uniform
+            messages_sent: 100,
+            elapsed_ms: 100,
+            ..Default::default()
+        };
         r.finalize_latency();
         assert_eq!(r.latency_min_us, 1);
         assert_eq!(r.latency_max_us, 100);
         // With 100 evenly-spaced samples, p50 lands around the middle,
         // p99 lands near the top. Exact index is (n-1)*p rounded.
-        assert!(r.latency_p50_us >= 49 && r.latency_p50_us <= 52, "p50 was {}", r.latency_p50_us);
+        assert!(
+            r.latency_p50_us >= 49 && r.latency_p50_us <= 52,
+            "p50 was {}",
+            r.latency_p50_us
+        );
         assert!(r.latency_p99_us >= 98, "p99 was {}", r.latency_p99_us);
         assert_eq!(r.latency_mean_us, 50);
         // 100 messages in 100 ms -> 1000 msg/s
