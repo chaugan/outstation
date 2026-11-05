@@ -2012,3 +2012,62 @@ async fn retention_spares_the_capture_awaiting_analysis() {
     let files = h.files_in("state/captures");
     assert!(!files.contains(&format!("run_{first}.pcap")), "{files:?}");
 }
+
+// ---------------------------------------------------------------------------
+// N23: the live WebSocket stream ends when the client closes it.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_stream_ends_on_client_close() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (s, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = crate::router(h.state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::security::ConnAddrs>(),
+        )
+        .await
+        .unwrap();
+    });
+    let gauge = || {
+        h.state
+            .metrics
+            .live_sockets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for round in 0..3 {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/api/runs/1/live")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", format!("http://{addr}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let first = ws.next().await.unwrap().unwrap();
+        assert!(matches!(first, Message::Text(_)), "{first:?}");
+        assert_eq!(gauge(), 1, "round {round}");
+        // Close, but keep the TCP connection open: the server must
+        // notice the Close itself rather than wait for a failed send.
+        ws.send(Message::Close(None)).await.unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if gauge() == 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "round {round}: server still streaming after Close");
+        drop(ws);
+    }
+    h.call(Method::POST, "/api/runs/1/stop", None).await;
+    h.wait_status(1, "stopped").await;
+}

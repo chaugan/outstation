@@ -68,7 +68,32 @@ impl SessionRateWindow {
     }
 }
 
+/// Counts an open stream in the metrics for as long as it lives.
+struct LiveSocketGauge(std::sync::Arc<crate::metrics::Metrics>);
+
+impl LiveSocketGauge {
+    fn new(m: std::sync::Arc<crate::metrics::Metrics>) -> Self {
+        m.live_sockets
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Self(m)
+    }
+}
+
+impl Drop for LiveSocketGauge {
+    fn drop(&mut self) {
+        self.0
+            .live_sockets
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
+/// Stream frames until the run is terminal, the server shuts down, or
+/// the client goes away. The socket is read between ticks so a Close
+/// (or a dropped connection) ends the stream at once instead of after
+/// the next failed send, which a half-open socket may never produce
+/// (N23, F106).
 pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocket) {
+    let _gauge = LiveSocketGauge::new(state.metrics.clone());
     let interval = std::time::Duration::from_millis(200);
     // Sliding-window rate estimators for the global aggregate and for
     // each per-source session. Indexed by per_source position.
@@ -147,9 +172,19 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
             // state before we close.
             break;
         }
-        tokio::select! {
-            _ = tokio::time::sleep(interval) => {}
-            _ = state.shutdown.cancelled() => break,
+        let tick = tokio::time::sleep(interval);
+        tokio::pin!(tick);
+        loop {
+            tokio::select! {
+                _ = &mut tick => break,
+                _ = state.shutdown.cancelled() => return,
+                msg = socket.recv() => match msg {
+                    // Pings are answered by the WebSocket layer; other
+                    // client messages are ignored.
+                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => return,
+                    Some(Ok(_)) => {}
+                },
+            }
         }
     }
 }

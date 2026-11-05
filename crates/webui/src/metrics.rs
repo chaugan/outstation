@@ -61,6 +61,8 @@ pub(crate) struct Metrics {
     pub(crate) uploads_ok: AtomicU64,
     pub(crate) uploads_failed: AtomicU64,
     pub(crate) analyses_running: AtomicU64,
+    /// Open live-progress WebSockets (N23).
+    pub(crate) live_sockets: AtomicU64,
     /// `[source][ok=0 / error=1]`, this process only.
     analyses: [[AtomicU64; 2]; 3],
     /// Taken by the scrape and by run deletion (before any run lock).
@@ -478,6 +480,12 @@ pub(crate) fn render(state: &AppState, health: &Health) -> String {
         "gauge",
         "Analyses in progress.",
         m.analyses_running.load(Ordering::Relaxed) as f64,
+    );
+    o.one(
+        "outstation_live_websockets",
+        "gauge",
+        "Open live-progress WebSocket streams.",
+        m.live_sockets.load(Ordering::Relaxed) as f64,
     );
     if let Ok(counts) = state.db.analysis_counts() {
         o.head(
