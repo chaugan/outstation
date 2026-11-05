@@ -32,6 +32,7 @@
 
 mod analysis;
 mod analysis_run;
+pub mod bench;
 mod captures;
 mod cleanup;
 mod compare;

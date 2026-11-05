@@ -1,6 +1,6 @@
 //! Top-level `outstation` binary — the user-facing CLI: pcap
-//! inspection, a synchronous `run`, the web UI (`serve`) and host
-//! cleanup (`cleanup`).
+//! inspection, a synchronous `run`, the web UI (`serve`), a headless
+//! benchmark with assertions (`bench`) and host cleanup (`cleanup`).
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -35,6 +35,11 @@ enum Cmd {
     Run(RunArgs),
     /// Start the web UI (axum backend + embedded SPA).
     Serve(ServeArgs),
+    /// Run one benchmark headless (same code path as the web UI),
+    /// analyse its own capture, check assertions and write a JSON
+    /// report. Exit 0 = all assertions passed, 1 = an assertion
+    /// failed, 2 = the run failed or was interrupted.
+    Bench(BenchArgs),
     /// Undo host network changes left by runs (IP aliases, bridges,
     /// veths and, once available, iptables/sysctl state). Safe to run
     /// at any time; used as the systemd unit's ExecStopPost.
@@ -74,6 +79,53 @@ struct ServeArgs {
     /// OUTSTATION_CAPTURE_MAX_MB.
     #[arg(long, value_name = "MIB")]
     capture_max_mb: Option<u64>,
+
+    /// Do not analyse finished benchmark runs automatically. Also
+    /// OUTSTATION_AUTO_ANALYZE=0.
+    #[arg(long)]
+    no_auto_analyze: bool,
+}
+
+#[derive(clap::Args)]
+struct BenchArgs {
+    /// Source pcap. Without it, the profile's `pcap_id` is looked up in
+    /// `<state-dir>/library`.
+    #[arg(long)]
+    pcap: Option<PathBuf>,
+
+    /// Run request JSON: a `POST /api/run` body or a profile exported
+    /// from `GET /api/profiles/:id`. `mode` defaults to benchmark.
+    #[arg(long)]
+    profile: PathBuf,
+
+    /// Assertion `<metric><op><number>`, repeatable. Metrics: score,
+    /// p50_ms, p90_ms, p99_ms, max_ms, throughput, sessions_failed,
+    /// delivered_pct, verdict_failures. Ops: >=, <=, ==, >, <.
+    #[arg(long = "assert", value_name = "EXPR", value_parser = parse_assertion)]
+    asserts: Vec<webui::bench::Assertion>,
+
+    /// Write the JSON report here (`-` = stdout).
+    #[arg(long)]
+    report: Option<PathBuf>,
+
+    /// State directory for host-state journals and captures (default:
+    /// parent of OUTSTATION_LIBRARY_DIR, i.e. /var/lib/outstation).
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Mirror capture path (default
+    /// `<state-dir>/captures/bench_<run id>.pcap`).
+    #[arg(long)]
+    capture: Option<PathBuf>,
+
+    /// Analyse in "correct" mode: the target is the device recorded in
+    /// the pcap, so its replies are compared byte for byte too.
+    #[arg(long)]
+    correct: bool,
+}
+
+fn parse_assertion(s: &str) -> Result<webui::bench::Assertion, String> {
+    s.parse()
 }
 
 #[derive(clap::Args)]
@@ -203,10 +255,17 @@ fn main() -> Result<()> {
             if let Some(mb) = args.capture_max_mb {
                 cfg.capture_max_total_bytes = mb.saturating_mul(1024 * 1024);
             }
+            if args.no_auto_analyze {
+                cfg.auto_analyze = false;
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
             rt.block_on(async move { webui::serve(cfg).await })?;
+        }
+        Cmd::Bench(args) => {
+            let code = bench_cmd(args);
+            std::process::exit(code);
         }
         Cmd::Cleanup { state_dir } => {
             let dir = state_dir.unwrap_or_else(webui::default_state_dir);
@@ -214,6 +273,29 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn bench_cmd(args: BenchArgs) -> i32 {
+    let opts = webui::bench::BenchOptions {
+        pcap: args.pcap,
+        profile: args.profile,
+        asserts: args.asserts,
+        report: args.report,
+        state_dir: args.state_dir.unwrap_or_else(webui::default_state_dir),
+        capture: args.capture,
+        correct_mode: args.correct,
+    };
+    let mut report = webui::bench::run(&opts);
+    if let Some(path) = &opts.report {
+        if let Err(e) = webui::bench::write_report(path, &report) {
+            eprintln!("error: {e:#}");
+            report.exit_code = webui::bench::EXIT_RUN_ERROR;
+        }
+    }
+    if opts.report.as_deref() != Some(std::path::Path::new("-")) {
+        print!("{}", webui::bench::summary_text(&report));
+    }
+    report.exit_code
 }
 
 fn run_cmd(args: RunArgs) -> Result<()> {
@@ -308,6 +390,53 @@ mod tests {
             .collect();
         assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
         assert_eq!(a.max_upload_mb, Some(10));
+    }
+
+    #[test]
+    fn bench_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "outstation",
+            "bench",
+            "--pcap",
+            "/x.pcap",
+            "--profile",
+            "run.json",
+            "--assert",
+            "score>=99",
+            "--assert",
+            "p99_ms<=500",
+            "--assert",
+            "sessions_failed==0",
+            "--report",
+            "out.json",
+            "--state-dir",
+            "/s",
+        ])
+        .unwrap();
+        let Cmd::Bench(b) = cli.cmd else {
+            panic!("not bench")
+        };
+        assert_eq!(b.asserts.len(), 3);
+        assert_eq!(b.asserts[1].to_string(), "p99_ms<=500");
+        assert_eq!(b.report, Some(PathBuf::from("out.json")));
+        assert_eq!(b.state_dir, Some(PathBuf::from("/s")));
+        // A bad assertion is a usage error before anything runs.
+        assert!(Cli::try_parse_from([
+            "outstation",
+            "bench",
+            "--profile",
+            "r.json",
+            "--assert",
+            "latency<1"
+        ])
+        .is_err());
+        let Cmd::Serve(a) = Cli::try_parse_from(["outstation", "serve", "--no-auto-analyze"])
+            .unwrap()
+            .cmd
+        else {
+            panic!("not serve")
+        };
+        assert!(a.no_auto_analyze);
     }
 
     #[test]
