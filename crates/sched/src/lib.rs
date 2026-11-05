@@ -1111,6 +1111,136 @@ pub struct BenchmarkConfig {
     /// Slave-only: replay the script `iterations` times inside a
     /// single TCP session instead of reconnecting per iteration.
     pub loop_within_session: bool,
+    /// Master-only: pause between two iterations of a session (each
+    /// iteration is one connection), whatever the pacing. Connect
+    /// failures of an unbounded run back off from here. See
+    /// [`IterationPolicy`].
+    pub iteration_gap: Duration,
+}
+
+/// Default [`BenchmarkConfig::iteration_gap`].
+pub const DEFAULT_ITERATION_GAP: Duration = Duration::from_secs(1);
+/// Longest wait between reconnect attempts of an unbounded master run
+/// whose target refuses or does not answer.
+pub const MAX_CONNECT_BACKOFF: Duration = Duration::from_secs(30);
+/// Base of the connect backoff when the configured gap is shorter.
+const MIN_CONNECT_BACKOFF: Duration = Duration::from_millis(500);
+
+/// How a master session spaces its iterations (O1). Without it an
+/// unbounded run on a short capture reconnected 8-12 times a second:
+/// each iteration ended right after its last I-frame was acknowledged.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct IterationPolicy {
+    /// Shortest iteration, measured from its start: with original
+    /// timing, the captured flow's span (first to last packet, either
+    /// direction) divided by the speed, so the server's trailing
+    /// traffic gets its time too. Zero otherwise.
+    pub min_iteration: Duration,
+    /// Pause after every iteration (but the last).
+    pub gap: Duration,
+    /// Unbounded runs retry a connection that failed, backing off
+    /// exponentially (from `max(gap, 500 ms)`, doubling, capped at
+    /// [`MAX_CONNECT_BACKOFF`]). Bounded runs stop at the first error.
+    pub retry_connect: bool,
+}
+
+impl IterationPolicy {
+    /// The policy of a master session of `cfg` whose captured flow
+    /// spans `flow_span_ns`.
+    pub fn for_master(cfg: &BenchmarkConfig, flow_span_ns: u64) -> Self {
+        let min_iteration = match cfg.pacing {
+            protoplay::Pacing::OriginalTiming { speed } if speed > 0.0 && speed.is_finite() => {
+                Duration::from_secs_f64(flow_span_ns as f64 / 1e9 / speed)
+            }
+            _ => Duration::ZERO,
+        };
+        Self {
+            min_iteration,
+            gap: cfg.iteration_gap,
+            retry_connect: cfg.iterations == 0,
+        }
+    }
+
+    /// How long to wait after an iteration that took `elapsed`, with
+    /// `connect_failures` failed connections in a row (0 after a
+    /// successful one).
+    pub fn wait_after(&self, elapsed: Duration, connect_failures: u32) -> Duration {
+        if connect_failures > 0 {
+            let base = self.gap.max(MIN_CONNECT_BACKOFF);
+            let factor = 1u32 << (connect_failures - 1).min(16);
+            return base.saturating_mul(factor).min(MAX_CONNECT_BACKOFF);
+        }
+        self.min_iteration.saturating_sub(elapsed) + self.gap
+    }
+}
+
+/// Outcome of [`master_iterations`].
+#[derive(Debug, Default)]
+pub struct MasterLoopOutcome {
+    pub report: protoplay::ProtoReport,
+    /// Stopped by a cancel (before the planned iterations were done).
+    pub cancelled_mid_run: bool,
+    /// Iterations started, including failed connection attempts.
+    pub attempts: u64,
+}
+
+/// Run up to `target_iters` iterations of one master session with
+/// `run_one(iteration index)`, spaced by `policy`, merging their
+/// reports. Stops at the first error, except a failed connection of a
+/// run that retries ([`IterationPolicy::retry_connect`]), and when
+/// `cancelled` turns true (also during a wait).
+pub fn master_iterations(
+    target_iters: u64,
+    policy: IterationPolicy,
+    cancelled: &dyn Fn() -> bool,
+    mut run_one: impl FnMut(u64) -> protoplay::ProtoReport,
+) -> MasterLoopOutcome {
+    let mut acc = SessionAccumulator::new();
+    let mut out = MasterLoopOutcome::default();
+    let mut connect_failures = 0u32;
+    let mut last_connect_error: Option<String> = None;
+    let mut iter_idx = 0u64;
+    while iter_idx < target_iters {
+        if cancelled() {
+            out.cancelled_mid_run = true;
+            break;
+        }
+        let started = std::time::Instant::now();
+        let r = run_one(iter_idx);
+        out.attempts += 1;
+        let retry = r.error.is_some() && !r.connected && policy.retry_connect;
+        if retry {
+            // Not an iteration: the target was unreachable. Keep only
+            // the error text for the record, and retry later.
+            connect_failures = connect_failures.saturating_add(1);
+            last_connect_error.clone_from(&r.error);
+            warn!(
+                attempt = connect_failures,
+                error = ?r.error,
+                "master: connection failed; retrying after a backoff"
+            );
+        } else {
+            connect_failures = 0;
+            let had_error = r.error.is_some();
+            merge_proto_report(&mut acc, r);
+            iter_idx += 1;
+            if had_error || iter_idx >= target_iters {
+                break;
+            }
+        }
+        let wait = policy.wait_after(started.elapsed(), connect_failures);
+        sleep_interruptible(wait, cancelled);
+    }
+    if cancelled() && iter_idx < target_iters {
+        out.cancelled_mid_run = true;
+    }
+    out.report = acc.into_report();
+    if let (None, Some(e)) = (&out.report.error, last_connect_error) {
+        if !out.report.connected {
+            out.report.error = Some(e);
+        }
+    }
+    out
 }
 
 impl Default for BenchmarkConfig {
@@ -1143,6 +1273,7 @@ impl Default for BenchmarkConfig {
             tcp_nodelay: None,
             selected_endpoints: None,
             loop_within_session: false,
+            iteration_gap: DEFAULT_ITERATION_GAP,
         }
     }
 }
@@ -1477,6 +1608,8 @@ pub fn run_benchmark(
         client_ip: Ipv4Addr,
         client_mac: MacAddr,
         first_pkt_rel_ns: u64,
+        /// First to last packet of the flow, either direction.
+        flow_span_ns: u64,
         payload: Vec<u8>,
         capture_gaps: Vec<usize>,
         frame_times_ns: Vec<u64>,
@@ -1507,6 +1640,13 @@ pub fn run_benchmark(
             .first()
             .map(|i| pcap.packets[*i].rel_ts_ns)
             .unwrap_or(0);
+        let flow_span_ns = flow
+            .packet_indices
+            .iter()
+            .map(|i| pcap.packets[*i].rel_ts_ns)
+            .max()
+            .unwrap_or(0)
+            .saturating_sub(first_pkt_rel_ns);
         match pcap.reassemble_client_payload(idx) {
             Ok(reassembled) => {
                 let frame_times_ns = replayer
@@ -1516,6 +1656,7 @@ pub fn run_benchmark(
                     client_ip,
                     client_mac: src_info.src_mac,
                     first_pkt_rel_ns,
+                    flow_span_ns,
                     capture_gaps: reassembled.gaps.iter().map(|g| g.offset).collect(),
                     payload: reassembled.payload,
                     frame_times_ns,
@@ -1634,6 +1775,7 @@ pub fn run_benchmark(
         let pick = &mut picks[b.pick_idx];
         let flow_idx = pick.flow_idx;
         let first_pkt_rel_ns = pick.first_pkt_rel_ns;
+        let policy = IterationPolicy::for_master(&cfg, pick.flow_span_ns);
         let payload = std::mem::take(&mut pick.payload);
         let capture_gaps = std::mem::take(&mut pick.capture_gaps);
         let frame_times_ns = std::mem::take(&mut pick.frame_times_ns);
@@ -1683,13 +1825,7 @@ pub fn run_benchmark(
                 let started_at_ns = now_ns();
                 info!(%src_ip, flow_idx, bytes = payload.len(), "benchmark session starting");
                 let target_iters = effective_iterations(cfg_w.iterations);
-                let mut acc = SessionAccumulator::new();
-                let mut cancelled_mid_run = false;
-                for iter_idx in 0..target_iters {
-                    if cancelled() {
-                        cancelled_mid_run = true;
-                        break;
-                    }
+                let outcome = master_iterations(target_iters, policy, &cancelled, |iter_idx| {
                     sp.begin_iteration(iter_idx + 1);
                     let run_cfg = ProtoRunCfg {
                         bind_ip: src_ip,
@@ -1721,13 +1857,10 @@ pub fn run_benchmark(
                     ctx_w
                         .bytes
                         .fetch_add(iter_report.bytes_written, Ordering::Relaxed);
-                    let had_error = iter_report.error.is_some();
-                    merge_proto_report(&mut acc, iter_report);
-                    if had_error {
-                        break;
-                    }
-                }
-                let pr = acc.into_report();
+                    iter_report
+                });
+                let cancelled_mid_run = outcome.cancelled_mid_run;
+                let pr = outcome.report;
                 let cancelled = finish_session(&ctx_w, &sp, &pr, cancelled_mid_run);
                 info!(
                     %src_ip,
@@ -2698,5 +2831,175 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(validate_run_cfg(&cfg).unwrap().bridge, "pcr5_br");
+    }
+
+    fn ok_report(sent: u64) -> protoplay::ProtoReport {
+        protoplay::ProtoReport {
+            connected: true,
+            messages_sent: sent,
+            ..Default::default()
+        }
+    }
+
+    fn refused() -> protoplay::ProtoReport {
+        protoplay::ProtoReport {
+            error: Some("connect(10.0.0.1:2404): Connection refused".into()),
+            ..Default::default()
+        }
+    }
+
+    /// O1: original timing makes an iteration last at least the flow's
+    /// span / speed, and every pacing mode leaves the gap in between.
+    #[test]
+    fn iteration_policy_honours_flow_span_and_gap() {
+        let cfg = BenchmarkConfig {
+            pacing: protoplay::Pacing::OriginalTiming { speed: 2.0 },
+            iterations: 0,
+            ..Default::default()
+        };
+        let p = IterationPolicy::for_master(&cfg, 3_000_000_000);
+        assert_eq!(p.min_iteration, Duration::from_millis(1500));
+        assert_eq!(p.gap, DEFAULT_ITERATION_GAP);
+        assert!(p.retry_connect);
+        // A 200 ms iteration waits out the span, then the gap.
+        assert_eq!(
+            p.wait_after(Duration::from_millis(200), 0),
+            Duration::from_millis(1300) + DEFAULT_ITERATION_GAP
+        );
+        // A long iteration only gets the gap.
+        assert_eq!(
+            p.wait_after(Duration::from_secs(9), 0),
+            DEFAULT_ITERATION_GAP
+        );
+        // Fast pacing: no minimum, still the gap; bounded: no retries.
+        let fast = BenchmarkConfig {
+            iterations: 3,
+            iteration_gap: Duration::from_millis(250),
+            ..Default::default()
+        };
+        let p = IterationPolicy::for_master(&fast, 3_000_000_000);
+        assert_eq!(p.min_iteration, Duration::ZERO);
+        assert!(!p.retry_connect);
+        assert_eq!(p.wait_after(Duration::ZERO, 0), Duration::from_millis(250));
+        // Connect failures back off exponentially from max(gap, 500 ms)
+        // up to the cap.
+        let waits: Vec<Duration> = (1..=8).map(|n| p.wait_after(Duration::ZERO, n)).collect();
+        assert_eq!(waits[0], Duration::from_millis(500));
+        assert_eq!(waits[1], Duration::from_secs(1));
+        assert_eq!(waits[2], Duration::from_secs(2));
+        assert_eq!(waits[7], MAX_CONNECT_BACKOFF);
+        assert!(waits.windows(2).all(|w| w[0] <= w[1]));
+        assert_eq!(p.wait_after(Duration::ZERO, u32::MAX), MAX_CONNECT_BACKOFF);
+        // A degenerate speed never divides by zero.
+        let odd = BenchmarkConfig {
+            pacing: protoplay::Pacing::OriginalTiming { speed: 0.0 },
+            ..Default::default()
+        };
+        assert_eq!(
+            IterationPolicy::for_master(&odd, 5).min_iteration,
+            Duration::ZERO
+        );
+    }
+
+    /// O1: a short capture no longer reconnects in a tight loop: an
+    /// unbounded session starts its iterations at least
+    /// `max(span / speed, iteration time) + gap` apart.
+    #[test]
+    fn unbounded_master_iterations_are_spaced() {
+        let policy = IterationPolicy {
+            min_iteration: Duration::from_millis(120),
+            gap: Duration::from_millis(40),
+            retry_connect: true,
+        };
+        let starts = Mutex::new(Vec::new());
+        let t0 = std::time::Instant::now();
+        let stop = AtomicBool::new(false);
+        let out = master_iterations(u64::MAX, policy, &|| stop.load(Ordering::Relaxed), |i| {
+            starts.lock().unwrap().push(t0.elapsed());
+            if i == 4 {
+                stop.store(true, Ordering::Relaxed);
+            }
+            // The session itself ends quickly (short capture).
+            std::thread::sleep(Duration::from_millis(5));
+            ok_report(2)
+        });
+        let starts = starts.into_inner().unwrap();
+        assert_eq!(starts.len(), 5);
+        for w in starts.windows(2) {
+            assert!(
+                w[1] - w[0] >= Duration::from_millis(160),
+                "iterations too close: {starts:?}"
+            );
+        }
+        assert!(out.cancelled_mid_run);
+        assert_eq!(out.report.messages_sent, 10);
+        assert!(out.report.error.is_none());
+    }
+
+    /// O1: an unbounded run keeps retrying a target that refuses, with
+    /// growing pauses, and recovers when it comes back; a bounded run
+    /// stops at the first failure as before.
+    #[test]
+    fn connect_failures_back_off_and_recover() {
+        let policy = IterationPolicy {
+            min_iteration: Duration::ZERO,
+            gap: Duration::ZERO,
+            retry_connect: true,
+        };
+        let starts = Mutex::new(Vec::new());
+        let t0 = std::time::Instant::now();
+        let out = master_iterations(2, policy, &|| false, |_| {
+            let mut s = starts.lock().unwrap();
+            s.push(t0.elapsed());
+            if s.len() <= 2 {
+                refused()
+            } else {
+                ok_report(1)
+            }
+        });
+        let starts = starts.into_inner().unwrap();
+        assert_eq!(starts.len(), 4, "2 refused attempts + 2 iterations");
+        assert!(starts[1] - starts[0] >= Duration::from_millis(500));
+        assert!(starts[2] - starts[1] >= Duration::from_millis(1000));
+        // After a success the gap is back to the configured one (0).
+        assert!(starts[3] - starts[2] < Duration::from_millis(400));
+        assert_eq!(out.attempts, 4);
+        assert!(out.report.error.is_none(), "{:?}", out.report.error);
+        assert!(out.report.connected);
+        assert_eq!(out.report.messages_sent, 2);
+        assert!(!out.cancelled_mid_run);
+
+        // Never reachable: stopped by a cancel during the backoff, with
+        // the connect error kept.
+        let stop = AtomicBool::new(false);
+        let tries = AtomicU64::new(0);
+        let t = std::time::Instant::now();
+        let out = master_iterations(u64::MAX, policy, &|| stop.load(Ordering::Relaxed), |_| {
+            if tries.fetch_add(1, Ordering::Relaxed) == 1 {
+                stop.store(true, Ordering::Relaxed);
+            }
+            refused()
+        });
+        assert!(
+            t.elapsed() < Duration::from_millis(1500),
+            "cancel cut the wait"
+        );
+        assert!(out.cancelled_mid_run);
+        assert!(!out.report.connected);
+        assert!(out.report.error.as_deref().unwrap().contains("refused"));
+
+        // Bounded: the first failure ends the session.
+        let bounded = IterationPolicy {
+            retry_connect: false,
+            ..policy
+        };
+        let calls = AtomicU64::new(0);
+        let out = master_iterations(5, bounded, &|| false, |_| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            refused()
+        });
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(out.report.error.is_some());
+        assert!(!out.cancelled_mid_run);
     }
 }

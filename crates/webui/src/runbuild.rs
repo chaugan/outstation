@@ -104,6 +104,11 @@ pub struct RunRequest {
     /// Number of times to repeat the captured script. `0` = unlimited.
     #[serde(default = "default_iterations")]
     pub iterations: u64,
+    /// Master benchmark: pause between two iterations (connections) of
+    /// a session, in milliseconds, whatever the pacing. Connect
+    /// failures of an unbounded run back off from here (O1).
+    #[serde(default = "default_iteration_gap_ms")]
+    pub iteration_gap_ms: u64,
     #[serde(default)]
     pub scada_gateway_ip: Option<Ipv4Addr>,
     #[serde(default)]
@@ -130,6 +135,11 @@ pub struct RunRequest {
 fn default_iterations() -> u64 {
     1
 }
+fn default_iteration_gap_ms() -> u64 {
+    sched::DEFAULT_ITERATION_GAP.as_millis() as u64
+}
+/// Largest accepted `iteration_gap_ms` (one hour).
+pub const MAX_ITERATION_GAP_MS: u64 = 3_600_000;
 fn default_pacing() -> PacingReq {
     PacingReq::Fast
 }
@@ -229,6 +239,11 @@ pub fn validate_settings(req: &RunRequest) -> Result<(), RequestError> {
     }
     if req.warmup_secs > MAX_WARMUP_SECS {
         return Err(bad(format!("warmup_secs must be <= {MAX_WARMUP_SECS}")));
+    }
+    if req.iteration_gap_ms > MAX_ITERATION_GAP_MS {
+        return Err(bad(format!(
+            "iteration_gap_ms must be <= {MAX_ITERATION_GAP_MS}"
+        )));
     }
     validate_ifname("bridge", &req.bridge, 15)?;
     validate_ifname("tap_prefix", &req.tap_prefix, 10)?;
@@ -387,6 +402,7 @@ pub fn benchmark_config(
             Some(req.selected_rtus.iter().copied().collect())
         },
         loop_within_session: req.loop_within_session,
+        iteration_gap: std::time::Duration::from_millis(req.iteration_gap_ms),
     };
     (cfg, replayer)
 }
@@ -467,9 +483,26 @@ mod tests {
         assert!(v.get("bridge").is_none() && v.get("tap_prefix").is_none());
         assert!(v.get("pcap").is_none());
         assert_eq!(v["iterations"], 1);
+        assert_eq!(v["iteration_gap_ms"], 1000);
         assert_eq!(v["listen_port_base"], 2404);
         let again = canonical_json(&from_json(v.clone()).unwrap());
         assert_eq!(v, again);
+    }
+
+    #[test]
+    fn iteration_gap_reaches_the_scheduler_and_is_bounded() {
+        let r = bench(json!({"role": "master", "iteration_gap_ms": 250}));
+        assert!(validate_settings(&r).is_ok());
+        let (cfg, _) = benchmark_config(&r, std::path::Path::new("/nonexistent"), vec![]);
+        assert_eq!(cfg.iteration_gap, std::time::Duration::from_millis(250));
+        let (cfg, _) = benchmark_config(
+            &bench(json!({"role": "master"})),
+            std::path::Path::new("/nonexistent"),
+            vec![],
+        );
+        assert_eq!(cfg.iteration_gap, sched::DEFAULT_ITERATION_GAP);
+        let r = bench(json!({"iteration_gap_ms": MAX_ITERATION_GAP_MS + 1}));
+        assert!(validate_settings(&r).is_err());
     }
 
     #[test]
