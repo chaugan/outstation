@@ -133,7 +133,7 @@ function runSubmeta(r) {
   const parts = [];
   if (r.mode === 'benchmark') {
     parts.push(`${esc(r.proto)} ${esc(r.role)}`);
-    if (r.target_port) parts.push(r.role === 'slave' ? `ports ${r.target_port}+` : `port ${r.target_port}`);
+    if (r.target_port) parts.push(r.role === 'slave' ? `listening on port ${r.target_port}` : `port ${r.target_port}`);
   } else {
     parts.push('raw L2');
     parts.push(`speed ${esc(r.speed)}×${r.top_speed ? ' (top)' : ''}`);
