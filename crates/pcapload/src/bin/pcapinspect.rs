@@ -27,12 +27,19 @@ fn main() -> Result<()> {
     println!("packets      : {}", p.packets.len());
     println!("non-ip       : {}", p.non_ip_count);
     println!("malformed    : {}", p.malformed_count);
+    println!("ipv6         : {}", p.ingest.ipv6_packets);
+    println!("ip fragments : {}", p.ingest.ip_fragments);
+    println!("vlan tagged  : {}", p.ingest.vlan_tagged_packets);
+    println!("skipped link : {}", p.ingest.unsupported_link_packets);
     println!(
         "duration     : {:.3} s",
         (p.last_ts_ns.saturating_sub(p.first_ts_ns)) as f64 / 1e9
     );
     println!("sources      : {}", p.sources.len());
     println!("tcp flows    : {}", p.flows.len());
+    for note in p.ingest_notes() {
+        println!("note         : {note}");
+    }
     println!();
 
     println!(
@@ -100,6 +107,7 @@ fn main() -> Result<()> {
                 PacketKind::Udp => "UDP".into(),
                 PacketKind::Icmp => "ICMP".into(),
                 PacketKind::IpOther { proto } => format!("IP proto={}", proto),
+                PacketKind::IpFragment { proto } => format!("IP fragment proto={}", proto),
                 PacketKind::NonIp { ethertype } => format!("non-ip eth=0x{:04x}", ethertype),
                 PacketKind::Malformed => "MALFORMED".into(),
             };
