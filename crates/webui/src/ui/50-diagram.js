@@ -328,6 +328,8 @@ function renderDiagramText(frame, sessions) {
     `<div class="stat"><span class="k">Active sessions</span><span class="v">${active} of ${sessions.length}</span></div>` +
     `<div class="stat"><span class="k">Animated streams</span><span class="v">${st.animated}${st.hidden ? ` (${st.hidden} not animated)` : ''}</span></div>`);
   const p = pct(frame.sent || 0, frame.planned || 0);
+  // No plan yet (slaves waiting for the master): no "0% · 0 / 0".
+  qs('#diagram-card .diagram-progress').hidden = !(frame.planned > 0);
   el('diagram-pfill').style.width = p + '%';
   setText(el('diagram-plabel'), `${p}% · ${fmtInt(frame.sent || 0)} / ${fmtInt(frame.planned || 0)}`);
   let lg = '';

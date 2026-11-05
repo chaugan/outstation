@@ -288,7 +288,8 @@ function renderAnalysis() {
   const judged = f.slave_count != null ? f.slave_count : slaves.length;
   facts.push(`<b>${fmtInt(f.fully_correct || 0)}</b> of ${fmtInt(judged)} endpoints all correct`);
   if (f.worst && slaves.length > 1 && (Number(f.worst.score_pct) < 99.95 || (f.fully_correct || 0) < judged)) facts.push(`worst <code>${esc(f.worst.slave_ip)}</code> ${Number(f.worst.score_pct).toFixed(1)}%`);
-  facts.push(`${esc(run ? libraryName(run.pcap_id, run.pcap) : basename(r.original_pcap))}, ${esc(r.role)} role, ${esc(r.mode)} mode`);
+  const capName = run ? libraryName(run.pcap_id, run.pcap) : basename(r.original_pcap);
+  facts.push(`${capName ? esc(capName) + ', ' : ''}${esc(r.role)} role, ${esc(r.mode)} mode`);
   if (r.run_status) facts.push(`run <span class="status s-${esc(r.run_status)}">${esc(r.run_status)}</span>`);
   h += `<p class="an-facts">${facts.join(' · ')}</p>`;
   if (r.run_warning) h += `<div class="err-box" role="alert"><b>Run warning:</b> ${esc(r.run_warning)}</div>`;
@@ -336,7 +337,7 @@ function renderAnalysis() {
 // legend counts and the endpoint table are the text alternative.
 
 const TONE_WORD = { ok: 'pass', warn: 'warning', bad: 'fail', muted: 'not judged' };
-const TONE_MARK = { ok: '✓', warn: '◐', bad: '✗', muted: '○' };
+const TONE_MARK = { ok: '✓', warn: '!', bad: '✗', muted: '·' };
 
 function heatmapHtml(slaves) {
   if (!slaves.length) return '<section class="card an-heat"><h4>Endpoints</h4><p class="hint">No endpoints to report.</p></section>';
@@ -480,7 +481,8 @@ function dimensionsHtml(r) {
       const frac = d.of ? d.pass / d.of : 0;
       tone = tone || (d.of === 0 ? 'muted' : frac >= 1 ? 'ok' : (d.pass === 0 ? 'bad' : 'warn'));
       val = `${fmtInt(d.pass)}<span class="of"> / ${fmtInt(d.of)}</span>`;
-      bar = `<span class="dim-bar" aria-hidden="true"><span class="t-${tone}" style="width:${(frac * 100).toFixed(1)}%"></span></span>`;
+      // Passing share in green, the rest in the row's tone.
+      bar = `<span class="dim-bar" aria-hidden="true"><span class="seg-pass" style="flex:${d.pass}"></span><span class="seg-rest t-${tone === 'ok' ? 'muted' : tone}" style="flex:${Math.max(0, d.of - d.pass)}"></span></span>`;
     }
     const sr = d.of != null ? `<span class="sr-only">${TONE_WORD[tone] || ''}: ${d.pass} of ${d.of} ${d.unit || 'endpoints'}</span>` : '';
     h += `<li class="dim-row tone-${tone}"><span class="dim-mark ${tone}" aria-hidden="true">${TONE_MARK[tone] || ''}</span>` +
@@ -616,7 +618,7 @@ function initAnalysis() {
   });
   on('theme', rerenderAnalysisForTheme);
   // Capture names come from the library; it may load after the report.
-  on('library', () => { if (S.view === 'analysis') rerenderAnalysisForTheme(); });
+  on('library', () => { if (S.view === 'analysis' && !isBusyIn(el('an-result'))) rerenderAnalysisForTheme(); });
   on('analysis-event', ({ data }) => {
     if (S.view !== 'analysis') return;
     const r = selectedRun();

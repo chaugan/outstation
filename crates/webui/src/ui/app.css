@@ -1010,10 +1010,14 @@ table.t tr.row-problem th { background: var(--err-soft); }
 .dim-row:last-child { border-bottom: 0; }
 .dim-mark { grid-area: mark; font-weight: 700; }
 .dim-label { grid-area: label; font-weight: 600; color: var(--ink); }
-.dim-bar { grid-area: bar; height: 8px; background: var(--surface-2); position: relative; overflow: hidden; }
+.dim-bar { grid-area: bar; height: 8px; background: var(--surface-3); position: relative; overflow: hidden; }
 .dim-bar-none { background: transparent; }
-.dim-bar > span { position: absolute; inset: 0 auto 0 0; }
-.dim-bar > .t-warn { background: var(--hm-warn); box-shadow: none; }
+.dim-bar:not(.dim-bar-none) { display: flex; gap: 1px; }
+.dim-bar > .seg-pass { background: var(--hm-ok); }
+.dim-bar > .seg-rest { box-shadow: none; }
+.dim-bar > .seg-rest.t-warn { background: var(--hm-warn); }
+.dim-bar > .seg-rest.t-bad { background: var(--hm-bad); }
+.dim-bar > .seg-rest.t-muted { background: transparent; }
 .dim-val { grid-area: val; text-align: right; font-weight: 700; white-space: nowrap; }
 .dim-val .of { color: var(--dim); font-weight: 400; }
 .dim-note { grid-area: note; font-size: var(--fs-xs); color: var(--dim); }

@@ -62,7 +62,7 @@ function renderLibrary() {
     setHTML(empty, emptyStateHtml({
       step: 1,
       title: 'Start with a capture',
-      body: 'Upload a Wireshark capture (.pcap or .pcapng) of the IEC 104 traffic you want to replay. The server checks how heavy it is to replay and which RTUs and masters it contains.',
+      body: 'Drop a Wireshark capture (.pcap or .pcapng) of the IEC 104 traffic you want to replay on the Upload pcap box, or press the box to browse. The server then checks how heavy it is to replay and which RTUs and masters it contains.',
     }));
   }
   el('lib-filter-wrap').hidden = n < 2;

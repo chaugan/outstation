@@ -351,7 +351,9 @@ function renderRunCard(li, r, isNew) {
   setHTML(part('states'), stateBarHtml(r));
 
   const th = r.throughput_history || [];
-  setHTML(part('spark'), r.status === 'running' && th.length > 1
+  // While the live strip shows this run, its sparkline is not repeated.
+  const strip = r.status === 'running' && liveFrameFor(r.id);
+  setHTML(part('spark'), r.status === 'running' && th.length > 1 && !strip
     ? `<div class="sparkrow"><span class="lbl">Throughput</span>${sparklineSvg(th)}<span class="val">${fmtInt(th[th.length - 1])} pkt/s</span></div>` : finishedStatsHtml(r));
   setHTML(part('analysis'), analysisStateHtml(r));
 
