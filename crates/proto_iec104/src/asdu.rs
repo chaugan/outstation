@@ -723,12 +723,6 @@ pub struct SessionConfig {
     /// master closes the connection or the run is cancelled.
     #[serde(default)]
     pub idle_serve_secs: Option<f64>,
-    /// Slave mode: answer live GI/CI commands with synthesized
-    /// responses. When on, the captured GI/CI response bursts are
-    /// stripped from the replayed script so the master does not get
-    /// unsolicited ActCon/ActTerm.
-    #[serde(default = "default_true")]
-    pub synthesize_interrogation: bool,
 }
 
 fn default_k() -> u16 {
@@ -746,9 +740,6 @@ fn default_t2() -> f64 {
 fn default_t3() -> f64 {
     20.0
 }
-fn default_true() -> bool {
-    true
-}
 
 /// IEC default t0 in seconds.
 pub const DEFAULT_T0_SECS: f64 = 30.0;
@@ -765,7 +756,6 @@ impl Default for SessionConfig {
             t2: default_t2(),
             t3: default_t3(),
             idle_serve_secs: None,
-            synthesize_interrogation: true,
         }
     }
 }
@@ -1577,7 +1567,7 @@ mod tests {
     #[test]
     fn session_config_parse_and_validate() {
         let c = Iec104ProtoConfig::parse(Some(
-            r#"{"cot":{"3":5},"session":{"k":20,"w":10,"t0":5,"t1":2.5,"t2":0.5,"t3":4,"idle_serve_secs":0,"synthesize_interrogation":false}}"#,
+            r#"{"cot":{"3":5},"session":{"k":20,"w":10,"t0":5,"t1":2.5,"t2":0.5,"t3":4,"idle_serve_secs":0}}"#,
         ))
         .unwrap();
         assert_eq!(c.session.k, 20);
@@ -1587,7 +1577,6 @@ mod tests {
         assert_eq!(c.session.t2, 0.5);
         assert_eq!(c.session.t3, 4.0);
         assert_eq!(c.session.idle_serve_secs, Some(0.0));
-        assert!(!c.session.synthesize_interrogation);
         assert!(c.session.warnings().is_empty());
         // The rewrite-map loader ignores the session section.
         assert!(validate_proto_config(Some(r#"{"session":{"k":4,"w":2}}"#)).is_ok());

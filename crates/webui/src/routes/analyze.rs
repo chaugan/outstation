@@ -5,6 +5,13 @@
 //! `cp56_tolerance_ms`. The upload is streamed into a private temp file
 //! under `<state>/tmp` (0700 dir, random O_EXCL name) that is removed
 //! when the request ends, on success and on error (F051).
+//!
+//! Every analysis is persisted (F067): the bounded summary in
+//! `analyses`, each endpoint's bounded detail in `analysis_details`.
+//! `GET /api/runs/:id/analyses` lists a run's analyses,
+//! `GET /api/analyses/:id` returns a summary and
+//! `GET /api/analyses/:id/endpoints/:ip` returns one endpoint's detail,
+//! so the UI can fetch per-RTU drill-downs lazily.
 
 use axum::extract::{Multipart, State};
 use axum::http::HeaderMap;
@@ -12,8 +19,9 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use crate::analysis::{self, analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
+use crate::db::StoredAnalysis;
 use crate::dto::*;
-use crate::error::{ApiQuery, AppError, LockExt};
+use crate::error::{ApiPath, ApiQuery, AppError, LockExt};
 use crate::routes::library::{
     check_free_space, declared_length, multipart_error, stream_field_to_file,
 };
@@ -35,6 +43,9 @@ pub(crate) struct AnalyzeResponse {
     /// newest finished benchmark run was picked.
     run_selection: &'static str,
     warnings: Vec<String>,
+    /// Id of the stored analysis (`GET /api/analyses/:id`); `None` if
+    /// persisting failed (see `warnings`).
+    analysis_id: Option<u64>,
 }
 
 fn parse_run_id(s: &str) -> Result<u64, AppError> {
@@ -183,27 +194,6 @@ pub(crate) async fn api_analyze(
             ),
         ));
     }
-    if matches!(rs.status, RunStatus::Failed) {
-        warnings.push(format!(
-            "run #{} failed{}; the comparison may be meaningless",
-            rs.id,
-            rs.error
-                .as_deref()
-                .map(|e| format!(": {e}"))
-                .unwrap_or_default()
-        ));
-    }
-    let sent = rs
-        .benchmark
-        .as_ref()
-        .map(|b| b.total_messages_sent)
-        .unwrap_or(rs.sent);
-    if sent == 0 {
-        warnings.push(format!(
-            "run #{} sent no messages; there is nothing to compare",
-            rs.id
-        ));
-    }
     if !rs.pcap.is_file() {
         return Err(AppError::NotFound(format!(
             "source pcap of run {} is no longer in the library (pcap_id {})",
@@ -219,6 +209,7 @@ pub(crate) async fn api_analyze(
     };
     let replayer = proto_registry::lookup(&rs.proto)
         .ok_or_else(|| AppError::BadRequest(format!("unknown protocol: {}", rs.proto)))?;
+    let run_info = run_info_of(&rs);
     let tmp_path = tmp.path().to_path_buf();
     let report = tokio::task::spawn_blocking({
         let original_pcap = rs.pcap.clone();
@@ -228,20 +219,33 @@ pub(crate) async fn api_analyze(
         move || {
             analyze(
                 replayer.as_ref(),
-                &original_pcap,
-                &tmp_path,
-                run_id,
-                target_port,
-                role_hint,
-                mode,
-                proto_config,
-                cp56_tolerance_ms,
+                &analysis::AnalyzeRequest {
+                    original_pcap_path: &original_pcap,
+                    captured_pcap_path: &tmp_path,
+                    run_id,
+                    target_port,
+                    role: role_hint,
+                    mode,
+                    proto_config,
+                    cp56_tolerance_ms,
+                    run: run_info,
+                },
             )
         }
     })
     .await
     .map_err(|e| AppError::Internal(format!("analyze task: {e}")))?
     .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
+    if let Some(w) = &report.run_warning {
+        warnings.push(format!("run #{}: {w}", rs.id));
+    }
+    let analysis_id = match persist(&state, report.clone()).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warnings.push(format!("analysis not saved: {e:#}"));
+            None
+        }
+    };
     // `tmp` drops here (and on every early return above), removing the
     // uploaded capture.
     drop(tmp);
@@ -249,5 +253,138 @@ pub(crate) async fn api_analyze(
         report,
         run_selection: selection,
         warnings,
+        analysis_id,
     }))
+}
+
+/// Run facts the analysis judges against (F060, F062, F093).
+fn run_info_of(rs: &RunState) -> analysis::RunInfo {
+    analysis::RunInfo {
+        status: match rs.status {
+            RunStatus::Completed => analysis::RunStatusHint::Completed,
+            RunStatus::Partial => analysis::RunStatusHint::Partial,
+            RunStatus::Stopped => analysis::RunStatusHint::Stopped,
+            RunStatus::Failed => analysis::RunStatusHint::Failed,
+            RunStatus::Running => analysis::RunStatusHint::Running,
+        },
+        error: rs.error.clone(),
+        messages_sent: Some(
+            rs.benchmark
+                .as_ref()
+                .map(|b| b.total_messages_sent)
+                .unwrap_or(rs.sent),
+        ),
+        endpoints: rs
+            .per_source_progress
+            .iter()
+            .filter_map(|p| {
+                Some(analysis::SelectedEndpoint {
+                    source_ip: p.src_ip.as_deref()?.parse().ok()?,
+                    listen_ip: p.listen_ip.parse().ok(),
+                    listen_port: (p.listen_port != 0).then_some(p.listen_port),
+                    state: p.state.clone(),
+                    cancelled: p.cancelled,
+                    sent: p.sent,
+                })
+            })
+            .collect(),
+        iterations: rs
+            .per_source_progress
+            .iter()
+            .map(|p| p.iter_total)
+            .max()
+            .unwrap_or(1),
+        // Not persisted on RunState yet (T08 stores the full request).
+        loop_within_session: None,
+        paced_speed: None,
+        source_port: None,
+    }
+}
+
+/// Store the bounded summary and per-endpoint details.
+async fn persist(state: &AppState, report: analysis::AnalysisReport) -> anyhow::Result<u64> {
+    let db = state.db.clone();
+    tokio::task::spawn_blocking(move || {
+        let run_id = report.run_id;
+        let (summary, details) = report.split();
+        let summary_json = serde_json::to_string(&summary)?;
+        let details: Vec<(String, String)> = details
+            .into_iter()
+            .map(|(ep, d)| Ok((ep, serde_json::to_string(&d)?)))
+            .collect::<anyhow::Result<_>>()?;
+        db.insert_analysis(
+            run_id,
+            summary.verdict,
+            summary.score_pct,
+            &summary_json,
+            &details,
+        )
+    })
+    .await?
+}
+
+fn parse_stored(json: Option<String>, what: &str) -> Result<Json<serde_json::Value>, AppError> {
+    let json = json.ok_or_else(|| AppError::NotFound(format!("{what} not found")))?;
+    serde_json::from_str(&json)
+        .map(Json)
+        .map_err(|e| AppError::Internal(format!("stored {what} is not JSON: {e}")))
+}
+
+/// `GET /api/runs/:id/analyses`: stored analyses of a run, newest first.
+pub(crate) async fn api_run_analyses(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<u64>,
+) -> Result<Json<Vec<StoredAnalysisJson>>, AppError> {
+    let rows = state
+        .db
+        .analyses_for_run(id)
+        .map_err(|e| AppError::Internal(format!("list analyses: {e:#}")))?;
+    Ok(Json(
+        rows.into_iter().map(StoredAnalysisJson::from).collect(),
+    ))
+}
+
+#[derive(Serialize)]
+pub(crate) struct StoredAnalysisJson {
+    id: u64,
+    run_id: u64,
+    created_at: u64,
+    verdict: String,
+    score_pct: f64,
+}
+
+impl From<StoredAnalysis> for StoredAnalysisJson {
+    fn from(a: StoredAnalysis) -> Self {
+        Self {
+            id: a.id,
+            run_id: a.run_id,
+            created_at: a.created_at,
+            verdict: a.verdict,
+            score_pct: a.score_pct,
+        }
+    }
+}
+
+/// `GET /api/analyses/:id`: the stored summary (no per-endpoint detail).
+pub(crate) async fn api_analysis_summary(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<u64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let json = state
+        .db
+        .analysis_summary(id)
+        .map_err(|e| AppError::Internal(format!("read analysis: {e:#}")))?;
+    parse_stored(json, &format!("analysis {id}"))
+}
+
+/// `GET /api/analyses/:id/endpoints/:ip`: one endpoint's detail.
+pub(crate) async fn api_analysis_detail(
+    State(state): State<AppState>,
+    ApiPath((id, endpoint)): ApiPath<(u64, String)>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let json = state
+        .db
+        .analysis_detail(id, &endpoint)
+        .map_err(|e| AppError::Internal(format!("read analysis detail: {e:#}")))?;
+    parse_stored(json, &format!("endpoint {endpoint} of analysis {id}"))
 }

@@ -393,7 +393,9 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // CA/IOA-rewritten frames (including the captured interrogation
     // responses, which carry values too) so the responder's CA filter
     // matches the addresses the live master uses.
-    let synthesize = pc.session.synthesize_interrogation;
+    // Shared on/off switch with the analyzer: `{"gi_ci_synthesis": false}`
+    // replays the captured bursts verbatim and answers nothing live.
+    let synthesize = crate::interrogation::synthesis_enabled(cfg.proto_config.as_deref());
     let responder = synthesize.then(|| {
         let mut inventory = Inventory::default();
         for f in &script.frames {
@@ -409,21 +411,11 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         // The live master gets synthesized answers to its own GI/CI;
         // replaying the captured bursts too would hand it unsolicited
         // ActCon/ActTerm and duplicate data.
-        let asdus: Vec<&[u8]> = script.frames.iter().map(|f| &f.asdu[..]).collect();
-        let strip = crate::interrogation::interrogation_member_indices(&asdus);
-        if !strip.is_empty() {
-            let mut idx = 0usize;
-            let mut k = 0usize;
-            script.frames.retain(|_| {
-                let drop_it = strip.get(k) == Some(&idx);
-                if drop_it {
-                    k += 1;
-                }
-                idx += 1;
-                !drop_it
-            });
-        }
-        report.protocol.stripped_capture_frames = strip.len() as u64;
+        let before = script.frames.len();
+        script
+            .frames
+            .retain(|f| !crate::interrogation::is_captured_interrogation_frame(&f.asdu));
+        report.protocol.stripped_capture_frames = (before - script.frames.len()) as u64;
     }
     info!(
         count = script.frames.len(),

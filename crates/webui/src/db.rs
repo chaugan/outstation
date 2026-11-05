@@ -8,6 +8,9 @@
 //! * v1 → v2: rebuild `runs` with `INTEGER PRIMARY KEY AUTOINCREMENT`
 //!   so ids are never reused (F073, F078), and add `started_by` and
 //!   `pcap_id`.
+//! * v2 → v3: `analyses` (one bounded fidelity-analysis summary per
+//!   analysis, linked to its run) and `analysis_details` (one bounded
+//!   per-endpoint detail per row, fetched lazily) (F067).
 //!
 //! A fresh database is created directly at the latest version.
 //!
@@ -24,7 +27,7 @@ use tracing::{info, warn};
 use crate::error::LockExt;
 
 /// Latest schema version understood by this binary.
-pub const SCHEMA_VERSION: i64 = 2;
+pub const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Clone)]
 pub struct Db {
@@ -100,6 +103,34 @@ const CREATE_RUNS_V2: &str = r#"
     );
 "#;
 
+const CREATE_ANALYSES_V3: &str = r#"
+    CREATE TABLE analyses (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        run_id       INTEGER NOT NULL,
+        created_at   INTEGER NOT NULL,
+        verdict      TEXT NOT NULL,
+        score_pct    REAL NOT NULL,
+        summary_json TEXT NOT NULL
+    );
+    CREATE INDEX analyses_by_run ON analyses(run_id);
+    CREATE TABLE analysis_details (
+        analysis_id INTEGER NOT NULL,
+        endpoint    TEXT NOT NULL,
+        detail_json TEXT NOT NULL,
+        PRIMARY KEY (analysis_id, endpoint)
+    );
+"#;
+
+/// One stored fidelity analysis, without its JSON bodies.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredAnalysis {
+    pub id: u64,
+    pub run_id: u64,
+    pub created_at: u64,
+    pub verdict: String,
+    pub score_pct: f64,
+}
+
 fn now_secs() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -142,6 +173,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
     if !table_exists(conn, "runs")? {
         let tx = conn.transaction()?;
         tx.execute_batch(CREATE_RUNS_V2)?;
+        tx.execute_batch(CREATE_ANALYSES_V3)?;
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         return Ok(());
@@ -192,7 +224,18 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         .context("migrate v2: rebuild runs with AUTOINCREMENT")?;
         tx.execute_batch("PRAGMA user_version = 2")?;
         tx.commit()?;
+        version = 2;
         info!("runs db migrated to schema v2");
+    }
+    if version < 3 {
+        let tx = conn.transaction()?;
+        if !table_exists(&tx, "analyses")? {
+            tx.execute_batch(CREATE_ANALYSES_V3)
+                .context("migrate v3: create analyses tables")?;
+        }
+        tx.execute_batch("PRAGMA user_version = 3")?;
+        tx.commit()?;
+        info!("runs db migrated to schema v3");
     }
     Ok(())
 }
@@ -356,9 +399,94 @@ impl Db {
         Ok(out)
     }
 
+    /// Delete a run and every analysis stored for it.
     pub fn delete(&self, id: u64) -> Result<usize> {
+        let mut conn = self.conn.lock_safe();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "DELETE FROM analysis_details WHERE analysis_id IN
+                 (SELECT id FROM analyses WHERE run_id = ?1)",
+            params![id as i64],
+        )?;
+        tx.execute("DELETE FROM analyses WHERE run_id = ?1", params![id as i64])?;
+        let n = tx.execute("DELETE FROM runs WHERE id = ?1", params![id as i64])?;
+        tx.commit()?;
+        Ok(n)
+    }
+
+    /// Store one fidelity analysis: its bounded summary JSON and one
+    /// detail JSON per endpoint `(endpoint, json)`. Returns its id.
+    pub fn insert_analysis(
+        &self,
+        run_id: u64,
+        verdict: &str,
+        score_pct: f64,
+        summary_json: &str,
+        details: &[(String, String)],
+    ) -> Result<u64> {
+        let mut conn = self.conn.lock_safe();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO analyses (run_id, created_at, verdict, score_pct, summary_json)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![run_id as i64, now_secs(), verdict, score_pct, summary_json],
+        )?;
+        let id = tx.last_insert_rowid();
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO analysis_details (analysis_id, endpoint, detail_json)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            for (ep, json) in details {
+                stmt.execute(params![id, ep, json])?;
+            }
+        }
+        tx.commit()?;
+        Ok(id as u64)
+    }
+
+    /// Analyses stored for one run, newest first.
+    pub fn analyses_for_run(&self, run_id: u64) -> Result<Vec<StoredAnalysis>> {
         let conn = self.conn.lock_safe();
-        Ok(conn.execute("DELETE FROM runs WHERE id = ?1", params![id as i64])?)
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, created_at, verdict, score_pct FROM analyses
+             WHERE run_id = ?1 ORDER BY id DESC",
+        )?;
+        let rows = stmt.query_map(params![run_id as i64], |r| {
+            Ok(StoredAnalysis {
+                id: r.get::<_, i64>(0)? as u64,
+                run_id: r.get::<_, i64>(1)? as u64,
+                created_at: r.get::<_, i64>(2)? as u64,
+                verdict: r.get(3)?,
+                score_pct: r.get(4)?,
+            })
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The summary JSON of one stored analysis.
+    pub fn analysis_summary(&self, id: u64) -> Result<Option<String>> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT summary_json FROM analyses WHERE id = ?1",
+                params![id as i64],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// One endpoint's detail JSON of a stored analysis.
+    pub fn analysis_detail(&self, id: u64, endpoint: &str) -> Result<Option<String>> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT detail_json FROM analysis_details
+                 WHERE analysis_id = ?1 AND endpoint = ?2",
+                params![id as i64, endpoint],
+                |r| r.get(0),
+            )
+            .optional()?)
     }
 
     /// Highest run id ever handed out: the larger of the current
@@ -533,6 +661,62 @@ mod tests {
         // Re-opening is a no-op.
         drop(db);
         Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn analyses_round_trip_and_die_with_their_run() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_run_start(&sample(1)).unwrap();
+        let details = vec![
+            (
+                "10.0.0.2".to_string(),
+                r#"{"verdict":"good_delivery"}"#.to_string(),
+            ),
+            (
+                "10.0.0.3".to_string(),
+                r#"{"verdict":"never_connected"}"#.to_string(),
+            ),
+        ];
+        let id = db
+            .insert_analysis(1, "partial", 50.0, r#"{"verdict":"partial"}"#, &details)
+            .unwrap();
+        let list = db.analyses_for_run(1).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].id, id);
+        assert_eq!(list[0].verdict, "partial");
+        assert_eq!(
+            db.analysis_summary(id).unwrap().as_deref(),
+            Some(r#"{"verdict":"partial"}"#)
+        );
+        assert_eq!(
+            db.analysis_detail(id, "10.0.0.3").unwrap().as_deref(),
+            Some(r#"{"verdict":"never_connected"}"#)
+        );
+        assert_eq!(db.analysis_detail(id, "10.0.0.9").unwrap(), None);
+        db.delete(1).unwrap();
+        assert!(db.analyses_for_run(1).unwrap().is_empty());
+        assert_eq!(db.analysis_detail(id, "10.0.0.2").unwrap(), None);
+    }
+
+    #[test]
+    fn migrates_v2_to_v3() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(CREATE_RUNS_V2).unwrap();
+            conn.execute_batch("PRAGMA user_version = 2").unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        db.insert_run_start(&sample(1)).unwrap();
+        db.insert_analysis(1, "all_correct", 100.0, "{}", &[])
+            .unwrap();
+        let v: i64 = db
+            .conn
+            .lock_safe()
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(v, 3);
     }
 
     #[test]

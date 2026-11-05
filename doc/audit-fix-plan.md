@@ -104,7 +104,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - `early_break` on send error; idle-serve when the script is empty.
   - `shutdown(Both)` RAII guard and a joined reader.
   - Mock-peer tests for the slave and master paths, TESTFR, STOPDT, wraparound, misbehaving peers and GI timing. Port the scratch probes.
-- [~] **T06 Fidelity analysis** (`proto_iec104/src/analysis.rs`, `webui/src/analysis.rs`). Refs: F012, F058, F059, F060, F061, F062, F063, F064, F065, F066, F067, F068 (report half), F069, F093 (backend), F136.
+- [x] **T06 Fidelity analysis** (`proto_iec104/src/analysis.rs`, `webui/src/analysis.rs`). Refs: F012, F058, F059, F060, F061, F062, F063, F064, F065, F066, F067, F068 (report half), F069, F093 (backend), F136.
   - Symmetric or synthesized-only GI filter.
   - Content-based score: byte-identical plus CP56-only, with `real_mismatch_count==0` required.
   - Clamp the score; per-iteration and stopped-tail verdicts.
@@ -205,3 +205,12 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - The local request address goes into `protected_addrs`.
   - Partly fixed: F055/F149 (no per-run capture size cap yet; tracked in T04c) and F133 (docs part moved to T15).
 - 2026-11-05: T07 started, with T14 folded in, in `/opt/code/outstation-wt/frontend`. T06 finished its first pass and is now adapting to T04's split and to T05's GI-burst stripping.
+- 2026-11-05: T06 merged. Workspace tests: 293 passed.
+  - Content-based scoring with Myers alignment over masked hashes.
+  - Per-iteration and per-session verdicts.
+  - New `never_connected`, `unpaired`, `no_reference` and `run_failed` verdicts.
+  - Verdict dimensions, honest speed labels and bounded detail.
+  - DB schema v3 persists analyses, with lazy per-endpoint detail routes.
+  - The shared `interrogation` module defines the captured GI/CI burst rule and the `gi_ci_synthesis` switch.
+  - Partly fixed: F060 and F066. They need the run's `loop_within_session`, `paced_speed` and `source_port`, which T08 will persist.
+  - Expected interim gap until T05 merges: with synthesis on, the analyzer expects stripped bursts, but the current replayer still sends them.

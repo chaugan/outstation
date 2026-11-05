@@ -16,6 +16,9 @@
 //! | GET | `/api/runs/:id/live` | WebSocket progress |
 //! | GET | `/api/runs/:id/download`, `/gaps` | capture, gap histogram |
 //! | POST | `/api/analyze[?run_id=N]` | fidelity analysis upload |
+//! | GET | `/api/runs/:id/analyses` | stored analyses of a run |
+//! | GET | `/api/analyses/:id` | stored analysis summary |
+//! | GET | `/api/analyses/:id/endpoints/:endpoint` | one endpoint's stored detail |
 //! | * | `/api/pcaps...` | library |
 //!
 //! Only one run may be active at a time. Every request passes the
@@ -100,6 +103,12 @@ pub fn router(state: AppState) -> Router {
         .route(
             "/api/analyze",
             post(api_analyze).layer(DefaultBodyLimit::max(body_limit)),
+        )
+        .route("/api/runs/:id/analyses", get(api_run_analyses))
+        .route("/api/analyses/:id", get(api_analysis_summary))
+        .route(
+            "/api/analyses/:id/endpoints/:endpoint",
+            get(api_analysis_detail),
         )
         .route("/api/runs/:id/download", get(api_run_download))
         .route("/api/runs/:id/gaps", get(api_run_gaps))
