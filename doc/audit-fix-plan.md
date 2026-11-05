@@ -185,7 +185,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [x] **T17a Re-audit fixes, core engine (fx1).** New defects N1–N5, N8, N10, N12 and N16–N19 from the independent re-audit, plus the remaining gaps in F028, F039, F055/F072, F079, P06 and P07. The full list is in the session scratchpad, `T17_new_defects.md`.
 - [x] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
-- [~] **T17c Engine issues found by the scale benchmark (fx3).**
+- [x] **T17c Engine issues found by the scale benchmark (fx3).**
   1. Gateway mode with an egress NIC in master role cannot work. Refuse `scada_gateway_*` in master role and document it (the repro is `scripts/netns-gateway-egress.sh`).
   2. The capture writes its two sources in arrival order, so a SYN-ACK can land before its SYN and master sessions get misjudged. Merge the sources by kernel timestamp.
   3. Regression from N8: with RT priority only when `realtime` is set, full-speed slave capture drops went up 5×. The capture thread should run at RT priority whenever it is allowed to.
@@ -204,9 +204,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Delete with an undo toast instead of a confirm dialog where it is safe.
   - Keyboard shortcuts (g l / g c / g r / g a, `/` to filter) with a `?` help overlay.
   - Typography pass: consistent mono/sans use and number alignment in tables.
-- [ ] **T20b UI follow-ups.**
+- [~] **T20b UI follow-ups.**
   - Live ack-latency p50/p99 while a run is going. This needs a small log-scale latency histogram in the shared progress counters (protoplay, link.rs, sched SourceProgress), summed in the live WebSocket stream. Starts after fx3 merges.
   - The Compare regression list shows raw metric names and µs ("p99_us rose from 245242 µs"); show friendly labels with ms.
+  - Configure must hide the SCADA-gateway section in master role; the server now refuses it with 400 `gateway_requires_slave`.
+  - The flaky test `uploads_respect_disk_reserve_and_library_quota` derives its reserve from live free space, so parallel tests change the result; inject a free-space provider.
 - [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -398,3 +400,12 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - ui-smoke: 522/522 and 542/542 (Chromium 1440/390 and WebKit 1440, light and dark).
   - README screenshots regenerated from real runs with `netns-screenshots.sh`.
   - Disk housekeeping: removed 66 GB of finished lanes' build caches from the session scratchpad; the disk is at 81%.
+- 2026-11-05: T17c (fx3) merged. Workspace tests: 485 passed, 2 runs green.
+  - Gateway mode refused in master role.
+  - The capture merges its sources by kernel timestamp, uses a TPACKET_V3 ring (with the security-review bounds checks) and runs at RT priority again.
+  - Analysis notes carry the capture warnings.
+  - A slave listens again when a master leaves before STARTDT.
+  - Master setup is parallel and batched: 11.1 s → 0.8 s for 200 sessions.
+  - Result: every full-speed 200/400-session run in both roles scores `all_correct` with 0 dropped frames.
+  - Privileged suites: netctl 9/9, bench 3+5, slave 2/2, smoke 10/10, gateway-egress 6/6.
+  - README Scale updated with the new numbers.
