@@ -401,6 +401,8 @@ pub fn benchmark_config(
         connect_timeout_secs: 5,
         startup_delay_secs: req.warmup_secs,
         capture_path: None,
+        capture_max_bytes: None,
+        realtime: false,
         proto_config: req.proto_config.clone(),
         role: match req.role {
             RoleReq::Slave => protoplay::Role::Slave,
@@ -456,6 +458,7 @@ pub fn raw_config(
         include_non_ip: !req.skip_non_ip,
         startup_delay_secs: req.warmup_secs,
         capture_path: None,
+        capture_max_bytes: None,
         iterations: req.iterations,
         state_dir: Some(state_dir.to_path_buf()),
         protected_addrs,

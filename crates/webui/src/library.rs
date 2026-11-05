@@ -399,6 +399,28 @@ impl<'a> protoplay::LoadedPcapView for LoadedPcapAdapter<'a> {
             .map(|rf| rf.payload.to_vec())
             .unwrap_or_default()
     }
+    fn with_flow_side(
+        &self,
+        flow_idx: usize,
+        side: protoplay::FlowSide,
+        f: &mut dyn FnMut(&protoplay::FlowSideView<'_>),
+    ) {
+        let dir = match side {
+            protoplay::FlowSide::Client => pcapload::StreamDir::ClientToServer,
+            protoplay::FlowSide::Server => pcapload::StreamDir::ServerToClient,
+        };
+        if let Ok(rf) = self.inner.reassemble(flow_idx, dir) {
+            let gaps: Vec<usize> = rf.gaps.iter().map(|g| g.offset).collect();
+            f(&protoplay::FlowSideView {
+                payload: &rf.payload,
+                gap_offsets: &gaps,
+                missing_bytes: rf.missing_bytes(),
+            });
+        }
+    }
+    fn packet_count(&self) -> u64 {
+        self.inner.packets.len() as u64
+    }
 }
 
 /// Convert a generic [`protoplay::ProtoViability`] into the

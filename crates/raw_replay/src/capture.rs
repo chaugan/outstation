@@ -36,6 +36,9 @@ struct Inner {
     socks: Vec<CapSock>,
     /// Kernel filter every socket carries; `None` = unfiltered.
     filter: Option<Vec<bpf::Insn>>,
+    /// The byte cap was reached: the sockets are closed and no
+    /// interface is added any more.
+    closed: bool,
 }
 
 /// Handle to a running capture thread.
@@ -50,6 +53,11 @@ pub struct Capture {
     /// full (PACKET_STATISTICS): the capture file is missing them.
     /// Updated about once a second and when the capture stops.
     pub dropped: Arc<AtomicU64>,
+    /// Largest capture file in bytes (headers included); `u64::MAX` =
+    /// no cap. See [`Capture::set_max_bytes`].
+    max_bytes: Arc<AtomicU64>,
+    /// The cap was reached and the capture stopped recording.
+    truncated: Arc<AtomicBool>,
 }
 
 /// Final counters of a capture, see [`Capture::finish`].
@@ -60,6 +68,9 @@ pub struct CaptureStats {
     pub bytes: u64,
     /// Frames the kernel dropped (receive queue full).
     pub dropped: u64,
+    /// The capture reached its byte cap and stopped recording: the file
+    /// holds only the start of the run.
+    pub truncated: bool,
 }
 
 /// Receive buffer requested for every capture socket. The default
@@ -91,6 +102,7 @@ impl Capture {
             Inner {
                 socks: vec![sock],
                 filter: None,
+                closed: false,
             },
             rt_priority,
         )
@@ -112,6 +124,7 @@ impl Capture {
             Inner {
                 socks: Vec::new(),
                 filter: Some(filter),
+                closed: false,
             },
             rt_priority,
         )
@@ -121,11 +134,25 @@ impl Capture {
         self.inner.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// Cap the capture file at `max` bytes (pcap headers included;
+    /// `None` = no cap). A frame that would cross the cap is not
+    /// written: the capture stops recording, closes its sockets and
+    /// reports [`CaptureStats::truncated`] (F055/F072).
+    pub fn set_max_bytes(&self, max: Option<u64>) {
+        self.max_bytes
+            .store(max.unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Whether the byte cap stopped the capture.
+    pub fn truncated(&self) -> bool {
+        self.truncated.load(Ordering::Relaxed)
+    }
+
     /// Also capture on `iface` (an Ethernet or loopback interface).
     /// Returns `false` if it is already captured.
     pub fn add_iface(&self, iface: &str) -> Result<bool> {
         let mut inner = self.lock();
-        if inner.socks.iter().any(|s| s.iface == iface) {
+        if inner.closed || inner.socks.iter().any(|s| s.iface == iface) {
             return Ok(false);
         }
         let sock = open_socket(iface, inner.filter.as_deref())?;
@@ -145,7 +172,7 @@ impl Capture {
         if inner.filter.is_some() {
             bail!("add_iface_with_filter on a filtered capture; use add_iface");
         }
-        if inner.socks.iter().any(|s| s.iface == iface) {
+        if inner.closed || inner.socks.iter().any(|s| s.iface == iface) {
             return Ok(false);
         }
         let sock = open_socket(iface, Some(filter))?;
@@ -193,11 +220,15 @@ impl Capture {
         let packets = Arc::new(AtomicU64::new(0));
         let bytes = Arc::new(AtomicU64::new(0));
         let dropped = Arc::new(AtomicU64::new(0));
+        let max_bytes = Arc::new(AtomicU64::new(u64::MAX));
+        let truncated = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
         let counters = Counters {
             packets: Arc::clone(&packets),
             bytes: Arc::clone(&bytes),
             dropped: Arc::clone(&dropped),
+            max_bytes: Arc::clone(&max_bytes),
+            truncated: Arc::clone(&truncated),
         };
         let inner_c = Arc::clone(&inner);
         let name = path
@@ -205,9 +236,11 @@ impl Capture {
             .map(|s| s.to_string_lossy().into_owned())
             .unwrap_or_default();
 
+        let span = tracing::Span::current();
         let thread = thread::Builder::new()
             .name(format!("capture-{name}"))
             .spawn(move || {
+                let _span = span.enter();
                 if let Some(prio) = rt_priority {
                     crate::try_set_realtime(prio);
                 }
@@ -227,6 +260,8 @@ impl Capture {
             packets,
             bytes,
             dropped,
+            max_bytes,
+            truncated,
         })
     }
 
@@ -242,6 +277,7 @@ impl Capture {
             packets: self.packets.load(Ordering::Relaxed),
             bytes: self.bytes.load(Ordering::Relaxed),
             dropped: self.dropped.load(Ordering::Relaxed),
+            truncated: self.truncated.load(Ordering::Relaxed),
         }
     }
 
@@ -266,7 +302,13 @@ struct Counters {
     packets: Arc<AtomicU64>,
     bytes: Arc<AtomicU64>,
     dropped: Arc<AtomicU64>,
+    max_bytes: Arc<AtomicU64>,
+    truncated: Arc<AtomicBool>,
 }
+
+/// Size of the classic pcap global header and of a record header.
+const PCAP_GLOBAL_HEADER: u64 = 24;
+const PCAP_RECORD_HEADER: u64 = 16;
 
 /// How often the kernel's per-socket drop counters are collected.
 const STATS_EVERY: Duration = Duration::from_secs(1);
@@ -461,6 +503,23 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
         batch.sort_by_key(|p| (p.ts_sec, p.ts_us));
         for p in &batch {
             let frame = &arena[p.start..p.start + p.len];
+            let file_bytes = PCAP_GLOBAL_HEADER
+                + c.packets.load(Ordering::Relaxed) * PCAP_RECORD_HEADER
+                + c.bytes.load(Ordering::Relaxed);
+            let cap = c.max_bytes.load(Ordering::Relaxed);
+            if file_bytes + PCAP_RECORD_HEADER + frame.len() as u64 > cap {
+                warn!(
+                    cap,
+                    packets = c.packets.load(Ordering::Relaxed),
+                    "capture reached its byte cap; recording stopped"
+                );
+                c.truncated.store(true, Ordering::Relaxed);
+                collect_drops(&socks, &c.dropped);
+                let mut inner = inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.closed = true;
+                inner.socks.clear();
+                return;
+            }
             if let Err(e) = write_record(writer, p.ts_sec, p.ts_us, frame) {
                 warn!(error = %e, "capture write failed");
                 return;
@@ -741,10 +800,54 @@ mod tests {
             Inner {
                 socks,
                 filter: None,
+                closed: false,
             },
             None,
         )
         .unwrap()
+    }
+
+    /// F055/F072: at the byte cap the capture stops recording, the file
+    /// stays within the cap and holds whole records only, and the stats
+    /// say it was truncated; no interface can be added afterwards.
+    #[test]
+    fn byte_cap_stops_the_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("capped.pcap");
+        let (rx, tx) = pair();
+        let cap = capture_on(&path, vec![rx]);
+        // Room for exactly 10 records of 60-byte frames.
+        let max = 24 + 10 * (16 + 60);
+        cap.set_max_bytes(Some(max));
+        for i in 0..25 {
+            send(&tx, &frame(i));
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !cap.truncated() {
+            assert!(Instant::now() < deadline, "cap never reached");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !cap.add_iface("lo").unwrap(),
+            "closed capture took an iface"
+        );
+        let st = cap.finish();
+        assert!(st.truncated);
+        assert_eq!(st.packets, 10);
+        assert_eq!(records(&path).len(), 10);
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), max);
+
+        // No cap: nothing is truncated.
+        let path = dir.path().join("free.pcap");
+        let (rx, tx) = pair();
+        let cap = capture_on(&path, vec![rx]);
+        cap.set_max_bytes(None);
+        for i in 0..25 {
+            send(&tx, &frame(i));
+        }
+        let st = cap.finish();
+        assert!(!st.truncated);
+        assert_eq!(st.packets, 25);
     }
 
     /// The records of a classic pcap: (sec, usec, frame).

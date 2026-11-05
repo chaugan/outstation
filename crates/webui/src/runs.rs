@@ -618,6 +618,7 @@ mod tests {
             iter_total: Arc::new(AtomicU64::new(0)),
             sent_done_iters: Arc::new(AtomicU64::new(0)),
             bytes_done_iters: Arc::new(AtomicU64::new(0)),
+            fold_seq: Arc::new(AtomicU64::new(0)),
             error: Arc::new(Mutex::new(None)),
         }
     }

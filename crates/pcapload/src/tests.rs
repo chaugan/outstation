@@ -363,3 +363,12 @@ fn non_ip_sources_are_indexed_by_mac() {
     assert!(a.ethertypes.contains(&0x88b8));
     assert!(a.ethertypes.contains(&0x88ba));
 }
+
+/// proto_iec104's viability estimate (`PER_PACKET_RAM_BYTES` = 128)
+/// assumes a packet costs at most this much beyond its bytes: the
+/// `Packet` itself plus one flow and one source index entry.
+#[test]
+fn packet_overhead_fits_the_viability_estimate() {
+    let per_packet = std::mem::size_of::<Packet>() + 2 * std::mem::size_of::<usize>();
+    assert!(per_packet <= 128, "{per_packet} B per packet");
+}

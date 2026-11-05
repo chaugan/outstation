@@ -947,6 +947,7 @@ dependencies = [
  "rewrite",
  "tempfile",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

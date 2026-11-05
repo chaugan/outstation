@@ -310,6 +310,56 @@ fn p05_seq_jump_without_handshake_is_split() {
     assert_eq!(streams(&p, 1), (b.client, b.server));
 }
 
+/// N16 (re-audit a3_stale_after_syn): after a FIN and a reconnect with
+/// new ISNs, the server retransmits the old connection's last data
+/// segment, captured right after the new SYN-ACK. It belongs to the old
+/// flow; the reconnect stays one flow with both streams intact (it used
+/// to split into extra flows, losing the client's first 6 bytes).
+#[test]
+fn n16_stale_retransmit_after_a_new_syn_does_not_split_the_reconnect() {
+    let s1 = session(1000, 5000, 7, 1_000_000_000_000, true);
+    let s2 = session(900_000, 7_000_000, 7, 1_100_000_000_000, true);
+    let fin_seq = 1000 + 1 + s1.client.len() as u32;
+    let mut pk = s1.pkts.clone();
+    pk.push((1_050_000_000_000, frame(true, fin_seq, 0, FIN | ACK, &[])));
+    // s1's last server data segment.
+    let stale = s1
+        .pkts
+        .iter()
+        .rev()
+        .find(|(_, f)| f[26..30] == SIP && f.len() > 54)
+        .unwrap()
+        .1
+        .clone();
+    pk.extend(s2.pkts[..2].iter().cloned());
+    pk.push((1_100_000_001_500, stale));
+    pk.extend(s2.pkts[2..].iter().cloned());
+    let p = load(&pcap(&pk));
+    assert_eq!(p.flows.len(), 2, "flows: {:?}", p.flows);
+    assert_eq!(p.ingest.flows_split, 1);
+    assert_eq!(streams(&p, 0), (s1.client.clone(), s1.server.clone()));
+    assert_eq!(streams(&p, 1), (s2.client.clone(), s2.server.clone()));
+    let r = p.reassemble(0, StreamDir::ServerToClient).unwrap();
+    assert_eq!(r.dup_segments, 1, "the stale copy is a duplicate");
+}
+
+/// N17 (re-audit a4_same_isn): a reconnect that reuses the same ISNs
+/// without FIN or RST (an embedded stack with a fixed ISN after a cable
+/// pull) is a new connection: a SYN after data split it, instead of the
+/// second session being dropped as retransmits.
+#[test]
+fn n17_reconnect_with_the_same_isn_and_no_fin_is_split() {
+    let s3 = session(1000, 5000, 6, 1_000_000_000_000, true);
+    let s4 = session(1000, 5000, 6, 1_100_000_000_000, true);
+    let mut pk = s3.pkts.clone();
+    pk.extend(s4.pkts.iter().cloned());
+    let p = load(&pcap(&pk));
+    assert_eq!(p.flows.len(), 2, "flows: {:?}", p.flows);
+    assert_eq!(p.flows[1].previous_on_tuple, Some(0));
+    assert_eq!(streams(&p, 0), (s3.client, s3.server));
+    assert_eq!(streams(&p, 1), (s4.client, s4.server));
+}
+
 #[test]
 fn p05_retransmitted_syn_does_not_split() {
     let b = base();
@@ -324,10 +374,9 @@ fn p05_retransmitted_syn_does_not_split() {
 
 // ---- P06: O(n) ingest ----
 
-#[test]
-fn p06_many_flows_from_one_source() {
-    let n: u32 = 60_000;
-    let pk: Vec<Pkt> = (0..n)
+/// `n` single-SYN flows from one source to distinct ports.
+fn many_flows(n: u32) -> Vec<Pkt> {
+    (0..n)
         .map(|i| {
             let t = tcp_hdr(1024 + (i % 60_000) as u16, 2404, i, 0, SYN, &[]);
             let dst = [10, 1, (i / 60_000) as u8, 1];
@@ -336,17 +385,47 @@ fn p06_many_flows_from_one_source() {
                 eth(CMAC, SMAC, 0x0800, &ip4(CIP, dst, 6, &t, 1, 0x4000)),
             )
         })
-        .collect();
-    let start = std::time::Instant::now();
-    let p = load(&pcap(&pk));
-    let took = start.elapsed();
+        .collect()
+}
+
+/// Best of three load times.
+fn load_time(bytes: &[u8]) -> std::time::Duration {
+    (0..3)
+        .map(|_| {
+            let start = std::time::Instant::now();
+            let p = load(bytes);
+            let took = start.elapsed();
+            assert!(!p.flows.is_empty());
+            took
+        })
+        .min()
+        .unwrap()
+}
+
+#[test]
+fn p06_many_flows_from_one_source() {
+    let n: u32 = 60_000;
+    let p = load(&pcap(&many_flows(n)));
     assert_eq!(p.flows.len(), n as usize);
     let fi = &p.sources[&Ipv4Addr::from(CIP)].flow_indices;
     assert_eq!(fi.len(), n as usize);
     assert!(fi.windows(2).all(|w| w[0] < w[1]));
-    // The quadratic version took ~0.3 s for 60k flows in release and
-    // several seconds in debug; linear ingest is far below this bound.
-    assert!(took.as_secs() < 20, "ingest took {took:?}");
+}
+
+/// P06: ingest time grows linearly with the number of flows of one
+/// source. Four times the flows must take well under 16 times as long
+/// (the quadratic version's ratio); linear ingest is near 4. Best of
+/// three runs each, so a busy machine does not fail the check.
+#[test]
+fn p06_ingest_scales_linearly() {
+    let small = pcap(&many_flows(15_000));
+    let large = pcap(&many_flows(60_000));
+    let (t1, t4) = (load_time(&small), load_time(&large));
+    let ratio = t4.as_secs_f64() / t1.as_secs_f64().max(1e-6);
+    assert!(
+        ratio < 9.0,
+        "4x the flows took {ratio:.1}x as long ({t1:?} vs {t4:?})"
+    );
 }
 
 // ---- P07: shared buffer ----
