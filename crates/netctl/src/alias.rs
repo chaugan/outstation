@@ -158,6 +158,12 @@ fn registry() -> MutexGuard<'static, HashMap<(String, Ipv4Addr), AliasEntry>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Forget every in-process alias reference (after [`crate::cleanup_all`]
+/// restored the host, they no longer describe anything real).
+pub(crate) fn forget_registry() {
+    registry().clear();
+}
+
 /// A reference to a `/32` alias. The address is removed when the last
 /// lease on it drops, and only if this process added it.
 #[derive(Debug)]

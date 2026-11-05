@@ -359,6 +359,11 @@ pub fn cleanup_all(state_dir: &Path) -> Result<CleanupReport> {
         }
     }
 
+    // The host is back to its journaled state: in-process lease
+    // bookkeeping from crashed or leaked guards is stale now.
+    crate::alias::forget_registry();
+    crate::guard::forget_registry();
+
     if report.total_actions() > 0 || !report.errors.is_empty() {
         info!(?report, "cleanup_all finished");
     }

@@ -192,6 +192,12 @@ fn knob_registry() -> MutexGuard<'static, HashMap<String, KnobEntry>> {
         .unwrap_or_else(|e| e.into_inner())
 }
 
+/// Forget every in-process override reference (see
+/// [`crate::alias`]'s counterpart).
+pub(crate) fn forget_registry() {
+    knob_registry().clear();
+}
+
 /// A reference to an overridden host setting. The prior value is
 /// restored when the last lease on the same setting drops.
 #[derive(Debug)]
