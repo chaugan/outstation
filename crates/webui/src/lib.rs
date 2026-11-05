@@ -25,6 +25,7 @@
 //! | POST | `/api/runs/:id/analyze` | analyse the run's own capture now |
 //! | GET | `/api/analyses/:id` | stored analysis summary |
 //! | GET | `/api/analyses/:id/endpoints/:endpoint` | one endpoint's stored detail |
+//! | GET | `/api/analyses/:id/report.html` | self-contained, printable HTML report |
 //! | * | `/api/pcaps...` | library |
 //!
 //! Only one run may be active at a time. Every request passes the
@@ -45,6 +46,7 @@ mod library;
 mod metrics;
 mod netprobe;
 mod persist;
+mod report_html;
 mod routes;
 pub mod runbuild;
 mod runs;
@@ -136,6 +138,10 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs/:id/analyses", get(api_run_analyses))
         .route("/api/runs/:id/analyze", post(api_run_analyze))
         .route("/api/analyses/:id", get(api_analysis_summary))
+        .route(
+            "/api/analyses/:id/report.html",
+            get(api_analysis_report_html),
+        )
         .route(
             "/api/analyses/:id/endpoints/:endpoint",
             get(api_analysis_detail),

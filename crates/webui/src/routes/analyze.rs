@@ -375,3 +375,77 @@ pub(crate) async fn api_run_analyze(
         created_at: a.created_at,
     }))
 }
+
+/// `GET /api/analyses/:id/report.html`: the stored analysis as one
+/// self-contained, printable HTML page (F131). `?download=1` serves it
+/// as an attachment.
+pub(crate) async fn api_analysis_report_html(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<u64>,
+    ApiQuery(q): ApiQuery<ReportQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::{header, HeaderValue};
+    use axum::response::IntoResponse;
+    let st = state.clone();
+    let html = tokio::task::spawn_blocking(move || -> Result<(String, u64), AppError> {
+        let row = st
+            .db
+            .analysis_row(id)
+            .map_err(|e| AppError::Internal(format!("read analysis: {e:#}")))?
+            .ok_or_else(|| AppError::NotFound(format!("analysis {id} not found")))?;
+        let summary: serde_json::Value = st
+            .db
+            .analysis_summary(id)
+            .map_err(|e| AppError::Internal(format!("read analysis: {e:#}")))?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let details: Vec<(String, serde_json::Value)> = st
+            .db
+            .analysis_details_all(id)
+            .map_err(|e| AppError::Internal(format!("read analysis details: {e:#}")))?
+            .into_iter()
+            .filter_map(|(ep, j)| Some((ep, serde_json::from_str(&j).ok()?)))
+            .collect();
+        let run = st
+            .get_run_any(row.run_id)
+            .map(|(e, _)| e.lock_safe().clone());
+        Ok((
+            crate::report_html::render(&row, &summary, &details, run.as_ref()),
+            row.run_id,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("report task: {e}")))??;
+    let (html, run_id) = html;
+    let mut resp = html.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Self-contained by construction; the policy makes sure nothing in
+    // it can load or run anything.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if matches!(q.download.as_deref(), Some("1" | "true" | "yes")) {
+        let name = format!("outstation_run{run_id}_analysis{id}.html");
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        );
+    }
+    Ok(resp)
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ReportQuery {
+    #[serde(default)]
+    download: Option<String>,
+}

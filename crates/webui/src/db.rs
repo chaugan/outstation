@@ -714,6 +714,30 @@ impl Db {
             .optional()?)
     }
 
+    /// The index row of one stored analysis.
+    pub fn analysis_row(&self, id: u64) -> Result<Option<StoredAnalysis>> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT id, run_id, created_at, verdict, score_pct, source FROM analyses
+                 WHERE id = ?1",
+                params![id as i64],
+                decode_analysis,
+            )
+            .optional()?)
+    }
+
+    /// Every endpoint detail of a stored analysis, `(endpoint, json)`.
+    pub fn analysis_details_all(&self, id: u64) -> Result<Vec<(String, String)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT endpoint, detail_json FROM analysis_details
+             WHERE analysis_id = ?1 ORDER BY endpoint",
+        )?;
+        let rows = stmt.query_map(params![id as i64], |r| Ok((r.get(0)?, r.get(1)?)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// One endpoint's detail JSON of a stored analysis.
     pub fn analysis_detail(&self, id: u64, endpoint: &str) -> Result<Option<String>> {
         let conn = self.conn.lock_safe();

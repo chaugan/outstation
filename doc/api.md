@@ -349,6 +349,7 @@ curl -H "Origin: $B" -F file=@target-side.pcap -F mode=generic "$B/api/analyze?r
 | `GET /api/runs/:id/analyses` | `[{id, run_id, created_at, verdict, score_pct, source}]`, newest first |
 | `GET /api/analyses/:id` | The stored summary: the report without per-endpoint detail |
 | `GET /api/analyses/:id/endpoints/:endpoint` | One endpoint's stored detail; `:endpoint` is the endpoint IP as listed in `slaves[].slave_ip` |
+| `GET /api/analyses/:id/report.html[?download=1]` | The analysis as one self-contained HTML page (inline CSS, no scripts or external assets, print-friendly): verdict, warnings, run facts, fleet counts, every endpoint and its detail. `download=1` sends it as an attachment |
 
 ## Compare
 

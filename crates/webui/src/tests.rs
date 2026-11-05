@@ -2345,3 +2345,50 @@ async fn runs_are_paged_and_old_ones_come_from_the_db() {
     assert_eq!(ids, vec![4, 5, 6]);
     assert!(st.get_run_any(2).is_some());
 }
+
+/// F131: a stored analysis exports as one self-contained HTML page.
+#[tokio::test]
+async fn analysis_exports_as_self_contained_html() {
+    let h = harness(Behaviour::SessionsWithCapture(&[None]));
+    add_fixture(&h, "pcr_1");
+    let id = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(id).await;
+    let aid = v["latest_analysis"]["id"].as_u64().unwrap();
+    let get = |q: String| {
+        Request::builder()
+            .uri(q)
+            .header("host", HOST)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (s, headers, body) = h
+        .send(get(format!("/api/analyses/{aid}/report.html")))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+    assert!(headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .starts_with("default-src 'none'"));
+    assert!(headers.get("content-disposition").is_none());
+    let html = String::from_utf8(body).unwrap();
+    assert!(
+        html.contains(&format!("Analysis #{aid} of run #{id}")),
+        "{html}"
+    );
+    let verdict = v["latest_analysis"]["verdict"].as_str().unwrap();
+    assert!(html.contains(verdict));
+    assert!(html.contains("<h2>Endpoints"));
+    assert!(html.contains("class=\"ep\""), "endpoint details included");
+    assert!(!html.contains("<script") && !html.contains("src="));
+    let (s, headers, _) = h
+        .send(get(format!("/api/analyses/{aid}/report.html?download=1")))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(headers["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment"));
+    let (s, _, _) = h.send(get("/api/analyses/999/report.html".into())).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
