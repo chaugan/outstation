@@ -115,6 +115,10 @@ pub struct MessageProgress {
     /// treat it exactly like [`MessageProgress::cancel`]; use
     /// [`MessageProgress::is_cancelled`], which checks both.
     pub run_cancel: Arc<AtomicBool>,
+    /// Ack latency of every acknowledged message so far, all
+    /// iterations, for live percentiles. Replayers that measure ack
+    /// latency record into it as they retire acknowledged messages.
+    pub ack_latency: Arc<LiveLatencyHist>,
 }
 
 impl MessageProgress {
@@ -353,6 +357,131 @@ impl LatencyReservoir {
 
     pub fn into_vec(self) -> Vec<u64> {
         self.samples
+    }
+}
+
+/// Lowest bin edge of the live ack-latency histogram, as log10(µs):
+/// 10 µs. Shared with the web UI's report histogram so both bin alike.
+pub const LATENCY_HIST_LOG10_MIN_US: f64 = 1.0;
+/// Highest bin edge, as log10(µs): 10 s.
+pub const LATENCY_HIST_LOG10_MAX_US: f64 = 7.0;
+/// Log-spaced bins between the two edges: four per decade.
+pub const LATENCY_HIST_BINS: usize = 24;
+
+/// Lower edge of bin `i` in whole µs, `ceil(10^(1 + i/4))`, plus the
+/// overflow edge (10 s) last. An integer sample `s` lies in bin `i`
+/// exactly when `log10(s) >= 1 + i/4`, so this integer table bins
+/// like the floating-point formula without a `log10` per sample.
+const LATENCY_HIST_EDGES_US: [u64; LATENCY_HIST_BINS + 1] = [
+    10, 18, 32, 57, 100, 178, 317, 563, 1_000, 1_779, 3_163, 5_624, 10_000, 17_783, 31_623, 56_235,
+    100_000, 177_828, 316_228, 562_342, 1_000_000, 1_778_280, 3_162_278, 5_623_414, 10_000_000,
+];
+
+/// Lock-free, fixed log-scale histogram of ack latencies that a
+/// session updates as it retires acknowledged messages and the UI
+/// reads while the run goes on. Slot 0 counts samples below 10 µs,
+/// slots `1..=24` the bins of [`LATENCY_HIST_LOG10_MIN_US`]..
+/// [`LATENCY_HIST_LOG10_MAX_US`], the last slot samples of 10 s or
+/// more. One relaxed `fetch_add` per sample; each session owns its
+/// histogram, so writers never contend.
+#[derive(Debug)]
+pub struct LiveLatencyHist {
+    slots: [AtomicU64; LATENCY_HIST_BINS + 2],
+}
+
+impl Default for LiveLatencyHist {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LiveLatencyHist {
+    /// Count one latency sample of `us` microseconds.
+    #[inline]
+    pub fn record_us(&self, us: u64) {
+        let slot = LATENCY_HIST_EDGES_US.partition_point(|&e| e <= us);
+        self.slots[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current counts (relaxed; good enough for display).
+    pub fn snapshot(&self) -> LatencyHistSnapshot {
+        LatencyHistSnapshot {
+            slots: std::array::from_fn(|i| self.slots[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Point-in-time copy of a [`LiveLatencyHist`]; snapshots of several
+/// sessions add up with [`LatencyHistSnapshot::add`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyHistSnapshot {
+    slots: [u64; LATENCY_HIST_BINS + 2],
+}
+
+impl Default for LatencyHistSnapshot {
+    fn default() -> Self {
+        Self {
+            slots: [0; LATENCY_HIST_BINS + 2],
+        }
+    }
+}
+
+impl LatencyHistSnapshot {
+    /// Samples below 10 µs.
+    pub fn underflow(&self) -> u64 {
+        self.slots[0]
+    }
+    /// Samples of 10 s or more.
+    pub fn overflow(&self) -> u64 {
+        self.slots[LATENCY_HIST_BINS + 1]
+    }
+    /// The [`LATENCY_HIST_BINS`] in-range bin counts.
+    pub fn bins(&self) -> &[u64] {
+        &self.slots[1..=LATENCY_HIST_BINS]
+    }
+    /// Number of samples.
+    pub fn total(&self) -> u64 {
+        self.slots.iter().sum()
+    }
+    /// Add another session's counts.
+    pub fn add(&mut self, other: &LatencyHistSnapshot) {
+        for (a, b) in self.slots.iter_mut().zip(other.slots.iter()) {
+            *a = a.saturating_add(*b);
+        }
+    }
+
+    /// Estimated `q`-quantile (0..=1) in µs, `None` without samples.
+    /// Interpolates log-linearly inside the bin that holds the rank,
+    /// so the estimate is within one bin (a factor of 1.78) of the
+    /// true value. Underflow reports 10 µs, overflow 10 s.
+    pub fn quantile_us(&self, q: f64) -> Option<u64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        // 1-based rank of the sample to report, as with nearest-rank.
+        let rank = ((q.clamp(0.0, 1.0) * total as f64).ceil() as u64).clamp(1, total);
+        let mut below = 0u64;
+        for (slot, &n) in self.slots.iter().enumerate() {
+            if n == 0 || below + n < rank {
+                below += n;
+                continue;
+            }
+            if slot == 0 {
+                return Some(LATENCY_HIST_EDGES_US[0]);
+            }
+            if slot == LATENCY_HIST_BINS + 1 {
+                return Some(LATENCY_HIST_EDGES_US[LATENCY_HIST_BINS]);
+            }
+            let w =
+                (LATENCY_HIST_LOG10_MAX_US - LATENCY_HIST_LOG10_MIN_US) / LATENCY_HIST_BINS as f64;
+            let lo = LATENCY_HIST_LOG10_MIN_US + (slot - 1) as f64 * w;
+            let frac = (rank - below) as f64 / n as f64;
+            return Some(10f64.powf(lo + frac * w).round() as u64);
+        }
+        None
     }
 }
 
@@ -1361,6 +1490,77 @@ pub fn stub_report(name: &str) -> ProtoReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_hist_edges_match_the_log_formula() {
+        let w = (LATENCY_HIST_LOG10_MAX_US - LATENCY_HIST_LOG10_MIN_US) / LATENCY_HIST_BINS as f64;
+        for (i, &e) in LATENCY_HIST_EDGES_US.iter().enumerate() {
+            let exact = 10f64.powf(LATENCY_HIST_LOG10_MIN_US + i as f64 * w);
+            assert_eq!(e, (exact - 1e-9).ceil() as u64, "edge {i}");
+        }
+        // Every integer sample lands where the float formula puts it.
+        let h = LiveLatencyHist::default();
+        for us in [
+            0u64,
+            1,
+            9,
+            10,
+            17,
+            18,
+            31,
+            32,
+            999,
+            1_000,
+            1_778,
+            1_779,
+            9_999_999,
+            10_000_000,
+            u64::MAX,
+        ] {
+            h.record_us(us);
+        }
+        let s = h.snapshot();
+        assert_eq!(s.underflow(), 3);
+        assert_eq!(s.overflow(), 2);
+        assert_eq!(s.total(), 15);
+        assert_eq!(s.bins()[0], 2); // 10, 17
+        assert_eq!(s.bins()[1], 2); // 18, 31
+        assert_eq!(s.bins()[2], 1); // 32
+        assert_eq!(s.bins()[7], 1); // 999 in [563, 1000)
+        assert_eq!(s.bins()[8], 2); // 1000, 1778
+        assert_eq!(s.bins()[9], 1); // 1779
+        assert_eq!(s.bins()[23], 1); // 9_999_999
+    }
+
+    #[test]
+    fn live_hist_quantiles_are_within_one_bin() {
+        assert_eq!(LatencyHistSnapshot::default().quantile_us(0.5), None);
+        let h = LiveLatencyHist::default();
+        // 90 samples at ~2 ms, 10 at ~200 ms.
+        for _ in 0..90 {
+            h.record_us(2_000);
+        }
+        for _ in 0..10 {
+            h.record_us(200_000);
+        }
+        let s = h.snapshot();
+        let p50 = s.quantile_us(0.5).unwrap();
+        let p99 = s.quantile_us(0.99).unwrap();
+        assert!((1_779..3_163).contains(&p50), "p50 {p50}");
+        assert!((177_828..316_228).contains(&p99), "p99 {p99}");
+        // Sums of sessions add up.
+        let mut sum = s;
+        sum.add(&s);
+        assert_eq!(sum.total(), 200);
+        assert_eq!(sum.quantile_us(0.5), Some(p50));
+        // Out-of-range samples report the edges.
+        let lo = LiveLatencyHist::default();
+        lo.record_us(3);
+        assert_eq!(lo.snapshot().quantile_us(0.99), Some(10));
+        let hi = LiveLatencyHist::default();
+        hi.record_us(20_000_000);
+        assert_eq!(hi.snapshot().quantile_us(0.5), Some(10_000_000));
+    }
 
     #[test]
     fn flow_quality_prefers_the_longest_contiguous_run() {

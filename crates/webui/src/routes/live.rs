@@ -119,6 +119,17 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
             global_win.push(now, rs.sent, total_recv);
             let (pps_sent, pps_recv) = global_win.pps();
 
+            // Ack-latency histograms, per session and summed (a few
+            // hundred relaxed loads per session per tick).
+            let hists: Vec<protoplay::LatencyHistSnapshot> = rs
+                .ctx
+                .per_source
+                .lock_safe()
+                .iter()
+                .map(|p| p.snapshot_ack_latency())
+                .collect();
+            let ack_latency = live_ack_latency(&hists);
+
             let per_session: Vec<_> = rs
                 .per_source_progress
                 .iter()
@@ -126,6 +137,7 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
                 .map(|(i, p)| {
                     session_wins[i].push(now, p.sent, p.received);
                     let (pps_s, pps_r) = session_wins[i].pps();
+                    let h = hists.get(i);
                     LivePerSession {
                         src_ip: p.src_ip.clone(),
                         src_mac: p.src_mac.clone(),
@@ -142,6 +154,8 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
                         pps_recv: pps_r,
                         iter_current: p.iter_current,
                         iter_total: p.iter_total,
+                        ack_p50_us: h.and_then(|h| h.quantile_us(0.50)),
+                        ack_p99_us: h.and_then(|h| h.quantile_us(0.99)),
                     }
                 })
                 .collect();
@@ -158,6 +172,7 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
                     bytes: rs.bytes_progress,
                     pps_sent,
                     pps_recv,
+                    ack_latency,
                     per_session,
                 },
                 terminal,
@@ -204,7 +219,38 @@ pub(crate) struct LiveFrame {
     pub(crate) bytes: u64,
     pub(crate) pps_sent: u64,
     pub(crate) pps_recv: u64,
+    /// Ack latency over every session so far; `None` until the first
+    /// acknowledgement (and for raw replay, which has none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ack_latency: Option<LiveAckLatency>,
     pub(crate) per_session: Vec<LivePerSession>,
+}
+
+/// Live ack-latency summary of a running benchmark, from the
+/// sessions' log-scale histograms (estimates within one bin, a factor
+/// of 1.78; the final report computes exact percentiles).
+#[derive(Serialize)]
+pub(crate) struct LiveAckLatency {
+    pub(crate) p50_us: u64,
+    pub(crate) p99_us: u64,
+    /// Acknowledged messages measured so far.
+    pub(crate) samples: u64,
+    /// The summed histogram, in the report histogram's layout.
+    pub(crate) histogram: LatencyHistogramJson,
+}
+
+/// Sum the sessions' histograms; `None` without any sample.
+pub(crate) fn live_ack_latency(hists: &[protoplay::LatencyHistSnapshot]) -> Option<LiveAckLatency> {
+    let mut sum = protoplay::LatencyHistSnapshot::default();
+    for h in hists {
+        sum.add(h);
+    }
+    Some(LiveAckLatency {
+        p50_us: sum.quantile_us(0.50)?,
+        p99_us: sum.quantile_us(0.99)?,
+        samples: sum.total(),
+        histogram: LatencyHistogramJson::from(&sum),
+    })
 }
 
 #[derive(Serialize)]
@@ -235,4 +281,10 @@ pub(crate) struct LivePerSession {
     pub(crate) iter_current: u64,
     /// Total iterations planned (0 = unbounded).
     pub(crate) iter_total: u64,
+    /// This session's ack latency so far (estimate, see
+    /// [`LiveAckLatency`]); absent before its first acknowledgement.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ack_p50_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) ack_p99_us: Option<u64>,
 }

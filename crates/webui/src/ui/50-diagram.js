@@ -346,7 +346,8 @@ function renderDiagramText(frame, sessions) {
   if (wrap.open && performance.now() - diag.tableAt > 1000) {
     diag.tableAt = performance.now();
     const rows = sessions.map(p => `<tr><td><code>${esc(p.src_ip || '—')}</code></td><td><span class="st st-${liveState(p)}">${liveState(p)}</span></td>` +
-      `<td class="num">${fmtInt(p.sent)}</td><td class="num">${fmtInt(p.received)}</td><td class="num">${fmtInt(p.pps_sent)}</td><td class="num">${fmtInt(p.pps_recv)}</td></tr>`).join('');
+      `<td class="num">${fmtInt(p.sent)}</td><td class="num">${fmtInt(p.received)}</td><td class="num">${fmtInt(p.pps_sent)}</td><td class="num">${fmtInt(p.pps_recv)}</td>` +
+      `<td class="num">${p.ack_p50_us != null ? usFmt(p.ack_p50_us) : '—'}</td><td class="num">${p.ack_p99_us != null ? usFmt(p.ack_p99_us) : '—'}</td></tr>`).join('');
     setHTML(qs('#diagram-table tbody'), rows);
   }
 }

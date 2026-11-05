@@ -1139,9 +1139,10 @@ document.addEventListener('mouseout', e => { if (e.target.classList && e.target.
 // ---------------------------------------------------------------------------
 // Live dashboard strip: throughput sparkline (uplink and downlink),
 // messages in flight, ack latency and the session-state bar, fed by
-// the running run's WebSocket frames (see 50-diagram.js). Ack latency
-// percentiles are computed by the sessions when they finish, so they
-// appear for finished runs; while running the strip says so.
+// the running run's WebSocket frames (see 50-diagram.js). The live ack
+// latency comes from the sessions' log-scale histograms (four bins per
+// decade), so it is an estimate; the finished run's card shows the
+// exact percentiles.
 
 const liveHist = { runId: null, up: [], down: [], lastAt: 0 };
 const LIVE_HIST_N = 120;
@@ -1180,6 +1181,19 @@ function stateBarFromRows(rows) {
   return bar + `</div><p class="state-line">${words.join('')}</p>`;
 }
 
+// Live ack-latency tile: p50 / p99 over every acknowledgement so far.
+function liveLatencyTile(running, f, tile) {
+  const k = 'Ack latency p50 / p99';
+  const lat = f && f.ack_latency;
+  if (lat) {
+    return tile(k, `<span class="ls-lat">${usFmt(lat.p50_us)} <span class="u">/</span> ${usFmt(lat.p99_us)}</span>`,
+      `${fmtInt(lat.samples)} acks so far · estimate, ±1 bin`);
+  }
+  const mode = (f && f.mode) || running.mode;
+  if (mode && mode !== 'benchmark') return tile(k, '—', 'raw replay has no acknowledgements', 'muted');
+  return tile(k, '—', f ? 'waiting for the first acknowledgement' : 'connecting…', 'muted');
+}
+
 function renderLiveStrip() {
   const box = el('live-strip');
   const running = S.runs.find(r => r.status === 'running');
@@ -1199,7 +1213,7 @@ function renderLiveStrip() {
   h += `<div class="ls-tile ls-tp"><span class="k">Throughput <span class="ls-key"><span class="lk-up"></span>sent <span class="lk-down"></span>received</span></span>` +
     `<span class="v">${fmtInt(up)} <span class="u">msg/s</span> <span class="ls-down">↓ ${fmtInt(down)}</span></span>${dualSparkSvg(hist.up, hist.down)}<span class="sub">peak ${fmtInt(peak)} msg/s, last ${hist.up.length} s</span></div>`;
   h += tile('In flight', fmtInt(inflight), 'sent, not yet acknowledged');
-  h += tile('Ack latency p50 / p99', '—', 'measured per session; shown when the run ends', 'muted');
+  h += liveLatencyTile(running, f, tile);
   h += `<div class="ls-tile ls-states"><span class="k">Sessions · ${fmtInt(rows.length || running.sources || 0)}</span>${rows.length ? stateBarFromRows(rows) : '<span class="sub">no session data yet</span>'}</div>`;
   h += '</div>';
   setHTML(el('ls-grid'), h);

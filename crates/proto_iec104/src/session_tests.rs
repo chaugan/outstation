@@ -199,10 +199,20 @@ fn windowed_send_blocks_until_server_acks() {
     p.recv_until(ms(2000), |a| is_u(a, U_STOPDT_ACT))
         .expect("STOPDT");
     p.send_u(U_STOPDT_CON);
+    let live = run.progress.ack_latency.clone();
     let (rep, _, _) = run.join_within(ms(3000));
     assert!(rep.error.is_none(), "{:?}", rep.error);
     assert_eq!(rep.messages_sent, 15);
     assert!(rep.window_stalls >= 1);
+    // The live histogram saw every retired frame as it was acked.
+    let h = live.snapshot();
+    assert_eq!(h.total(), 15);
+    let reservoir = protoplay::LiveLatencyHist::default();
+    for &us in &rep.latency_samples_us {
+        reservoir.record_us(us);
+    }
+    assert_eq!(h, reservoir.snapshot(), "live and final samples bin alike");
+    assert!(h.quantile_us(0.99).unwrap() >= 100_000);
     assert_eq!(rep.latency_samples_us.len(), 15);
     let slow = rep
         .latency_samples_us

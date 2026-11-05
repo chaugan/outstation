@@ -596,13 +596,13 @@ pub(crate) fn join_workers(state: &AppState, timeout: Duration) -> Vec<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::net::Ipv4Addr;
     use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
     use std::sync::Mutex;
 
-    fn source(sent: u64, planned: u64) -> sched::SourceProgress {
+    pub(crate) fn source(sent: u64, planned: u64) -> sched::SourceProgress {
         sched::SourceProgress {
             src_ip: Some(Ipv4Addr::new(10, 0, 0, 1)),
             src_mac: [0; 6],
@@ -623,6 +623,7 @@ mod tests {
             bytes_done_iters: Arc::new(AtomicU64::new(0)),
             fold_seq: Arc::new(AtomicU64::new(0)),
             error: Arc::new(Mutex::new(None)),
+            ack_latency: Default::default(),
         }
     }
 
