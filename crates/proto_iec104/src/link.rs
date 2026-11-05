@@ -39,7 +39,8 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use protoplay::{
-    MessageProgress, ProtoReport, ProtocolError, Role, PROTOCOL_ERRORS_CAP, SYNTHESIZED_INDICES_CAP,
+    progress_cancelled, LatencyReservoir, MessageProgress, ProtoReport, ProtocolError, Role,
+    LATENCY_RESERVOIR_CAP, PROTOCOL_ERRORS_CAP, SYNTHESIZED_INDICES_CAP,
 };
 use tracing::{debug, warn};
 
@@ -159,70 +160,6 @@ impl LinkEnd {
 struct PendingIFrame {
     ns: u16,
     send_ns: u64,
-}
-
-/// Maximum latency samples retained per session. With reservoir
-/// sampling this gives unbiased percentile estimation up to ~1%
-/// p99 error from any stream length, while bounding per-session
-/// memory to ~80 KB. 10k × 8 B = 80 KB.
-const LATENCY_RESERVOIR_CAP: usize = 10_000;
-
-/// Reservoir-sample collector for per-session latency. Uses a small
-/// inline PCG-style LCG so we don't pull in the `rand` crate.
-struct LatencyReservoir {
-    capacity: usize,
-    samples: Vec<u64>,
-    /// Total samples seen, including ones we didn't keep.
-    count: u64,
-    rng_state: u64,
-    /// Fast accept-all path while we're still under capacity.
-    full: bool,
-}
-
-impl LatencyReservoir {
-    fn new(capacity: usize) -> Self {
-        // Seed from the monotonic clock so concurrent sessions don't
-        // draw the same sequence.
-        let seed = now_ns().wrapping_add(0x9E3779B97F4A7C15);
-        Self {
-            capacity,
-            samples: Vec::with_capacity(capacity.min(1024)),
-            count: 0,
-            rng_state: seed | 1,
-            full: false,
-        }
-    }
-
-    #[inline]
-    fn next_rand(&mut self) -> u64 {
-        self.rng_state = self
-            .rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.rng_state
-    }
-
-    fn push(&mut self, sample: u64) {
-        self.count = self.count.saturating_add(1);
-        if !self.full {
-            self.samples.push(sample);
-            if self.samples.len() >= self.capacity {
-                self.full = true;
-            }
-            return;
-        }
-        // Algorithm R: pick uniform i in [0, count); if i < capacity
-        // it replaces the i-th sample.
-        let r = self.next_rand();
-        let i = (r % self.count) as usize;
-        if i < self.capacity {
-            self.samples[i] = sample;
-        }
-    }
-
-    fn take(&mut self) -> Vec<u64> {
-        std::mem::take(&mut self.samples)
-    }
 }
 
 /// One synthesized ASDU waiting to be sent.
@@ -411,10 +348,8 @@ impl Link {
     }
 
     fn cancelled(&self) -> bool {
-        self.progress
-            .as_ref()
-            .map(|p| p.cancel.load(Ordering::Relaxed))
-            .unwrap_or(false)
+        // Session cancel or run-level cancel.
+        progress_cancelled(&self.progress)
     }
 
     // ------------------------------------------------------------------
@@ -520,7 +455,8 @@ impl Link {
     /// is dropped right after.
     pub fn into_report(mut self) -> ProtoReport {
         self.report.unacked_at_end = self.pending.len() as u64;
-        self.report.latency_samples_us = self.latency.take();
+        self.report.latency_samples_us =
+            std::mem::replace(&mut self.latency, LatencyReservoir::new(1)).into_vec();
         if let Some(p) = &self.progress {
             p.unacked
                 .store(self.pending.len() as u64, Ordering::Relaxed);

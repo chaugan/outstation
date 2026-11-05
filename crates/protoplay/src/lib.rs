@@ -25,9 +25,9 @@
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -101,6 +101,188 @@ pub struct MessageProgress {
     pub iter_current: Arc<AtomicU64>,
     /// Total iterations planned for this session (0 = unlimited).
     pub iter_total: Arc<AtomicU64>,
+    /// Run-level cancel flag shared by every session of the run (the
+    /// scheduler passes `RunContext::cancel` here). Replayers should
+    /// treat it exactly like [`MessageProgress::cancel`]; use
+    /// [`MessageProgress::is_cancelled`], which checks both.
+    pub run_cancel: Arc<AtomicBool>,
+}
+
+impl MessageProgress {
+    /// True if either this session or the whole run was cancelled.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.run_cancel.load(Ordering::Relaxed)
+    }
+}
+
+/// Cancellation check for the common `Option<MessageProgress>` shape.
+/// `None` (no progress sink) is never cancelled.
+#[inline]
+pub fn progress_cancelled(progress: &Option<MessageProgress>) -> bool {
+    progress.as_ref().is_some_and(MessageProgress::is_cancelled)
+}
+
+/// Longest time any cancellable wait sleeps before re-checking its
+/// cancel condition. Bounds STOP latency for every helper below.
+pub const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sleep until `deadline`, waking at least every
+/// [`CANCEL_POLL_INTERVAL`] to evaluate `cancelled`. Returns `true` if
+/// the deadline was reached and `false` if the wait was cancelled.
+pub fn sleep_until_cancellable(deadline: Instant, cancelled: impl Fn() -> bool) -> bool {
+    loop {
+        if cancelled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(CANCEL_POLL_INTERVAL));
+    }
+}
+
+/// Sleep for `dur` in [`CANCEL_POLL_INTERVAL`] slices. Same return
+/// convention as [`sleep_until_cancellable`].
+pub fn sleep_cancellable(dur: Duration, cancelled: impl Fn() -> bool) -> bool {
+    match Instant::now().checked_add(dur) {
+        Some(deadline) => sleep_until_cancellable(deadline, cancelled),
+        // Absurd duration: sleep "forever", i.e. until cancelled.
+        None => loop {
+            if cancelled() {
+                return false;
+            }
+            std::thread::sleep(CANCEL_POLL_INTERVAL);
+        },
+    }
+}
+
+/// Run `poll(slice)` repeatedly until it returns `Some`, `deadline`
+/// passes, or `cancelled()` is true. `slice` is the remaining time
+/// capped at [`CANCEL_POLL_INTERVAL`], so a blocking receive inside
+/// `poll` (e.g. `Receiver::recv_timeout(slice)`) never holds off a
+/// cancel for more than 100 ms. Returns [`Wait::Done`] with the value,
+/// [`Wait::TimedOut`] or [`Wait::Cancelled`].
+pub fn poll_until_cancellable<T>(
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+    mut poll: impl FnMut(Duration) -> Option<T>,
+) -> Wait<T> {
+    loop {
+        if cancelled() {
+            return Wait::Cancelled;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Wait::TimedOut;
+        }
+        if let Some(v) = poll((deadline - now).min(CANCEL_POLL_INTERVAL)) {
+            return Wait::Done(v);
+        }
+    }
+}
+
+/// Outcome of [`poll_until_cancellable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait<T> {
+    Done(T),
+    TimedOut,
+    Cancelled,
+}
+
+/// Default number of latency samples kept per session.
+pub const LATENCY_RESERVOIR_CAP: usize = 10_000;
+
+/// Bounded uniform sample of a latency stream (Vitter's Algorithm R).
+/// Keeps at most `capacity` values no matter how many are pushed, so
+/// per-session memory stays bounded across any number of iterations.
+/// Uses a tiny inline LCG so the crate needs no `rand` dependency.
+#[derive(Debug, Clone)]
+pub struct LatencyReservoir {
+    capacity: usize,
+    samples: Vec<u64>,
+    seen: u64,
+    rng_state: u64,
+}
+
+impl LatencyReservoir {
+    /// New reservoir, seeded from the clock plus a per-process counter
+    /// so concurrent sessions draw different sequences.
+    pub fn new(capacity: usize) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let salt = NEXT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0xD1B5_4A32_D192_ED03);
+        Self::with_seed(capacity, clock ^ salt)
+    }
+
+    /// Deterministic variant for tests.
+    pub fn with_seed(capacity: usize, seed: u64) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            samples: Vec::with_capacity(capacity.clamp(1, 1024)),
+            seen: 0,
+            rng_state: seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1,
+        }
+    }
+
+    #[inline]
+    fn next_rand(&mut self) -> u64 {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // Use the high bits; the low bits of an LCG are weak.
+        self.rng_state >> 16
+    }
+
+    pub fn push(&mut self, sample: u64) {
+        self.seen = self.seen.saturating_add(1);
+        if self.samples.len() < self.capacity {
+            self.samples.push(sample);
+            return;
+        }
+        let i = (self.next_rand() % self.seen) as usize;
+        if i < self.capacity {
+            self.samples[i] = sample;
+        }
+    }
+
+    pub fn extend(&mut self, samples: impl IntoIterator<Item = u64>) {
+        for s in samples {
+            self.push(s);
+        }
+    }
+
+    /// Number of values pushed so far (kept or not).
+    pub fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn as_slice(&self) -> &[u64] {
+        &self.samples
+    }
+
+    pub fn into_vec(self) -> Vec<u64> {
+        self.samples
+    }
 }
 
 /// Controls how the replayer paces its own sends. Benchmark mode
@@ -352,7 +534,20 @@ impl ProtoReport {
     /// Call this once at the end of a session, after all samples have
     /// been recorded and `elapsed_ms` and `messages_sent` are set.
     pub fn finalize_latency(&mut self) {
+        // Throughput does not depend on the latency samples; a session
+        // that never saw an ACK still sent messages.
+        self.throughput_msgs_per_sec = if self.elapsed_ms > 0 {
+            (self.messages_sent as f64) * 1000.0 / (self.elapsed_ms as f64)
+        } else {
+            0.0
+        };
         if self.latency_samples_us.is_empty() {
+            self.latency_min_us = 0;
+            self.latency_max_us = 0;
+            self.latency_p50_us = 0;
+            self.latency_p90_us = 0;
+            self.latency_p99_us = 0;
+            self.latency_mean_us = 0;
             return;
         }
         let mut v = self.latency_samples_us.clone();
@@ -369,10 +564,6 @@ impl ProtoReport {
         self.latency_p99_us = at(0.99);
         let sum: u128 = v.iter().map(|x| *x as u128).sum();
         self.latency_mean_us = (sum / n as u128) as u64;
-        if self.elapsed_ms > 0 {
-            self.throughput_msgs_per_sec =
-                (self.messages_sent as f64) * 1000.0 / (self.elapsed_ms as f64);
-        }
     }
 }
 
@@ -794,5 +985,77 @@ mod tests {
         r.finalize_latency();
         assert_eq!(r.latency_p99_us, 0);
         assert_eq!(r.latency_mean_us, 0);
+    }
+
+    #[test]
+    fn finalize_latency_throughput_without_samples() {
+        let mut r = ProtoReport {
+            messages_sent: 50,
+            elapsed_ms: 500,
+            ..Default::default()
+        };
+        r.finalize_latency();
+        assert_eq!(r.throughput_msgs_per_sec as u64, 100);
+    }
+
+    #[test]
+    fn reservoir_is_bounded_and_counts_everything() {
+        let mut r = LatencyReservoir::with_seed(100, 7);
+        r.extend(0..10_000u64);
+        assert_eq!(r.len(), 100);
+        assert_eq!(r.seen(), 10_000);
+        // Uniform sample of 0..10000: the mean should be near 5000.
+        let mean = r.as_slice().iter().sum::<u64>() / 100;
+        assert!((3000..7000).contains(&mean), "mean {mean}");
+    }
+
+    #[test]
+    fn reservoir_keeps_all_below_capacity() {
+        let mut r = LatencyReservoir::with_seed(10, 1);
+        r.extend([5, 6, 7]);
+        assert_eq!(r.into_vec(), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn progress_cancel_checks_run_and_session_flags() {
+        let p = MessageProgress::default();
+        assert!(!p.is_cancelled());
+        p.run_cancel.store(true, Ordering::Relaxed);
+        assert!(p.is_cancelled());
+        let q = MessageProgress::default();
+        q.cancel.store(true, Ordering::Relaxed);
+        assert!(progress_cancelled(&Some(q)));
+        assert!(!progress_cancelled(&None));
+    }
+
+    #[test]
+    fn cancellable_sleep_returns_promptly() {
+        let flag = AtomicBool::new(true);
+        let t = Instant::now();
+        assert!(!sleep_cancellable(Duration::from_secs(3600), || flag.load(Ordering::Relaxed)));
+        assert!(t.elapsed() < Duration::from_millis(50));
+        // Huge durations must not overflow Instant arithmetic.
+        assert!(!sleep_cancellable(Duration::MAX, || true));
+        assert!(sleep_cancellable(Duration::from_millis(5), || false));
+    }
+
+    #[test]
+    fn poll_until_cancellable_outcomes() {
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let r: Wait<u8> = poll_until_cancellable(
+            deadline,
+            || false,
+            |slice| {
+                assert!(slice <= CANCEL_POLL_INTERVAL);
+                std::thread::sleep(slice.min(Duration::from_millis(5)));
+                None
+            },
+        );
+        assert_eq!(r, Wait::TimedOut);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let r = poll_until_cancellable(deadline, || false, |_| Some(3u8));
+        assert_eq!(r, Wait::Done(3));
+        let r: Wait<u8> = poll_until_cancellable(deadline, || true, |_| None);
+        assert_eq!(r, Wait::Cancelled);
     }
 }

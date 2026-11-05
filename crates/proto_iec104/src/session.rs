@@ -28,7 +28,9 @@ use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use protoplay::{session_state, MessageProgress, Pacing, ProtoReport, ProtoRunCfg, Role};
+use protoplay::{
+    progress_cancelled, session_state, MessageProgress, Pacing, ProtoReport, ProtoRunCfg, Role,
+};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
@@ -51,14 +53,6 @@ fn bump(pg: &Option<MessageProgress>, f: impl FnOnce(&MessageProgress)) {
 
 fn set_state(progress: &Option<MessageProgress>, new_state: u8) {
     bump(progress, |p| p.state.store(new_state, Ordering::Relaxed));
-}
-
-#[inline]
-fn check_cancel(progress: &Option<MessageProgress>) -> bool {
-    progress
-        .as_ref()
-        .map(|p| p.cancel.load(Ordering::Relaxed))
-        .unwrap_or(false)
 }
 
 /// Compute the target send time (ns, relative to the first captured
@@ -463,7 +457,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     let accept_deadline = Instant::now() + LISTEN_ACCEPT_TIMEOUT;
     listener.set_nonblocking(true).ok();
     let (stream, peer_addr) = loop {
-        if check_cancel(&progress) {
+        if progress_cancelled(&progress) {
             report.error = Some("cancelled while listening".into());
             report.elapsed_ms = t_start.elapsed().as_millis() as u64;
             set_state(&progress, session_state::FAILED);

@@ -30,6 +30,19 @@ impl Capture {
     /// writer uses classic pcap format with microsecond timestamps,
     /// LINKTYPE_ETHERNET, and a 65535-byte snaplen.
     pub fn start(iface: &str, path: impl Into<PathBuf>) -> Result<Self> {
+        Self::start_with_priority(iface, path, None)
+    }
+
+    /// Like [`Capture::start`], optionally promoting the reader thread
+    /// to `SCHED_FIFO` at `rt_priority`. Runs that put replay workers on
+    /// SCHED_FIFO pass [`crate::CAPTURE_RT_PRIORITY`] here so the reader
+    /// (which only blocks in `recv`, never spins) outranks the workers
+    /// and keeps draining the socket instead of dropping frames.
+    pub fn start_with_priority(
+        iface: &str,
+        path: impl Into<PathBuf>,
+        rt_priority: Option<i32>,
+    ) -> Result<Self> {
         let path: PathBuf = path.into();
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
@@ -95,6 +108,9 @@ impl Capture {
         let thread = thread::Builder::new()
             .name(format!("capture-{iface_c}"))
             .spawn(move || {
+                if let Some(prio) = rt_priority {
+                    crate::try_set_realtime(prio);
+                }
                 let mut buf = vec![0u8; 65536];
                 loop {
                     if stop_c.load(Ordering::Relaxed) {

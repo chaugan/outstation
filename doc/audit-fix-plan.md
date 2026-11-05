@@ -42,7 +42,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Surface cp56 config errors, and fix the TZ-vs-SU decode.
   - Single-bit U-frame validation; replace `remove(0)` in the resync with a proper buffer.
   - Sum `per_rtu_bytes` across flows instead of overwriting (P02, consumer part).
-- [~] **T03 Host safety and scheduler** (`crates/netctl`, `crates/sched`, `crates/raw_replay`). Refs: F026, F028, F030 (sched part), F031, F032, F033, F034, F035, F038, F039, F040, F041, F043, F045, F047, F075, F137 (library part), P02 (`seen` ordering in `sched:1300`), P04 (raw pacing guard).
+- [x] **T03 Host safety and scheduler** (`crates/netctl`, `crates/sched`, `crates/raw_replay`). Refs: F026, F028, F030 (sched part), F031, F032, F033, F034, F035, F038, F039, F040, F041, F043, F045, F047, F075, F137 (library part), P02 (`seen` ordering in `sched:1300`), P04 (raw pacing guard).
   - Derive bridge and tap names from the run id. `reclaim_stale` deletes only interfaces marked as ours.
   - Refuse the default-route NIC, the NIC carrying the request's local address, real bridges (fix `is_bridge`) and existing bridge ports.
   - /32 `noprefixroute` aliases; distinguish Added from AlreadyPresent, with refcounts.
@@ -55,7 +55,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - SCHED_FIFO policy: cap at cores−1, no FIFO with top-speed, no spin for gaps over 1 ms.
   - Join and tear down on spawn failure; no `expect()` in spawn paths.
   - Correct sent and progress counters.
-- [~] **T04 webui backend: split, then fix** (`crates/webui/src/{lib,db}.rs` → modules, `crates/outstation/src/main.rs`, `systemd/`). Refs: F027, F029, F036, F037, F042, F044, F046, F048, F049, F050, F051, F052, F053, F054, F055, F056, F057, F071, F072, F073, F074, F076, F077, F078, F079, F086, F087, F088 (backend), F089, F090, F091, F092, F094, F101 (backend), F108 (backend), F132, F133, F146, F148, F149, F151.
+- [x] **T04 webui backend: split, then fix** (`crates/webui/src/{lib,db}.rs` → modules, `crates/outstation/src/main.rs`, `systemd/`). Refs: F027, F029, F036, F037, F042, F044, F046, F048, F049, F050, F051, F052, F053, F054, F055, F056, F057, F071, F072, F073, F074, F076, F077, F078, F079, F086, F087, F088 (backend), F089, F090, F091, F092, F094, F101 (backend), F108 (backend), F132, F133, F146, F148, F149, F151.
   - Split `lib.rs` into `routes/`, `dto`, `persist`, `library`, `netprobe` and `runs` modules.
   - Single-active-run lock. A 409 names the active run, client IP and start time. Broadcast an event channel (SSE or WS) for run started/stopped, which the UI shows as a banner.
   - Validate the request, then allocate the run id. `catch_unwind` around workers; stop and delete can finalize a run with no worker; final status derived from session errors.
@@ -79,6 +79,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Fix `install.sh`.
   - Real `/api/status` health (DB writable, free disk, capabilities, active guards).
   - Plain-text logs under journald; run-id tracing spans.
+
+- [x] **T04b Integration of T03 and T04** (orchestrator, after both merge).
+  - `host_cleanup()` → `netctl::cleanup_all(state_dir)`, wired to SIGTERM, `outstation cleanup` and ExecStopPost.
+  - `api_run` fills `protected_addrs` for RunConfig and BenchmarkConfig with the request's local socket address (ConnectInfo / the bound listener address), from a security review.
+  - Thread the `force` override through RunReq with a UI confirmation.
+
+- [ ] **T04c Leftovers from wave 1.**
+  - Per-run capture size cap while writing: a hook in sched/raw_replay capture (F055/F149 remainder). Until then, a low-disk watchdog stops the run.
+  - The UI must expose `alias_iface` and `force` (with a confirmation dialog), or slave runs with non-local RTU IPs fail. Owned by T07.
+  - curl/script clients now need an `Origin` header for POST/DELETE/PATCH; document this in the README and smoke scripts (T15, T16).
 
 ## Wave 2: depends on wave 1
 
@@ -106,7 +116,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Paginated or lazy per-RTU detail, with the report persisted to the DB.
   - Run-status check: refuse or warn when the run failed or sent nothing.
   - Table-driven verdict and rollup tests. Adopt the T02 frame iterator.
-- [ ] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
+- [~] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
   - Split the SPA into modules.
   - Block START on invalid JSON; pre-flight validation with inline errors.
   - Fix the stuck ANALYZING panel.
@@ -135,7 +145,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 - [ ] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
 - [ ] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [ ] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
-- [ ] **T14 UI restructure.** Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
+- [~] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
 ## Wave 4: docs, privileged validation, final audit
 
@@ -172,3 +182,26 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - P01–P12 fixed, except that P07 is partly fixed: RSS went from 2.9× to about 2× the file size, and the remainder is per-packet metadata.
   - Removed the dead `tcp_session` crate.
   - Gap-tolerant reassembly records gaps (`StreamGap`). Consumers must reframe at gap offsets; T05 does this for the session replay path.
+- 2026-11-05: T03 merged. Workspace tests: 204 passed. T03 is complete except F028, which is partly fixed: the session-internal waits went to T05.
+  - Run-id-derived names and the ifalias ownership marker.
+  - NIC and address protection.
+  - /32 noprefixroute aliases with refcounts.
+  - A locked, atomic state journal and `netctl::cleanup_all`.
+  - Fail-closed guards.
+  - A latency reservoir across iterations.
+  - Cancellable sleeps and a shared epoch.
+  - The SCHED_FIFO policy.
+  - Six netns tests, run with `scripts/netns-test.sh`.
+- 2026-11-05: Security-review follow-ups.
+  - The port-IP exemption is limited to the run's own interfaces, not any `pcr*` interface.
+  - Captures no longer read or migrate from world-writable /tmp, and downloads are confined to `captures_dir`.
+- 2026-11-05: T04 merged together with the T04b integration. Workspace tests: 247 passed.
+  - Single-run 409 with the client IP, plus an SSE `/api/events` feed.
+  - Host/Origin guard.
+  - Library-id-only pcap references.
+  - Streamed I/O and durable captures.
+  - DB migrations and id integrity.
+  - Graceful shutdown, which calls `netctl::cleanup_all`.
+  - The local request address goes into `protected_addrs`.
+  - Partly fixed: F055/F149 (no per-run capture size cap yet; tracked in T04c) and F133 (docs part moved to T15).
+- 2026-11-05: T07 started, with T14 folded in, in `/opt/code/outstation-wt/frontend`. T06 finished its first pass and is now adapting to T04's split and to T05's GI-burst stripping.
