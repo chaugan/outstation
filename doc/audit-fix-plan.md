@@ -170,7 +170,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 4: docs, privileged validation, final audit
 
-- [~] **T15 Docs truth pass.**
+- [x] **T15 Docs truth pass.**
   - README: the timers, the scale claim backed by a measured sizing benchmark, the safety and LAN-exposure guidance, capture locations, the API (`run_id`) and the new features.
   - Rewrite `doc/scada-lab.en.md` and `doc/scada-lab.md`.
   - Fix `doc/adding-a-protocol.md`.
@@ -297,3 +297,10 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - With this, T08 and T10 are complete.
 - 2026-11-05: Orchestrator: IEC 104 `proto_config` is validated at submit through `ProtoReplayer::validate_config`, returning 400 `invalid_proto_config`.
 - 2026-11-05: Orchestrator fixed a race found by a flaky test: the single-run slot was released after the terminal status became visible, giving a spurious 409. A too-tight timing assertion in raw_replay was also relaxed. The full suite then passed 4 runs in a row (406 tests). Note: commit 804c131 was pushed after a red test run; the cause was this race, now fixed.
+- 2026-11-05: T15 merged.
+  - README truth pass: conformance from link.rs, an honest Scale section, safety and LAN exposure, the new features. Old screenshots removed (T17 refreshes them).
+  - New `doc/api.md`, `doc/iec104-config.md` and `doc/operations.md`.
+  - Lab guide rewritten around the two scenarios, in English and Norwegian.
+  - `adding-a-protocol.md` fixed; errata and caveats added to the reports.
+  - The orchestrator reconciled the docs with T19, fixed the `cleanup --help` text and re-ran the link check (0 problems).
+  - Left for T17 to measure: max throughput, CPU and memory per session, per-session setup time, and gateway mode with an egress NIC.
