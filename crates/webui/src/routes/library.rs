@@ -81,23 +81,135 @@ pub(crate) fn multipart_error(e: axum::extract::multipart::MultipartError) -> Ap
     AppError::new(status, code, format!("read upload: {e}"))
 }
 
-/// Stream one multipart field into `file`, enforcing `max` bytes.
-pub(crate) async fn stream_field_to_file(
-    field: &mut axum::extract::multipart::Field<'_>,
-    file: &mut tokio::fs::File,
+/// Byte limits one upload is streamed against (F051).
+pub(crate) struct UploadLimits {
+    /// The configured per-upload cap.
     max: u64,
-) -> Result<u64, AppError> {
-    use tokio::io::AsyncWriteExt;
-    let mut written: u64 = 0;
-    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
-        written += chunk.len() as u64;
-        if written > max {
+    /// Bytes that may be written before free space in the state dir
+    /// drops below the reserve, measured when the upload started.
+    disk_budget: Option<u64>,
+    /// Bytes left under the library quota, for library uploads.
+    quota_left: Option<u64>,
+    state_dir: PathBuf,
+    min_free: u64,
+}
+
+/// Re-measure free space every this many bytes of an upload, so
+/// concurrent writers (a run capture) are noticed too.
+const FREE_RECHECK_BYTES: u64 = 16 * 1024 * 1024;
+
+impl UploadLimits {
+    pub(crate) fn new(state: &AppState) -> Self {
+        let min_free = state.cfg.min_free_bytes;
+        Self {
+            max: state.cfg.max_upload_bytes,
+            disk_budget: crate::sysinfo::free_bytes(&state.cfg.state_dir)
+                .map(|f| f.saturating_sub(min_free)),
+            quota_left: None,
+            state_dir: state.cfg.state_dir.clone(),
+            min_free,
+        }
+    }
+
+    /// Also hold the upload to the library quota.
+    pub(crate) fn with_library_quota(mut self, state: &AppState) -> Result<Self, AppError> {
+        let quota = state.cfg.library_max_bytes;
+        if quota > 0 {
+            let used = library_bytes(&state.library_dir);
+            if used >= quota {
+                return Err(library_full(used, quota));
+            }
+            self.quota_left = Some(quota - used);
+        }
+        Ok(self)
+    }
+
+    fn check(&self, written: u64, recheck: bool) -> Result<(), AppError> {
+        if written > self.max {
             return Err(AppError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "too_large",
-                format!("upload exceeds the {max}-byte limit"),
+                format!("upload exceeds the {}-byte limit", self.max),
             ));
         }
+        if let Some(left) = self.quota_left {
+            if written > left {
+                return Err(AppError::new(
+                    StatusCode::INSUFFICIENT_STORAGE,
+                    "library_full",
+                    format!(
+                        "upload exceeds the library quota ({left} bytes left); \
+                         delete pcaps from the library or raise --library-max-mb"
+                    ),
+                ));
+            }
+        }
+        let low = self.disk_budget.is_some_and(|b| written > b)
+            || (recheck
+                && crate::sysinfo::free_bytes(&self.state_dir).is_some_and(|f| f < self.min_free));
+        if low {
+            return Err(AppError::new(
+                StatusCode::INSUFFICIENT_STORAGE,
+                "disk_full",
+                format!(
+                    "upload stopped: free disk in {} would drop below the {}-byte reserve",
+                    self.state_dir.display(),
+                    self.min_free
+                ),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn library_full(used: u64, quota: u64) -> AppError {
+    AppError::new(
+        StatusCode::INSUFFICIENT_STORAGE,
+        "library_full",
+        format!(
+            "the library holds {used} bytes of its {quota}-byte quota; delete pcaps \
+             or raise --library-max-mb"
+        ),
+    )
+}
+
+/// Total size of the library's pcaps and in-progress uploads.
+pub(crate) fn library_bytes(dir: &StdPath) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter(|e| {
+                    let n = e.file_name();
+                    let n = n.to_string_lossy();
+                    n.ends_with(".pcap") || n.ends_with(".part")
+                })
+                .filter_map(|e| e.metadata().ok())
+                .filter(|m| m.is_file())
+                .map(|m| m.len())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// Stream one multipart field into `file`, enforcing `limits` while
+/// the bytes arrive: the size cap, the library quota and the free-disk
+/// reserve, which a chunked upload without Content-Length would
+/// otherwise only meet at the end (F051).
+pub(crate) async fn stream_field_to_file(
+    field: &mut axum::extract::multipart::Field<'_>,
+    file: &mut tokio::fs::File,
+    limits: &UploadLimits,
+) -> Result<u64, AppError> {
+    use tokio::io::AsyncWriteExt;
+    let mut written: u64 = 0;
+    let mut next_recheck = FREE_RECHECK_BYTES;
+    while let Some(chunk) = field.chunk().await.map_err(multipart_error)? {
+        written += chunk.len() as u64;
+        let recheck = written >= next_recheck;
+        if recheck {
+            next_recheck = written + FREE_RECHECK_BYTES;
+        }
+        limits.check(written, recheck)?;
         file.write_all(&chunk).await.map_err(|e| {
             AppError::new(
                 StatusCode::INSUFFICIENT_STORAGE,
@@ -134,6 +246,16 @@ async fn library_upload(
         .try_acquire_owned()
         .map_err(|_| crate::routes::runs::busy())?;
     check_free_space(state, declared_length(&headers))?;
+    let limits = UploadLimits::new(state).with_library_quota(state)?;
+    if let Some(left) = limits.quota_left {
+        let declared = declared_length(&headers);
+        if declared > left {
+            return Err(library_full(
+                state.cfg.library_max_bytes - left,
+                state.cfg.library_max_bytes,
+            ));
+        }
+    }
     let dir: &StdPath = state.library_dir.as_ref();
     let mut field = mp
         .next_field()
@@ -169,7 +291,7 @@ async fn library_upload(
         .open(&tmp_path)
         .await
         .map_err(|e| AppError::Internal(format!("open tmp: {e}")))?;
-    stream_field_to_file(&mut field, &mut f, state.cfg.max_upload_bytes).await?;
+    stream_field_to_file(&mut field, &mut f, &limits).await?;
     drop(f);
 
     // Fast validation: check the magic bytes only. Full parse runs in a
@@ -208,6 +330,7 @@ async fn library_upload(
         pcap_end_unix_ms: None,
         mac_collisions: 0,
         viability: None,
+        load_error: None,
     };
     save_library_entry(dir, &pending).map_err(|e| AppError::Internal(format!("sidecar: {e}")))?;
     final_guard.keep();
@@ -218,65 +341,15 @@ async fn library_upload(
     // library poll picks up the populated sidecar when it's done.
     let dir_owned = dir.to_path_buf();
     let final_path_owned = final_path.clone();
-    let id_for_thread = id.clone();
-    let original_name_for_thread = original_name.clone();
+    let pending_owned = pending.clone();
     std::thread::Builder::new()
         .name(format!("library-analyze-{id}"))
         .spawn(move || {
-            let qi = quick_inspect(&final_path_owned);
-            if qi.packets == 0 {
-                // Parse failed after passing the magic check — rare
-                // (truncated body, exotic linktype). Mark the sidecar
-                // with a sentinel and leave it for the user to delete.
-                warn!(id = %id_for_thread, "background parse failed; leaving stub sidecar");
-                let stub = LibraryEntry {
-                    id: id_for_thread.clone(),
-                    name: format!("{original_name_for_thread} (parse failed)"),
-                    uploaded_at_ms,
-                    size_bytes,
-                    packets: 0,
-                    ip_sources: 0,
-                    non_ip_sources: 0,
-                    tcp_flows: 0,
-                    duration_ms: 0.0,
-                    pcap_start_unix_ms: None,
-                    pcap_end_unix_ms: None,
-                    mac_collisions: 0,
-                    viability: Some(Viability {
-                        client_payload_bytes: 0,
-                        server_payload_bytes: 0,
-                        sessions_master_mode: 0,
-                        sessions_slave_mode: 0,
-                        estimated_peak_mb: 0,
-                        verdict: "not_recommended".into(),
-                        verdict_reason: "background parse failed — file may be truncated or use an unsupported link type".into(),
-                        notes: vec![],
-                        slave_rtus: vec![],
-                        master_clients: vec![],
-                    }),
-                };
-                let _ = save_library_entry(&dir_owned, &stub);
-                return;
-            }
-            let final_entry = LibraryEntry {
-                id: id_for_thread.clone(),
-                name: original_name_for_thread,
-                uploaded_at_ms,
-                size_bytes,
-                packets: qi.packets,
-                ip_sources: qi.ip_sources,
-                non_ip_sources: qi.non_ip_sources,
-                tcp_flows: qi.tcp_flows,
-                duration_ms: qi.duration_ms,
-                pcap_start_unix_ms: qi.pcap_start_unix_ms,
-                pcap_end_unix_ms: qi.pcap_end_unix_ms,
-                mac_collisions: qi.mac_collisions,
-                viability: qi.viability,
-            };
-            if let Err(e) = save_library_entry(&dir_owned, &final_entry) {
-                warn!(id = %id_for_thread, error = %e, "sidecar rewrite failed");
-            } else {
-                info!(id = %id_for_thread, packets = qi.packets, "background analysis complete");
+            let entry = finished_entry(&pending_owned, &final_path_owned);
+            if let Err(e) = save_library_entry(&dir_owned, &entry) {
+                warn!(id = %entry.id, error = %e, "sidecar rewrite failed");
+            } else if entry.load_error.is_none() {
+                info!(id = %entry.id, packets = entry.packets, "background analysis complete");
             }
         })
         .map_err(|e| AppError::Internal(format!("spawn analyzer: {e}")))?;

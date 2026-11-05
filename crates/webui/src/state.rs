@@ -73,6 +73,9 @@ pub struct ServeConfig {
     pub capture_max_total_bytes: u64,
     /// Maximum number of capture files kept.
     pub capture_max_count: usize,
+    /// Total size quota of the pcap library in bytes; 0 = no quota
+    /// (F051). `--library-max-mb` or `OUTSTATION_LIBRARY_MAX_MB`.
+    pub library_max_bytes: u64,
     /// Concurrent heavy requests (analysis, uploads, gap histograms).
     pub heavy_concurrency: usize,
     /// Analyse every finished benchmark run's own capture automatically
@@ -122,6 +125,9 @@ impl ServeConfig {
             capture_max_count: env_u64("OUTSTATION_CAPTURE_MAX_COUNT")
                 .map(|v| v as usize)
                 .unwrap_or(200),
+            library_max_bytes: env_u64("OUTSTATION_LIBRARY_MAX_MB")
+                .map(|v| v * MIB)
+                .unwrap_or(0),
             heavy_concurrency: 2,
             auto_analyze: std::env::var("OUTSTATION_AUTO_ANALYZE")
                 .ok()

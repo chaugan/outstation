@@ -188,6 +188,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         min_free_bytes: 0,
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
+        library_max_bytes: 0,
         heavy_concurrency: 2,
         auto_analyze: true,
     }
@@ -2103,4 +2104,60 @@ async fn pcap_loads_wait_for_a_heavy_permit() {
     let (s, v) = run.await.unwrap();
     assert_eq!(s, StatusCode::OK, "{v}");
     h.wait_status(1, "completed").await;
+}
+
+/// F051: uploads without a usable Content-Length are held to the
+/// free-disk reserve and the library quota while they stream.
+#[tokio::test]
+async fn uploads_respect_disk_reserve_and_library_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = crate::sysinfo::free_bytes(dir.path()).unwrap();
+    // Leave ~200 KiB of budget above the reserve.
+    let h = harness_cfg(dir, Behaviour::BlockUntilCancel, |c| {
+        c.max_upload_bytes = 8 * 1024 * 1024;
+        c.min_free_bytes = free.saturating_sub(200 * 1024);
+    });
+    let mut big = tiny_pcap(1);
+    big.resize(4 * 1024 * 1024, 0);
+    for uri in ["/api/pcaps", "/api/analyze"] {
+        let (s, v) = h
+            .multipart(uri, &[("file", Some("big.pcap"), big.clone())])
+            .await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (StatusCode::INSUFFICIENT_STORAGE, Some("disk_full")),
+            "{uri}: {v}"
+        );
+    }
+    assert!(h.files_in("state/library").is_empty());
+    assert!(h.files_in("state/tmp").is_empty());
+
+    // Library quota: 64 KiB.
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| {
+            c.max_upload_bytes = 1024 * 1024;
+            c.library_max_bytes = 64 * 1024;
+        },
+    );
+    let mut mid = tiny_pcap(1);
+    mid.resize(40 * 1024, 0);
+    let (s, v) = h
+        .multipart("/api/pcaps", &[("file", Some("a.pcap"), mid.clone())])
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .multipart("/api/pcaps", &[("file", Some("b.pcap"), mid)])
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::INSUFFICIENT_STORAGE, Some("library_full")),
+        "{v}"
+    );
+    assert!(!h
+        .files_in("state/library")
+        .iter()
+        .any(|f| f.ends_with(".pcap.part")
+            || (f.starts_with('.') && f.ends_with(".part") && !f.contains(".json"))));
 }

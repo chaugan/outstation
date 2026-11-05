@@ -27,7 +27,7 @@ use crate::dto::*;
 use crate::error::{ApiPath, ApiQuery, AppError, LockExt};
 use crate::metrics::AnalysisSource;
 use crate::routes::library::{
-    check_free_space, declared_length, multipart_error, stream_field_to_file,
+    check_free_space, declared_length, multipart_error, stream_field_to_file, UploadLimits,
 };
 use crate::routes::runs::busy;
 use crate::state::*;
@@ -94,7 +94,8 @@ pub(crate) async fn api_analyze(
                     .reopen()
                     .map_err(|e| AppError::Internal(format!("open temp file: {e}")))?;
                 let mut f = tokio::fs::File::from_std(std_file);
-                size = stream_field_to_file(&mut field, &mut f, state.cfg.max_upload_bytes).await?;
+                let limits = UploadLimits::new(&state);
+                size = stream_field_to_file(&mut field, &mut f, &limits).await?;
                 got_file = true;
             }
             "mode" => {

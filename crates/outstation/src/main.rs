@@ -81,6 +81,12 @@ struct ServeArgs {
     #[arg(long, value_name = "MIB")]
     capture_max_mb: Option<u64>,
 
+    /// Total size quota of the pcap library, in MiB; uploads that
+    /// would exceed it are refused. Default: no quota, or
+    /// OUTSTATION_LIBRARY_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    library_max_mb: Option<u64>,
+
     /// Do not analyse finished benchmark runs automatically. Also
     /// OUTSTATION_AUTO_ANALYZE=0.
     #[arg(long)]
@@ -258,6 +264,9 @@ fn main() -> Result<()> {
             if let Some(mb) = args.capture_max_mb {
                 cfg.capture_max_total_bytes = mb.saturating_mul(1024 * 1024);
             }
+            if let Some(mb) = args.library_max_mb {
+                cfg.library_max_bytes = mb.saturating_mul(1024 * 1024);
+            }
             if args.no_auto_analyze {
                 cfg.auto_analyze = false;
             }
@@ -379,6 +388,8 @@ mod tests {
             "--ephemeral",
             "--max-upload-mb",
             "10",
+            "--library-max-mb",
+            "2048",
         ])
         .unwrap();
         let Cmd::Serve(a) = cli.cmd else {
@@ -393,6 +404,7 @@ mod tests {
             .collect();
         assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
         assert_eq!(a.max_upload_mb, Some(10));
+        assert_eq!(a.library_max_mb, Some(2048));
     }
 
     #[test]
