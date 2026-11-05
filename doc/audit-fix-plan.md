@@ -184,7 +184,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O2: inject ports send IGMPv3 reports onto the LAN with the RTU's MAC.
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [~] **T17a Re-audit fixes, core engine (fx1).** New defects N1–N5, N8, N10, N12 and N16–N19 from the independent re-audit, plus the remaining gaps in F028, F039, F055/F072, F079, P06 and P07. The full list is in the session scratchpad, `T17_new_defects.md`.
-- [ ] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
+- [~] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
 - [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -336,3 +336,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Totals so far: F000–F025 24 fixed + 2 partly; F026–F051 19 + 6; F052–F077 20 + 6; F078–F104 24 + 3 with minor gaps + 1 partly; F128–F151 + P01–P12 29 + 6.
   - Nothing NOT FIXED.
   - 22 new defects were found (3 medium: false PASS for a failed session that was then stopped; scheduler warnings not surfaced; throughput understated by idle-serve). They are split into T17a (core) and T17b (webui and docs).
+- 2026-11-05: UI/a11y re-audit slice F105–F127: 20 fixed + 3 partly, 4 new defects (medium: live WebSocket never handles client close; phone sticky bars cover 42% of the screen). fx2 (T17b) started.
