@@ -170,13 +170,13 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 4: docs, privileged validation, final audit
 
-- [ ] **T15 Docs truth pass.**
+- [~] **T15 Docs truth pass.**
   - README: the timers, the scale claim backed by a measured sizing benchmark, the safety and LAN-exposure guidance, capture locations, the API (`run_id`) and the new features.
   - Rewrite `doc/scada-lab.en.md` and `doc/scada-lab.md`.
   - Fix `doc/adding-a-protocol.md`.
   - Annotate `fidelity_report_run2.md`.
   - Refs: F007, F068, F128, F129, F130, F133, F135, F138; product items #1, #6 and #10.
-- [ ] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
+- [~] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
 - [ ] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -285,3 +285,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - A run that delivered nothing gets `run_failed` with a score of 0.
   - Slave runs now capture through a kernel-BPF-filtered AF_PACKET socket on the RTU-IP and master-route interfaces, so auto-analysis and bench scoring work in slave role.
   - Privileged suites rerun by the orchestrator: netns-test 7/7, netns-bench-test 3/3, netns-slave-test 2/2 on 10 of 11 runs. The one flaky failure, right after the bench suite, went back to the lane for a root cause (T18b). Host interface and iptables counts unchanged.
+- 2026-11-05: T15 (docs) and T16 (privileged HTTP smoke suite) started in parallel with T19 (UI) and T18b (flake).
