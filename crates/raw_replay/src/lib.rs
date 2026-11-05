@@ -340,7 +340,7 @@ pub fn plan_for_source(pcap: &pcapload::LoadedPcap, src_ip: std::net::Ipv4Addr) 
     let mut plan = Plan::default();
     for &idx in &src.packet_indices {
         let pkt = &pcap.packets[idx];
-        plan.push(pkt.rel_ts_ns, pkt.data.clone());
+        plan.push(pkt.rel_ts_ns, pkt.ether_frame().into_owned());
     }
     Ok(plan)
 }

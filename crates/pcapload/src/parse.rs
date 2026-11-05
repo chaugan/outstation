@@ -1,7 +1,9 @@
 //! Streaming parser for classic pcap files.
 //!
 //! Supports both microsecond (0xa1b2c3d4) and nanosecond (0xa1b23c4d)
-//! timestamp variants in either endianness.
+//! timestamp variants in either endianness. A record cut short by the
+//! end of the file is an error; the loader turns it into a warning and
+//! keeps the records before it.
 
 use anyhow::{bail, Result};
 
@@ -62,8 +64,13 @@ impl<'a> PcapParser<'a> {
         if self.pos >= self.bytes.len() {
             return Ok(None);
         }
-        if self.bytes.len() < self.pos + 16 {
-            bail!("truncated packet header at offset {}", self.pos);
+        if self.bytes.len() - self.pos < 16 {
+            let pos = self.pos;
+            self.pos = self.bytes.len();
+            bail!(
+                "truncated record header at offset {pos} ({} bytes left, 16 needed)",
+                self.bytes.len() - pos
+            );
         }
         let read_u32 = |b: &[u8]| -> u32 {
             let arr = [b[0], b[1], b[2], b[3]];
@@ -77,10 +84,16 @@ impl<'a> PcapParser<'a> {
         let ts_sub = read_u32(&self.bytes[self.pos + 4..]);
         let incl_len = read_u32(&self.bytes[self.pos + 8..]) as usize;
         let orig_len = read_u32(&self.bytes[self.pos + 12..]);
-        self.pos += 16;
-        if self.bytes.len() < self.pos + incl_len {
-            bail!("truncated packet body at offset {}", self.pos);
+        let body = self.pos + 16;
+        if self.bytes.len() - body < incl_len {
+            let left = self.bytes.len() - body;
+            // Stop here: later calls return `Ok(None)`.
+            self.pos = self.bytes.len();
+            bail!(
+                "truncated record body at offset {body} ({left} bytes left, {incl_len} declared)"
+            );
         }
+        self.pos = body;
         let data = &self.bytes[self.pos..self.pos + incl_len];
         self.pos += incl_len;
         let ts_ns = if self.ns_resolution {

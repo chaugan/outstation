@@ -163,7 +163,9 @@ pub fn analyze_iec104_flow(
     cap_target: Option<FlowSnapshot>,
     ctx: &AnalyzeCtx,
 ) -> ProtoSlaveAnalysis {
-    let cp56_cfg = Iec104ProtoConfig::parse(ctx.proto_config.as_deref()).cp56;
+    let cp56_cfg = Iec104ProtoConfig::parse(ctx.proto_config.as_deref())
+        .unwrap_or_default()
+        .cp56;
     let rewrite_cp56_was_on = cp56_cfg.rewrite_to_now;
     let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
 
@@ -853,7 +855,9 @@ fn compute_cp56_drift(
                         if off + 7 <= asdu.len() {
                             let mut arr = [0u8; 7];
                             arr.copy_from_slice(&asdu[off..off + 7]);
-                            let (ns, iv) = decode_cp56time2a_local(&arr);
+                            let Some((ns, iv)) = decode_cp56time2a_local(&arr) else {
+                                continue;
+                            };
                             let su = arr[3] & 0x80 != 0;
                             redone.push((ns, iv, su));
                         }
@@ -1498,7 +1502,6 @@ pub fn audit_master_commands(
             ca: req.ca,
             oa: req.oa,
             test: req.cot_byte & 0x80 != 0,
-            negative: req.cot_byte & 0x40 != 0,
         };
         let expected: Vec<Vec<u8>> = if req.type_id == 100 {
             build_gi_response(src_inv, echo, req.qualifier)
@@ -1843,7 +1846,6 @@ mod tests {
             ca: 1,
             oa: 42,
             test: false,
-            negative: false,
         };
         let resp = build_gi_response(&inv, echo, 20);
         assert_eq!(resp.len(), 3);
@@ -1913,7 +1915,6 @@ mod tests {
             ca: 1,
             oa: 0,
             test: false,
-            negative: false,
         };
         let resp = build_gi_response(&inv, echo, 20);
         // Drop the ActTerm to simulate a misbehaving slave.
