@@ -144,13 +144,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   4. Stale `listen_port_base + n − 1 ≤ 65535` check, although every slave shares one port on its own IP.
   5. Analysing a run that sent 0 messages gives a `partial` verdict rather than a clear failure or inconclusive result.
 
+- [ ] **T12b Fault and command caveats** (from the T11/T12 lane).
+  - With `return_info` on, captured COT 11/12 return-information frames are still replayed next to the live ones; strip them when echo plus return info is on.
+  - GI after a command with return info can be judged non-compliant, because the analyzer's inventory comes from the capture. Track the command-updated values in the audit.
+
 ## Wave 3: product features
 
 - [~] **T08 Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
 - [~] **T09 Headless bench CLI.** `outstation bench --profile run.json --assert score>=99 --assert p99_ms<=500 --report out.json`. It runs, captures, analyses its own mirror and exits non-zero on failure. Refs: F131; product item #2.
 - [~] **T10 Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
-- [~] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
-- [~] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
+- [x] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
+- [x] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [~] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
 - [x] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
@@ -242,3 +246,8 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Partly fixed: F100 (re-run and URL state go to T08) and F101 (relies on the server's 409).
   - Five backend issues logged as T07b.
 - 2026-11-05: Security review (HIGH) on the features lane's netctl change (inject-side IPs and a hub bridge). Isolation sysctls, raw/FORWARD drop rules and netns tests were sent back to the features lane; to be verified at its merge.
+- 2026-11-05: T11 and T12 merged. Workspace tests: 350 passed; the suite ran 3 times with no flakes after fixing a racy upload test.
+  - Command echo: SbO, set-points, clock sync, read, test and reset, with return info and negative COTs.
+  - Per-type command ActCon and ActTerm latency in both roles.
+  - A FaultPlan with ten fault kinds, peer-reaction detection and a `faults` verdict dimension.
+  - Two minor caveats logged as T12b.
