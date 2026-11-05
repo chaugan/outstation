@@ -127,7 +127,7 @@ async function api(path, method = 'GET', body = null, opts = {}) {
     if (isJson && text && !parsed) {
       return { ok: false, status: r.status, data, code: 'bad_json', error: 'the server sent a malformed reply' };
     }
-    return { ok: true, status: r.status, data, error: null, code: null };
+    return { ok: true, status: r.status, data, error: null, code: null, headers: r.headers };
   }
   let error = null;
   let code = null;

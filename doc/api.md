@@ -225,7 +225,7 @@ The request is validated completely before a run id is allocated. A rejected req
 Slim summaries, newest first, one page at a time. `S` is one of `running`, `completed`, `partial`, `stopped`, `failed`; any other value is 400. `limit` is the page size (default 100, at most 1000); `before` returns only runs with a smaller id. When older runs exist, the response carries the headers `X-Next-Before: <id>` (pass it as `before` for the next page) and `X-Has-More: true`. The newest runs come from memory (`--runs-in-memory`, default 500 finished runs); older pages, and `GET /api/runs/:id` of an older run, are read from the database. Each row:
 
 - identity and request echo: `id, status, started_at, finished_at, started_by, pcap, pcap_id, target_ip, target_mac, speed, top_speed, realtime, error, mode, role, target_port, proto`;
-- progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s), `per_source_progress` (only while running);
+- progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s);
 - counts: `sources, sources_failed, sources_cancelled, has_capture`;
 - `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes, captured_dropped}`;
 - `report` and `benchmark` both also carry `warnings[]` (non-fatal problems: capture failures, a truncated capture, guard restore or teardown errors) and `capture_ok` (false when a requested capture failed or holds no frame although frames were sent; absent in rows that predate it); the detail also has `capture_truncated`;
@@ -265,11 +265,12 @@ Progress stream, one JSON text frame every 200 ms until the run ends (one final 
 ```json
 {"run_id":3,"status":"running","mode":"benchmark","role":"slave","planned":1200,"sent":480,"bytes":51234,
  "pps_sent":12,"pps_recv":3,
- "per_session":[{"src_ip":"192.168.10.2","state":"active","planned":88,"sent":40,"received":9,"unacked":2,
+ "per_session":[{"src_ip":"192.168.10.2","src_mac":"02:00:00:00:00:02","listen_ip":"192.168.10.2","cancelled":false,
+                 "state":"active","planned":88,"sent":40,"received":9,"unacked":2,
                  "listen_port":2404,"pps_sent":1,"pps_recv":1,"iter_current":1,"iter_total":1}]}
 ```
 
-Rates are messages per second over a 1.5 s window.
+Rates are messages per second over a 1.5 s window. A failed session also has `error`. The stream ends at once when the client sends a Close frame or the connection drops. The web UI feeds the running run's card from this stream and polls `GET /api/runs` only every 4 s while it is fresh.
 
 ### `GET /api/runs/:id/download`
 
