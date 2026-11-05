@@ -86,6 +86,7 @@ impl Fake {
                             error: e.map(str::to_string),
                             ..Default::default()
                         },
+                        cancelled: false,
                     })
                     .collect(),
                 total_messages_sent: 10 * s.len() as u64,

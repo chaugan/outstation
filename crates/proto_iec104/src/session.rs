@@ -502,7 +502,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
         if progress_cancelled(&progress) {
             report.error = Some("cancelled while listening".into());
             report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-            set_state(&progress, session_state::FAILED);
+            // Stopped before any master connected: not a failure.
+            set_state(&progress, session_state::CANCELLED);
             return report;
         }
         match listener.accept() {

@@ -129,6 +129,9 @@ pub struct SourceProgressJson {
     pub iter_current: u64,
     /// Total iterations planned. `0` = unbounded.
     pub iter_total: u64,
+    /// Why the session failed, set when `state` is "failed" (T07b).
+    /// `null` otherwise, and in rows stored before this field existed.
+    pub error: Option<String>,
 }
 
 pub(crate) fn state_to_str(s: u8) -> &'static str {
@@ -393,6 +396,9 @@ pub struct SessionReportJson {
     pub latency_samples_us: Vec<u64>,
     /// Protocol-level counters and violations (absent in old rows).
     pub protocol: Option<ProtocolStatsJson>,
+    /// The session was stopped (run stop or per-session cancel), not
+    /// failed; `error` then says where it was stopped (T07b).
+    pub cancelled: bool,
 }
 
 /// One protocol violation, as recorded by the session.
@@ -484,11 +490,18 @@ impl BenchmarkReportJson {
             .sum()
     }
 
+    /// Sessions that ended with an error and were not stopped.
     pub(crate) fn sessions_failed(&self) -> usize {
         self.per_session
             .iter()
-            .filter(|s| s.error.is_some())
+            .filter(|s| s.error.is_some() && !s.cancelled)
             .count()
+    }
+
+    /// Sessions stopped (run stop or per-session cancel) before they
+    /// finished.
+    pub(crate) fn sessions_cancelled(&self) -> usize {
+        self.per_session.iter().filter(|s| s.cancelled).count()
     }
 }
 
@@ -518,6 +531,7 @@ impl From<&SessionReport> for SessionReportJson {
                 .then(|| histogram_of(&pr.latency_samples_us)),
             latency_samples_us: Vec::new(),
             protocol: Some(ProtocolStatsJson::from(&pr.protocol)),
+            cancelled: s.cancelled,
         }
     }
 }
@@ -632,7 +646,10 @@ pub struct BenchmarkSummary {
     pub captured_packets: u64,
     pub captured_bytes: u64,
     pub sessions: usize,
+    /// Sessions that ended with an error (cancelled ones excluded).
     pub sessions_failed: usize,
+    /// Sessions stopped before they finished (T07b).
+    pub sessions_cancelled: usize,
     /// Protocol violations summed over every session.
     pub protocol_violations: u64,
 }
@@ -667,6 +684,8 @@ pub struct RunSummary {
     pub sources: usize,
     /// Rows whose final state was "failed".
     pub sources_failed: usize,
+    /// Rows whose final state was "cancelled" (stopped, never failed).
+    pub sources_cancelled: usize,
     /// True when the capture file exists on disk and can be downloaded.
     pub has_capture: bool,
     pub report: Option<RunReportSummary>,
@@ -715,6 +734,11 @@ impl RunState {
                 .iter()
                 .filter(|p| p.state == "failed")
                 .count(),
+            sources_cancelled: self
+                .per_source_progress
+                .iter()
+                .filter(|p| p.state == "cancelled")
+                .count(),
             has_capture: self.capture_file.as_ref().is_some_and(|p| p.is_file()),
             report: self.report.as_ref().map(|r| RunReportSummary {
                 total_packets: r.total_packets,
@@ -738,6 +762,7 @@ impl RunState {
                 captured_bytes: b.captured_bytes,
                 sessions: b.per_session.len(),
                 sessions_failed: b.sessions_failed(),
+                sessions_cancelled: b.sessions_cancelled(),
                 protocol_violations: b.protocol_violations(),
             }),
             rerun_of: self.rerun_of,
@@ -764,6 +789,7 @@ mod tests {
                 latency_samples_us: samples,
                 ..Default::default()
             },
+            cancelled: false,
         }
     }
 
