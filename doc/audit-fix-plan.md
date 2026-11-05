@@ -116,7 +116,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Paginated or lazy per-RTU detail, with the report persisted to the DB.
   - Run-status check: refuse or warn when the run failed or sent nothing.
   - Table-driven verdict and rollup tests. Adopt the T02 frame iterator.
-- [~] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
+- [x] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
   - Split the SPA into modules.
   - Block START on invalid JSON; pre-flight validation with inline errors.
   - Fix the stuck ANALYZING panel.
@@ -137,6 +137,13 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Fix the µs label.
   - Concurrent-run banner, using the T04 event channel.
 
+- [ ] **T07b Backend issues found by the frontend lane.**
+  1. Slave listen IPs in 127.0.0.0/8 are treated as non-local and aliased; all of 127/8 is local on Linux.
+  2. `per_source_progress` has no per-session failure reason.
+  3. Stopping a slave run counts pending sessions as failed.
+  4. Stale `listen_port_base + n − 1 ≤ 65535` check, although every slave shares one port on its own IP.
+  5. Analysing a run that sent 0 messages gives a `partial` verdict rather than a clear failure or inconclusive result.
+
 ## Wave 3: product features
 
 - [~] **T08 Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
@@ -145,7 +152,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 - [~] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
 - [~] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [~] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
-- [~] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
+- [x] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
 ## Wave 4: docs, privileged validation, final audit
 
@@ -225,3 +232,13 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Orchestrator change: slave idle-serve defaults to 30 s, so runs still finish on their own.
   - New report fields for the UI: `protocol_violations`, `protocol_errors`, `stripped_capture_frames`, `synthesized_frames`, `idle_serve_ms`, `command_response_us`, `acks_sent` and `keepalives_sent`.
 - 2026-11-05: T11 and T12 started in `/opt/code/outstation-wt/proto-features`.
+- 2026-11-05: T07 and T14 merged. Workspace tests: 316 passed.
+  - The SPA is split into `ui/*.css` and `ui/*.js`, spliced by build.rs.
+  - Library, Configure, Runs and Analysis views with hash routing.
+  - A single poller, the SSE banner, keyed DOM updates, a scalable diagram and run cards.
+  - Accessibility: labels, live regions, contrast and a 12px minimum.
+  - IEC 104 link parameters, plus the force/alias_iface flow with a confirmation dialog.
+  - `scripts/ui-smoke.mjs` passes all checks in Chromium (1440 and 390) and WebKit (1440), re-run by the orchestrator against a fresh release build.
+  - Partly fixed: F100 (re-run and URL state go to T08) and F101 (relies on the server's 409).
+  - Five backend issues logged as T07b.
+- 2026-11-05: Security review (HIGH) on the features lane's netctl change (inject-side IPs and a hub bridge). Isolation sysctls, raw/FORWARD drop rules and netns tests were sent back to the features lane; to be verified at its merge.
