@@ -272,16 +272,11 @@ pub fn validate_settings(req: &RunRequest) -> Result<(), RequestError> {
             if req.target_port == 0 {
                 return Err(bad("target_port must be 1..=65535"));
             }
-            if req.role == RoleReq::Slave {
-                if req.listen_port_base == 0 {
-                    return Err(bad("listen_port_base must be 1..=65535"));
-                }
-                let n = req.selected_rtus.len().max(1) as u32;
-                if u32::from(req.listen_port_base) + n - 1 > u32::from(u16::MAX) {
-                    return Err(bad(
-                        "listen_port_base + number of selected RTUs exceeds 65535",
-                    ));
-                }
+            // Every slave listens on this same port, each on its own
+            // listen IP (sched gives every session `listen_port_base`),
+            // so only the port itself needs checking.
+            if req.role == RoleReq::Slave && req.listen_port_base == 0 {
+                return Err(bad("listen_port_base must be 1..=65535"));
             }
             let Some(rep) = proto_registry::lookup(&req.proto_name) else {
                 return Err(bad(format!("unknown proto_name: {}", req.proto_name)));
@@ -457,6 +452,17 @@ mod tests {
         assert_eq!(v["listen_port_base"], 2404);
         let again = canonical_json(&from_json(v.clone()).unwrap());
         assert_eq!(v, again);
+    }
+
+    #[test]
+    fn slave_port_is_checked_alone() {
+        // T07b: every slave shares the port; 200 RTUs on 65535 is fine.
+        let rtus: Vec<String> = (1..=200).map(|n| format!("10.1.0.{n}")).collect();
+        let r = bench(json!({"listen_port_base": 65535, "selected_rtus": rtus}));
+        assert!(validate_settings(&r).is_ok());
+        let r = bench(json!({"listen_port_base": 0}));
+        let e = validate_settings(&r).unwrap_err();
+        assert!(e.message.contains("listen_port_base"), "{}", e.message);
     }
 
     #[test]
