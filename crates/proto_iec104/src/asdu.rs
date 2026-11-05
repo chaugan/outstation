@@ -678,13 +678,143 @@ pub fn load_rewrite_map(proto_config: Option<&str>) -> Result<RewriteMap> {
 ///   "common_address": {...},
 ///   "cot": {...},
 ///   "ioa": {...},
-///   "cp56": { "rewrite_to_now": false, "zone": "local" }
+///   "cp56": { "rewrite_to_now": false, "zone": "local" },
+///   "session": { "k": 12, "w": 8, "t1": 15, "t2": 10, "t3": 20 }
 /// }
 /// ```
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Iec104ProtoConfig {
     #[serde(default)]
     pub cp56: Cp56Config,
+    /// APCI link parameters and live-session behaviour.
+    #[serde(default)]
+    pub session: SessionConfig,
+}
+
+/// IEC 60870-5-104 §5 link parameters plus session behaviour knobs.
+/// Timers are in seconds and may be fractional. Defaults are the IEC
+/// recommended values (k=12, w=8, t0=30, t1=15, t2=10, t3=20).
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SessionConfig {
+    /// Max unacknowledged I-frames we send before stalling.
+    #[serde(default = "default_k")]
+    pub k: u16,
+    /// Acknowledge (S-frame) at the latest after receiving w I-frames.
+    #[serde(default = "default_w")]
+    pub w: u16,
+    /// Connection-establishment timeout (master mode TCP connect).
+    /// When absent the run's `connect_timeout` is used.
+    #[serde(default)]
+    pub t0: Option<f64>,
+    /// Timeout for the peer to acknowledge a sent I-frame or to
+    /// confirm a STARTDT/STOPDT/TESTFR act. Expiry closes the link.
+    #[serde(default = "default_t1")]
+    pub t1: f64,
+    /// Acknowledge received I-frames at the latest t2 after the first
+    /// unacknowledged one arrived. Must be below t1.
+    #[serde(default = "default_t2")]
+    pub t2: f64,
+    /// Send TESTFR act after t3 without receiving anything.
+    #[serde(default = "default_t3")]
+    pub t3: f64,
+    /// Slave mode: how long to keep serving the master (GI/CI, TESTFR,
+    /// acks) after the captured script has ended, unless the master
+    /// closes first or the run is cancelled. Absent =
+    /// [`DEFAULT_IDLE_SERVE_SECS`], so a run (and each outer iteration)
+    /// still finishes on its own; set a large value to impersonate an
+    /// RTU that never hangs up.
+    #[serde(default)]
+    pub idle_serve_secs: Option<f64>,
+}
+
+/// Default slave idle-serve window after the script ends (seconds).
+pub const DEFAULT_IDLE_SERVE_SECS: f64 = 30.0;
+
+fn default_k() -> u16 {
+    12
+}
+fn default_w() -> u16 {
+    8
+}
+fn default_t1() -> f64 {
+    15.0
+}
+fn default_t2() -> f64 {
+    10.0
+}
+fn default_t3() -> f64 {
+    20.0
+}
+
+/// IEC default t0 in seconds.
+pub const DEFAULT_T0_SECS: f64 = 30.0;
+/// Largest sequence-number distance; k and w must stay below it.
+const MAX_WINDOW: u16 = 32767;
+
+impl Default for SessionConfig {
+    fn default() -> Self {
+        Self {
+            k: default_k(),
+            w: default_w(),
+            t0: None,
+            t1: default_t1(),
+            t2: default_t2(),
+            t3: default_t3(),
+            idle_serve_secs: None,
+        }
+    }
+}
+
+impl SessionConfig {
+    /// Hard errors: out-of-range k/w, non-positive or non-finite
+    /// timers, t2 >= t1.
+    pub fn validate(&self) -> Result<()> {
+        if !(1..=MAX_WINDOW).contains(&self.k) {
+            bail!("session.k must be 1..={MAX_WINDOW}, got {}", self.k);
+        }
+        if !(1..=MAX_WINDOW).contains(&self.w) {
+            bail!("session.w must be 1..={MAX_WINDOW}, got {}", self.w);
+        }
+        let timers = [
+            ("t0", self.t0),
+            ("t1", Some(self.t1)),
+            ("t2", Some(self.t2)),
+            ("t3", Some(self.t3)),
+        ];
+        for (name, v) in timers {
+            if let Some(v) = v {
+                if !v.is_finite() || v <= 0.0 || v > 86_400.0 {
+                    bail!("session.{name} must be > 0 and <= 86400 seconds, got {v}");
+                }
+            }
+        }
+        if let Some(v) = self.idle_serve_secs {
+            if !v.is_finite() || v < 0.0 {
+                bail!("session.idle_serve_secs must be >= 0, got {v}");
+            }
+        }
+        if self.t2 >= self.t1 {
+            bail!(
+                "session.t2 ({}) must be less than session.t1 ({})",
+                self.t2,
+                self.t1
+            );
+        }
+        Ok(())
+    }
+
+    /// Non-fatal advice (IEC 60870-5-104 §5.5 recommends w <= 2k/3).
+    pub fn warnings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        if 3 * u32::from(self.w) > 2 * u32::from(self.k) {
+            out.push(format!(
+                "session.w ({}) exceeds the recommended 2/3 of k ({})",
+                self.w, self.k
+            ));
+        }
+        out
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -748,6 +878,9 @@ impl Iec104ProtoConfig {
                 cfg.cp56.zone
             );
         }
+        cfg.session
+            .validate()
+            .map_err(|e| anyhow::anyhow!("proto_config (session): {e}"))?;
         Ok(cfg)
     }
 }
@@ -1300,6 +1433,7 @@ mod tests {
             Some(r#"{"ioa":{}}"#),
         ] {
             let c = Iec104ProtoConfig::parse(ok).unwrap();
+            assert_eq!(c.session, SessionConfig::default());
             assert!(!c.cp56.rewrite_to_now);
             assert_eq!(c.cp56.zone(), Cp56Zone::Local);
         }
@@ -1433,6 +1567,40 @@ mod tests {
                 let b = encode_cp56time2a_local(t * S, false);
                 assert_eq!(dec(b), Some(t), "round trip at {t} bytes={b:x?}");
             }
+        }
+    }
+
+    #[test]
+    fn session_config_parse_and_validate() {
+        let c = Iec104ProtoConfig::parse(Some(
+            r#"{"cot":{"3":5},"session":{"k":20,"w":10,"t0":5,"t1":2.5,"t2":0.5,"t3":4,"idle_serve_secs":0}}"#,
+        ))
+        .unwrap();
+        assert_eq!(c.session.k, 20);
+        assert_eq!(c.session.w, 10);
+        assert_eq!(c.session.t0, Some(5.0));
+        assert_eq!(c.session.t1, 2.5);
+        assert_eq!(c.session.t2, 0.5);
+        assert_eq!(c.session.t3, 4.0);
+        assert_eq!(c.session.idle_serve_secs, Some(0.0));
+        assert!(c.session.warnings().is_empty());
+        // The rewrite-map loader ignores the session section.
+        assert!(validate_proto_config(Some(r#"{"session":{"k":4,"w":2}}"#)).is_ok());
+        // w above 2k/3 is only a warning.
+        let c = Iec104ProtoConfig::parse(Some(r#"{"session":{"k":12,"w":12}}"#)).unwrap();
+        assert_eq!(c.session.warnings().len(), 1);
+        for bad in [
+            r#"{"session":{"t1":10,"t2":10}}"#,
+            r#"{"session":{"t2":20}}"#,
+            r#"{"session":{"k":0}}"#,
+            r#"{"session":{"w":40000}}"#,
+            r#"{"session":{"t3":-1}}"#,
+            r#"{"session":{"t0":0}}"#,
+            r#"{"session":{"idle_serve_secs":-2}}"#,
+            r#"{"session":{"kk":3}}"#,
+        ] {
+            assert!(Iec104ProtoConfig::parse(Some(bad)).is_err(), "{bad}");
+            assert!(validate_proto_config(Some(bad)).is_err(), "{bad}");
         }
     }
 }

@@ -1157,8 +1157,10 @@ impl SessionAccumulator {
 /// [`protoplay::ProtoReport::finalize_latency`] so the merged report is
 /// always self-consistent. `elapsed_ms` is the sum of the iterations'
 /// active times, so throughput is messages per second of activity.
-pub fn merge_proto_report(acc: &mut SessionAccumulator, new: protoplay::ProtoReport) {
+pub fn merge_proto_report(acc: &mut SessionAccumulator, mut new: protoplay::ProtoReport) {
     let r = &mut acc.report;
+    r.protocol
+        .merge(std::mem::take(&mut new.protocol), r.messages_sent);
     r.connected = r.connected || new.connected;
     r.messages_sent = r.messages_sent.saturating_add(new.messages_sent);
     r.messages_received = r.messages_received.saturating_add(new.messages_received);
@@ -1403,6 +1405,7 @@ pub fn run_benchmark(
         client_mac: MacAddr,
         first_pkt_rel_ns: u64,
         payload: Vec<u8>,
+        capture_gaps: Vec<usize>,
         frame_times_ns: Vec<u64>,
     }
 
@@ -1440,6 +1443,7 @@ pub fn run_benchmark(
                     client_ip,
                     client_mac: src_info.src_mac,
                     first_pkt_rel_ns,
+                    capture_gaps: reassembled.gaps.iter().map(|g| g.offset).collect(),
                     payload: reassembled.payload,
                     frame_times_ns,
                 });
@@ -1558,6 +1562,7 @@ pub fn run_benchmark(
         let flow_idx = pick.flow_idx;
         let first_pkt_rel_ns = pick.first_pkt_rel_ns;
         let payload = std::mem::take(&mut pick.payload);
+        let capture_gaps = std::mem::take(&mut pick.capture_gaps);
         let frame_times_ns = std::mem::take(&mut pick.frame_times_ns);
         let replayer = Arc::clone(&replayer);
         let cfg_w = cfg.clone();
@@ -1632,6 +1637,7 @@ pub fn run_benchmark(
                         pacing: cfg_w.pacing,
                         frame_times_ns: frame_times_ns.clone(),
                         loop_iterations: 1,
+                        capture_gaps: capture_gaps.clone(),
                     };
                     let iter_report = run_iteration(&*replayer, run_cfg);
                     ctx_w
@@ -1783,6 +1789,7 @@ fn run_benchmark_slave(
         server_ip: Ipv4Addr,
         server_mac: MacAddr,
         payload: Vec<u8>,
+        capture_gaps: Vec<usize>,
         frame_times_ns: Vec<u64>,
     }
     let picks: Vec<SlavePick> = select_slave_flows(
@@ -1801,6 +1808,7 @@ fn run_benchmark_slave(
             .map(|s| s.src_mac)
             .unwrap_or([0; 6]),
         frame_times_ns: replayer.extract_message_times_ns(&r.payload, &r.packet_offsets),
+        capture_gaps: r.gaps.iter().map(|g| g.offset).collect(),
         payload: r.payload,
     })
     .collect();
@@ -1875,6 +1883,7 @@ fn run_benchmark_slave(
         }
         let flow_idx = pick.flow_idx;
         let payload = pick.payload;
+        let capture_gaps = pick.capture_gaps;
         let frame_times_ns = pick.frame_times_ns;
         let replayer = Arc::clone(&replayer);
         let cfg_w = cfg.clone();
@@ -1977,6 +1986,7 @@ fn run_benchmark_slave(
                         pacing: cfg_w.pacing,
                         frame_times_ns: frame_times_ns.clone(),
                         loop_iterations: run_loop_iterations,
+                        capture_gaps: capture_gaps.clone(),
                     };
                     let iter_report = run_iteration(&*replayer, run_cfg);
                     ctx_w
@@ -2278,6 +2288,7 @@ mod tests {
             pacing: protoplay::Pacing::AsFastAsPossible,
             frame_times_ns: vec![],
             loop_iterations: 1,
+            capture_gaps: vec![],
         };
         let r = run_iteration(&PanicReplayer, cfg);
         assert!(r.error.unwrap().contains("spawn iec104-reader"));

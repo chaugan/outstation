@@ -117,12 +117,24 @@ impl Apdu {
 ///
 /// For captured streams prefer [`crate::apci::frames`], which also
 /// applies the two-frame boundary check when resyncing.
+///
+/// A live connection should use [`ApduReader::strict`]: a TCP stream
+/// from a conformant peer never contains bytes between frames, so the
+/// strict reader applies the frame-boundary rule of
+/// [`crate::apci`] (the octet after a frame must be the next 0x68)
+/// as each next frame arrives, and reports a violation as
+/// `InvalidData` instead of skipping it.
 pub struct ApduReader<R: Read> {
     inner: R,
     buf: Vec<u8>,
     /// Read cursor into `buf`. Consumed bytes are dropped in bulk
     /// before the next read, so skipping junk is O(n) overall.
     pos: usize,
+    /// Reject (rather than skip) bytes that are not a 0x68 start octet
+    /// at a frame boundary.
+    strict: bool,
+    /// Stream offset of `buf[0]`, for error messages.
+    consumed: u64,
 }
 
 impl<R: Read> ApduReader<R> {
@@ -131,6 +143,19 @@ impl<R: Read> ApduReader<R> {
             inner,
             buf: Vec::with_capacity(512),
             pos: 0,
+            strict: false,
+            consumed: 0,
+        }
+    }
+
+    /// Reader for a live connection: every frame must start exactly
+    /// where the previous one ended. A different octet there is
+    /// reported as `InvalidData` (and the offending octet is skipped,
+    /// so a tolerant caller could continue).
+    pub fn strict(inner: R) -> Self {
+        Self {
+            strict: true,
+            ..Self::new(inner)
         }
     }
 
@@ -138,11 +163,26 @@ impl<R: Read> ApduReader<R> {
     /// EOF with no buffered data, returns `Ok(None)`.
     pub fn next_apdu(&mut self) -> io::Result<Option<Apdu>> {
         loop {
-            // Skip to the next start byte.
-            let pending = &self.buf[self.pos..];
-            match pending.iter().position(|&b| b == START_BYTE) {
-                Some(k) => self.pos += k,
-                None => self.pos = self.buf.len(),
+            if self.strict {
+                if let Some(&b) = self.buf.get(self.pos) {
+                    if b != START_BYTE {
+                        let at = self.consumed + self.pos as u64;
+                        self.pos += 1;
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "framing error: octet 0x{b:02x} at stream offset {at} where a 0x68 start octet was expected"
+                            ),
+                        ));
+                    }
+                }
+            } else {
+                // Skip to the next start byte.
+                let pending = &self.buf[self.pos..];
+                match pending.iter().position(|&b| b == START_BYTE) {
+                    Some(k) => self.pos += k,
+                    None => self.pos = self.buf.len(),
+                }
             }
             let avail = self.buf.len() - self.pos;
             if avail >= 2 {
@@ -166,6 +206,7 @@ impl<R: Read> ApduReader<R> {
             // what remains is at most one partial frame (< 256 bytes),
             // so compacting here is cheap.
             if self.pos > 0 {
+                self.consumed += self.pos as u64;
                 self.buf.drain(..self.pos);
                 self.pos = 0;
             }
@@ -316,6 +357,26 @@ mod tests {
         let mut r = ApduReader::new(&stream[..]);
         assert!(r.next_apdu().is_err());
         assert!(matches!(r.next_apdu().unwrap(), Some(Apdu::S { nr: 4 })));
+    }
+
+    #[test]
+    fn strict_reader_rejects_bytes_between_frames() {
+        let mut stream = Apdu::S { nr: 1 }.serialize();
+        stream.push(0x42);
+        stream.extend_from_slice(&Apdu::S { nr: 2 }.serialize());
+        let mut r = ApduReader::strict(&stream[..]);
+        assert!(matches!(r.next_apdu().unwrap(), Some(Apdu::S { nr: 1 })));
+        let e = r.next_apdu().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        assert!(e.to_string().contains("offset 6"), "{e}");
+        // The lenient reader skips the junk octet.
+        let mut r = ApduReader::new(&stream[..]);
+        assert!(matches!(r.next_apdu().unwrap(), Some(Apdu::S { nr: 1 })));
+        assert!(matches!(r.next_apdu().unwrap(), Some(Apdu::S { nr: 2 })));
+        // Strict reader on a clean stream, including a leading junk
+        // octet being an error rather than a resync.
+        let mut r = ApduReader::strict(&[0x00, 0x68, 4, 1, 0, 0, 0][..]);
+        assert!(r.next_apdu().is_err());
     }
 
     #[test]
