@@ -378,6 +378,47 @@ pub fn validate_alias_ip(ip: Ipv4Addr, prot: &Protection) -> Result<()> {
     assess_alias_ip(ip, &facts, prot).map_err(|e| anyhow::anyhow!("refusing to alias {ip}: {e:#}"))
 }
 
+/// Pure check for an address about to be put on one of our own bridge
+/// ports (master-mode session source IPs): the [`assess_alias_ip`]
+/// rules always apply, and an address already configured on a host
+/// interface outside our `pcr*` ports is refused unless `force`, since
+/// binding it to a replay port would steal it from that interface.
+pub fn assess_port_ip(
+    ip: Ipv4Addr,
+    local_addrs: &[(String, IpAddr)],
+    facts: &AliasIpFacts,
+    prot: &Protection,
+) -> Result<()> {
+    assess_alias_ip(ip, facts, prot)?;
+    let holders: Vec<&str> = local_addrs
+        .iter()
+        .filter(|(iface, a)| *a == IpAddr::V4(ip) && !iface.starts_with(IFNAME_PREFIX))
+        .map(|(iface, _)| iface.as_str())
+        .collect();
+    if !holders.is_empty() {
+        if prot.force {
+            warn!(%ip, ?holders, "port IP already on a host interface; allowed because force is set");
+        } else {
+            bail!(
+                "{ip} is already configured on host interface(s) {}; \
+                 set force to use it as a replay source address anyway",
+                holders.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Live version of [`assess_port_ip`].
+pub fn validate_port_ip(ip: Ipv4Addr, prot: &Protection) -> Result<()> {
+    let facts = AliasIpFacts {
+        gateways: default_gateways_v4().unwrap_or_default(),
+    };
+    let local = all_local_addrs()?;
+    assess_port_ip(ip, &local, &facts, prot)
+        .map_err(|e| anyhow::anyhow!("refusing source address {ip}: {e:#}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -467,6 +508,31 @@ mod tests {
         assert_eq!(v.len(), 3);
         assert_eq!(v[2].0, "v0");
         assert_eq!(v[2].1, "10.1.1.1".parse::<IpAddr>().unwrap());
+    }
+
+    #[test]
+    fn port_ip_rules() {
+        let f = AliasIpFacts {
+            gateways: vec![Ipv4Addr::new(192, 168, 1, 1)],
+        };
+        let local: Vec<(String, IpAddr)> = vec![
+            ("eth0".into(), "192.168.1.10".parse().unwrap()),
+            ("pcr1_b0".into(), "10.5.5.5".parse().unwrap()),
+        ];
+        let p = Protection::default();
+        // Captured client IP that is free: fine.
+        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 6), &local, &f, &p).is_ok());
+        // Already on one of our own ports (shared master_bind_ip): fine.
+        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 5), &local, &f, &p).is_ok());
+        // The host's management address: refused unless forced.
+        let mgmt = Ipv4Addr::new(192, 168, 1, 10);
+        let e = assess_port_ip(mgmt, &local, &f, &p).unwrap_err();
+        assert!(format!("{e}").contains("eth0"), "{e}");
+        assert!(assess_port_ip(mgmt, &local, &f, &Protection::new(vec![], true)).is_ok());
+        // Absolute refusals stay absolute even with force.
+        let forced = Protection::new(vec![], true);
+        assert!(assess_port_ip(Ipv4Addr::new(192, 168, 1, 1), &local, &f, &forced).is_err());
+        assert!(assess_port_ip(Ipv4Addr::LOCALHOST, &local, &f, &forced).is_err());
     }
 
     #[test]

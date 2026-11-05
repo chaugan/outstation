@@ -1485,7 +1485,12 @@ pub fn run_benchmark(
             let effective_src_ip = master_override.unwrap_or(p.client_ip);
             let bridge_side = names.port(PortKind::Session, i)?;
             let inject_side = topo
-                .add_port_with_ip(&bridge_side, Some(p.client_mac), Some(effective_src_ip))
+                .add_port_with_ip(
+                    &bridge_side,
+                    Some(p.client_mac),
+                    Some(effective_src_ip),
+                    &prot,
+                )
                 .with_context(|| format!("add session port {bridge_side}"))?;
             bindings.push(SessionBinding {
                 pick_idx: i,

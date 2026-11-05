@@ -318,6 +318,46 @@ fn drop_rule_is_not_duplicated() {
     std::fs::remove_dir_all(&dir).unwrap();
 }
 
+/// Master-mode source IPs on our ports: refused when they belong to a
+/// host interface (unless forced) or are the LAN gateway; allowed when
+/// free or shared between our own ports.
+#[test]
+#[ignore = "privileged: run via scripts/netns-test.sh inside an ostest-* netns"]
+fn port_source_ip_is_validated() {
+    setup();
+    let none = Protection::default();
+    let mut topo = Topology::new("pcr4_br", 4).unwrap();
+    topo.create_bridge().unwrap();
+    // 10.99.3.1 is nsfree0's address: stealing it is refused.
+    let e = topo
+        .add_port_with_ip("pcr4_b0", None, Some(Ipv4Addr::new(10, 99, 3, 1)), &none)
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("nsfree0"), "{e:#}");
+    assert!(!exists("pcr4_b0"), "port created despite refusal");
+    // The LAN gateway is refused even with force.
+    let forced = Protection::new(vec![], true);
+    assert!(topo
+        .add_port_with_ip(
+            "pcr4_b0",
+            None,
+            Some(Ipv4Addr::new(10, 99, 0, 254)),
+            &forced
+        )
+        .is_err());
+    // A free address works, and a second port may share it
+    // (master_bind_ip override).
+    let ip = Ipv4Addr::new(10, 77, 0, 1);
+    topo.add_port_with_ip("pcr4_b1", None, Some(ip), &none)
+        .unwrap();
+    topo.add_port_with_ip("pcr4_b2", None, Some(ip), &none)
+        .unwrap();
+    // force lets an operator reuse a host address on purpose.
+    topo.add_port_with_ip("pcr4_b3", None, Some(Ipv4Addr::new(10, 99, 3, 1)), &forced)
+        .unwrap();
+    topo.teardown().unwrap();
+    assert!(has_addr("nsfree0", "10.99.3.1"));
+}
+
 /// The default-route NIC, protected-address NICs, bridges and bridge
 /// ports are refused unless forced; loopback always.
 #[test]

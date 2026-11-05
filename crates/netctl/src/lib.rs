@@ -41,8 +41,8 @@ pub use guard::{EgressGuard, GatewayGuard};
 pub use journal::{aliases_path, guards_path, DEFAULT_STATE_DIR};
 pub use names::{IfaceNames, PortKind};
 pub use protect::{
-    check_nic_allowed, is_bridge, is_bridge_port, nic_assessment, validate_alias_ip, NicAssessment,
-    Protection,
+    check_nic_allowed, is_bridge, is_bridge_port, nic_assessment, validate_alias_ip,
+    validate_port_ip, NicAssessment, Protection,
 };
 
 pub type MacAddr = [u8; 6];
@@ -159,19 +159,30 @@ impl Topology {
     /// `id` is the bridge-side interface name. The inject-side name is
     /// `{id}i`; both must be valid outstation names within IFNAMSIZ.
     pub fn add_port(&mut self, id: impl Into<String>, mac: Option<MacAddr>) -> Result<String> {
-        self.add_port_with_ip(id, mac, None)
+        self.add_port_with_ip(id, mac, None, &Protection::default())
     }
 
     /// Same as [`Topology::add_port`], but also assigns `src_ip/32` to
     /// the bridge-side end so that the kernel can own TCP sockets bound
     /// to that IP. Needed for protocol-aware modules.
+    ///
+    /// `src_ip` is checked with [`protect::validate_port_ip`] before
+    /// anything is created: loopback/multicast/broadcast/reserved
+    /// addresses, the host's default gateways and `prot`'s protected
+    /// addresses are always refused, and an address already configured
+    /// on a host interface outside our `pcr*` ports is refused unless
+    /// `prot.force`.
     pub fn add_port_with_ip(
         &mut self,
         id: impl Into<String>,
         mac: Option<MacAddr>,
         src_ip: Option<std::net::Ipv4Addr>,
+        prot: &Protection,
     ) -> Result<String> {
         let bridge_side = id.into();
+        if let Some(ip) = src_ip {
+            protect::validate_port_ip(ip, prot)?;
+        }
         let inject_side = format!("{bridge_side}i");
         names::validate_owned_ifname(&bridge_side)?;
         names::validate_owned_ifname(&inject_side).with_context(|| {
