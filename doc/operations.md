@@ -86,6 +86,7 @@ Otherwise restrict port 8080 at the network layer. The Host and Origin checks ([
 | `--capture-max-mb N` | `OUTSTATION_CAPTURE_MAX_MB` | 10240 | Total size of stored run captures; oldest evicted first |
 | | `OUTSTATION_CAPTURE_MAX_COUNT` | 200 | Most run captures kept |
 | | `OUTSTATION_MIN_FREE_MB` | 512 | Free-space reserve in the state directory |
+| `--library-max-mb N` | `OUTSTATION_LIBRARY_MAX_MB` | none | Total size quota of the pcap library; an upload that would exceed it is refused with 507 `quota_exceeded` |
 | `--no-auto-analyze` | `OUTSTATION_AUTO_ANALYZE=0` | on | Do not analyse finished benchmark runs automatically |
 | | `OUTSTATION_LIBRARY_DIR` | `/var/lib/outstation/library` | Library directory. The state directory is its parent |
 | | `RUST_LOG` | `info` | Log filter, e.g. `RUST_LOG=debug,hyper=info` |
@@ -98,7 +99,7 @@ Environment=OUTSTATION_ALLOW_HOSTS=outstation.lab.example
 Environment=OUTSTATION_CAPTURE_MAX_MB=20480
 ```
 
-**Disk limits.** An upload is refused (507 `disk_full`) when free space would drop below the reserve. While a run is active, the server checks free space every 5 s and stops the run when it falls below half the reserve; the run's `error` says so. Captures are evicted after each run until both the size and the count cap hold; the active run's capture is never evicted. There is no per-run size cap yet, so one long run can still write a large capture.
+**Disk limits.** An upload is refused (507 `disk_full`) when free space would drop below the reserve. The check runs before the upload and again while its bytes arrive, so a chunked upload without `Content-Length` is stopped as soon as it would cross the reserve. With a library quota, concurrent uploads reserve their share of it as they stream, so together they never exceed it (507 `quota_exceeded`). While a run is active, the server checks free space every 5 s and stops the run when it falls below half the reserve; the run's `error` says so. Captures are evicted after each run until both the size and the count cap hold; the active run's capture is never evicted. There is no per-run size cap yet, so one long run can still write a large capture.
 
 Logs go to stdout. Under journald (`journalctl -u outstation`) they are plain text without colour; every line of a run carries `run{id=N}`.
 
@@ -116,6 +117,7 @@ Default `/var/lib/outstation` (the parent of `OUTSTATION_LIBRARY_DIR`):
 | `runs.sqlite` | Run history, run requests, analyses and profiles |
 | `state-aliases.txt` | Journal of IP aliases we added (`<iface> <ip> <prefix>` per line) |
 | `state-guards.txt` | Journal of sysctl and offload prior values and tagged iptables rules |
+| `outstation.lock` | Held (`flock`) by the running `serve` or `bench`; holds its pid and role. See below |
 | `*.lock` | Lock files of the journals |
 | `tmp/` | Private (0700) temp files, e.g. an analysis upload while it is analysed; swept at startup |
 
@@ -138,7 +140,13 @@ Normally each run undoes its changes when it ends. The safety net:
 
 The cleanup deletes every interface marked `outstation:<id>` (which also frees an enslaved NIC), every iptables rule in the journal and any other rule tagged `outstation-run-*` in the raw, nat, filter and mangle tables, restores journaled sysctls and offloads, and removes journaled aliases. Entries it cannot undo stay in the journal and are reported (`cleanup_pending` in `/api/status`).
 
-Do not run `outstation cleanup` (or interrupt an `outstation bench`) while the server has a run active on the same host: the cleanup removes every outstation-marked interface and tagged rule, including the active run's.
+**One process per state directory.** `outstation serve` and `outstation bench` hold an exclusive lock on `<state>/outstation.lock` for as long as they run. The kernel releases it when the process exits, however it exits, so a crash never leaves a stale lock. While it is held:
+
+- a second `outstation serve` with the same state directory refuses to start ("the state directory is in use by another outstation process (pid=N role=serve …)"), instead of running its startup cleanup over the live run;
+- `outstation bench` refuses with exit code 2;
+- `outstation cleanup` refuses and exits non-zero. `outstation cleanup --force` cleans up anyway and tears down the active run. The unit's `ExecStopPost` cleanup runs after the server has exited, so it never needs `--force`.
+
+The lock is per state directory. The cleanup itself is host-wide: it removes every outstation-marked interface and tagged rule in the network namespace, whichever state directory the run belongs to. So do not run two servers with different state directories on one host (or network namespace), and do not run `outstation cleanup --force` while a run is active.
 
 ## Health and metrics
 

@@ -50,6 +50,7 @@ pub mod runbuild;
 mod runs;
 mod security;
 mod state;
+pub mod statelock;
 mod sysinfo;
 
 #[cfg(test)]
@@ -266,6 +267,10 @@ pub(crate) async fn shutdown(state: &AppState, join_timeout: Duration) -> Vec<u6
 /// Run the web UI until SIGTERM/SIGINT, then shut down gracefully.
 pub async fn serve(cfg: ServeConfig) -> Result<()> {
     let bind = cfg.bind;
+    // One server per state directory: a second one would run the
+    // startup cleanup below and tear down this one's live run (N7).
+    let _lock = statelock::StateLock::acquire(&cfg.state_dir, "serve")
+        .context("refusing to start a second server on this state directory")?;
     // Reclaim host state left by a previous process before anything new
     // is created.
     let state_dir = cfg.state_dir.clone();

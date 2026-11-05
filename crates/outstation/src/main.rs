@@ -49,6 +49,10 @@ enum Cmd {
         /// i.e. /var/lib/outstation).
         #[arg(long)]
         state_dir: Option<PathBuf>,
+        /// Clean up even while a live `serve` or `bench` holds the state
+        /// directory. This tears down its active run.
+        #[arg(long)]
+        force: bool,
     },
 }
 
@@ -279,12 +283,32 @@ fn main() -> Result<()> {
             let code = bench_cmd(args);
             std::process::exit(code);
         }
-        Cmd::Cleanup { state_dir } => {
+        Cmd::Cleanup { state_dir, force } => {
             let dir = state_dir.unwrap_or_else(webui::default_state_dir);
-            webui::host_cleanup(&dir)?;
+            cleanup_cmd(&dir, force)?;
         }
     }
     Ok(())
+}
+
+/// `outstation cleanup`: refuse while a live server or bench holds the
+/// state directory, unless `force` (N7).
+fn cleanup_cmd(dir: &std::path::Path, force: bool) -> Result<()> {
+    let _lock = match webui::statelock::StateLock::acquire(dir, "cleanup") {
+        Ok(l) => Some(l),
+        Err(e) => match e.downcast::<webui::statelock::LockHeld>() {
+            Ok(held) if force => {
+                tracing::warn!(%held, "--force: cleaning up while another process holds the state directory");
+                None
+            }
+            Ok(held) => anyhow::bail!(
+                "{held}. It undoes its own host changes when it stops; \
+                 pass --force to clean up anyway (this tears down its active run)"
+            ),
+            Err(e) => return Err(e),
+        },
+    };
+    webui::host_cleanup(dir)
 }
 
 fn bench_cmd(args: BenchArgs) -> i32 {
@@ -460,7 +484,7 @@ mod tests {
             panic!("not serve")
         };
         assert_eq!(a.bind.to_string(), "127.0.0.1:8080");
-        let Cmd::Cleanup { state_dir } =
+        let Cmd::Cleanup { state_dir, .. } =
             Cli::try_parse_from(["outstation", "cleanup", "--state-dir", "/x"])
                 .unwrap()
                 .cmd

@@ -502,6 +502,11 @@ pub fn run(opts: &BenchOptions) -> BenchReport {
 }
 
 fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
+    // Never run next to a server (or another bench) on the same state
+    // directory: their host cleanup would tear down each other's run
+    // (N7).
+    let _lock = crate::statelock::StateLock::acquire(&opts.state_dir, "bench")
+        .context("refusing to run a benchmark on a state directory in use")?;
     let text = std::fs::read_to_string(&opts.profile)
         .with_context(|| format!("read profile {}", opts.profile.display()))?;
     let req = load_profile(&text)?;
