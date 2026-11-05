@@ -56,6 +56,7 @@ use crate::asdu::{
     common_address, cot_value, cp56_field_offsets, decode_cp56time2a, decode_cp56time2a_local,
     load_rewrite_map, rewrite_asdu, vsq, Cp56Zone, Iec104ProtoConfig, DUI_LEN, IOA_LEN,
 };
+use crate::interrogation;
 use crate::inventory::Inventory;
 use crate::responder::{
     respond_ci, respond_gi, InterrogationResponse, RequestEcho, COT_ACT_CON, COT_ACT_TERM,
@@ -127,6 +128,11 @@ pub struct PlaybackReport {
     pub delivered_iframes: usize,
     /// Delivered I-frames identified as synthesized GI/CI responses.
     pub synthesized_excluded: usize,
+    /// GI/CI response synthesis was on for this run (slave role).
+    pub gi_ci_synthesis: bool,
+    /// Captured interrogation frames removed from the expected side
+    /// because the replayer strips them when synthesis is on.
+    pub source_interrogation_stripped: usize,
     /// Primary metric: (byte-identical + accepted CP56-only) /
     /// (expected + extra), in percent.
     pub content_score_pct: f64,
@@ -435,6 +441,29 @@ pub fn analyze_iec104_flow(
     push_walk_note(&mut notes, "source", &src.stats);
     push_walk_note(&mut notes, "captured", &cap.stats);
 
+    // --- Expected side ---
+    // With GI/CI synthesis on, the slave strips the captured
+    // interrogation exchanges from its script (it answers live requests
+    // instead), so they are not expected either. Same rule as the
+    // replayer: `crate::interrogation`.
+    let synthesis_on =
+        ctx.role == Role::Slave && interrogation::synthesis_enabled(ctx.proto_config.as_deref());
+    let expected_frames: Vec<IFrame> = if synthesis_on {
+        src.iframes
+            .iter()
+            .filter(|f| !interrogation::is_captured_interrogation_frame(f.asdu))
+            .copied()
+            .collect()
+    } else {
+        src.iframes.clone()
+    };
+    let source_interrogation_stripped = src.iframes.len() - expected_frames.len();
+    if source_interrogation_stripped > 0 {
+        notes.push(format!(
+            "GI/CI synthesis was on: {source_interrogation_stripped} captured interrogation frames are not replayed and not expected"
+        ));
+    }
+
     // --- Synthesized GI/CI responses (slave role only) ---
     let mut inventory = Inventory::default();
     for f in &src.iframes {
@@ -490,7 +519,7 @@ pub fn analyze_iec104_flow(
         stopped_early: ctx.run.stopped_early,
         paced_speed: ctx.run.paced_speed,
     };
-    let cmp = compare_playback(&src.iframes, &delivered, &cmp_cfg);
+    let cmp = compare_playback(&expected_frames, &delivered, &cmp_cfg);
     if !cmp.alignment_complete {
         notes.push(format!(
             "some regions differed by more than {ALIGN_MAX_D} edits and were compared positionally"
@@ -500,7 +529,7 @@ pub fn analyze_iec104_flow(
         notes.push(format!(
             "captured session contains {} passes of the {}-frame source script; each pass is judged separately",
             cmp.iterations_observed,
-            src.iframes.len()
+            expected_frames.len()
         ));
     }
 
@@ -510,6 +539,8 @@ pub fn analyze_iec104_flow(
         Role::Slave => "slave → master",
     };
     playback.synthesized_excluded = synthesized_excluded;
+    playback.gi_ci_synthesis = synthesis_on;
+    playback.source_interrogation_stripped = source_interrogation_stripped;
     playback.source_stream = src.stats.clone();
     playback.delivered_stream = cap.stats.clone();
 
@@ -2931,35 +2962,64 @@ mod tests {
         assert_eq!(o.n("matched_type_ids"), 10);
     }
 
-    #[test]
-    fn probe_b_verbatim_replay_of_gi_bearing_source_scores_100() {
-        // F012 / F059: a byte-perfect replay of a capture that starts
-        // with a station GI burst must score 100 %.
+    const SYNTH_OFF: &str = r#"{"gi_ci_synthesis":false}"#;
+
+    fn gi_bearing_script() -> Vec<Vec<u8>> {
         let mut exp = vec![gi_actcon()];
         exp.extend((0..5).map(|i| sp(20, i, 1)));
         exp.push(gi_actterm());
         exp.extend((0..10).map(|i| me(3, i, i)));
-        let o = run(&exp, &exp.clone());
+        exp
+    }
+
+    fn without_bursts(script: &[Vec<u8>]) -> Vec<Vec<u8>> {
+        script
+            .iter()
+            .filter(|a| !interrogation::is_captured_interrogation_frame(a))
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn probe_b_verbatim_replay_of_gi_bearing_source_scores_100_with_synthesis_off() {
+        // F012 / F059: with synthesis off the replayer sends the
+        // captured GI burst verbatim; a byte-perfect replay of a
+        // capture that starts with a station GI must score 100 %.
+        let exp = gi_bearing_script();
+        let o = run_with(&exp, &exp, &ctx_with(RunFacts::default(), Some(SYNTH_OFF)));
         assert_eq!(o.r.verdict, "good_delivery", "{}", o.r.verdict_reason);
         assert_eq!(o.r.score_pct, 100.0);
         assert_eq!(o.r.outcome, VerdictOutcome::Pass);
         assert_eq!(o.pb("type_id_sequence_match"), true);
-        assert_eq!(o.n("synthesized_excluded"), 0);
+        assert_eq!(o.pb("gi_ci_synthesis"), false);
+        assert_eq!(o.n("source_interrogation_stripped"), 0);
         assert_eq!(o.n("byte_identical_count"), 17);
     }
 
     #[test]
-    fn live_gi_synthesized_response_is_excluded_and_script_burst_kept() {
-        // Source script carries its own captured GI burst. The live
-        // master sends a GI; the slave answers with a synthesized burst
-        // and then replays the script (including the captured burst).
-        let mut script = vec![gi_actcon()];
-        script.extend((0..3).map(|i| sp(20, i, 1)));
-        script.push(gi_actterm());
-        script.extend((0..5).map(|i| me(3, i, i)));
+    fn gi_bearing_source_with_synthesis_on_expects_the_bursts_stripped() {
+        // F018 mirror: with synthesis on the replayer strips captured
+        // interrogation exchanges, and so does the expected side.
+        let exp = gi_bearing_script();
+        let o = run(&exp, &without_bursts(&exp));
+        assert_eq!(o.r.verdict, "good_delivery", "{}", o.r.verdict_reason);
+        assert_eq!(o.pb("gi_ci_synthesis"), true);
+        assert_eq!(o.n("source_interrogation_stripped"), 7);
+        assert_eq!(o.n("byte_identical_count"), 10);
 
+        // A replayer that still sent the captured burst is caught.
+        let o = run(&exp, &exp);
+        assert_eq!(o.r.verdict, "partial_delivery");
+        assert_eq!(o.n("extra_count"), 7);
+    }
+
+    fn live_gi_run(
+        script: &[Vec<u8>],
+        replayed: &[Vec<u8>],
+        cfg: Option<&str>,
+    ) -> (ProtoSlaveAnalysis, usize) {
         let mut inv = Inventory::default();
-        let (sp_payload, _) = stream(&script);
+        let (sp_payload, _) = stream(script);
         inv.ingest_payload(&sp_payload);
         let synth = build_gi_response(
             &inv,
@@ -2972,41 +3032,45 @@ mod tests {
         );
         assert!(synth.len() >= 3);
         let mut delivered = synth.clone();
-        delivered.extend(script.iter().cloned());
+        delivered.extend(replayed.iter().cloned());
+        let r = run_with_request(
+            script,
+            &delivered,
+            &gi_request(),
+            &ctx_with(RunFacts::default(), cfg),
+        );
+        (r, synth.len())
+    }
 
-        let (ep, eo) = stream(&script);
-        let (gp, go) = stream_at(&delivered, 1_000_000_000, 100_000_000);
-        let mut tp = vec![0x68, 4, 0x07, 0, 0, 0];
-        tp.extend_from_slice(&wrap_iframe(&gi_request(), 0, 0));
-        let to = vec![(0u64, 0usize), (900_000_000, 6)];
-        let r = analyze_iec104_flow(
-            Some(FlowSnapshot {
-                payload: &ep,
-                packet_offsets: &eo,
-            }),
-            Some(FlowSnapshot {
-                payload: &gp,
-                packet_offsets: &go,
-            }),
-            None,
-            Some(FlowSnapshot {
-                payload: &tp,
-                packet_offsets: &to,
-            }),
-            &ctx(),
-        );
-        assert_eq!(
-            r.verdict, "good_delivery",
-            "{} {:?}",
-            r.verdict_reason, r.notes
-        );
-        assert_eq!(r.score_pct, 100.0);
-        let pb = &r.protocol_specific["playback"];
-        assert_eq!(pb["synthesized_excluded"], synth.len());
-        assert_eq!(pb["delivered_iframes"], script.len());
-        let audit = &r.protocol_specific["gi_ci_audit"];
-        assert_eq!(audit["gi_total"], 1);
-        assert_eq!(audit["gi_compliant"], 1);
+    #[test]
+    fn live_gi_synthesized_response_is_excluded_in_both_modes() {
+        // Source script carries its own captured GI burst. The live
+        // master sends a GI; the slave answers with a synthesized burst
+        // and then replays the script: without the captured burst when
+        // synthesis is on, with it when synthesis is off.
+        let mut script = vec![gi_actcon()];
+        script.extend((0..3).map(|i| sp(20, i, 1)));
+        script.push(gi_actterm());
+        script.extend((0..5).map(|i| me(3, i, i)));
+
+        for (cfg, replayed) in [
+            (None, without_bursts(&script)),
+            (Some(SYNTH_OFF), script.clone()),
+        ] {
+            let (r, n_synth) = live_gi_run(&script, &replayed, cfg);
+            assert_eq!(
+                r.verdict, "good_delivery",
+                "{cfg:?}: {} {:?}",
+                r.verdict_reason, r.notes
+            );
+            assert_eq!(r.score_pct, 100.0);
+            let pb = &r.protocol_specific["playback"];
+            assert_eq!(pb["synthesized_excluded"], n_synth);
+            assert_eq!(pb["delivered_iframes"], replayed.len());
+            let audit = &r.protocol_specific["gi_ci_audit"];
+            assert_eq!(audit["gi_total"], 1);
+            assert_eq!(audit["gi_compliant"], 1, "{cfg:?}");
+        }
     }
 
     /// Run one slave-role analysis where the live master sent `req`
