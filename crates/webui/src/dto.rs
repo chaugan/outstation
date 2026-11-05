@@ -348,6 +348,69 @@ pub struct SessionReportJson {
     /// Legacy raw samples; read from old rows, never written.
     #[serde(skip_serializing)]
     pub latency_samples_us: Vec<u64>,
+    /// Protocol-level counters and violations (absent in old rows).
+    pub protocol: Option<ProtocolStatsJson>,
+}
+
+/// One protocol violation, as recorded by the session.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtocolErrorJson {
+    pub at_ms: u64,
+    pub kind: String,
+    pub detail: String,
+    pub fatal: bool,
+}
+
+/// [`protoplay::ProtocolStats`] for the UI. The capped per-message
+/// vectors are summarised instead of shipped.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ProtocolStatsJson {
+    pub protocol_violations: u64,
+    pub protocol_errors: Vec<ProtocolErrorJson>,
+    pub synthesized_frames: u64,
+    pub stripped_capture_frames: u64,
+    pub command_response_count: u64,
+    pub command_response_p50_us: u64,
+    pub command_response_max_us: u64,
+    pub capture_gaps: u64,
+    pub script_skipped_bytes: u64,
+    pub script_dropped_frames: u64,
+    pub idle_serve_ms: u64,
+    pub acks_sent: u64,
+    pub keepalives_sent: u64,
+}
+
+impl From<&protoplay::ProtocolStats> for ProtocolStatsJson {
+    fn from(p: &protoplay::ProtocolStats) -> Self {
+        let mut cr = p.command_response_us.clone();
+        cr.sort_unstable();
+        Self {
+            protocol_violations: p.protocol_violations,
+            protocol_errors: p
+                .protocol_errors
+                .iter()
+                .map(|e| ProtocolErrorJson {
+                    at_ms: e.at_ms,
+                    kind: e.kind.clone(),
+                    detail: e.detail.clone(),
+                    fatal: e.fatal,
+                })
+                .collect(),
+            synthesized_frames: p.synthesized_frames,
+            stripped_capture_frames: p.stripped_capture_frames,
+            command_response_count: cr.len() as u64,
+            command_response_p50_us: cr.get(cr.len() / 2).copied().unwrap_or(0),
+            command_response_max_us: cr.last().copied().unwrap_or(0),
+            capture_gaps: p.capture_gaps,
+            script_skipped_bytes: p.script_skipped_bytes,
+            script_dropped_frames: p.script_dropped_frames,
+            idle_serve_ms: p.idle_serve_ms,
+            acks_sent: p.acks_sent,
+            keepalives_sent: p.keepalives_sent,
+        }
+    }
 }
 
 impl BenchmarkReportJson {
@@ -367,6 +430,15 @@ impl BenchmarkReportJson {
             }
             s.latency_samples_us = Vec::new();
         }
+    }
+
+    /// Protocol violations summed over every session.
+    pub(crate) fn protocol_violations(&self) -> u64 {
+        self.per_session
+            .iter()
+            .filter_map(|s| s.protocol.as_ref())
+            .map(|p| p.protocol_violations)
+            .sum()
     }
 
     pub(crate) fn sessions_failed(&self) -> usize {
@@ -402,6 +474,7 @@ impl From<&SessionReport> for SessionReportJson {
             latency_histogram: (!pr.latency_samples_us.is_empty())
                 .then(|| histogram_of(&pr.latency_samples_us)),
             latency_samples_us: Vec::new(),
+            protocol: Some(ProtocolStatsJson::from(&pr.protocol)),
         }
     }
 }
@@ -517,6 +590,8 @@ pub struct BenchmarkSummary {
     pub captured_bytes: u64,
     pub sessions: usize,
     pub sessions_failed: usize,
+    /// Protocol violations summed over every session.
+    pub protocol_violations: u64,
 }
 
 /// One row of `GET /api/runs`.
@@ -614,6 +689,7 @@ impl RunState {
                 captured_bytes: b.captured_bytes,
                 sessions: b.per_session.len(),
                 sessions_failed: b.sessions_failed(),
+                protocol_violations: b.protocol_violations(),
             }),
         }
     }
@@ -678,6 +754,34 @@ mod tests {
         let out = serde_json::to_value(&b).unwrap();
         assert!(out.get("aggregate_latency_samples_us").is_none());
         assert!(out["per_session"][0].get("latency_samples_us").is_none());
+    }
+
+    #[test]
+    fn session_json_carries_protocol_stats() {
+        let mut s = session(vec![10], 5);
+        s.proto_report.protocol.protocol_violations = 3;
+        s.proto_report.protocol.command_response_us = vec![30, 10, 20];
+        s.proto_report.protocol.protocol_errors = vec![protoplay::ProtocolError {
+            at_ms: 7,
+            kind: "ns_mismatch".into(),
+            detail: "expected 1, got 4".into(),
+            fatal: true,
+        }];
+        let r = BenchmarkReport {
+            per_session: vec![s],
+            ..Default::default()
+        };
+        let j = BenchmarkReportJson::from(&r);
+        let p = j.per_session[0].protocol.as_ref().unwrap();
+        assert_eq!(p.protocol_violations, 3);
+        assert_eq!(p.command_response_count, 3);
+        assert_eq!(p.command_response_p50_us, 20);
+        assert_eq!(p.command_response_max_us, 30);
+        assert_eq!(p.protocol_errors[0].kind, "ns_mismatch");
+        assert_eq!(j.protocol_violations(), 3);
+        // Old rows without the field still load.
+        let old: SessionReportJson = serde_json::from_str(r#"{"src_ip":"10.0.0.1"}"#).unwrap();
+        assert!(old.protocol.is_none());
     }
 
     #[test]
