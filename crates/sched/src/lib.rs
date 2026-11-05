@@ -2307,6 +2307,23 @@ mod tests {
     }
 
     #[test]
+    fn loopback_listen_ips_need_no_alias() {
+        // T07b: all of 127/8 is local via `lo`; a slave listening there
+        // must never be aliased onto a NIC (or refused for lack of one).
+        let prot = Protection::new(Vec::new(), false);
+        for ip in ["127.0.0.1", "127.0.10.49", "127.254.0.9"] {
+            let lease = ensure_listen_alias(
+                ip.parse().unwrap(),
+                None,
+                Path::new("/nonexistent-state-dir"),
+                &prot,
+            )
+            .unwrap();
+            assert!(lease.is_none(), "{ip} was aliased");
+        }
+    }
+
+    #[test]
     fn invalid_names_are_rejected_before_touching_the_host() {
         // F035/F047: a request-supplied name like "br0" or an empty
         // prefix must fail validation, never reach reclaim.

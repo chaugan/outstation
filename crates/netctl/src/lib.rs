@@ -30,6 +30,7 @@ pub mod cleanup;
 pub mod guard;
 pub mod harden;
 pub mod journal;
+pub mod local;
 pub mod names;
 pub mod protect;
 
@@ -40,6 +41,7 @@ pub use alias::{
 pub use cleanup::{cleanup_all, iface_owner, reclaim_run_ifaces, reclaim_stale, CleanupReport};
 pub use guard::{EgressGuard, GatewayGuard};
 pub use journal::{aliases_path, guards_path, DEFAULT_STATE_DIR};
+pub use local::{local_iface_of, session_ifaces};
 pub use names::{IfaceNames, PortKind};
 pub use protect::{
     check_nic_allowed, is_bridge, is_bridge_port, nic_assessment, validate_alias_ip,
