@@ -453,26 +453,36 @@ fn add_session_ports(
         info!(%ip, "master_bind_ip override active — sessions will originate from this address");
     }
     let topo = res.topo.as_mut().context("topology missing")?;
-    let mut bindings: Vec<SessionBinding> = Vec::with_capacity(picks.len());
-    for (i, p) in picks.iter().enumerate() {
-        let effective_src_ip = master_override.unwrap_or(p.client_ip);
-        let bridge_side = names.port(PortKind::Session, i)?;
-        let inject_side = topo
-            .add_port_with_ip(
-                &bridge_side,
-                Some(p.client_mac),
-                Some(effective_src_ip),
-                prot,
-            )
-            .with_context(|| format!("add session port {bridge_side}"))?;
-        bindings.push(SessionBinding {
-            src_ip: effective_src_ip,
+    let specs = picks
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Ok(netctl::PortSpec {
+                id: names.port(PortKind::Session, i)?,
+                mac: Some(p.client_mac),
+                src_ip: Some(master_override.unwrap_or(p.client_ip)),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // One batch: parallel port setup, one iptables transaction (T17c).
+    let t0 = std::time::Instant::now();
+    let injects = topo.add_ports(&specs, prot).context("add session ports")?;
+    info!(
+        ports = specs.len(),
+        ms = t0.elapsed().as_millis() as u64,
+        "session ports up"
+    );
+    Ok(specs
+        .into_iter()
+        .zip(injects)
+        .zip(picks)
+        .map(|((spec, inject_side), p)| SessionBinding {
+            src_ip: spec.src_ip.unwrap_or(p.client_ip),
             src_mac: p.client_mac,
-            bridge_side,
+            bridge_side: spec.id,
             inject_side,
-        });
-    }
-    Ok(bindings)
+        })
+        .collect())
 }
 
 /// Pre-populate per-session progress. `planned` stays 0 until the
