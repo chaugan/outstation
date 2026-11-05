@@ -247,7 +247,7 @@ Open `http://<eth1-address>:8080`. The header shows the server's health; a warni
 
 The run card shows the status (`completed`, `partial` when some sessions failed, `stopped`, `failed`), messages sent and received, and the capture download. **Details** adds:
 
-- **Ack latency** min/p50/p90/p99/max: time from sending an I-frame to the peer's acknowledgement, across all sessions, with a histogram. In scenario A this mostly reflects the master's own `w` and `t2`: it acknowledges after `w` I-frames or `t2` after the first unacknowledged one, so sparse telemetry gives latencies near the master's `t2`. It is not a network round-trip time ([details](iec104-config.md#session-report-fields)).
+- **Ack latency** min/p50/p90/p99/max: time from sending an I-frame to the peer's acknowledgement, across all sessions, with a histogram. In scenario A this mostly reflects the master's own `w` and `t2`: it acknowledges after `w` I-frames or `t2` after the first unacknowledged one, so sparse telemetry gives latencies near the master's `t2`. It is not a network round-trip time ([details](iec104-config.md#session-report-fields)). The **Peer ack cadence** line under it shows which rule drove the acks (a full window, the t2 timer, or N(R) on the peer's own data) and says so when most were timer-driven.
 - **Per session**: sent and received messages, latency percentiles, messages per second, **window stalls** (how often the session waited because the peer had not acknowledged k frames; a high number means the peer is slow to acknowledge), **unacked at end**, and the session's error, if any.
 - The **gap histogram** compares inter-frame gaps in the source with the replay.
 

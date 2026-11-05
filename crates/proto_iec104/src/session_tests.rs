@@ -224,6 +224,47 @@ fn windowed_send_blocks_until_server_acks() {
     assert!(rep.latency_p99_us >= rep.latency_p50_us);
 }
 
+/// F009: the report says how the peer acknowledged: a full window w,
+/// its t2 timer (fewer than w, after t2), or N(R) on its own data.
+#[test]
+fn peer_ack_cadence_is_classified() {
+    let (l, port) = listener();
+    let payload: Vec<Vec<u8>> = (0..9).map(|i| sp_asdu(i, 1)).collect();
+    let mut c = cfg(Role::Master, port, blob(&payload));
+    c.proto_config = Some(r#"{"session":{"k":12,"w":4,"t1":5,"t2":0.3,"t3":30}}"#.into());
+    let run = Running::spawn(c);
+    let mut p = Peer::accept(&l);
+    server_handshake(&mut p);
+    let mut got = 0;
+    let mut recv_i = |p: &mut Peer, n: usize| {
+        while got < n {
+            if is_i(&p.recv(ms(3000)).expect("I-frame")) {
+                got += 1;
+            }
+        }
+    };
+    recv_i(&mut p, 4);
+    p.ack(); // 4 frames: a full window
+    recv_i(&mut p, 8);
+    p.send_i(sp_asdu(100, 1)); // N(R) on our own data: 4 frames
+    recv_i(&mut p, 9);
+    std::thread::sleep(ms(320));
+    p.ack(); // 1 frame after t2: the timer
+    p.recv_until(ms(3000), |a| is_u(a, U_STOPDT_ACT))
+        .expect("STOPDT");
+    p.send_u(U_STOPDT_CON);
+    let (rep, _, _) = run.join_within(ms(3000));
+    assert!(rep.error.is_none(), "{:?}", rep.error);
+    let a = rep.protocol.ack_cadence;
+    assert_eq!(a.messages_acked, 9, "{a:?}");
+    assert_eq!(a.standalone_acks, 2, "{a:?}");
+    assert_eq!(a.window_acks, 1, "{a:?}");
+    assert_eq!(a.below_window_acks, 1, "{a:?}");
+    assert_eq!(a.timer_acks, 1, "{a:?}");
+    assert_eq!(a.piggybacked_acks, 1, "{a:?}");
+    assert_eq!(a.max_messages_per_ack, 4, "{a:?}");
+}
+
 /// F008/F147/F010: 15-bit wraparound of V(S) and of the peer's N(R),
 /// over 32768+ frames in fast mode.
 #[test]

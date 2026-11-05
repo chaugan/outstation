@@ -1245,7 +1245,7 @@ impl Link {
                     return Err(LinkEnd::Protocol(msg));
                 }
                 self.check_nr(nr, "I")?;
-                self.retire(nr, recv_ns);
+                self.retire(nr, recv_ns, false);
                 self.vr = (self.vr + 1) & SEQ_MASK;
                 // Saturating: while acks are withheld, a peer that
                 // ignores its own k could otherwise overflow it (N3).
@@ -1296,7 +1296,7 @@ impl Link {
                     p.bytes_read.fetch_add(6, Ordering::Relaxed);
                 }
                 self.check_nr(nr, "S")?;
-                self.retire(nr, recv_ns);
+                self.retire(nr, recv_ns, true);
             }
             Apdu::U { code } => {
                 self.report.bytes_read += 6;
@@ -1338,13 +1338,21 @@ impl Link {
     }
 
     /// Retire every pending I-frame acknowledged by `nr` (already
-    /// validated by [`Link::check_nr`]) and record its ack latency.
-    fn retire(&mut self, nr: u16, recv_ns: u64) {
+    /// validated by [`Link::check_nr`]), record its ack latency, and
+    /// classify the acknowledgement in the peer's ack cadence (F009).
+    /// `standalone` is true for an S-frame, false for an I-frame's N(R).
+    fn retire(&mut self, nr: u16, recv_ns: u64, standalone: bool) {
+        let mut n = 0u64;
+        let mut oldest_wait_ns = 0u64;
         while let Some(front) = self.pending.front().copied() {
             if front.ns == nr {
                 break;
             }
             self.pending.pop_front();
+            if n == 0 {
+                oldest_wait_ns = recv_ns.saturating_sub(front.send_ns);
+            }
+            n += 1;
             if !front.dropped {
                 let us = recv_ns.saturating_sub(front.send_ns) / 1_000;
                 self.latency.push(us);
@@ -1353,6 +1361,13 @@ impl Link {
                 }
             }
         }
+        self.report.protocol.ack_cadence.record(
+            n,
+            standalone,
+            u64::from(self.params.w),
+            oldest_wait_ns,
+            self.params.t2_ns,
+        );
     }
 
     fn handle_u(&mut self, code: u8) -> Result<(), LinkEnd> {

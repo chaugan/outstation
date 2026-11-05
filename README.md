@@ -47,7 +47,7 @@ Most pcap replay tools treat a capture as bytes to retransmit. outstation treats
 - **Built-in fidelity analysis.** After a run the analyzer compares the run's own capture against the source pcap endpoint by endpoint: delivered vs expected frames aligned by content, byte-identical counts, time-tag drift, pacing drift, a GI/CI compliance audit and a verdict per RTU and for the fleet. Runs are analysed automatically and can be compared run against run.
 - **Timing-preserving pacing.** Original-timing pacing sends each I-frame at its captured offset (scaled by a speed factor), so the shape of the telemetry feed survives: the pauses, the bursts, the outliers. As-fast-as-possible pacing is there for throughput tests.
 - **Fault injection.** Withhold acks, drop, duplicate or delay I-frames, corrupt N(S), go silent on TESTFR, send STOPDT, malformed APDUs or an RST at a chosen time or frame, and see how the peer reacts.
-- **Benchmark metrics.** Per-session send→ack latency (p50/p90/p99/max; p50/p99 also live on the Runs page while a run goes), window stalls, throughput and byte counts, plus how fast the replayed RTUs answered the master's commands.
+- **Benchmark metrics.** Per-session send→ack latency (p50/p90/p99/max; p50/p99 also live on the Runs page while a run goes) together with the peer's ack cadence (full window, t2 timer or piggybacked, so you can tell what the latency reflects), window stalls, throughput and byte counts, plus how fast the replayed RTUs answered the master's commands.
 
 ## How it works
 

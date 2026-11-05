@@ -709,6 +709,7 @@ function renderDetail(box, r, expanded) {
     h += `<dt>Messages</dt><dd>${fmtInt(b.total_messages_sent)} sent · ${fmtInt(b.total_messages_received)} received</dd>`;
     h += `<dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd>`;
     h += `<dt>Ack latency</dt><dd>min ${usFmt(b.aggregate_latency_min_us || 0)} · p50 ${usFmt(b.aggregate_latency_p50_us || 0)} · p90 ${usFmt(b.aggregate_latency_p90_us || 0)} · p99 ${usFmt(b.aggregate_latency_p99_us || 0)} · max ${usFmt(b.aggregate_latency_max_us || 0)}</dd>`;
+    h += ackCadenceHtml(b.aggregate_ack_cadence);
     h += `<dt>Protocol violations</dt><dd class="${violations ? 'bad' : 'ok'}">${fmtInt(violations)}</dd>`;
     h += commandFaultTotals(b.per_session || []);
     if (b.capture_path) h += `<dt>Capture</dt><dd>${fmtInt(b.captured_packets)} frames · ${fmtBytes(b.captured_bytes)}</dd>`;
@@ -870,6 +871,31 @@ function faultsInjectedHtml(p) {
   return h;
 }
 
+// F009: how the peer acknowledged our data messages, and so what the
+// ack latency mostly measures. `c` is an AckCadenceJson (absent in old
+// runs, which get no row).
+function ackCadenceHtml(c) {
+  if (!c || !c.messages_acked) return '';
+  const acks = (c.standalone_acks || 0) + (c.piggybacked_acks || 0);
+  const share = n => acks ? Math.round(100 * n / acks) + '%' : '0%';
+  const parts = [];
+  if (c.window_acks) parts.push(`${share(c.window_acks)} after a full window (≥ w)`);
+  if (c.below_window_acks) {
+    parts.push(`${share(c.below_window_acks)} before the window filled` +
+      (c.timer_acks ? ` (${fmtInt(c.timer_acks)} of them when t2 expired)` : ''));
+  }
+  if (c.piggybacked_acks) parts.push(`${share(c.piggybacked_acks)} on the peer's own data`);
+  let hint = '';
+  if (c.timer_acks * 2 > acks) {
+    hint = 'Most acks waited for the peer\'s t2 timer, so ack latency mostly shows t2, not how fast the peer processes data.';
+  } else if (c.window_acks * 2 > acks) {
+    hint = 'Most acks came after a full window of w messages, so ack latency includes the time for the window to fill.';
+  }
+  return `<dt>Peer ack cadence</dt><dd>${fmtInt(acks)} acks for ${fmtInt(c.messages_acked)} messages · ${esc(parts.join(' · '))}` +
+    ` · up to ${fmtInt(c.max_messages_per_ack)} per ack` +
+    (hint ? `<br><span class="hint">${esc(hint)}</span>` : '') + '</dd>';
+}
+
 function protoStatsHtml(s, proto) {
   const p = s.protocol;
   let h = '<dl class="kv compact">';
@@ -878,6 +904,7 @@ function protoStatsHtml(s, proto) {
   h += `<dt>Unacked at end</dt><dd>${fmtInt(s.unacked_at_end)}</dd>`;
   if (p) {
     h += `<dt>Acks sent (S-frames)</dt><dd>${fmtInt(p.acks_sent)}</dd>`;
+    h += ackCadenceHtml(p.ack_cadence);
     h += `<dt>Keep-alives (TESTFR)</dt><dd>${fmtInt(p.keepalives_sent)}</dd>`;
     h += `<dt>Synthesized frames</dt><dd>${fmtInt(p.synthesized_frames)} (captured frames stripped: ${fmtInt(p.stripped_capture_frames)})</dd>`;
     if (p.command_response_count) {

@@ -410,6 +410,10 @@ pub struct BenchmarkReportJson {
     /// The capture stopped at the per-run byte cap.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub capture_truncated: Option<bool>,
+    /// The peer's ack cadence summed over every session (F009); `None`
+    /// when no session recorded one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aggregate_ack_cadence: Option<AckCadenceJson>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -489,6 +493,80 @@ pub struct ProtocolStatsJson {
     pub faults_injected: Vec<FaultRecordJson>,
     /// Peer reaction to the injected faults; `None` when none fired.
     pub fault_reaction: Option<FaultReactionJson>,
+    /// How the peer acknowledged our data messages (F009); absent in
+    /// rows written before it was recorded.
+    pub ack_cadence: Option<AckCadenceJson>,
+}
+
+/// [`protoplay::AckCadence`] for the UI: which of the peer's ack
+/// triggers (full window w, t2 timer, its own data) drove the acks,
+/// and so what the ack latency figures mostly reflect.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AckCadenceJson {
+    pub standalone_acks: u64,
+    pub window_acks: u64,
+    pub below_window_acks: u64,
+    pub timer_acks: u64,
+    pub piggybacked_acks: u64,
+    pub messages_acked: u64,
+    pub max_messages_per_ack: u64,
+}
+
+impl From<&protoplay::AckCadence> for AckCadenceJson {
+    fn from(a: &protoplay::AckCadence) -> Self {
+        Self {
+            standalone_acks: a.standalone_acks,
+            window_acks: a.window_acks,
+            below_window_acks: a.below_window_acks,
+            timer_acks: a.timer_acks,
+            piggybacked_acks: a.piggybacked_acks,
+            messages_acked: a.messages_acked,
+            max_messages_per_ack: a.max_messages_per_ack,
+        }
+    }
+}
+
+impl AckCadenceJson {
+    fn add(&mut self, o: &AckCadenceJson) {
+        self.standalone_acks = self.standalone_acks.saturating_add(o.standalone_acks);
+        self.window_acks = self.window_acks.saturating_add(o.window_acks);
+        self.below_window_acks = self.below_window_acks.saturating_add(o.below_window_acks);
+        self.timer_acks = self.timer_acks.saturating_add(o.timer_acks);
+        self.piggybacked_acks = self.piggybacked_acks.saturating_add(o.piggybacked_acks);
+        self.messages_acked = self.messages_acked.saturating_add(o.messages_acked);
+        self.max_messages_per_ack = self.max_messages_per_ack.max(o.max_messages_per_ack);
+    }
+
+    /// One line for reports: how many acks, and what share came after
+    /// a full window, before it (and by the t2 timer), or on the peer's
+    /// own data.
+    pub fn summary(&self) -> String {
+        let acks = self.standalone_acks + self.piggybacked_acks;
+        let pct = |n: u64| (n * 100 + acks / 2).checked_div(acks).unwrap_or(0);
+        format!(
+            "{acks} acks for {} messages · {}% after a full window · {}% before it ({} when t2 expired) · {}% on the peer's own data · up to {} per ack",
+            self.messages_acked,
+            pct(self.window_acks),
+            pct(self.below_window_acks),
+            self.timer_acks,
+            pct(self.piggybacked_acks),
+            self.max_messages_per_ack
+        )
+    }
+
+    /// Sum over every session that recorded a cadence; `None` when none
+    /// did (old rows, or no message was ever acknowledged).
+    pub fn fleet(sessions: &[SessionReportJson]) -> Option<Self> {
+        let mut acc: Option<Self> = None;
+        for c in sessions
+            .iter()
+            .filter_map(|s| s.protocol.as_ref()?.ack_cadence.as_ref())
+        {
+            acc.get_or_insert_with(Self::default).add(c);
+        }
+        acc.filter(|a| a.messages_acked > 0)
+    }
 }
 
 /// [`protoplay::CommandTypeStats`] for the UI.
@@ -611,6 +689,7 @@ impl From<&protoplay::ProtocolStats> for ProtocolStatsJson {
                 first_reaction_ms: r.first_reaction_ms,
                 summary: r.summary.clone(),
             }),
+            ack_cadence: Some((&p.ack_cadence).into()),
         }
     }
 }
@@ -631,6 +710,9 @@ impl BenchmarkReportJson {
                 s.latency_histogram = Some(histogram_of(&s.latency_samples_us));
             }
             s.latency_samples_us = Vec::new();
+        }
+        if self.aggregate_ack_cadence.is_none() {
+            self.aggregate_ack_cadence = AckCadenceJson::fleet(&self.per_session);
         }
     }
 
@@ -748,6 +830,8 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
                 Some(acc.finish()),
             )
         };
+        let per_session: Vec<SessionReportJson> = r.per_session.iter().map(Into::into).collect();
+        let aggregate_ack_cadence = AckCadenceJson::fleet(&per_session);
         Self {
             total_messages_sent: r.total_messages_sent,
             total_messages_received: r.total_messages_received,
@@ -759,7 +843,7 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
             aggregate_throughput_msgs_per_sec: r.aggregate_throughput_msgs_per_sec,
             aggregate_latency_histogram: hist,
             aggregate_latency_samples_us: Vec::new(),
-            per_session: r.per_session.iter().map(Into::into).collect(),
+            per_session,
             capture_path: r.capture_path.as_ref().map(|p| p.display().to_string()),
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
@@ -767,6 +851,7 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
             warnings: with_truncation_warning(&r.warnings, r.capture_truncated),
             capture_ok: Some(r.capture_ok),
             capture_truncated: Some(r.capture_truncated),
+            aggregate_ack_cadence,
         }
     }
 }
@@ -1039,6 +1124,50 @@ mod tests {
         let out = serde_json::to_value(&b).unwrap();
         assert!(out.get("aggregate_latency_samples_us").is_none());
         assert!(out["per_session"][0].get("latency_samples_us").is_none());
+    }
+
+    #[test]
+    fn ack_cadence_is_summed_over_the_fleet() {
+        let mut a = session(vec![10], 5);
+        a.proto_report
+            .protocol
+            .ack_cadence
+            .record(8, true, 8, 0, 10);
+        let mut b = session(vec![10], 5);
+        b.proto_report
+            .protocol
+            .ack_cadence
+            .record(2, true, 8, 10, 10);
+        b.proto_report
+            .protocol
+            .ack_cadence
+            .record(3, false, 8, 0, 10);
+        let r = BenchmarkReport {
+            per_session: vec![a, b],
+            ..Default::default()
+        };
+        let j = BenchmarkReportJson::from(&r);
+        let f = j.aggregate_ack_cadence.unwrap();
+        assert_eq!(f.window_acks, 1);
+        assert_eq!(f.timer_acks, 1);
+        assert_eq!(f.piggybacked_acks, 1);
+        assert_eq!(f.messages_acked, 13);
+        assert_eq!(f.max_messages_per_ack, 8);
+        let s0 = j.per_session[0].protocol.as_ref().unwrap();
+        assert_eq!(s0.ack_cadence.unwrap().window_acks, 1);
+        assert_eq!(
+            f.summary(),
+            "3 acks for 13 messages · 33% after a full window · 33% before it (1 when t2 expired) · 33% on the peer's own data · up to 8 per ack"
+        );
+        // Old rows without cadence: computed on read, `None` when absent.
+        let old = r#"{"per_session":[{"src_ip":"10.0.0.1","protocol":{"acks_sent":1}}]}"#;
+        let mut o: BenchmarkReportJson = serde_json::from_str(old).unwrap();
+        o.upgrade_legacy();
+        assert!(o.aggregate_ack_cadence.is_none());
+        assert!(serde_json::to_value(&o)
+            .unwrap()
+            .get("aggregate_ack_cadence")
+            .is_none());
     }
 
     #[test]

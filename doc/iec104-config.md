@@ -234,12 +234,21 @@ Each session of a benchmark run (`benchmark.per_session[]` in `GET /api/runs/:id
 | `capture_gaps`, `script_skipped_bytes`, `script_dropped_frames` | Gaps in the captured stream, bytes that did not frame, frames dropped because they straddled a gap |
 | `idle_serve_ms` | Slave: time spent serving after the script ended |
 | `acks_sent`, `keepalives_sent` | S-frames and TESTFR acts we sent |
+| `ack_cadence` | How the peer acknowledged our I-frames (see below): `{standalone_acks, window_acks, below_window_acks, timer_acks, piggybacked_acks, messages_acked, max_messages_per_ack}`. The run's `benchmark.aggregate_ack_cadence` sums it over every session |
 
 The engine also records, per session, per-command-type round trips (`commands[]`: `{type_id, commands, act_con, negative, act_term, deact_con, unanswered, actcon_us[], actterm_us[]}`), `negative_confirmations[]`, `faults_injected[]` (`{at_ms, kind, detail, frames_affected}`) and `fault_reaction` (`{peer_closed, peer_reset, peer_stopdt, protocol_errors[], first_reaction_ms, summary}`). All four appear in each session's `protocol` object in `GET /api/runs/:id` and in the `bench` JSON report; the analyzer's `faults` section additionally judges the fault side from the capture.
 
 Latency (`latency_*_us`) is the time from sending an I-frame to the peer acknowledging it (the S-frame or I-frame N(R) that covers it, timestamped on receipt). It is not a command round trip.
 
 **Ack latency is bounded by the peer's w and t2, not the network.** The peer acknowledges on its own schedule: after it has received `w` I-frames, or `t2` after the first unacknowledged one, whichever comes first (the `w` and `t2` that matter are the peer's, not the ones in `session` above). In slave role the live master sends few or no I-frames of its own, so it acknowledges with S-frames by that rule: with sparse telemetry the latency approaches the master's t2 (often 10 s), with dense telemetry it is the time `w` frames take to go out. Read slave-role latency as the master's acknowledgement policy, and compare runs only against the same master settings. In master role an RTU that sends data carries N(R) in its own I-frames and so usually acknowledges sooner.
+
+**`ack_cadence` says which rule drove the acks**, so you can tell what the latency figures mostly show. Every acknowledgement that retires at least one of our I-frames is counted once:
+
+- `piggybacked_acks`: N(R) in one of the peer's own I-frames.
+- `standalone_acks`: S-frames, split into `window_acks` (they covered at least `w` I-frames) and `below_window_acks` (fewer). Of the latter, `timer_acks` are those whose oldest I-frame had waited at least 90% of `t2`, so the peer's t2 timer sent them.
+- `messages_acked` and `max_messages_per_ack` give the batch sizes.
+
+The peer's own `w` and `t2` are not visible on the wire, so the split uses the `w` and `t2` of this session's `session` settings (the standard defaults, 8 and 10 s, unless you changed them). Set them to the peer's values for an exact split. The run details and the HTML report show the shares and say when most acks were timer-driven (latency then mostly shows the peer's t2) or window-driven (latency includes the time the window takes to fill).
 
 ## Analysis report
 

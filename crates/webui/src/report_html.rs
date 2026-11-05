@@ -197,6 +197,9 @@ pub(crate) fn render(
                     b.aggregate_latency_max_us as f64 / 1e3
                 ),
             );
+            if let Some(c) = &b.aggregate_ack_cadence {
+                dd("Peer ack cadence", c.summary());
+            }
             dd(
                 "Sessions",
                 format!(
