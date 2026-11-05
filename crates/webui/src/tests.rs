@@ -900,10 +900,24 @@ async fn uploads_leave_no_part_files() {
     assert_eq!(s, StatusCode::OK, "{v}");
     let id = v["id"].as_str().unwrap().to_string();
     assert!(h.state.library_dir.join(format!("{id}.pcap")).is_file());
-    assert!(!h
+    // The upload's own temp file is gone as soon as the request returns.
+    assert!(!h.state.library_dir.join(format!(".{id}.part")).exists());
+    // The background viability pass writes its sidecar atomically via a
+    // transient `.<id>.json.part`; wait for it to settle, then require
+    // that nothing `.part` is left at all.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while h
         .files_in("state/library")
         .iter()
-        .any(|f| f.ends_with(".part")));
+        .any(|f| f.ends_with(".part"))
+    {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{:?}",
+            h.files_in("state/library")
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
 }
 
 #[tokio::test]
