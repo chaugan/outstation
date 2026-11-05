@@ -204,7 +204,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Delete with an undo toast instead of a confirm dialog where it is safe.
   - Keyboard shortcuts (g l / g c / g r / g a, `/` to filter) with a `?` help overlay.
   - Typography pass: consistent mono/sans use and number alignment in tables.
-- [~] **T20b UI follow-ups.**
+- [x] **T20b UI follow-ups.**
   - Live ack-latency p50/p99 while a run is going. This needs a small log-scale latency histogram in the shared progress counters (protoplay, link.rs, sched SourceProgress), summed in the live WebSocket stream. Starts after fx3 merges.
   - The Compare regression list shows raw metric names and µs ("p99_us rose from 245242 µs"); show friendly labels with ms.
   - Configure must hide the SCADA-gateway section in master role; the server now refuses it with 400 `gateway_requires_slave`.
@@ -409,3 +409,10 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Result: every full-speed 200/400-session run in both roles scores `all_correct` with 0 dropped frames.
   - Privileged suites: netctl 9/9, bench 3+5, slave 2/2, smoke 10/10, gateway-egress 6/6.
   - README Scale updated with the new numbers.
+- 2026-11-05: T20b merged. Workspace tests: 490 passed, 2 runs green; MSRV 1.85 check clean.
+  - Live ack-latency p50/p99 on the Runs strip and in the diagram's session table. It uses a lock-free per-session log histogram (`protoplay::LiveLatencyHist`), costs one relaxed `fetch_add` per acked I-frame, and showed no measurable change in the 200-session scale runs.
+  - Compare regressions carry friendly labels and show ms; the run details and the HTML report use readable units.
+  - Configure disables SCADA-gateway mode in master role, with a note; gateway fields are sent only in slave role.
+  - `ServeConfig.free_space` makes the free-space source injectable; the disk-reserve test is deterministic (10/10 consecutive runs).
+  - ui-smoke: 560/560 and 580/580 (`--no-auto-analyze`). netns-smoke 10/10, netns-slave 2/2.
+  - Note: commit 5ae1786 on the lane branch was made while that flaky test was still red; the next commit (043d76e) fixed it.
