@@ -1748,6 +1748,46 @@ async fn api_analyze(
     let replayer = proto_registry::lookup(&rs.proto)
         .ok_or_else(|| AppError::BadRequest(format!("unknown protocol: {}", rs.proto)))?;
     let proto_config = rs.proto_config.clone();
+    // Run facts the analysis judges against (T06: F060, F062, F093).
+    let run_info = analysis::RunInfo {
+        status: match rs.status {
+            RunStatus::Completed => analysis::RunStatusHint::Completed,
+            RunStatus::Stopped => analysis::RunStatusHint::Stopped,
+            RunStatus::Failed => analysis::RunStatusHint::Failed,
+            RunStatus::Running => analysis::RunStatusHint::Running,
+        },
+        error: rs.error.clone(),
+        messages_sent: Some(
+            rs.benchmark
+                .as_ref()
+                .map(|b| b.total_messages_sent)
+                .unwrap_or(rs.sent),
+        ),
+        endpoints: rs
+            .per_source_progress
+            .iter()
+            .filter_map(|p| {
+                Some(analysis::SelectedEndpoint {
+                    source_ip: p.src_ip.as_deref()?.parse().ok()?,
+                    listen_ip: p.listen_ip.parse().ok(),
+                    listen_port: (p.listen_port != 0).then_some(p.listen_port),
+                    state: p.state.clone(),
+                    cancelled: p.cancelled,
+                    sent: p.sent,
+                })
+            })
+            .collect(),
+        iterations: rs
+            .per_source_progress
+            .iter()
+            .map(|p| p.iter_total)
+            .max()
+            .unwrap_or(1),
+        // Not persisted on RunState yet (T08 stores the full request).
+        loop_within_session: None,
+        paced_speed: None,
+        source_port: None,
+    };
     let report = tokio::task::spawn_blocking({
         let original_pcap = rs.pcap.clone();
         let tmp_path = tmp_path.clone();
@@ -1755,14 +1795,17 @@ async fn api_analyze(
         move || {
             analyze(
                 replayer.as_ref(),
-                &original_pcap,
-                &tmp_path,
-                run_id,
-                target_port,
-                role_hint,
-                mode,
-                proto_config,
-                cp56_tolerance_ms,
+                &analysis::AnalyzeRequest {
+                    original_pcap_path: &original_pcap,
+                    captured_pcap_path: &tmp_path,
+                    run_id,
+                    target_port,
+                    role: role_hint,
+                    mode,
+                    proto_config,
+                    cp56_tolerance_ms,
+                    run: run_info,
+                },
             )
         }
     })

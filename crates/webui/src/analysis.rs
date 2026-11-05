@@ -1,29 +1,63 @@
 //! Post-run analysis shell: compare a user-uploaded captured pcap
 //! against the source pcap of a completed run.
 //!
-//! The shell is protocol-agnostic. It handles pcap loading, slave IP
-//! enumeration, flow picking, fleet rollup, iteration-boundary
-//! detection, and fleet-level pacing timeline construction — all
-//! generic concepts — then delegates the per-slave protocol analysis
-//! (playback vs target diff, handshake detection, drift measurement,
-//! timing stats) to the selected [`protoplay::ProtoReplayer`] via its
-//! [`analyze_flow`](protoplay::ProtoReplayer::analyze_flow) method.
+//! The shell is protocol-agnostic. It handles pcap loading, endpoint
+//! enumeration and pairing, per-session flow picking, fleet rollup,
+//! iteration-boundary detection, and the fleet pacing timeline. The
+//! per-session protocol analysis (playback vs target diff, handshake,
+//! drift, timing, verdict) is delegated to the selected
+//! [`protoplay::ProtoReplayer`] via
+//! [`analyze_flow`](protoplay::ProtoReplayer::analyze_flow), whose
+//! [`VerdictOutcome`] drives the rollup so the shell never interprets
+//! protocol verdict strings.
 //!
-//! The protocol-specific detail lands inside
-//! `SlaveDetail.protocol_specific` as a JSON value rendered by the
-//! matching proto crate's UI fragment (see `static/*.js`).
+//! # Which endpoints are judged
+//!
+//! The run's own selection ([`RunInfo::endpoints`], taken from its
+//! per-source progress) is authoritative:
+//!
+//! * a selected endpoint with no captured session is `never_connected`
+//!   (a failure);
+//! * captured traffic on the run's port that pairs with no selected
+//!   endpoint is listed as `unpaired` and is not scored;
+//! * every captured TCP session of an endpoint is analysed (not just
+//!   the busiest), and the endpoint's verdict is its worst session's,
+//!   with reconnects counted.
+//!
+//! Without run facts (old runs) the shell falls back to the endpoints
+//! present in both pcaps.
+//!
+//! # Report size and persistence
+//!
+//! [`AnalysisReport`] still carries `details_by_ip` for the current UI,
+//! but every per-endpoint detail is bounded by the protocol's caps
+//! (IEC 104: 200 mismatches, 2 000-entry sequences, strided samples).
+//! [`AnalysisReport::split`] separates it into a small serializable
+//! [`AnalysisSummary`] (verdicts, scores, fleet rollup, timelines) and
+//! the per-endpoint [`SlaveDetail`] map, so the caller can persist the
+//! summary with the run and store or serve each detail lazily.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
 use pcapload::{LoadedPcap, ReassembledFlow};
-use protoplay::{AnalyzeCtx, FleetDriftTimeline, FlowSnapshot, ProtoReplayer, Role};
+use protoplay::{
+    AnalyzeCtx, FleetDriftTimeline, FlowSnapshot, ProtoReplayer, ProtoSlaveAnalysis, Role,
+    RunFacts, VerdictOutcome,
+};
 use serde::Serialize;
 
 /// Default tolerance for the CP56Time2a drift analyzer: 50 ms is
 /// generous for a LAN SCADA session but keeps noise out of the count.
 pub const DEFAULT_CP56_TOLERANCE_MS: f64 = 50.0;
+
+/// Cap on points emitted in the fleet timelines. Aggregate stats stay
+/// accurate beyond this; only the scatter is trimmed.
+pub const MAX_FLEET_TIMELINE_POINTS: usize = 5_000;
+
+/// Cap on the per-endpoint session list in a detail.
+pub const MAX_SESSIONS_LISTED: usize = 200;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AnalysisMode {
@@ -53,9 +87,90 @@ impl RoleHint {
     }
 }
 
+/// Final status of the run being judged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RunStatusHint {
+    Completed,
+    /// Stopped by the user: a truncated final iteration is expected.
+    Stopped,
+    Failed,
+    /// Still running when analysed.
+    Running,
+    #[default]
+    Unknown,
+}
+
+/// One endpoint the run was configured to replay, from the run's
+/// per-source progress.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SelectedEndpoint {
+    /// The endpoint's IP in the source pcap: the RTU (server) IP in
+    /// slave role, the master (client) IP in master role.
+    pub source_ip: Ipv4Addr,
+    /// Slave role: the address the session listened on, when it was
+    /// not the source IP (user-edited listen IP). `None` or
+    /// `0.0.0.0` = the source IP.
+    pub listen_ip: Option<Ipv4Addr>,
+    /// Slave role: the port the session listened on.
+    pub listen_port: Option<u16>,
+    /// Final lifecycle state ("completed", "failed", "cancelled", …).
+    pub state: String,
+    pub cancelled: bool,
+    /// Messages the endpoint's session(s) sent.
+    pub sent: u64,
+}
+
+/// Run facts the analysis needs from the caller (F060, F062, F093).
+/// `RunInfo::default()` means "unknown" and reproduces the
+/// capture-driven behaviour for runs that predate these facts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunInfo {
+    pub status: RunStatusHint,
+    pub error: Option<String>,
+    /// Total messages the run reported sending; `Some(0)` triggers the
+    /// "run sent nothing" warning.
+    pub messages_sent: Option<u64>,
+    /// Selected endpoints. Empty = unknown (fall back to the capture).
+    pub endpoints: Vec<SelectedEndpoint>,
+    /// Configured iterations; `0` = unbounded (loop until stopped).
+    pub iterations: u64,
+    /// Whether iterations ran inside one TCP session. `None` = unknown:
+    /// iterations are then detected from the captured stream.
+    pub loop_within_session: Option<bool>,
+    /// Pacing speed when the run replayed original timing; `None` =
+    /// as fast as possible or unknown (timing not judged).
+    pub paced_speed: Option<f64>,
+    /// Server port of the endpoint flows in the source pcap. `None` =
+    /// the analysis target port, else detected.
+    pub source_port: Option<u16>,
+}
+
+/// Everything [`analyze`] needs.
+#[derive(Debug, Clone)]
+pub struct AnalyzeRequest<'a> {
+    pub original_pcap_path: &'a Path,
+    pub captured_pcap_path: &'a Path,
+    pub run_id: u64,
+    /// Captured-side port: the target port in master role, the listen
+    /// port (base) in slave role.
+    pub target_port: u16,
+    pub role: RoleHint,
+    pub mode: AnalysisMode,
+    pub proto_config: Option<String>,
+    pub cp56_tolerance_ms: f64,
+    pub run: RunInfo,
+}
+
 #[derive(Serialize, Debug, Clone)]
 pub struct AnalysisReport {
     pub run_id: u64,
+    /// Status of the run this capture was judged against.
+    pub run_status: RunStatusHint,
+    /// Set when the run failed or sent nothing: the verdict can then
+    /// never be `all_correct` (F093).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_warning: Option<String>,
     pub mode: &'static str,
     pub role: &'static str,
     /// Protocol name (e.g. `"iec104"`) — lets the UI pick the right
@@ -78,37 +193,120 @@ pub struct AnalysisReport {
     /// (e.g. IEC 104 without fresh-timestamps mode).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_drift_timeline: Option<FleetDriftTimeline>,
-    /// Fleet-wide pacing drift — `None` when no slave delivered any
+    /// Fleet-wide pacing drift — `None` when no endpoint delivered any
     /// messages in both pcaps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_pacing_timeline: Option<FleetPacingTimeline>,
 }
 
+/// [`AnalysisReport`] without the per-endpoint details: small enough
+/// to persist with the run and to send on every poll. Serialize it as
+/// JSON and store it as text; fetch details separately by endpoint
+/// key (`SlaveSummary::slave_ip`).
+// Not yet called outside tests: T04 persists the summary and serves
+// details lazily.
+#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Serialize, Debug, Clone)]
+pub struct AnalysisSummary {
+    pub run_id: u64,
+    pub run_status: RunStatusHint,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run_warning: Option<String>,
+    pub mode: &'static str,
+    pub role: &'static str,
+    pub protocol: &'static str,
+    pub original_pcap: String,
+    pub captured_size_bytes: u64,
+    pub captured_total_packets: usize,
+    pub verdict: &'static str,
+    pub verdict_reason: String,
+    pub score_pct: f64,
+    pub notes: Vec<String>,
+    pub fleet: FleetSummary,
+    pub slaves: Vec<SlaveSummary>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub master_ip_mapping: Option<MasterIpMapping>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_drift_timeline: Option<FleetDriftTimeline>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_pacing_timeline: Option<FleetPacingTimeline>,
+}
+
+impl AnalysisReport {
+    #[cfg_attr(not(test), allow(dead_code))]
+    /// Split into the persistable summary and the per-endpoint detail
+    /// map (keyed like `SlaveSummary::slave_ip`).
+    pub fn split(self) -> (AnalysisSummary, BTreeMap<String, SlaveDetail>) {
+        (
+            AnalysisSummary {
+                run_id: self.run_id,
+                run_status: self.run_status,
+                run_warning: self.run_warning,
+                mode: self.mode,
+                role: self.role,
+                protocol: self.protocol,
+                original_pcap: self.original_pcap,
+                captured_size_bytes: self.captured_size_bytes,
+                captured_total_packets: self.captured_total_packets,
+                verdict: self.verdict,
+                verdict_reason: self.verdict_reason,
+                score_pct: self.score_pct,
+                notes: self.notes,
+                fleet: self.fleet,
+                slaves: self.slaves,
+                master_ip_mapping: self.master_ip_mapping,
+                fleet_drift_timeline: self.fleet_drift_timeline,
+                fleet_pacing_timeline: self.fleet_pacing_timeline,
+            },
+            self.details_by_ip,
+        )
+    }
+}
+
+#[derive(Serialize, Debug, Clone, Default, PartialEq)]
 pub struct FleetSummary {
+    /// Endpoints judged (selected endpoints; unpaired traffic excluded).
     pub slave_count: usize,
+    /// Endpoints with at least one captured session.
     pub attempted: usize,
+    /// Same as `never_connected`; kept for the current UI.
     pub not_attempted: usize,
+    pub never_connected: usize,
+    /// Captured endpoints that pair with no selected endpoint (not
+    /// scored).
+    pub unpaired: usize,
+    /// Endpoints whose verdict is inconclusive (no reference…), not
+    /// scored but blocking `all_correct`.
+    pub inconclusive: usize,
     pub fully_correct: usize,
     pub partial: usize,
     pub failed: usize,
+    /// Extra TCP sessions beyond the expected count, summed.
+    pub reconnects: usize,
+    /// Mean of per-endpoint scores (each clamped to 0..=100) over the
+    /// scored endpoints; never-connected endpoints count as 0.
     pub aggregate_score_pct: f64,
+    /// Same, weighted by each endpoint's expected message count.
+    pub frame_weighted_score_pct: f64,
     pub best: Option<BestWorst>,
     pub worst: Option<BestWorst>,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct BestWorst {
     pub slave_ip: String,
     pub score_pct: f64,
 }
 
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct SlaveSummary {
+    /// Endpoint key: the RTU IP in slave role, the replayed master IP
+    /// in master role (name kept for the UI).
     pub slave_ip: String,
     pub score_pct: f64,
     pub verdict: &'static str,
     pub verdict_reason: String,
+    pub outcome: VerdictOutcome,
     /// Expected protocol messages (IEC 104: I-frames; Modbus: PDUs).
     pub expected_iframes: usize,
     /// Delivered protocol messages on the wire.
@@ -116,25 +314,52 @@ pub struct SlaveSummary {
     pub packets: usize,
     /// Protocol-level handshake flag. For IEC 104 this is STARTDT.
     pub startdt_handshake_ok: bool,
+    /// Captured TCP sessions analysed for this endpoint.
+    pub sessions: usize,
+    /// Sessions beyond the expected count.
+    pub reconnects: usize,
+}
+
+/// One captured TCP session of an endpoint.
+#[derive(Serialize, Debug, Clone, PartialEq)]
+pub struct SessionSummary {
+    /// 1-based, in capture order.
+    pub index: usize,
+    pub flow: FlowInfo,
+    pub first_ts_ms: f64,
+    pub verdict: &'static str,
+    pub verdict_reason: String,
+    pub outcome: VerdictOutcome,
+    pub score_pct: f64,
+    pub expected: usize,
+    pub delivered: usize,
 }
 
 #[derive(Serialize, Debug, Clone)]
 pub struct SlaveDetail {
+    /// The session whose drill-down is in `protocol_specific` (the
+    /// worst one).
     pub tcp_flow: Option<FlowInfo>,
+    /// Every captured session of this endpoint, capped at
+    /// [`MAX_SESSIONS_LISTED`].
+    pub sessions: Vec<SessionSummary>,
+    pub sessions_total: usize,
     /// Protocol-specific drill-down produced by the replayer's
-    /// [`analyze_flow`](protoplay::ProtoReplayer::analyze_flow). The
-    /// matching UI renderer in `static/<proto>_ui.js` walks this blob.
+    /// [`analyze_flow`](protoplay::ProtoReplayer::analyze_flow) for the
+    /// worst session. The matching UI renderer in
+    /// `static/<proto>_ui.js` walks this blob.
     pub protocol_specific: serde_json::Value,
     pub verdict: &'static str,
     pub verdict_reason: String,
     pub score_pct: f64,
     pub notes: Vec<String>,
-    /// Per-message pacing-drift samples `[capture_wall_ms, drift_ms]`
-    /// surfaced at the top level so the core can aggregate them into a
-    /// protocol-agnostic fleet pacing timeline. The same series is also
-    /// available inside `protocol_specific` for per-slave rendering.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Pacing samples of every session, used for the fleet timeline
+    /// only (not serialized; the timeline is).
+    #[serde(skip)]
     pub pacing_samples: Vec<[f64; 2]>,
+    /// How many real samples each entry of `pacing_samples` stands for.
+    #[serde(skip)]
+    pub pacing_weight: f64,
 }
 
 #[derive(Serialize, Debug, Clone)]
@@ -153,11 +378,7 @@ pub struct FleetPacingTimeline {
     pub iteration_starts_ms: Vec<f64>,
 }
 
-/// Cap on points emitted in the fleet timelines. Aggregate stats stay
-/// accurate beyond this; only the scatter is trimmed.
-pub const MAX_FLEET_TIMELINE_POINTS: usize = 5_000;
-
-#[derive(Serialize, Debug, Clone)]
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct FlowInfo {
     pub client: String,
     pub server: String,
@@ -182,34 +403,23 @@ fn flow_state_label(flow: &pcapload::Flow) -> String {
     s.trim().to_string()
 }
 
-/// Pick the **busiest** captured flow for a given (server_ip, port).
-/// "Busiest" = most TCP packets. Ranking by packets fixes the case
-/// where a stale 10-packet FIN-only flow shadows the real working
-/// session that carries thousands of packets.
-fn find_busiest_captured_flow(
-    captured: &LoadedPcap,
-    server_ip: Ipv4Addr,
-    target_port: u16,
-) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (idx, flow) in captured.flows.iter().enumerate() {
-        let Some((ip, sp)) = flow.server else {
-            continue;
-        };
-        if sp != target_port || ip != server_ip {
-            continue;
-        }
-        let pkts = flow.packet_indices.len();
-        if best.is_none_or(|(_, p)| pkts > p) {
-            best = Some((idx, pkts));
-        }
+fn flow_info(flow: &pcapload::Flow) -> FlowInfo {
+    FlowInfo {
+        client: flow
+            .client
+            .map(|(ip, p)| format!("{ip}:{p}"))
+            .unwrap_or_else(|| "?".into()),
+        server: flow
+            .server
+            .map(|(ip, p)| format!("{ip}:{p}"))
+            .unwrap_or_else(|| "?".into()),
+        packets: flow.packet_indices.len(),
+        state: flow_state_label(flow),
     }
-    best.map(|(idx, _)| idx)
 }
 
-/// Auto-detect the master IP: unique client IP across all flows whose
-/// server port matches `target_port`. When multiple distinct clients
-/// exist, returns the busiest one (most flows).
+/// Auto-detect the master IP: the client IP with the most flows whose
+/// server port matches `target_port`.
 fn detect_master_ip(p: &LoadedPcap, target_port: u16) -> Option<Ipv4Addr> {
     let mut counts: HashMap<Ipv4Addr, usize> = HashMap::new();
     for flow in &p.flows {
@@ -221,69 +431,122 @@ fn detect_master_ip(p: &LoadedPcap, target_port: u16) -> Option<Ipv4Addr> {
             *counts.entry(cip).or_insert(0) += 1;
         }
     }
-    counts.into_iter().max_by_key(|(_, c)| *c).map(|(ip, _)| ip)
+    counts
+        .into_iter()
+        .max_by_key(|(ip, c)| (*c, std::cmp::Reverse(*ip)))
+        .map(|(ip, _)| ip)
 }
 
-fn list_slave_ips(p: &LoadedPcap, target_port: u16) -> BTreeSet<Ipv4Addr> {
-    let mut ips: BTreeSet<Ipv4Addr> = BTreeSet::new();
-    for flow in &p.flows {
-        if let Some((ip, sp)) = flow.server {
-            if sp == target_port {
-                ips.insert(ip);
+/// The endpoint key of a flow: RTU (server) IP in slave role, master
+/// (client) IP in master role.
+fn endpoint_of(flow: &pcapload::Flow, role: RoleHint) -> Option<Ipv4Addr> {
+    match role {
+        RoleHint::Slave => flow.server.map(|(ip, _)| ip),
+        RoleHint::Master => flow.client.map(|(ip, _)| ip),
+    }
+}
+
+fn server_port(flow: &pcapload::Flow) -> Option<u16> {
+    flow.server.map(|(_, p)| p)
+}
+
+fn first_ts_ms(p: &LoadedPcap, flow: &pcapload::Flow) -> f64 {
+    flow.packet_indices
+        .first()
+        .map(|&i| p.packets[i].rel_ts_ns as f64 / 1e6)
+        .unwrap_or(0.0)
+}
+
+/// Server port of the endpoint flows in the source pcap.
+fn detect_source_port(
+    original: &LoadedPcap,
+    target_port: u16,
+    run: &RunInfo,
+    role: RoleHint,
+) -> u16 {
+    if let Some(p) = run.source_port {
+        return p;
+    }
+    if role == RoleHint::Master
+        || original
+            .flows
+            .iter()
+            .any(|f| server_port(f) == Some(target_port))
+    {
+        return target_port;
+    }
+    // Slave role with a custom listen port: the source port is not
+    // recorded in the run, so take the most common server port among
+    // the selected RTUs' source flows.
+    let selected: BTreeSet<Ipv4Addr> = run.endpoints.iter().map(|e| e.source_ip).collect();
+    let mut counts: BTreeMap<u16, usize> = BTreeMap::new();
+    for f in &original.flows {
+        if let (Some((ip, port)), true) = (f.server, f.client.is_some()) {
+            if selected.is_empty() || selected.contains(&ip) {
+                *counts.entry(port).or_default() += 1;
             }
         }
     }
-    ips
+    counts
+        .into_iter()
+        .max_by_key(|(p, c)| (*c, std::cmp::Reverse(*p)))
+        .map(|(p, _)| p)
+        .unwrap_or(target_port)
 }
 
-fn find_original_flow_for_slave(
-    original: &LoadedPcap,
-    slave_ip: Ipv4Addr,
-    target_port: u16,
-) -> Option<usize> {
-    let mut best: Option<(usize, usize)> = None;
-    for (idx, flow) in original.flows.iter().enumerate() {
-        let Some((ip, sp)) = flow.server else {
-            continue;
-        };
-        if sp != target_port || ip != slave_ip {
-            continue;
-        }
-        let pkts = flow.packet_indices.len();
-        if best.is_none_or(|(_, p)| pkts > p) {
-            best = Some((idx, pkts));
+/// How captured sessions are recognised for one endpoint.
+#[derive(Debug, Clone)]
+struct EndpointMatch {
+    key: Ipv4Addr,
+    /// Slave role: the (ip, port) the session listened on.
+    listen: Option<(Ipv4Addr, u16)>,
+}
+
+impl EndpointMatch {
+    fn matches(&self, flow: &pcapload::Flow, role: RoleHint, port: u16) -> bool {
+        match role {
+            RoleHint::Slave => {
+                let (ip, p) = self.listen.unwrap_or((self.key, port));
+                flow.server == Some((ip, p))
+            }
+            RoleHint::Master => {
+                server_port(flow) == Some(port) && endpoint_of(flow, role) == Some(self.key)
+            }
         }
     }
-    best.map(|(idx, _)| idx)
 }
 
-/// Core entry point. Loads both pcaps, enumerates every slave
-/// (server-port == target_port) in the original pcap, runs a per-slave
-/// comparison via the replayer's `analyze_flow`, and rolls the per-
-/// slave outcomes up into a fleet report.
+/// Core entry point. Loads both pcaps, pairs every selected endpoint
+/// with its source flow and all of its captured sessions, runs the
+/// protocol analysis per session, and rolls the results up.
 pub fn analyze(
     replayer: &dyn ProtoReplayer,
-    original_pcap_path: &Path,
-    captured_pcap_path: &Path,
-    run_id: u64,
-    target_port: u16,
-    role: RoleHint,
-    mode: AnalysisMode,
-    proto_config: Option<String>,
-    cp56_tolerance_ms: f64,
+    req: &AnalyzeRequest,
 ) -> anyhow::Result<AnalysisReport> {
     use anyhow::Context;
 
-    let original = pcapload::load(original_pcap_path).context("load original pcap")?;
-    let captured = pcapload::load(captured_pcap_path).context("load captured pcap")?;
-    let captured_size_bytes = std::fs::metadata(captured_pcap_path)
+    let original = pcapload::load(req.original_pcap_path).context("load original pcap")?;
+    let captured = pcapload::load(req.captured_pcap_path).context("load captured pcap")?;
+    let captured_size_bytes = std::fs::metadata(req.captured_pcap_path)
         .map(|m| m.len())
         .unwrap_or(0);
+    analyze_loaded(replayer, req, &original, &captured, captured_size_bytes)
+}
 
+fn analyze_loaded(
+    replayer: &dyn ProtoReplayer,
+    req: &AnalyzeRequest,
+    original: &LoadedPcap,
+    captured: &LoadedPcap,
+    captured_size_bytes: u64,
+) -> anyhow::Result<AnalysisReport> {
+    let role = req.role;
+    let run = &req.run;
     let mut fleet_notes: Vec<String> = Vec::new();
+    let source_port = detect_source_port(original, req.target_port, run, role);
 
-    let captured_master_ip = detect_master_ip(&original, target_port);
-    let live_master_ip = detect_master_ip(&captured, target_port);
+    let captured_master_ip = detect_master_ip(original, source_port);
+    let live_master_ip = detect_master_ip(captured, req.target_port);
     let renamed = match (captured_master_ip, live_master_ip) {
         (Some(a), Some(b)) => a != b,
         _ => false,
@@ -297,64 +560,188 @@ pub fn analyze(
     } else {
         None
     };
-    if renamed {
-        fleet_notes.push(format!(
-            "master IP renamed: captured={} live={}",
-            captured_master_ip.unwrap(),
-            live_master_ip.unwrap()
-        ));
+    if let (true, Some(a), Some(b)) = (renamed, captured_master_ip, live_master_ip) {
+        fleet_notes.push(format!("master IP renamed: captured={a} live={b}"));
     }
 
-    // Slave list strategy: prefer the captured pcap's slave set
-    // (those are the RTUs the run actually attempted — matches the
-    // run-config "select RTUs" picker subset). Fall back to the
-    // source-pcap set only when the captured pcap has no slave-side
-    // traffic at all (e.g. capture started after the run finished or
-    // every session bailed pre-handshake) — in that case we still
-    // want to see what the source expected so the analysis isn't
-    // empty.
-    let source_slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&original, target_port);
-    let captured_slave_ips: BTreeSet<Ipv4Addr> = list_slave_ips(&captured, target_port);
-    let slave_ips: BTreeSet<Ipv4Addr> = if !captured_slave_ips.is_empty() {
-        captured_slave_ips.clone()
+    // Source endpoints and the reference flow the replayer used for
+    // each: the first flow in pcap order (sched picks the same one).
+    let mut reference: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
+    for (idx, f) in original.flows.iter().enumerate() {
+        if server_port(f) != Some(source_port) {
+            continue;
+        }
+        if let Some(ep) = endpoint_of(f, role) {
+            reference.entry(ep).or_insert(idx);
+        }
+    }
+
+    // Endpoints to judge.
+    let run_known = !run.endpoints.is_empty();
+    let matchers: Vec<(EndpointMatch, Option<&SelectedEndpoint>)> = if run_known {
+        run.endpoints
+            .iter()
+            .map(|e| {
+                let listen = match role {
+                    RoleHint::Slave => {
+                        let ip = e
+                            .listen_ip
+                            .filter(|ip| !ip.is_unspecified())
+                            .unwrap_or(e.source_ip);
+                        Some((ip, e.listen_port.unwrap_or(req.target_port)))
+                    }
+                    RoleHint::Master => None,
+                };
+                (
+                    EndpointMatch {
+                        key: e.source_ip,
+                        listen,
+                    },
+                    Some(e),
+                )
+            })
+            .collect()
     } else {
-        source_slave_ips.clone()
+        let captured_eps: BTreeSet<Ipv4Addr> = captured
+            .flows
+            .iter()
+            .filter(|f| server_port(f) == Some(req.target_port))
+            .filter_map(|f| endpoint_of(f, role))
+            .collect();
+        let paired: Vec<Ipv4Addr> = if captured_eps.iter().any(|ip| reference.contains_key(ip)) {
+            captured_eps
+                .iter()
+                .filter(|ip| reference.contains_key(ip))
+                .copied()
+                .collect()
+        } else {
+            reference.keys().copied().collect()
+        };
+        let not_in_capture = reference.keys().filter(|ip| !paired.contains(ip)).count();
+        if not_in_capture > 0 {
+            fleet_notes.push(format!(
+                "run facts unavailable: judging the {} source endpoint(s) seen in the capture; {} source endpoint(s) have no captured traffic and were not judged",
+                paired.len(),
+                not_in_capture
+            ));
+        }
+        paired
+            .into_iter()
+            .map(|ip| {
+                (
+                    EndpointMatch {
+                        key: ip,
+                        listen: None,
+                    },
+                    None,
+                )
+            })
+            .collect()
     };
-    if slave_ips.is_empty() {
+    if matchers.is_empty() {
         return Err(anyhow::anyhow!(
-            "no flow in source pcap with server_port={target_port}; nothing to compare against"
-        ));
-    }
-    let dropped = source_slave_ips.len().saturating_sub(slave_ips.len());
-    if dropped > 0 {
-        fleet_notes.push(format!(
-            "{} of {} captured-pcap RTUs not attempted in this run; only the {} replayed RTU(s) are listed below",
-            dropped,
-            source_slave_ips.len(),
-            slave_ips.len()
+            "no flow in source pcap with server_port={source_port}; nothing to compare against"
         ));
     }
 
-    let ctx = AnalyzeCtx {
+    // Captured sessions per endpoint, in capture order.
+    let mut claimed = vec![false; captured.flows.len()];
+    let mut sessions_by_ep: Vec<Vec<usize>> = Vec::with_capacity(matchers.len());
+    for (m, _) in &matchers {
+        let mut v: Vec<usize> = captured
+            .flows
+            .iter()
+            .enumerate()
+            .filter(|(_, f)| m.matches(f, role, req.target_port))
+            .map(|(i, _)| i)
+            .collect();
+        v.sort_by(|&a, &b| {
+            first_ts_ms(captured, &captured.flows[a])
+                .partial_cmp(&first_ts_ms(captured, &captured.flows[b]))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then(a.cmp(&b))
+        });
+        for &i in &v {
+            claimed[i] = true;
+        }
+        sessions_by_ep.push(v);
+    }
+
+    let base_ctx = AnalyzeCtx {
         role: role.as_role(),
-        mode_correct: matches!(mode, AnalysisMode::Correct),
+        mode_correct: matches!(req.mode, AnalysisMode::Correct),
         captured_first_ts_ns: captured.first_ts_ns,
-        target_port,
-        proto_config,
-        cp56_tolerance_ms,
+        target_port: req.target_port,
+        proto_config: req.proto_config.clone(),
+        cp56_tolerance_ms: req.cp56_tolerance_ms,
+        run: RunFacts::default(),
     };
 
     let mut summaries: Vec<SlaveSummary> = Vec::new();
     let mut details: BTreeMap<String, SlaveDetail> = BTreeMap::new();
-    for ip in &slave_ips {
-        match analyze_one_slave(replayer, &original, &captured, *ip, target_port, role, &ctx) {
-            Ok((summary, detail)) => {
-                summaries.push(summary);
-                details.insert(ip.to_string(), detail);
+    for ((m, sel), sessions) in matchers.iter().zip(&sessions_by_ep) {
+        let key = m.key.to_string();
+        let ref_idx = reference.get(&m.key).copied();
+        let (summary, detail) = analyze_endpoint(
+            replayer, original, captured, role, run, *sel, ref_idx, sessions, &base_ctx, &key,
+        );
+        summaries.push(summary);
+        details.insert(key, detail);
+    }
+
+    // Captured traffic on the run's port that pairs with nothing.
+    if run_known {
+        let mut unpaired: BTreeMap<Ipv4Addr, Vec<usize>> = BTreeMap::new();
+        for (i, f) in captured.flows.iter().enumerate() {
+            if claimed[i] || server_port(f) != Some(req.target_port) {
+                continue;
             }
-            Err(e) => {
-                fleet_notes.push(format!("slave {ip}: skipped ({e})"));
+            if let Some(ep) = endpoint_of(f, role) {
+                unpaired.entry(ep).or_default().push(i);
             }
+        }
+        for (ip, flows) in unpaired {
+            let key = ip.to_string();
+            if details.contains_key(&key) {
+                continue;
+            }
+            let packets = flows
+                .iter()
+                .map(|&i| captured.flows[i].packet_indices.len())
+                .sum();
+            let reason = format!(
+                "{} captured session(s) on port {} pair with no endpoint selected in this run; not scored",
+                flows.len(),
+                req.target_port
+            );
+            summaries.push(SlaveSummary {
+                slave_ip: key.clone(),
+                score_pct: 0.0,
+                verdict: "unpaired",
+                verdict_reason: reason.clone(),
+                outcome: VerdictOutcome::Inconclusive,
+                expected_iframes: 0,
+                delivered_iframes: 0,
+                packets,
+                startdt_handshake_ok: false,
+                sessions: flows.len(),
+                reconnects: 0,
+            });
+            details.insert(
+                key,
+                SlaveDetail {
+                    tcp_flow: flows.first().map(|&i| flow_info(&captured.flows[i])),
+                    sessions: Vec::new(),
+                    sessions_total: flows.len(),
+                    protocol_specific: serde_json::Value::Null,
+                    verdict: "unpaired",
+                    verdict_reason: reason,
+                    score_pct: 0.0,
+                    notes: Vec::new(),
+                    pacing_samples: Vec::new(),
+                    pacing_weight: 1.0,
+                },
+            );
         }
     }
 
@@ -366,27 +753,31 @@ pub fn analyze(
     });
 
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
+    let (verdict, verdict_reason, run_warning) =
+        apply_run_status(run, verdict, verdict_reason, &mut fleet_notes);
 
-    let iteration_starts_ms = detect_iteration_starts(&captured, target_port, fleet.slave_count);
+    let iteration_starts_ms = detect_iteration_starts(captured, req.target_port, fleet.slave_count);
 
     // Fleet-wide drift timeline is protocol-driven: the replayer pulls
-    // whatever drift series it cares about from each slave's
+    // whatever drift series it cares about from each endpoint's
     // protocol_specific JSON.
     let per_slave_proto: BTreeMap<String, serde_json::Value> = details
         .iter()
+        .filter(|(_, d)| !d.protocol_specific.is_null())
         .map(|(ip, d)| (ip.clone(), d.protocol_specific.clone()))
         .collect();
     let fleet_drift_timeline =
         replayer.aggregate_fleet_drift(&per_slave_proto, &iteration_starts_ms);
-
     let fleet_pacing_timeline = build_fleet_pacing_timeline(&details, &iteration_starts_ms);
 
     Ok(AnalysisReport {
-        run_id,
-        mode: mode_str(mode),
+        run_id: req.run_id,
+        run_status: run.status,
+        run_warning,
+        mode: mode_str(req.mode),
         role: role_str(role),
         protocol: replayer.name(),
-        original_pcap: original_pcap_path.display().to_string(),
+        original_pcap: req.original_pcap_path.display().to_string(),
         captured_size_bytes,
         captured_total_packets: captured.packets.len(),
         verdict,
@@ -402,46 +793,381 @@ pub fn analyze(
     })
 }
 
-/// Walk each slave's pacing samples, merge into one time-sorted
-/// timeline, and decimate. Protocol-agnostic — every protocol that
-/// returns a `ProtoSlaveAnalysis::pacing_samples` participates.
+/// F093: a run that failed or sent nothing can never be certified.
+fn apply_run_status(
+    run: &RunInfo,
+    verdict: &'static str,
+    reason: String,
+    notes: &mut Vec<String>,
+) -> (&'static str, String, Option<String>) {
+    let warning = match (run.status, run.messages_sent) {
+        (RunStatusHint::Failed, _) => Some(format!(
+            "the run being analysed FAILED{}",
+            run.error
+                .as_ref()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default()
+        )),
+        (_, Some(0)) => Some("the run being analysed sent 0 messages".to_string()),
+        (RunStatusHint::Running, _) => Some("the run being analysed is still running".to_string()),
+        _ => None,
+    };
+    let Some(w) = warning else {
+        return (verdict, reason, None);
+    };
+    notes.insert(0, format!("WARNING: {w}"));
+    if verdict == "all_correct" || verdict == "inconclusive" {
+        (
+            "run_failed",
+            format!("{w}; the capture matched ({reason}), but this run cannot be certified"),
+            Some(w),
+        )
+    } else {
+        (verdict, format!("{reason} ({w})"), Some(w))
+    }
+}
+
+/// Analyse every captured session of one endpoint and fold them into
+/// one summary/detail.
+#[allow(clippy::too_many_arguments)]
+fn analyze_endpoint(
+    replayer: &dyn ProtoReplayer,
+    original: &LoadedPcap,
+    captured: &LoadedPcap,
+    role: RoleHint,
+    run: &RunInfo,
+    sel: Option<&SelectedEndpoint>,
+    ref_idx: Option<usize>,
+    sessions: &[usize],
+    base_ctx: &AnalyzeCtx,
+    key: &str,
+) -> (SlaveSummary, SlaveDetail) {
+    let mut notes: Vec<String> = Vec::new();
+
+    // Reference flow (the one the replayer replays).
+    let (orig_client, orig_server) = match ref_idx {
+        Some(i) => (
+            original.reassemble_client_payload(i).ok(),
+            original.reassemble_server_payload(i).ok(),
+        ),
+        None => {
+            notes.push(format!(
+                "endpoint {key} has no flow in the source pcap; nothing to compare against"
+            ));
+            (None, None)
+        }
+    };
+    if let Some(i) = ref_idx {
+        let n = original
+            .flows
+            .iter()
+            .filter(|f| {
+                endpoint_of(f, role) == endpoint_of(&original.flows[i], role)
+                    && server_port(f) == server_port(&original.flows[i])
+            })
+            .count();
+        if n > 1 {
+            notes.push(format!(
+                "source pcap has {n} sessions for this endpoint; the replayer replays the first, which is the reference"
+            ));
+        }
+    }
+    let (orig_pb, orig_tg) = pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
+
+    let stopped = run.status == RunStatusHint::Stopped || sel.is_some_and(|s| s.cancelled);
+    let (per_session_iters, expected_sessions) = match run.loop_within_session {
+        Some(true) => (run.iterations, Some(1u64)),
+        Some(false) => (1, (run.iterations > 0).then_some(run.iterations)),
+        None => (0, None),
+    };
+    // An unbounded loop always ends on a stop.
+    let stopped = stopped || (run.loop_within_session.is_some() && run.iterations == 0);
+
+    // Sessions that carried no payload at all (port probes, refused
+    // connects) are listed but not judged.
+    let mut analyses: Vec<(usize, ProtoSlaveAnalysis)> = Vec::new();
+    let mut session_rows: Vec<SessionSummary> = Vec::new();
+    let mut empty_sessions = 0usize;
+    let payload_sessions: Vec<(usize, ReassembledFlow, ReassembledFlow)> = sessions
+        .iter()
+        .filter_map(|&i| {
+            let c = captured.reassemble_client_payload(i).ok()?;
+            let s = captured.reassemble_server_payload(i).ok()?;
+            if c.payload.is_empty() && s.payload.is_empty() {
+                None
+            } else {
+                Some((i, c, s))
+            }
+        })
+        .collect();
+    empty_sessions += sessions.len() - payload_sessions.len();
+    let n_sessions = payload_sessions.len();
+    for (k, (i, c, s)) in payload_sessions.iter().enumerate() {
+        let is_last = k + 1 == n_sessions;
+        let ctx = AnalyzeCtx {
+            run: RunFacts {
+                iterations_per_session: per_session_iters,
+                // Only the final session can have been cut by a stop.
+                stopped_early: stopped && is_last,
+                paced_speed: run.paced_speed,
+            },
+            ..base_ctx.clone()
+        };
+        let (cap_pb, cap_tg) = pick_playback_target(role, Some(c), Some(s));
+        let a = replayer.analyze_flow(
+            orig_pb.map(snapshot),
+            cap_pb.map(snapshot),
+            orig_tg.map(snapshot),
+            cap_tg.map(snapshot),
+            &ctx,
+        );
+        let flow = &captured.flows[*i];
+        session_rows.push(SessionSummary {
+            index: k + 1,
+            flow: flow_info(flow),
+            first_ts_ms: first_ts_ms(captured, flow),
+            verdict: a.verdict,
+            verdict_reason: a.verdict_reason.clone(),
+            outcome: a.outcome,
+            score_pct: a.score_pct.clamp(0.0, 100.0),
+            expected: a.expected_messages,
+            delivered: a.delivered_messages,
+        });
+        analyses.push((*i, a));
+    }
+    if empty_sessions > 0 {
+        notes.push(format!(
+            "{empty_sessions} captured session(s) carried no payload (connect without data) and were not judged"
+        ));
+    }
+
+    let packets: usize = sessions
+        .iter()
+        .map(|&i| captured.flows[i].packet_indices.len())
+        .sum();
+    let reconnects = match expected_sessions {
+        Some(n) => n_sessions.saturating_sub(n as usize),
+        None => n_sessions.saturating_sub(1),
+    };
+    if n_sessions > 1 {
+        notes.push(format!(
+            "{n_sessions} TCP sessions captured for this endpoint{}",
+            if reconnects > 0 {
+                format!(" ({reconnects} more than expected: reconnects)")
+            } else {
+                String::new()
+            }
+        ));
+    }
+
+    if analyses.is_empty() {
+        // Selected but never reached the wire.
+        let state = sel.map(|s| s.state.as_str()).unwrap_or("unknown");
+        let reason =
+            format!("no captured session with payload for this endpoint (run state: {state})");
+        let summary = SlaveSummary {
+            slave_ip: key.to_string(),
+            score_pct: 0.0,
+            verdict: "never_connected",
+            verdict_reason: reason.clone(),
+            outcome: VerdictOutcome::Fail,
+            expected_iframes: 0,
+            delivered_iframes: 0,
+            packets,
+            startdt_handshake_ok: false,
+            sessions: 0,
+            reconnects: 0,
+        };
+        let detail = SlaveDetail {
+            tcp_flow: sessions.first().map(|&i| flow_info(&captured.flows[i])),
+            sessions: Vec::new(),
+            sessions_total: 0,
+            protocol_specific: serde_json::Value::Null,
+            verdict: "never_connected",
+            verdict_reason: reason,
+            score_pct: 0.0,
+            notes,
+            pacing_samples: Vec::new(),
+            pacing_weight: 1.0,
+        };
+        return (summary, detail);
+    }
+
+    // Worst session: Fail < Inconclusive < Pass, then lowest score.
+    let rank = |o: VerdictOutcome| match o {
+        VerdictOutcome::Fail => 0,
+        VerdictOutcome::Inconclusive => 1,
+        VerdictOutcome::Pass => 2,
+    };
+    let worst = analyses
+        .iter()
+        .enumerate()
+        .min_by(|(_, (_, a)), (_, (_, b))| {
+            rank(a.outcome).cmp(&rank(b.outcome)).then(
+                a.score_pct
+                    .partial_cmp(&b.score_pct)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            )
+        })
+        .map(|(k, _)| k)
+        .unwrap_or(0);
+
+    let weight = |a: &ProtoSlaveAnalysis| a.expected_messages.max(1) as f64;
+    let mut wsum: f64 = analyses.iter().map(|(_, a)| weight(a)).sum();
+    let score_sum: f64 = analyses
+        .iter()
+        .map(|(_, a)| a.score_pct.clamp(0.0, 100.0) * weight(a))
+        .sum();
+    let expected_total: usize = analyses.iter().map(|(_, a)| a.expected_messages).sum();
+    let delivered_total: usize = analyses.iter().map(|(_, a)| a.delivered_messages).sum();
+    let handshake_ok = analyses.iter().all(|(_, a)| a.handshake_ok);
+
+    let (_, wa) = &analyses[worst];
+    let mut outcome = wa.outcome;
+    let mut verdict = wa.verdict;
+    let mut reason = if n_sessions > 1 {
+        format!(
+            "session {}/{}: {}",
+            worst + 1,
+            n_sessions,
+            wa.verdict_reason
+        )
+    } else {
+        wa.verdict_reason.clone()
+    };
+
+    // Configured iterations that never got a session.
+    if let Some(n) = expected_sessions {
+        let missing = (n as usize).saturating_sub(n_sessions);
+        if missing > 0 && !stopped {
+            let per = wsum / n_sessions as f64;
+            wsum += per * missing as f64;
+            outcome = VerdictOutcome::Fail;
+            verdict = "missing_sessions";
+            reason = format!(
+                "{n_sessions} of {n} configured iteration sessions captured; {missing} missing. Worst captured session: {}",
+                wa.verdict_reason
+            );
+        }
+    }
+    let score = if wsum > 0.0 {
+        (score_sum / wsum).clamp(0.0, 100.0)
+    } else {
+        0.0
+    };
+
+    let mut all_notes = notes;
+    let mut pacing: Vec<[f64; 2]> = Vec::new();
+    let mut pacing_total = 0usize;
+    for (k, (_, a)) in analyses.iter().enumerate() {
+        pacing.extend_from_slice(&a.pacing_samples);
+        pacing_total += a.pacing_samples_total.max(a.pacing_samples.len());
+        if k == worst {
+            all_notes.extend(a.notes.iter().cloned());
+        }
+    }
+    let pacing_weight = if pacing.is_empty() {
+        1.0
+    } else {
+        pacing_total as f64 / pacing.len() as f64
+    };
+
+    let sessions_total = session_rows.len();
+    session_rows.truncate(MAX_SESSIONS_LISTED);
+    let (worst_flow_idx, worst_analysis) = analyses.swap_remove(worst);
+    let summary = SlaveSummary {
+        slave_ip: key.to_string(),
+        score_pct: score,
+        verdict,
+        verdict_reason: reason.clone(),
+        outcome,
+        expected_iframes: expected_total,
+        delivered_iframes: delivered_total,
+        packets,
+        startdt_handshake_ok: handshake_ok,
+        sessions: n_sessions,
+        reconnects,
+    };
+    let detail = SlaveDetail {
+        tcp_flow: Some(flow_info(&captured.flows[worst_flow_idx])),
+        sessions: session_rows,
+        sessions_total,
+        protocol_specific: worst_analysis.protocol_specific,
+        verdict,
+        verdict_reason: reason,
+        score_pct: score,
+        notes: all_notes,
+        pacing_samples: pacing,
+        pacing_weight,
+    };
+    (summary, detail)
+}
+
+/// Merge every endpoint's pacing samples into one time-sorted timeline
+/// and decimate it, weighting each endpoint by how many real samples
+/// its (already decimated) series stands for (F136). Protocol-agnostic.
 fn build_fleet_pacing_timeline(
     details: &BTreeMap<String, SlaveDetail>,
     iteration_starts_ms: &[f64],
 ) -> Option<FleetPacingTimeline> {
-    let mut all: Vec<(f64, f64)> = Vec::new();
+    let mut all: Vec<(f64, f64, f64)> = Vec::new();
+    let mut total = 0.0f64;
     for d in details.values() {
+        let w = d.pacing_weight.max(1.0);
         for s in &d.pacing_samples {
-            all.push((s[0], s[1]));
+            all.push((s[0], s[1], w));
         }
+        total += w * d.pacing_samples.len() as f64;
     }
     if all.is_empty() {
         return None;
     }
-    let total_samples = all.len();
     all.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
-
-    let decimated = total_samples > MAX_FLEET_TIMELINE_POINTS;
-    let kept: Vec<[f64; 2]> = if decimated {
-        let stride = total_samples.div_ceil(MAX_FLEET_TIMELINE_POINTS);
-        all.iter().step_by(stride).map(|&(t, d)| [t, d]).collect()
-    } else {
-        all.iter().map(|&(t, d)| [t, d]).collect()
-    };
-
+    let total_samples = total.round() as usize;
+    let (kept, decimated) = weighted_decimate(&all, MAX_FLEET_TIMELINE_POINTS);
     Some(FleetPacingTimeline {
         samples: kept,
         total_samples,
-        decimated,
+        decimated: decimated || total_samples > all.len(),
         iteration_starts_ms: iteration_starts_ms.to_vec(),
     })
+}
+
+/// Weighted random sampling without replacement (Efraimidis–Spirakis)
+/// over time-sorted `(t, value, weight)`, deterministic (hash of the
+/// index as the random source). Returns points in time order.
+fn weighted_decimate(sorted: &[(f64, f64, f64)], cap: usize) -> (Vec<[f64; 2]>, bool) {
+    if sorted.len() <= cap {
+        return (sorted.iter().map(|&(t, d, _)| [t, d]).collect(), false);
+    }
+    let mut keyed: Vec<(f64, usize)> = sorted
+        .iter()
+        .enumerate()
+        .map(|(i, s)| {
+            let mut z = (i as u64).wrapping_add(0x9e37_79b9_7f4a_7c15);
+            z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+            z ^= z >> 31;
+            let u = ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64;
+            (u.ln() / s.2.max(1e-12), i)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    let mut idx: Vec<usize> = keyed.into_iter().take(cap).map(|(_, i)| i).collect();
+    idx.sort_unstable();
+    (
+        idx.into_iter()
+            .map(|i| [sorted[i].0, sorted[i].1])
+            .collect(),
+        true,
+    )
 }
 
 /// Detect iteration boundaries by clustering TCP SYN packets to the
 /// target port. Each benchmark iteration triggers a tight burst of
 /// handshakes, so we bin SYNs by 1-second windows and flag bins that
-/// contain at least 30 % of the expected slave count. Adjacent flagged
-/// bins coalesce into a single iteration start.
+/// contain at least 30 % of the expected endpoint count. Adjacent
+/// flagged bins coalesce into a single iteration start.
 fn detect_iteration_starts(
     captured: &LoadedPcap,
     target_port: u16,
@@ -503,146 +1229,6 @@ fn snapshot(rf: &ReassembledFlow) -> FlowSnapshot<'_> {
     }
 }
 
-/// Run the single-slave comparison shell: pick the original flow for
-/// this slave IP, pick the busiest captured flow for the same IP,
-/// delegate the actual protocol analysis to `replayer.analyze_flow`,
-/// and stitch a SlaveSummary + SlaveDetail from the result.
-fn analyze_one_slave(
-    replayer: &dyn ProtoReplayer,
-    original: &LoadedPcap,
-    captured: &LoadedPcap,
-    slave_ip: Ipv4Addr,
-    target_port: u16,
-    role: RoleHint,
-    ctx: &AnalyzeCtx,
-) -> anyhow::Result<(SlaveSummary, SlaveDetail)> {
-    use anyhow::Context;
-
-    let mut notes: Vec<String> = Vec::new();
-    let slave_ip_str = slave_ip.to_string();
-
-    // Original-side reassembly. Skip if the original pcap has no flow
-    // for this slave (orphan: slave seen in captured but not original).
-    let orig_flow_idx_opt = find_original_flow_for_slave(original, slave_ip, target_port);
-    let (orig_client, orig_server) = if let Some(orig_idx) = orig_flow_idx_opt {
-        let oc = original
-            .reassemble_client_payload(orig_idx)
-            .context("reassemble original client side")?;
-        let os = original
-            .reassemble_server_payload(orig_idx)
-            .context("reassemble original server side")?;
-        (Some(oc), Some(os))
-    } else {
-        notes.push(format!(
-            "slave {slave_ip} appears in captured pcap but not in source — \
-             nothing to compare against"
-        ));
-        (None, None)
-    };
-
-    // Captured-side flow (busiest match).
-    let cap_flow_idx_opt = find_busiest_captured_flow(captured, slave_ip, target_port);
-    let cap_flow_idx = match cap_flow_idx_opt {
-        Some(i) => i,
-        None => {
-            notes.push(format!(
-                "slave {slave_ip}: no TCP flow in captured pcap on port {target_port}"
-            ));
-            // Still call analyze_flow with no captured flows — the
-            // protocol's impl will produce a "not_attempted"-shaped
-            // report. Passing original lets it at least record the
-            // expected message count.
-            let (orig_pb, orig_tg) =
-                pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
-            let analysis = replayer.analyze_flow(
-                orig_pb.map(snapshot),
-                None,
-                orig_tg.map(snapshot),
-                None,
-                ctx,
-            );
-            let verdict_reason =
-                format!("no TCP flow on port {target_port} for slave {slave_ip} in captured pcap");
-            let detail = SlaveDetail {
-                tcp_flow: None,
-                protocol_specific: analysis.protocol_specific,
-                verdict: "not_attempted",
-                verdict_reason: verdict_reason.clone(),
-                score_pct: 0.0,
-                notes: {
-                    let mut n = notes.clone();
-                    n.extend(analysis.notes);
-                    n
-                },
-                pacing_samples: analysis.pacing_samples,
-            };
-            let summary = SlaveSummary {
-                slave_ip: slave_ip_str,
-                score_pct: 0.0,
-                verdict: "not_attempted",
-                verdict_reason,
-                expected_iframes: analysis.expected_messages,
-                delivered_iframes: 0,
-                packets: 0,
-                startdt_handshake_ok: false,
-            };
-            return Ok((summary, detail));
-        }
-    };
-    let cap_flow = &captured.flows[cap_flow_idx];
-    let flow_info = FlowInfo {
-        client: cap_flow
-            .client
-            .map(|(ip, p)| format!("{ip}:{p}"))
-            .unwrap_or_else(|| "?".into()),
-        server: cap_flow
-            .server
-            .map(|(ip, p)| format!("{ip}:{p}"))
-            .unwrap_or_else(|| "?".into()),
-        packets: cap_flow.packet_indices.len(),
-        state: flow_state_label(cap_flow),
-    };
-
-    let cap_client_rf = captured.reassemble_client_payload(cap_flow_idx).ok();
-    let cap_server_rf = captured.reassemble_server_payload(cap_flow_idx).ok();
-
-    let (orig_pb, orig_tg) = pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
-    let (cap_pb, cap_tg) =
-        pick_playback_target(role, cap_client_rf.as_ref(), cap_server_rf.as_ref());
-
-    let analysis = replayer.analyze_flow(
-        orig_pb.map(snapshot),
-        cap_pb.map(snapshot),
-        orig_tg.map(snapshot),
-        cap_tg.map(snapshot),
-        ctx,
-    );
-
-    let mut all_notes = notes;
-    all_notes.extend(analysis.notes);
-
-    let summary = SlaveSummary {
-        slave_ip: slave_ip_str,
-        score_pct: analysis.score_pct,
-        verdict: analysis.verdict,
-        verdict_reason: analysis.verdict_reason.clone(),
-        expected_iframes: analysis.expected_messages,
-        delivered_iframes: analysis.delivered_messages,
-        packets: flow_info.packets,
-        startdt_handshake_ok: analysis.handshake_ok,
-    };
-    let detail = SlaveDetail {
-        tcp_flow: Some(flow_info),
-        protocol_specific: analysis.protocol_specific,
-        verdict: analysis.verdict,
-        verdict_reason: analysis.verdict_reason,
-        score_pct: analysis.score_pct,
-        notes: all_notes,
-        pacing_samples: analysis.pacing_samples,
-    };
-    Ok((summary, detail))
-}
-
 /// Resolve (playback, target) flow references from (client, server)
 /// based on which role outstation played in this run.
 fn pick_playback_target<'a>(
@@ -656,103 +1242,152 @@ fn pick_playback_target<'a>(
     }
 }
 
+/// Fleet rollup. Classes come from each endpoint's [`VerdictOutcome`]
+/// (never from its score), so an endpoint with an unknown or
+/// inconclusive verdict can never count as fully correct.
+///
+/// | fleet verdict | when |
+/// |---|---|
+/// | `no_session` | no endpoint to judge |
+/// | `no_delivery` | no judged endpoint has a captured session |
+/// | `all_correct` | every judged endpoint passed |
+/// | `failed` | every judged endpoint failed with score 0 |
+/// | `inconclusive` | nothing failed, but some endpoints could not be verified |
+/// | `partial` | anything else |
+///
+/// `run_failed` is applied on top by [`apply_run_status`].
 fn roll_up_fleet(slaves: &[SlaveSummary]) -> (FleetSummary, &'static str, String, f64) {
-    let slave_count = slaves.len();
-    let attempted = slaves.iter().filter(|s| s.packets > 0).count();
-    let not_attempted = slave_count.saturating_sub(attempted);
-    let fully_correct = slaves
+    let judged: Vec<&SlaveSummary> = slaves.iter().filter(|s| s.verdict != "unpaired").collect();
+    let unpaired = slaves.len() - judged.len();
+    let slave_count = judged.len();
+    let never_connected = judged
         .iter()
-        .filter(|s| s.packets > 0 && s.score_pct >= 99.999)
+        .filter(|s| s.verdict == "never_connected")
         .count();
-    let failed = slaves
+    let attempted = judged.iter().filter(|s| s.sessions > 0).count();
+    let fully_correct = judged
         .iter()
-        .filter(|s| s.packets > 0 && s.score_pct == 0.0)
+        .filter(|s| s.outcome == VerdictOutcome::Pass)
         .count();
-    let partial = attempted
-        .saturating_sub(fully_correct)
-        .saturating_sub(failed);
+    let inconclusive = judged
+        .iter()
+        .filter(|s| s.outcome == VerdictOutcome::Inconclusive)
+        .count();
+    let failed = judged
+        .iter()
+        .filter(|s| s.outcome == VerdictOutcome::Fail && s.score_pct <= 0.0)
+        .count();
+    let partial = judged
+        .iter()
+        .filter(|s| s.outcome == VerdictOutcome::Fail && s.score_pct > 0.0)
+        .count();
+    let reconnects = judged.iter().map(|s| s.reconnects).sum();
 
-    let attempted_scores: Vec<f64> = slaves
+    let scored: Vec<&SlaveSummary> = judged
         .iter()
-        .filter(|s| s.packets > 0)
-        .map(|s| s.score_pct)
+        .copied()
+        .filter(|s| s.outcome != VerdictOutcome::Inconclusive)
         .collect();
-    let aggregate_score_pct = if attempted_scores.is_empty() {
+    let clamp = |s: &SlaveSummary| s.score_pct.clamp(0.0, 100.0);
+    let aggregate_score_pct = if scored.is_empty() {
         0.0
     } else {
-        attempted_scores.iter().sum::<f64>() / attempted_scores.len() as f64
+        scored.iter().map(|s| clamp(s)).sum::<f64>() / scored.len() as f64
     };
-
-    let best = slaves
+    let wsum: f64 = scored
         .iter()
-        .filter(|s| s.packets > 0)
-        .max_by(|a, b| {
-            a.score_pct
-                .partial_cmp(&b.score_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|s| BestWorst {
-            slave_ip: s.slave_ip.clone(),
-            score_pct: s.score_pct,
-        });
-    let worst = slaves
-        .iter()
-        .filter(|s| s.packets > 0)
-        .min_by(|a, b| {
-            a.score_pct
-                .partial_cmp(&b.score_pct)
-                .unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .map(|s| BestWorst {
-            slave_ip: s.slave_ip.clone(),
-            score_pct: s.score_pct,
-        });
+        .map(|s| s.expected_iframes.max(1) as f64)
+        .sum();
+    let frame_weighted_score_pct = if wsum > 0.0 {
+        scored
+            .iter()
+            .map(|s| clamp(s) * s.expected_iframes.max(1) as f64)
+            .sum::<f64>()
+            / wsum
+    } else {
+        0.0
+    };
+    let cmp = |a: &&SlaveSummary, b: &&SlaveSummary| {
+        clamp(a)
+            .partial_cmp(&clamp(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    };
+    let to_bw = |s: &SlaveSummary| BestWorst {
+        slave_ip: s.slave_ip.clone(),
+        score_pct: clamp(s),
+    };
+    let best = scored.iter().copied().max_by(cmp).map(to_bw);
+    let worst = scored.iter().copied().min_by(cmp).map(to_bw);
 
     let summary = FleetSummary {
         slave_count,
         attempted,
-        not_attempted,
+        not_attempted: never_connected,
+        never_connected,
+        unpaired,
+        inconclusive,
         fully_correct,
         partial,
         failed,
-        aggregate_score_pct,
+        reconnects,
+        aggregate_score_pct: aggregate_score_pct.clamp(0.0, 100.0),
+        frame_weighted_score_pct: frame_weighted_score_pct.clamp(0.0, 100.0),
         best,
         worst,
     };
 
     let (verdict, reason): (&'static str, String) = if slave_count == 0 {
-        ("no_session", "no slaves in source pcap".into())
+        (
+            "no_session",
+            if unpaired > 0 {
+                format!(
+                    "no selected endpoint to judge; {unpaired} unpaired endpoint(s) in the capture"
+                )
+            } else {
+                "no endpoints to judge".into()
+            },
+        )
     } else if attempted == 0 {
         (
             "no_delivery",
-            format!("none of {} slaves reached the wire", slave_count),
+            format!("none of {slave_count} endpoints reached the wire"),
         )
-    } else if failed == 0 && partial == 0 && fully_correct == attempted && not_attempted == 0 {
+    } else if fully_correct == slave_count {
         (
             "all_correct",
-            format!("all {} slaves replayed correctly", attempted),
+            format!("all {slave_count} endpoints replayed correctly"),
         )
-    } else if failed == attempted {
+    } else if failed == slave_count {
+        ("failed", format!("all {slave_count} endpoints failed"))
+    } else if failed + partial == 0 {
         (
-            "failed",
-            format!("all {} attempted slaves produced 0 messages", attempted),
+            "inconclusive",
+            format!(
+                "{fully_correct}/{slave_count} endpoints verified correct; {inconclusive} could not be verified"
+            ),
         )
     } else {
-        let na_tail = if not_attempted > 0 {
-            format!(", {} not attempted", not_attempted)
-        } else {
-            String::new()
-        };
+        let mut tail = String::new();
+        if never_connected > 0 {
+            tail.push_str(&format!(" ({never_connected} never connected)"));
+        }
+        if inconclusive > 0 {
+            tail.push_str(&format!(", {inconclusive} inconclusive"));
+        }
         (
             "partial",
             format!(
-                "{}/{} slaves replayed correctly; {} partial, {} failed{}",
-                fully_correct, attempted, partial, failed, na_tail
+                "{fully_correct}/{slave_count} endpoints replayed correctly; {partial} partial, {failed} failed{tail}"
             ),
         )
     };
 
-    (summary, verdict, reason, aggregate_score_pct)
+    (
+        summary,
+        verdict,
+        reason,
+        aggregate_score_pct.clamp(0.0, 100.0),
+    )
 }
 
 fn mode_str(m: AnalysisMode) -> &'static str {
@@ -765,5 +1400,586 @@ fn role_str(r: RoleHint) -> &'static str {
     match r {
         RoleHint::Master => "master",
         RoleHint::Slave => "slave",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    // ---------------- pcap builder ----------------
+
+    #[derive(Default)]
+    struct Cap {
+        pkts: Vec<(u64, Vec<u8>)>,
+    }
+
+    fn ip4_csum(h: &[u8]) -> u16 {
+        let mut s: u32 = 0;
+        for c in h.chunks(2) {
+            s += u32::from(u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)]));
+        }
+        while s >> 16 != 0 {
+            s = (s & 0xffff) + (s >> 16);
+        }
+        !(s as u16)
+    }
+
+    fn packet(
+        src: Ipv4Addr,
+        sport: u16,
+        dst: Ipv4Addr,
+        dport: u16,
+        seq: u32,
+        ack: u32,
+        flags: u8,
+        data: &[u8],
+    ) -> Vec<u8> {
+        let mut tcp = Vec::new();
+        tcp.extend_from_slice(&sport.to_be_bytes());
+        tcp.extend_from_slice(&dport.to_be_bytes());
+        tcp.extend_from_slice(&seq.to_be_bytes());
+        tcp.extend_from_slice(&ack.to_be_bytes());
+        tcp.push(0x50);
+        tcp.push(flags);
+        tcp.extend_from_slice(&65535u16.to_be_bytes());
+        tcp.extend_from_slice(&[0, 0, 0, 0]);
+        tcp.extend_from_slice(data);
+        let mut ip = vec![0x45, 0];
+        ip.extend_from_slice(&((20 + tcp.len()) as u16).to_be_bytes());
+        ip.extend_from_slice(&[0, 1, 0x40, 0, 64, 6, 0, 0]);
+        ip.extend_from_slice(&src.octets());
+        ip.extend_from_slice(&dst.octets());
+        let c = ip4_csum(&ip);
+        ip[10..12].copy_from_slice(&c.to_be_bytes());
+        ip.extend_from_slice(&tcp);
+        let mut eth = vec![0x02, 0, 0, 0, 0, 2, 0x02, 0, 0, 0, 0, 1, 0x08, 0x00];
+        eth[11] = src.octets()[3];
+        eth.extend_from_slice(&ip);
+        eth
+    }
+
+    enum Dir {
+        C2S,
+        S2C,
+    }
+
+    impl Cap {
+        /// One TCP session: handshake, `msgs` in order (`dt_ns` after
+        /// the previous packet), FIN.
+        fn session(
+            &mut self,
+            c: (Ipv4Addr, u16),
+            s: (Ipv4Addr, u16),
+            t0: u64,
+            msgs: &[(u64, Dir, Vec<u8>)],
+        ) {
+            const SYN: u8 = 0x02;
+            const ACK: u8 = 0x10;
+            const PSH: u8 = 0x08;
+            const FIN: u8 = 0x01;
+            let (mut cs, mut ss) = (1000u32, 5000u32);
+            let mut t = t0;
+            self.pkts
+                .push((t, packet(c.0, c.1, s.0, s.1, cs, 0, SYN, &[])));
+            cs += 1;
+            t += 1000;
+            self.pkts
+                .push((t, packet(s.0, s.1, c.0, c.1, ss, cs, SYN | ACK, &[])));
+            ss += 1;
+            t += 1000;
+            self.pkts
+                .push((t, packet(c.0, c.1, s.0, s.1, cs, ss, ACK, &[])));
+            for (dt, dir, data) in msgs {
+                t += dt;
+                match dir {
+                    Dir::C2S => {
+                        self.pkts
+                            .push((t, packet(c.0, c.1, s.0, s.1, cs, ss, ACK | PSH, data)));
+                        cs += data.len() as u32;
+                    }
+                    Dir::S2C => {
+                        self.pkts
+                            .push((t, packet(s.0, s.1, c.0, c.1, ss, cs, ACK | PSH, data)));
+                        ss += data.len() as u32;
+                    }
+                }
+            }
+            t += 1000;
+            self.pkts
+                .push((t, packet(c.0, c.1, s.0, s.1, cs, ss, FIN | ACK, &[])));
+        }
+
+        fn load(mut self) -> LoadedPcap {
+            self.pkts.sort_by_key(|p| p.0);
+            let mut out = Vec::new();
+            out.extend_from_slice(&0xa1b2_c3d4u32.to_le_bytes());
+            out.extend_from_slice(&2u16.to_le_bytes());
+            out.extend_from_slice(&4u16.to_le_bytes());
+            out.extend_from_slice(&[0; 8]);
+            out.extend_from_slice(&65535u32.to_le_bytes());
+            out.extend_from_slice(&1u32.to_le_bytes());
+            let base = 1_700_000_000_000_000_000u64;
+            for (t, d) in &self.pkts {
+                let t = base + t;
+                out.extend_from_slice(&((t / 1_000_000_000) as u32).to_le_bytes());
+                out.extend_from_slice(&(((t % 1_000_000_000) / 1000) as u32).to_le_bytes());
+                out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                out.extend_from_slice(&(d.len() as u32).to_le_bytes());
+                out.extend_from_slice(d);
+            }
+            pcapload::load_bytes(&out, PathBuf::from("test.pcap")).expect("load test pcap")
+        }
+    }
+
+    fn iframe(asdu: &[u8]) -> Vec<u8> {
+        let mut f = vec![0x68, (asdu.len() + 4) as u8, 0, 0, 0, 0];
+        f.extend_from_slice(asdu);
+        f
+    }
+
+    fn me(ioa: u8, val: u8) -> Vec<u8> {
+        vec![13, 1, 3, 0, 1, 0, ioa, 0, 0, val, 0, 0, 0, 0]
+    }
+
+    const STARTDT_ACT: [u8; 6] = [0x68, 4, 0x07, 0, 0, 0];
+    const STARTDT_CON: [u8; 6] = [0x68, 4, 0x0B, 0, 0, 0];
+
+    fn script() -> Vec<Vec<u8>> {
+        (0..8).map(|i| me(i, i)).collect()
+    }
+
+    /// Slave-role session: the master sends STARTDT, the RTU confirms
+    /// and sends `asdus` 100 ms apart.
+    fn rtu_session(
+        cap: &mut Cap,
+        rtu: Ipv4Addr,
+        port: u16,
+        cport: u16,
+        t0: u64,
+        asdus: &[Vec<u8>],
+    ) {
+        let master = Ipv4Addr::new(10, 0, 0, 1);
+        let mut msgs = vec![
+            (1_000_000, Dir::C2S, STARTDT_ACT.to_vec()),
+            (1_000_000, Dir::S2C, STARTDT_CON.to_vec()),
+        ];
+        for a in asdus {
+            msgs.push((100_000_000, Dir::S2C, iframe(a)));
+        }
+        cap.session((master, cport), (rtu, port), t0, &msgs);
+    }
+
+    fn rtu(n: u8) -> Ipv4Addr {
+        Ipv4Addr::new(10, 0, 0, n)
+    }
+
+    fn source_pcap(rtus: &[u8]) -> LoadedPcap {
+        let mut cap = Cap::default();
+        for (k, &n) in rtus.iter().enumerate() {
+            rtu_session(
+                &mut cap,
+                rtu(n),
+                2404,
+                40000 + k as u16,
+                k as u64 * 1_000,
+                &script(),
+            );
+        }
+        cap.load()
+    }
+
+    fn selected(n: u8) -> SelectedEndpoint {
+        SelectedEndpoint {
+            source_ip: rtu(n),
+            listen_ip: Some(rtu(n)),
+            listen_port: Some(2404),
+            state: "completed".into(),
+            cancelled: false,
+            sent: 8,
+        }
+    }
+
+    fn request(run: RunInfo) -> AnalyzeRequest<'static> {
+        AnalyzeRequest {
+            original_pcap_path: Path::new("source.pcap"),
+            captured_pcap_path: Path::new("captured.pcap"),
+            run_id: 7,
+            target_port: 2404,
+            role: RoleHint::Slave,
+            mode: AnalysisMode::Generic,
+            proto_config: None,
+            cp56_tolerance_ms: DEFAULT_CP56_TOLERANCE_MS,
+            run,
+        }
+    }
+
+    fn completed_run(eps: &[u8]) -> RunInfo {
+        RunInfo {
+            status: RunStatusHint::Completed,
+            messages_sent: Some(8 * eps.len() as u64),
+            endpoints: eps.iter().map(|&n| selected(n)).collect(),
+            iterations: 1,
+            loop_within_session: Some(false),
+            ..Default::default()
+        }
+    }
+
+    fn run_analysis(source: &LoadedPcap, captured: &LoadedPcap, run: RunInfo) -> AnalysisReport {
+        let replayer = proto_registry::lookup("iec104").expect("iec104 replayer");
+        analyze_loaded(replayer.as_ref(), &request(run), source, captured, 0).expect("analyze")
+    }
+
+    fn slave(r: &AnalysisReport, n: u8) -> &SlaveSummary {
+        let key = rtu(n).to_string();
+        r.slaves
+            .iter()
+            .find(|s| s.slave_ip == key)
+            .unwrap_or_else(|| panic!("{key} missing"))
+    }
+
+    // ---------------- end-to-end ----------------
+
+    #[test]
+    fn selected_rtus_are_authoritative() {
+        // F062: RTU .4 was selected but never connected; .9 shows up
+        // in the capture but was not selected.
+        let source = source_pcap(&[2, 3, 4, 9]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let mut dropped = script();
+        dropped.remove(3);
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &dropped);
+        rtu_session(&mut cap, rtu(9), 2404, 50002, 0, &script());
+        let r = run_analysis(&source, &cap.load(), completed_run(&[2, 3, 4]));
+
+        assert_eq!(slave(&r, 2).verdict, "good_delivery");
+        assert_eq!(slave(&r, 2).outcome, VerdictOutcome::Pass);
+        assert_eq!(slave(&r, 3).verdict, "partial_delivery");
+        assert!((slave(&r, 3).score_pct - 87.5).abs() < 1e-9);
+        assert_eq!(slave(&r, 4).verdict, "never_connected");
+        assert_eq!(slave(&r, 4).outcome, VerdictOutcome::Fail);
+        assert_eq!(slave(&r, 9).verdict, "unpaired");
+        assert_eq!(r.fleet.slave_count, 3);
+        assert_eq!(r.fleet.never_connected, 1);
+        assert_eq!(r.fleet.unpaired, 1);
+        assert_eq!(r.fleet.fully_correct, 1);
+        assert_eq!(r.verdict, "partial");
+        assert!((r.score_pct - (100.0 + 87.5 + 0.0) / 3.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn every_session_of_an_rtu_is_analysed() {
+        // F063: two iterations in two sessions; the second died early.
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(2), 2404, 50001, 5_000_000_000, &script()[..4]);
+        let run = RunInfo {
+            iterations: 2,
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 2);
+        assert_eq!(s.sessions, 2);
+        assert_eq!(s.verdict, "partial_delivery");
+        assert!(
+            s.verdict_reason.starts_with("session 2/2"),
+            "{}",
+            s.verdict_reason
+        );
+        assert_eq!(s.reconnects, 0);
+        assert!((s.score_pct - 75.0).abs() < 1e-9, "{}", s.score_pct);
+        let d = &r.details_by_ip[&rtu(2).to_string()];
+        assert_eq!(d.sessions.len(), 2);
+        assert_eq!(d.sessions[0].verdict, "good_delivery");
+
+        // The same capture as a single-iteration run: one reconnect.
+        let r = run_analysis(&source, &source_like_two(), completed_run(&[2]));
+        assert_eq!(slave(&r, 2).reconnects, 1);
+        assert_eq!(r.fleet.reconnects, 1);
+    }
+
+    fn source_like_two() -> LoadedPcap {
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(2), 2404, 50001, 5_000_000_000, &script());
+        cap.load()
+    }
+
+    #[test]
+    fn missing_iteration_sessions_fail() {
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let run = RunInfo {
+            iterations: 3,
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 2);
+        assert_eq!(s.verdict, "missing_sessions");
+        assert_eq!(s.outcome, VerdictOutcome::Fail);
+        assert!((s.score_pct - 100.0 / 3.0).abs() < 1e-9, "{}", s.score_pct);
+        assert_ne!(r.verdict, "all_correct");
+    }
+
+    #[test]
+    fn failed_or_silent_run_is_never_all_correct() {
+        // F093: a capture that matches perfectly, judged against a run
+        // that failed (or sent nothing), must not be certified.
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let captured = cap.load();
+
+        let r = run_analysis(&source, &captured, completed_run(&[2]));
+        assert_eq!(r.verdict, "all_correct");
+        assert!(r.run_warning.is_none());
+
+        let failed = RunInfo {
+            status: RunStatusHint::Failed,
+            error: Some("create bridge: Operation not permitted".into()),
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &captured, failed);
+        assert_eq!(r.verdict, "run_failed");
+        assert!(r.run_warning.as_deref().unwrap().contains("FAILED"));
+        assert!(r.notes[0].starts_with("WARNING"));
+
+        let silent = RunInfo {
+            messages_sent: Some(0),
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &captured, silent);
+        assert_eq!(r.verdict, "run_failed");
+    }
+
+    #[test]
+    fn listen_ip_remap_pairs_with_the_source_rtu() {
+        // The user moved RTU .3 to listen on .50: still paired with .3.
+        let source = source_pcap(&[3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(50), 2404, 50000, 0, &script());
+        let mut run = completed_run(&[3]);
+        run.endpoints[0].listen_ip = Some(rtu(50));
+        let r = run_analysis(&source, &cap.load(), run);
+        assert_eq!(slave(&r, 3).verdict, "good_delivery");
+        assert_eq!(r.fleet.unpaired, 0);
+        assert_eq!(r.verdict, "all_correct");
+    }
+
+    #[test]
+    fn without_run_facts_the_capture_decides() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let r = run_analysis(&source, &cap.load(), RunInfo::default());
+        assert_eq!(r.slaves.len(), 1);
+        assert_eq!(r.verdict, "all_correct");
+        assert!(r
+            .notes
+            .iter()
+            .any(|n| n.contains("1 source endpoint(s) have no captured traffic")));
+    }
+
+    #[test]
+    fn split_gives_a_detail_free_summary() {
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let r = run_analysis(&source, &cap.load(), completed_run(&[2]));
+        let (summary, details) = r.split();
+        let json = serde_json::to_value(&summary).unwrap();
+        assert!(json.get("details_by_ip").is_none());
+        assert_eq!(json["verdict"], "all_correct");
+        assert_eq!(json["slaves"][0]["slave_ip"], "10.0.0.2");
+        assert!(details.contains_key("10.0.0.2"));
+        let d = serde_json::to_value(&details["10.0.0.2"]).unwrap();
+        assert!(d.get("pacing_samples").is_none());
+        assert_eq!(
+            d["protocol_specific"]["playback"]["byte_identical_count"],
+            8
+        );
+    }
+
+    // ---------------- roll-up table ----------------
+
+    fn s(
+        ip: &str,
+        verdict: &'static str,
+        outcome: VerdictOutcome,
+        score: f64,
+        sessions: usize,
+    ) -> SlaveSummary {
+        SlaveSummary {
+            slave_ip: ip.into(),
+            score_pct: score,
+            verdict,
+            verdict_reason: String::new(),
+            outcome,
+            expected_iframes: 10,
+            delivered_iframes: 10,
+            packets: sessions * 10,
+            startdt_handshake_ok: true,
+            sessions,
+            reconnects: 0,
+        }
+    }
+
+    #[test]
+    fn roll_up_table() {
+        use VerdictOutcome::*;
+        let pass = |ip| s(ip, "good_delivery", Pass, 100.0, 1);
+        let cases: Vec<(&str, Vec<SlaveSummary>, &str, f64)> = vec![
+            ("empty", vec![], "no_session", 0.0),
+            (
+                "only unpaired",
+                vec![s("a", "unpaired", Inconclusive, 0.0, 1)],
+                "no_session",
+                0.0,
+            ),
+            (
+                "nobody reached the wire",
+                vec![s("a", "never_connected", Fail, 0.0, 0)],
+                "no_delivery",
+                0.0,
+            ),
+            ("all pass", vec![pass("a"), pass("b")], "all_correct", 100.0),
+            (
+                "all pass plus unpaired",
+                vec![pass("a"), s("z", "unpaired", Inconclusive, 0.0, 1)],
+                "all_correct",
+                100.0,
+            ),
+            (
+                "pass plus never connected",
+                vec![pass("a"), s("b", "never_connected", Fail, 0.0, 0)],
+                "partial",
+                50.0,
+            ),
+            (
+                "all failed",
+                vec![
+                    s("a", "no_delivery", Fail, 0.0, 1),
+                    s("b", "no_delivery", Fail, 0.0, 1),
+                ],
+                "failed",
+                0.0,
+            ),
+            (
+                "pass plus no_reference",
+                vec![pass("a"), s("b", "no_reference", Inconclusive, 0.0, 1)],
+                "inconclusive",
+                100.0,
+            ),
+            (
+                "unknown verdict at 100% is not correct",
+                vec![pass("a"), s("b", "unknown", Inconclusive, 100.0, 1)],
+                "inconclusive",
+                100.0,
+            ),
+            (
+                "degraded at 100% is not correct",
+                vec![pass("a"), s("b", "degraded", Fail, 100.0, 1)],
+                "partial",
+                100.0,
+            ),
+            (
+                "over-100 scores are clamped",
+                vec![
+                    s("a", "partial_delivery", Fail, 200.0, 1),
+                    s("b", "partial_delivery", Fail, 50.0, 1),
+                ],
+                "partial",
+                75.0,
+            ),
+        ];
+        for (name, slaves, verdict, score) in cases {
+            let (fleet, v, reason, sc) = roll_up_fleet(&slaves);
+            assert_eq!(v, verdict, "{name}: {reason}");
+            assert!((sc - score).abs() < 1e-9, "{name}: {sc}");
+            assert!((0.0..=100.0).contains(&fleet.aggregate_score_pct), "{name}");
+            assert!(
+                (0.0..=100.0).contains(&fleet.frame_weighted_score_pct),
+                "{name}"
+            );
+            if let Some(b) = &fleet.best {
+                assert!(b.score_pct <= 100.0, "{name}");
+            }
+            assert_eq!(
+                fleet.fully_correct,
+                slaves.iter().filter(|x| x.outcome == Pass).count(),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_run_status_table() {
+        let mut notes = Vec::new();
+        let ok = RunInfo {
+            status: RunStatusHint::Completed,
+            messages_sent: Some(10),
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_run_status(&ok, "all_correct", "x".into(), &mut notes).0,
+            "all_correct"
+        );
+        let failed = RunInfo {
+            status: RunStatusHint::Failed,
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_run_status(&failed, "all_correct", "x".into(), &mut notes).0,
+            "run_failed"
+        );
+        assert_eq!(
+            apply_run_status(&failed, "partial", "x".into(), &mut notes).0,
+            "partial"
+        );
+        let running = RunInfo {
+            status: RunStatusHint::Running,
+            ..Default::default()
+        };
+        assert_eq!(
+            apply_run_status(&running, "all_correct", "x".into(), &mut notes).0,
+            "run_failed"
+        );
+    }
+
+    #[test]
+    fn fleet_pacing_timeline_weights_decimated_endpoints() {
+        // F136: endpoint A kept every sample, B was decimated 10:1.
+        let mut details = BTreeMap::new();
+        let mk = |samples: Vec<[f64; 2]>, w: f64| SlaveDetail {
+            tcp_flow: None,
+            sessions: Vec::new(),
+            sessions_total: 0,
+            protocol_specific: serde_json::Value::Null,
+            verdict: "good_delivery",
+            verdict_reason: String::new(),
+            score_pct: 100.0,
+            notes: Vec::new(),
+            pacing_samples: samples,
+            pacing_weight: w,
+        };
+        details.insert(
+            "a".to_string(),
+            mk((0..40_000).map(|i| [i as f64, 0.0]).collect(), 1.0),
+        );
+        details.insert(
+            "b".to_string(),
+            mk((0..4_000).map(|i| [i as f64 * 10.0, 1.0]).collect(), 10.0),
+        );
+        let t = build_fleet_pacing_timeline(&details, &[]).unwrap();
+        assert_eq!(t.total_samples, 80_000);
+        assert_eq!(t.samples.len(), MAX_FLEET_TIMELINE_POINTS);
+        assert!(t.decimated);
+        let b = t.samples.iter().filter(|p| p[1] == 1.0).count() as f64;
+        let frac = b / t.samples.len() as f64;
+        assert!((0.4..0.6).contains(&frac), "B share {frac}");
     }
 }

@@ -558,6 +558,46 @@ pub struct AnalyzeCtx {
     /// only concept — not part of the run's proto_config (the runner
     /// never needs it).
     pub cp56_tolerance_ms: f64,
+    /// Facts about the run (or this endpoint's session) the capture is
+    /// judged against. `RunFacts::default()` means "unknown": the
+    /// analyzer then infers loop iterations from the stream and does
+    /// not judge timing.
+    pub run: RunFacts,
+}
+
+/// Run-level facts a protocol analyzer needs to judge one captured
+/// session fairly. Supplied by the caller (the webui shell) per
+/// endpoint; every field has a conservative default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunFacts {
+    /// Script iterations this TCP session was configured to play
+    /// back-to-back (loop-within-session). `0` = unknown or unbounded:
+    /// the analyzer detects iterations as restarts of the script.
+    pub iterations_per_session: u64,
+    /// The run (or this endpoint's session) ended on a user stop or
+    /// cancel, so a truncated final iteration is expected and is
+    /// reported as a stopped tail rather than as missing frames.
+    pub stopped_early: bool,
+    /// Pacing speed factor when the run replayed original timing
+    /// (`1.0` = real time). `None` = as-fast-as-possible or unknown:
+    /// timing is measured and reported but not judged.
+    pub paced_speed: Option<f64>,
+}
+
+/// Pass/fail class of a per-endpoint verdict, so the protocol-agnostic
+/// fleet rollup never has to interpret protocol verdict strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictOutcome {
+    /// The replay was verified correct.
+    Pass,
+    /// The replay was verified to deviate (or did not happen).
+    Fail,
+    /// Nothing could be verified (no reference, unparseable input…).
+    /// The default, so a protocol that never sets it cannot be counted
+    /// as correct by accident.
+    #[default]
+    Inconclusive,
 }
 
 /// Per-slave result the analyzer shell gets back from [`ProtoReplayer::analyze_flow`].
@@ -594,6 +634,14 @@ pub struct ProtoSlaveAnalysis {
     /// has a "when should each message have gone out" concept, so this
     /// is a generic field rather than protocol_specific.
     pub pacing_samples: Vec<[f64; 2]>,
+    /// How many pacing samples `pacing_samples` stands for before the
+    /// protocol decimated it. `0` means "not decimated" (same as
+    /// `pacing_samples.len()`). Lets the fleet timeline weight each
+    /// endpoint by its real frame count.
+    pub pacing_samples_total: usize,
+    /// Pass / fail / inconclusive class of `verdict`, used by the
+    /// fleet rollup.
+    pub outcome: VerdictOutcome,
 }
 
 impl Default for ProtoSlaveAnalysis {
@@ -608,6 +656,8 @@ impl Default for ProtoSlaveAnalysis {
             notes: Vec::new(),
             protocol_specific: serde_json::Value::Null,
             pacing_samples: Vec::new(),
+            pacing_samples_total: 0,
+            outcome: VerdictOutcome::Inconclusive,
         }
     }
 }
