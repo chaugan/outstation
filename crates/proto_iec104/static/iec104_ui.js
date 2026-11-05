@@ -1,6 +1,6 @@
 // IEC 60870-5-104 slave-detail UI renderer.
 //
-// Concatenated into `crates/webui/src/index.html` at build time by
+// Spliced into the served page at build time by
 // `crates/webui/build.rs`. Registers its entry points on
 // `window.PROTOCOL_RENDERERS['iec104']`; the core `renderSlaveDetail`
 // dispatcher looks up the right renderer based on the report's
@@ -43,14 +43,23 @@
 
   // Side-by-side ASDU type histogram. Per-type delta (captured − expected)
   // is shown so divergence is obvious at a glance even for thousand-frame pcaps.
+  // `expected` / `captured` are type-ID sequences, or {type: count}
+  // maps (the analyzer caps the sequences, the count maps are complete).
+  function countsOf(x) {
+    if (Array.isArray(x)) return new Map(tidHist(x));
+    const m = new Map();
+    for (const [k, v] of Object.entries(x || {})) m.set(Number(k), v);
+    return m;
+  }
+  function totalOf(m) { let t = 0; for (const v of m.values()) t += v; return t; }
   function renderTidHistogram(expected, captured) {
-    const e = new Map(tidHist(expected));
-    const c = new Map(tidHist(captured));
+    const e = countsOf(expected);
+    const c = countsOf(captured);
     const allTids = new Set([...e.keys(), ...c.keys()]);
     const rows = [...allTids].sort((a, b) => (c.get(b) || e.get(b) || 0) - (c.get(a) || e.get(a) || 0) || a - b);
     let h = `<div class="an-tid-hist">`;
-    h += `<div class="hd">EXPECTED (${expected.length} frames)</div>`;
-    h += `<div class="hd">CAPTURED (${captured.length} frames)</div>`;
+    h += `<div class="hd">Expected (${totalOf(e)} frames)</div>`;
+    h += `<div class="hd">Captured (${totalOf(c)} frames)</div>`;
     for (const t of rows) {
       const ec = e.get(t) || 0;
       const cc = c.get(t) || 0;
@@ -66,7 +75,7 @@
   // Collapsible full-sequence dump for byte-for-byte inspection.
   // Default closed; truncated past 2000 IDs to keep the DOM lean.
   function renderTidSequenceCollapsible(label, ids) {
-    if (!ids.length) return '';
+    if (!ids || !ids.length) return '';
     const MAX_DUMP = 2000;
     const head = ids.length <= MAX_DUMP
       ? ids.join(' ')
@@ -100,7 +109,7 @@
       grid: { left: 56, right: 14, top: 34, bottom: 56 },
       legend: {
         data: ['in tolerance', 'out of tolerance'],
-        textStyle: { color: dimColor, fontSize: 10 },
+        textStyle: { color: dimColor, fontSize: 11 },
         itemWidth: 10, itemHeight: 10, itemGap: 14,
         top: 6, left: 8,
       },
@@ -120,15 +129,15 @@
         },
       },
       xAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 },
                splitLine: { show: false } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
                splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
-          textStyle: { color: dimColor, fontSize: 9 } },
+          textStyle: { color: dimColor, fontSize: 11 } },
       ],
       series: [
         { name: 'in tolerance', type: 'scatter', data: inP, symbolSize: 4,
@@ -171,7 +180,7 @@
       },
       legend: {
         data: ['original', 'captured'],
-        textStyle: { color: dimColor, fontSize: 10 },
+        textStyle: { color: dimColor, fontSize: 11 },
         itemWidth: 18, itemHeight: 8, itemGap: 14,
         top: 6, left: 8,
       },
@@ -187,14 +196,14 @@
       },
       xAxis: { type: 'category',
                data: Array.from({ length: Math.max(orig.length, cap.length) }, (_, i) => String(i + 1)),
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 } },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
                splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
-          textStyle: { color: dimColor, fontSize: 9 } },
+          textStyle: { color: dimColor, fontSize: 11 } },
       ],
       series: [
         { name: 'original', type: 'line', data: orig, showSymbol: false, smooth: false,
@@ -245,14 +254,14 @@
       xAxis: { type: 'category',
                data: labels, axisLine: { lineStyle: { color: dimColor } },
                axisTick: { alignWithLabel: true },
-               axisLabel: { color: dimColor, fontSize: 9, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
+               axisLabel: { color: dimColor, fontSize: 11, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 },
                splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
       series: [{
         type: 'bar', data: bars, barCategoryGap: '20%',
         markLine: { silent: true, symbol: 'none',
-          data: [{ xAxis: Math.floor(tol / step) - 0.5, label: { formatter: `${tol} ms tolerance`, color: dimColor, fontSize: 9 },
+          data: [{ xAxis: Math.floor(tol / step) - 0.5, label: { formatter: `${tol} ms tolerance`, color: dimColor, fontSize: 11 },
                    lineStyle: { color: dimColor, type: 'dashed' } }] },
       }],
     });
@@ -281,7 +290,7 @@
       const ctx = Math.abs(r.d) <= tol ? `within tolerance` : `exceeds ${tol.toFixed(0)} ms`;
       h += `<div class="row">`;
       h += `  <div class="idx">#${r.idx}</div>`;
-      h += `  <div class="name">${esc(tidName(r.tid))} <span style="color:var(--dim);font-size:10px">[${r.tid}]</span></div>`;
+      h += `  <div class="name">${esc(tidName(r.tid))} <span class="ctx">[${r.tid}]</span></div>`;
       h += `  <div class="${driftCls}">${sign}${r.d.toFixed(1)} ms</div>`;
       h += `  <div class="ctx">${esc(ctx)}</div>`;
       h += `</div>`;
@@ -310,15 +319,34 @@
       h += `</div>`;
     }
 
+    const dims = ps.verdict_dimensions;
+    if (dims) {
+      const names = { content: 'content', time_tags: 'time tags', gi_ci: 'GI/CI audit', timing: 'timing', handshake: 'STARTDT handshake', target: 'target replies' };
+      h += `<ul class="an-dims" aria-label="Verdict dimensions">`;
+      for (const [k, label] of Object.entries(names)) {
+        const v = dims[k];
+        const cls = v === true ? 'ok' : v === false ? 'bad' : 'muted';
+        const word = v === true ? 'pass' : v === false ? 'fail' : 'not judged';
+        h += `<li class="${cls}"><span aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '–'}</span> ${esc(label)}: ${word}</li>`;
+      }
+      h += `</ul>`;
+    }
+
     if (pb) {
-      h += `<div class="an-h">PLAYBACK SIDE (${esc(pb.direction)})</div>`;
+      h += `<div class="an-h">Playback side (${esc(pb.direction)})</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">expected i-frames</div><div class="v">${pb.expected_iframes}</div>`;
+      if (pb.gi_ci_synthesis != null) {
+        h += `<div class="k">GI/CI synthesis</div><div class="v">${pb.gi_ci_synthesis ? 'on' : 'off'}${pb.source_interrogation_stripped ? ` · ${pb.source_interrogation_stripped} captured interrogation frames not expected` : ''}${pb.synthesized_excluded ? ` · ${pb.synthesized_excluded} synthesized frames excluded` : ''}</div>`;
+      }
+      if (pb.iterations_observed != null) {
+        h += `<div class="k">iterations</div><div class="v">${pb.iterations_observed} observed${pb.iterations_configured ? ' of ' + pb.iterations_configured : ''} · ${pb.iterations_complete || 0} complete · ${pb.iterations_clean || 0} clean${pb.stopped_tail ? ` · stopped in iteration ${pb.stopped_tail.iteration} after ${pb.stopped_tail.sent}/${pb.stopped_tail.script_iframes} frames${pb.stopped_tail.clean ? ' (clean)' : ''}` : ''}</div>`;
+      }
       const delivOk = pb.delivered_iframes === pb.expected_iframes;
       h += `<div class="k">delivered</div><div class="v ${delivOk?'ok':'bad'}">${pb.delivered_iframes}</div>`;
       h += `<div class="k">type-id sequence</div><div class="v ${pb.type_id_sequence_match?'ok':'warn'}">${pb.type_id_sequence_match ? 'match' : 'divergent'} · ${pb.matched_type_ids}/${pb.expected_iframes} matched</div>`;
       const cp56Only = pb.cp56_only_count || 0;
-      const realMm = (pb.real_mismatch_count != null) ? pb.real_mismatch_count : pb.mismatches.length;
+      const realMm = (pb.real_mismatch_count != null) ? pb.real_mismatch_count : (pb.mismatches || []).length;
       const allOk = (pb.byte_identical_count + cp56Only) === pb.expected_iframes && realMm === 0;
       const parts = [];
       parts.push(`<span class="ok">${pb.byte_identical_count} byte-identical</span>`);
@@ -332,19 +360,23 @@
       }
       const bdLine = `${pb.expected_iframes} frames &middot; ${parts.join(' &middot; ')}`;
       h += `<div class="k">body diff</div><div class="v ${allOk?'ok':(realMm>0?'bad':'')}">${bdLine}</div>`;
-      if (pb.missing_indices.length) {
+      if ((pb.missing_indices || []).length) {
         h += `<div class="k">missing idx</div><div class="v bad">${pb.missing_indices.slice(0,20).join(', ')}${pb.missing_indices.length>20?'…':''}</div>`;
       }
       h += `</div>`;
-      h += renderTidHistogram(pb.expected_type_ids, pb.delivered_type_ids);
+      h += renderTidHistogram(pb.expected_type_id_counts || pb.expected_type_ids || [], pb.delivered_type_id_counts || pb.delivered_type_ids || []);
+      if (pb.type_id_sequences_truncated) h += `<p class="hint">The sequences below are truncated; the histogram counts every frame.</p>`;
       h += renderTidSequenceCollapsible('expected', pb.expected_type_ids);
       h += renderTidSequenceCollapsible('captured', pb.delivered_type_ids);
-      if (pb.mismatches.length) {
-        h += `<div class="an-h">REAL MISMATCHES (${pb.mismatches.length})</div>`;
-        h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">CP56-only diffs (timestamps we deliberately rewrote) are excluded — they're tallied above.</div>`;
-        for (const m of pb.mismatches.slice(0, 20)) {
+      const mm = pb.mismatches || [];
+      if (mm.length) {
+        const total = pb.mismatches_total || mm.length;
+        h += `<div class="an-h">Real mismatches (${total}${total > mm.length ? ', first ' + mm.length + ' listed' : ''})</div>`;
+        h += `<p class="hint">CP56-only differences (timestamps rewritten on purpose) are excluded; they are counted above.</p>`;
+        const tid = v => (v == null ? '—' : `${esc(tidName(v))} [${v}]`);
+        for (const m of mm.slice(0, 20)) {
           h += `<div class="an-diff-row">`;
-          h += `  <div><span class="lbl">idx</span> ${m.index} · exp tid=${m.expected_type_id} · got tid=${m.actual_type_id}</div>`;
+          h += `  <div><span class="lbl">${esc(m.kind || 'diff')}</span> idx ${m.index}${m.iteration != null ? ' · iteration ' + m.iteration : ''} · expected ${tid(m.expected_type_id)} · got ${tid(m.actual_type_id)}</div>`;
           h += `  <div><span class="lbl">exp asdu</span> ${esc(m.expected_asdu_hex)}</div>`;
           h += `  <div><span class="lbl">got asdu</span> ${esc(m.actual_asdu_hex)}</div>`;
           h += `</div>`;
@@ -353,14 +385,14 @@
     }
 
     if (tg) {
-      h += `<div class="an-h">TARGET SIDE (${esc(tg.direction)})</div>`;
+      h += `<div class="an-h">Target side (${esc(tg.direction)})</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">u / s / i frames</div><div class="v">${tg.u_frames} · ${tg.s_frames} · ${tg.i_frames}</div>`;
-      h += `<div class="k">u-codes seen</div><div class="v">${tg.u_codes_seen.map(esc).join(', ') || '—'}</div>`;
+      h += `<div class="k">u-codes seen</div><div class="v">${(tg.u_codes_seen || []).map(esc).join(', ') || '—'}</div>`;
       h += `<div class="k">startdt handshake</div><div class="v ${tg.startdt_handshake_ok?'ok':'bad'}">${tg.startdt_handshake_ok ? 'completed' : 'missing'}</div>`;
       h += `</div>`;
-      if (tg.target_type_ids.length) {
-        h += `<div class="muted" style="font-family:var(--sans);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--dim);margin-top:8px">target's I-frame types</div>`;
+      if ((tg.target_type_ids || []).length) {
+        h += `<div class="an-chart-caption">Target's I-frame types</div>`;
         const hist = tidHist(tg.target_type_ids);
         h += `<div class="an-tid-hist" style="grid-template-columns:1fr">`;
         h += `<div class="hd">${tg.target_type_ids.length} frames sent by target</div>`;
@@ -392,10 +424,10 @@
           silent: "the live target never sent any i-frames of its own. it handshook and ack'd, but it didn't issue any commands. expected for a purely passive master or when the session was cut short.",
         }[c.target_script_kind] || '';
 
-        h += `<div class="an-h">TARGET SCRIPT COMPARISON (correct mode)</div>`;
-        h += `<div style="padding:10px 12px;background:var(--surface-2);border:1px solid var(--rule);border-left:2px solid ${kindColor};margin:6px 0 10px">`;
-        h += `  <div style="font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:0.1em;color:${kindColor};margin-bottom:6px">${esc(kindLabel)}</div>`;
-        h += `  <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);line-height:1.5">${esc(kindHelp)}</div>`;
+        h += `<div class="an-h">Target script comparison (correct mode)</div>`;
+        h += `<div style="padding:10px 12px;background:var(--surface-2);border:1px solid var(--rule);border-left:3px solid ${kindColor};margin:6px 0 10px">`;
+        h += `  <div style="font-size:12px;font-weight:700;color:${kindColor};margin-bottom:6px">${esc(kindLabel)}</div>`;
+        h += `  <div style="font-size:12px;color:var(--ink-2);line-height:1.5">${esc(kindHelp)}</div>`;
         h += `</div>`;
         h += `<div class="an-kv">`;
         h += `<div class="k">original sent</div><div class="v">${c.expected_iframes} i-frames</div>`;
@@ -421,15 +453,17 @@
     }
 
     if (t) {
-      h += `<div class="an-h">TIMING</div>`;
+      h += `<div class="an-h">Timing</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">duration (original)</div><div class="v">${(t.original_duration_ms/1000).toFixed(3)} s</div>`;
       h += `<div class="k">duration (captured)</div><div class="v">${(t.captured_duration_ms/1000).toFixed(3)} s</div>`;
       if (t.speedup_factor > 0) {
         const sp = t.speedup_factor;
-        const label = sp > 2 ? `${sp.toFixed(1)}× faster (fast mode)` : sp > 0.5 ? `~matched (original pacing)` : `${(1/sp).toFixed(1)}× slower`;
+        // The analyzer's label ("matched" within ±5 %, else "N.NN× faster/slower").
+        const label = t.speed_label || (Math.abs(sp - 1) <= 0.05 ? 'matched' : sp > 1 ? `${sp.toFixed(2)}× faster` : `${(1 / sp).toFixed(2)}× slower`);
         h += `<div class="k">speedup</div><div class="v">${esc(label)}</div>`;
       }
+      if (t.timing_failure) h += `<div class="k">timing</div><div class="v bad">${esc(t.timing_failure)}</div>`;
       h += `<div class="k">mean gap</div><div class="v">orig ${t.original_mean_gap_ms.toFixed(1)} ms · capt ${t.captured_mean_gap_ms.toFixed(2)} ms</div>`;
       h += `<div class="k">p50 gap</div><div class="v">orig ${t.original_p50_gap_ms.toFixed(1)} ms · capt ${t.captured_p50_gap_ms.toFixed(2)} ms</div>`;
       h += `<div class="k">p99 gap</div><div class="v">orig ${t.original_p99_gap_ms.toFixed(1)} ms · capt ${t.captured_p99_gap_ms.toFixed(2)} ms</div>`;
@@ -442,8 +476,8 @@
     const haveGapData = t && ((t.original_gaps_ms || []).length > 0
                            || (t.captured_gaps_ms || []).length > 0);
     if (haveDriftSamples || haveGapData) {
-      h += `<div class="an-h">ANOMALY DETECTION</div>`;
-      h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">scroll inside a chart to zoom &middot; drag to pan &middot; use the toolbox icons (top-right) for rectangular zoom or reset</div>`;
+      h += `<div class="an-h">Anomaly detection</div>`;
+      h += `<p class="hint">Scroll inside a chart to zoom, drag to pan, or use the toolbox icons at the top right.</p>`;
       if (haveDriftSamples) {
         h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
         h += `<div class="an-chart-axes">X: frame index &middot; Y: drift (ms, signed)</div>`;
@@ -468,7 +502,7 @@
       const withinPct = cp.samples > 0
         ? (100 * (cp.samples - cp.out_of_tolerance) / cp.samples).toFixed(2)
         : '0.00';
-      h += `<div class="an-h">EMBEDDED TIMESTAMP ACCURACY <span class="opt">(fresh-timestamps mode)</span></div>`;
+      h += `<div class="an-h">Embedded timestamp accuracy <span class="opt">(fresh-timestamps mode)</span></div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">verdict</div><div class="v" style="color:${passed ? 'var(--ok,#6a0)' : 'var(--err,#c33)'}">` +
            `${withinPct}% of ${cp.samples} CP56Time2a fields within ±${cp.tolerance_ms.toFixed(0)} ms of wire time</div>`;
@@ -490,7 +524,7 @@
     }
 
     if (d.notes && d.notes.length) {
-      h += `<div class="an-h">NOTES</div>`;
+      h += `<div class="an-h">Notes</div>`;
       for (const n of d.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
     }
 
@@ -512,7 +546,7 @@
     const giTot = a.gi_total || 0;
     const ciTot = a.ci_total || 0;
 
-    let s = `<div class="an-h">MASTER COMMANDS — GI / CI AUDIT</div>`;
+    let s = `<div class="an-h">Master commands: GI / CI audit</div>`;
 
     // Summary strip.
     s += `<div class="an-kv">`;
@@ -538,6 +572,7 @@
     }
     s += `</div>`;
 
+    if (a.events_truncated) s += `<p class="hint">The event list was truncated by the analyzer.</p>`;
     if (!a.events || !a.events.length) {
       return s;
     }
@@ -554,11 +589,11 @@
     //   bytes? — byte-for-byte match vs inventory-derived expected
     //   verdict
     s += `<div style="overflow-x:auto;margin:6px 0 10px">`;
-    s += `<table class="an-tbl" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">`;
-    s += `<thead><tr style="text-align:left;color:var(--dim);font-weight:600">`;
-    s += `<th style="padding:4px 8px">t (ms)</th><th>kind</th><th>qual</th><th>CA</th>`;
-    s += `<th>AC Δ ms</th><th>data (frames / elems)</th><th>AT Δ ms</th>`;
-    s += `<th>COT?</th><th>bytes?</th><th>verdict</th>`;
+    s += `<table class="t an-tbl">`;
+    s += `<thead><tr>`;
+    s += `<th scope="col">t (ms)</th><th scope="col">kind</th><th scope="col">qual</th><th scope="col">CA</th>`;
+    s += `<th scope="col">ActCon Δ (ms)</th><th scope="col">data (frames / elements)</th><th scope="col">ActTerm Δ (ms)</th>`;
+    s += `<th scope="col">COT ok</th><th scope="col">bytes ok</th><th scope="col">verdict</th>`;
     s += `</tr></thead><tbody>`;
     const rowColor = (v) => v === 'compliant' ? '' : (v === 'partial' ? 'background:rgba(255,200,0,0.06)' : 'background:rgba(255,80,80,0.06)');
     const tickClass = (b) => b ? 'ok' : 'bad';
@@ -583,12 +618,12 @@
       s += `<td style="color:${verdictColor};font-weight:600">${esc(ev.verdict)}</td>`;
       s += `</tr>`;
       if (ev.notes && ev.notes.length) {
-        s += `<tr style="${rowColor(ev.verdict)}"><td></td><td colspan="9" class="muted" style="padding:0 8px 4px;font-size:10px">${ev.notes.map(esc).join(' · ')}</td></tr>`;
+        s += `<tr style="${rowColor(ev.verdict)}"><td></td><td colspan="9" class="muted">${ev.notes.map(esc).join(' · ')}</td></tr>`;
       }
     }
     s += `</tbody></table>`;
     if (a.events.length > 200) {
-      s += `<div class="muted" style="font-size:10px;margin-top:4px">showing first 200 of ${a.events.length} events</div>`;
+      s += `<p class="hint">Showing the first 200 of ${a.events.length} events.</p>`;
     }
     s += `</div>`;
     return s;
@@ -640,19 +675,19 @@
     }
 
     const seg = (count, color, title) => count > 0
-      ? `<div title="${title}: ${count}" style="flex:${count};background:${color};color:#fff;padding:6px 8px;font-family:var(--mono);font-size:11px;text-align:center;min-width:24px">${count}</div>`
+      ? `<div title="${title}: ${count}" style="flex:${count};background:${color};color:#fff;padding:6px 8px;font-size:12px;text-align:center;min-width:24px">${count}</div>`
       : '';
 
-    let h = `<div class="an-h">FLEET INTERROGATION AUDIT &middot; ${slavesWithEvents} SLAVE${slavesWithEvents===1?'':'S'} WITH GI/CI ACTIVITY</div>`;
-    h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
-    h += `<div style="display:grid;grid-template-columns:120px 1fr;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;margin-bottom:8px">`;
+    let h = `<div class="an-h">Fleet interrogation audit &middot; ${slavesWithEvents} endpoint${slavesWithEvents===1?'':'s'} with GI/CI activity</div>`;
+    h += `<div class="hint">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
+    h += `<div style="display:grid;grid-template-columns:minmax(0,120px) minmax(0,1fr);gap:8px;align-items:center;font-size:12px;margin:8px 0">`;
     if (giTot > 0) {
       h += `<div>general (GI)</div>`;
       h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
       h += seg(giOk, 'var(--ok,#3a3)',  'compliant');
       h += seg(giPt, 'var(--warn,#fa0)', 'partial');
       h += seg(giNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${giTot} total</div>`;
+      h += `<div style="margin-left:auto;padding:6px 8px;font-size:12px;color:var(--dim)">${giTot} total</div>`;
       h += `</div>`;
     }
     if (ciTot > 0) {
@@ -661,7 +696,7 @@
       h += seg(ciOk, 'var(--ok,#3a3)',  'compliant');
       h += seg(ciPt, 'var(--warn,#fa0)', 'partial');
       h += seg(ciNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${ciTot} total</div>`;
+      h += `<div style="margin-left:auto;padding:6px 8px;font-size:12px;color:var(--dim)">${ciTot} total</div>`;
       h += `</div>`;
     }
     h += `</div>`;
