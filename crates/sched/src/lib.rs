@@ -1019,6 +1019,38 @@ pub(crate) fn best_flow_per_ip<T>(
         .collect()
 }
 
+/// The flow each endpoint replays, keyed by endpoint (client IP in
+/// master role, server IP in slave role), exactly as
+/// [`run_benchmark`] picks it among the flows whose server port is
+/// `port`: the best replayed side by [`protoplay::FlowQuality`]. The
+/// analyzer uses it as each endpoint's reference flow (N18).
+pub fn replayed_flows(
+    pcap: &LoadedPcap,
+    role: protoplay::Role,
+    port: u16,
+) -> std::collections::BTreeMap<Ipv4Addr, usize> {
+    let (dir, master) = match role {
+        protoplay::Role::Master => (pcapload::StreamDir::ClientToServer, true),
+        protoplay::Role::Slave => (pcapload::StreamDir::ServerToClient, false),
+    };
+    let candidates = pcap.flows.iter().enumerate().filter_map(|(idx, f)| {
+        let (server_ip, server_port) = f.server?;
+        if server_port != port {
+            return None;
+        }
+        let ip = if master { f.client?.0 } else { server_ip };
+        Some((idx, ip))
+    });
+    best_flow_per_ip(
+        candidates,
+        |idx| pcap.reassemble(idx, dir).map(|r| replay_quality(&r)),
+        |q| *q,
+    )
+    .into_iter()
+    .map(|(idx, ip, _)| (ip, idx))
+    .collect()
+}
+
 /// Resolve `iterations` into an actual loop count: 0 → unlimited
 /// (u64::MAX), N → N. Caller is expected to break on cancel.
 #[inline]

@@ -566,16 +566,15 @@ fn analyze_loaded(
     }
 
     // Source endpoints and the reference flow the replayer used for
-    // each: the first flow in pcap order (sched picks the same one).
-    let mut reference: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
-    for (idx, f) in original.flows.iter().enumerate() {
-        if server_port(f) != Some(source_port) {
-            continue;
-        }
-        if let Some(ep) = endpoint_of(f, role) {
-            reference.entry(ep).or_insert(idx);
-        }
-    }
+    // each: the one sched picks (its best flow per endpoint, N18).
+    let reference: BTreeMap<Ipv4Addr, usize> = sched::replayed_flows(
+        original,
+        match role {
+            RoleHint::Master => protoplay::Role::Master,
+            RoleHint::Slave => protoplay::Role::Slave,
+        },
+        source_port,
+    );
 
     // Endpoints to judge.
     let run_known = !run.endpoints.is_empty();

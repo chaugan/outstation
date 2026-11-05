@@ -334,16 +334,16 @@ pub fn run_benchmark(
 }
 
 /// One master session's captured flow.
-struct FlowPick {
-    flow_idx: usize,
-    client_ip: Ipv4Addr,
-    client_mac: MacAddr,
-    first_pkt_rel_ns: u64,
+pub(crate) struct FlowPick {
+    pub(crate) flow_idx: usize,
+    pub(crate) client_ip: Ipv4Addr,
+    pub(crate) client_mac: MacAddr,
+    pub(crate) first_pkt_rel_ns: u64,
     /// First to last packet of the flow, either direction.
-    flow_span_ns: u64,
-    payload: Vec<u8>,
-    capture_gaps: Vec<usize>,
-    frame_times_ns: Vec<u64>,
+    pub(crate) flow_span_ns: u64,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) capture_gaps: Vec<usize>,
+    pub(crate) frame_times_ns: Vec<u64>,
 }
 
 /// TCP flows whose server port is the target port, reassembled from
@@ -351,7 +351,7 @@ struct FlowPick {
 /// ([`replay_quality`]: the same ranking for both roles and the upload
 /// viability, N18). Only the current best payload per IP is kept while
 /// walking the flows (P07). Fails if none matches.
-fn select_master_flows(
+pub(crate) fn select_master_flows(
     pcap: &LoadedPcap,
     cfg: &BenchmarkConfig,
     replayer: &dyn protoplay::ProtoReplayer,

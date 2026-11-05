@@ -862,3 +862,27 @@ fn warmup_cancel_keeps_the_capture_warning() {
     assert!(!report.capture_ok);
     let _ = std::fs::remove_dir_all(state);
 }
+
+/// N18: the analyzer's reference flow per endpoint is the flow sched
+/// replays (both roles), not the first flow in the capture.
+#[test]
+fn replayed_flows_match_the_selection() {
+    let pcap = pcapload::load(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/synth_iec104_rtus200_ts.pcap"),
+    )
+    .unwrap();
+    let replayer = proto_iec104::Iec104Replayer::new();
+    let cfg = BenchmarkConfig::default();
+    let master = replayed_flows(&pcap, protoplay::Role::Master, 2404);
+    let picks = select_master_flows(&pcap, &cfg, &replayer).unwrap();
+    assert_eq!(master.len(), picks.len());
+    for p in &picks {
+        assert_eq!(master[&p.client_ip], p.flow_idx, "{}", p.client_ip);
+    }
+    let slave = replayed_flows(&pcap, protoplay::Role::Slave, 2404);
+    let picks = select_slave_picks(&pcap, &cfg, &replayer).unwrap();
+    assert_eq!(slave.len(), picks.len());
+    for p in &picks {
+        assert_eq!(slave[&p.server_ip], p.flow_idx, "{}", p.server_ip);
+    }
+}

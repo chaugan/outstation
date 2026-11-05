@@ -253,18 +253,18 @@ pub(crate) fn run_benchmark_slave(
 }
 
 /// One RTU's captured server-side flow.
-struct SlavePick {
-    flow_idx: usize,
-    server_ip: Ipv4Addr,
-    server_mac: MacAddr,
-    payload: Vec<u8>,
-    capture_gaps: Vec<usize>,
-    frame_times_ns: Vec<u64>,
+pub(crate) struct SlavePick {
+    pub(crate) flow_idx: usize,
+    pub(crate) server_ip: Ipv4Addr,
+    pub(crate) server_mac: MacAddr,
+    pub(crate) payload: Vec<u8>,
+    pub(crate) capture_gaps: Vec<usize>,
+    pub(crate) frame_times_ns: Vec<u64>,
 }
 
 /// The best flow per RTU ([`select_slave_flows`]), reassembled from
 /// the server side. Fails if none matches.
-fn select_slave_picks(
+pub(crate) fn select_slave_picks(
     pcap: &LoadedPcap,
     cfg: &BenchmarkConfig,
     replayer: &dyn protoplay::ProtoReplayer,
