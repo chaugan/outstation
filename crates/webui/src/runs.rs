@@ -371,6 +371,13 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
                 warn!(id, error = %e, "run failed");
             }
         }
+        // Free the single-run slot *before* the terminal status becomes
+        // visible: a client that sees "completed" and immediately starts
+        // the next run must not get a spurious 409 run_active. The worker
+        // has already returned (topology torn down) when finalize runs.
+        // Lock order entry -> active is safe: nothing holds `active`
+        // while taking a run entry lock (launch takes active -> runs map).
+        release_active(state, id);
         rs.status = status;
         rs.error = err.or_else(|| rs.error.take());
         rs.finished_at = Some(now_secs());
@@ -379,7 +386,6 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
         }
         (status, rs.started_by.clone().unwrap_or_default())
     };
-    release_active(state, id);
     let keep = state
         .active_run()
         .map(|a| captures::capture_path(&state.cfg.captures_dir(), a.run_id));

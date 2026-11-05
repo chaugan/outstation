@@ -1856,3 +1856,32 @@ async fn status_reports_pending_cleanup_and_low_disk() {
         .await;
     h.wait_status(id, "stopped").await;
 }
+
+// ---------------------------------------------------------------------------
+// The single-run slot is free as soon as a run is visibly terminal.
+
+#[tokio::test]
+async fn next_run_starts_as_soon_as_previous_is_terminal() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    for want in 1..=20u64 {
+        let (s, v) = h
+            .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+            .await;
+        assert_eq!(s, StatusCode::OK, "run {want}: {v}");
+        assert_eq!(v["id"], want);
+        // Poll tightly: the first time the run reads terminal, the slot
+        // must already be free (no window where status=completed but a
+        // new POST is refused with run_active).
+        loop {
+            let (_, r) = h
+                .call(Method::GET, &format!("/api/runs/{want}"), None)
+                .await;
+            if r["status"] != "running" {
+                assert!(h.state.active_run().is_none(), "slot still held after {r}");
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+}
