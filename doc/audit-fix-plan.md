@@ -184,7 +184,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O2: inject ports send IGMPv3 reports onto the LAN with the RTU's MAC.
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [x] **T17a Re-audit fixes, core engine (fx1).** New defects N1–N5, N8, N10, N12 and N16–N19 from the independent re-audit, plus the remaining gaps in F028, F039, F055/F072, F079, P06 and P07. The full list is in the session scratchpad, `T17_new_defects.md`.
-- [~] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
+- [x] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
 - [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -344,3 +344,17 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Pcap reconnect splitting fixed; the best flow per endpoint is used consistently by sched, viability and the analyzer.
   - Cancellable connect plus a send timeout; an RFC 5227 ARP duplicate-address probe; a per-run capture byte cap; `capture_ok`; the run span reaches every thread.
   - Privileged suites: netns-test 8/8, bench 3/3 + capture 4/4, slave 2/2, smoke 10/10.
+- 2026-11-05: T17b (fx2) merged. Workspace tests: 469 passed, 2 runs green.
+  - Run worker registered before the run is visible.
+  - State-directory lock for serve, bench and cleanup.
+  - Server-side target IP validation.
+  - No false PASS for failed-then-stopped endpoints; stopped fleets are `stopped_clean`.
+  - Warnings and `capture_ok` surfaced; a failed capture is never analysed.
+  - The live WebSocket handles close.
+  - Run list paginated, plus in-memory retention.
+  - Lazy analysis details.
+  - HTML report export.
+  - Atomic library quota (from a security review).
+  - Phone layout, a11y and UI fixes, unit hardening, and doc fixes.
+  - ui-smoke: 212/212 and 233/233. netns-smoke: 10/10.
+- 2026-11-05: Orchestrator closed F066 (configurable drift threshold, `proto_config.analysis`). Workspace tests: 470 passed.
