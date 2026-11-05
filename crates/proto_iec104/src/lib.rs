@@ -17,33 +17,19 @@ use protoplay::{
 };
 
 pub mod analysis;
+pub mod apci;
 pub mod apdu;
 pub mod asdu;
 pub mod inventory;
 pub mod responder;
 pub mod session;
 
-/// Cheap I-frame counter — walks the APDU stream looking for valid
-/// I-frame APCIs. Used by `quick_viability` to attribute per-RTU
-/// message counts without decoding ASDU bodies.
+/// Cheap I-frame counter used by `quick_viability` to attribute
+/// per-RTU message counts without decoding ASDU bodies. Uses the
+/// canonical [`apci::frames`] walker, so it counts exactly the I-frames
+/// the replayer will send and the pacing extractor will time.
 fn count_iframes(payload: &[u8]) -> usize {
-    let mut n = 0usize;
-    let mut i = 0usize;
-    while i + 6 <= payload.len() {
-        if payload[i] != 0x68 {
-            i += 1;
-            continue;
-        }
-        let ln = payload[i + 1] as usize;
-        if ln < 4 || i + 2 + ln > payload.len() {
-            break;
-        }
-        if payload[i + 2] & 0x01 == 0 {
-            n += 1;
-        }
-        i += 2 + ln;
-    }
-    n
+    apci::count_iframes(payload)
 }
 
 pub struct Iec104Replayer;
@@ -83,32 +69,15 @@ impl ProtoReplayer for Iec104Replayer {
     /// Walk the IEC 104 APCI framing in `payload` and emit one
     /// timestamp per I-frame, derived from `packet_offsets`. The first
     /// I-frame anchors at 0; subsequent frames are wall-clock-relative
-    /// to it. Length-prefixed frames are detected by the 0x68 start
-    /// byte + 1-byte APCI+ASDU length, with an I-frame discriminated
-    /// by the low bit of CF1 being 0.
+    /// to it. Framing (including resync on a mid-flow capture) is the
+    /// canonical [`apci::frames`] walk, so index `k` of the result
+    /// times the same `k`-th I-frame the replayer extracts.
     fn extract_message_times_ns(
         &self,
         payload: &[u8],
         packet_offsets: &[(u64, usize)],
     ) -> Vec<u64> {
-        let mut starts: Vec<usize> = Vec::new();
-        let mut i = 0usize;
-        while i + 6 <= payload.len() {
-            if payload[i] != 0x68 {
-                i += 1;
-                continue;
-            }
-            let ln = payload[i + 1] as usize;
-            if i + 2 + ln > payload.len() {
-                break;
-            }
-            let cf1 = payload[i + 2];
-            if cf1 & 0x01 == 0 {
-                // I-frame
-                starts.push(i);
-            }
-            i += 2 + ln;
-        }
+        let starts = apci::iframe_offsets(payload);
         if starts.len() < 2 {
             return Vec::new();
         }
@@ -279,15 +248,26 @@ impl ProtoReplayer for Iec104Replayer {
             let mut type_id_counts: std::collections::BTreeMap<u8, usize> =
                 std::collections::BTreeMap::new();
             let mut rtus_with_inventory: usize = 0;
+            // An RTU can appear in several flows (reconnects, port
+            // reuse): sum bytes and I-frames across them and merge
+            // their points into one inventory per RTU.
+            let mut per_rtu_inv: std::collections::BTreeMap<
+                std::net::Ipv4Addr,
+                inventory::Inventory,
+            > = std::collections::BTreeMap::new();
             for (flow_idx, server_ip) in &slave_flow_indices {
                 let payload = p.flow_server_payload(*flow_idx);
-                per_rtu_bytes.insert(*server_ip, payload.len() as u64);
-                per_rtu_msgs.insert(*server_ip, count_iframes(&payload) as u64);
+                *per_rtu_bytes.entry(*server_ip).or_insert(0) += payload.len() as u64;
+                *per_rtu_msgs.entry(*server_ip).or_insert(0) += count_iframes(&payload) as u64;
                 if payload.is_empty() {
                     continue;
                 }
-                let mut inv = inventory::Inventory::default();
-                inv.ingest_payload(&payload);
+                per_rtu_inv
+                    .entry(*server_ip)
+                    .or_default()
+                    .ingest_payload(&payload);
+            }
+            for (server_ip, inv) in &per_rtu_inv {
                 if inv.is_empty() {
                     continue;
                 }
@@ -403,5 +383,112 @@ impl ProtoReplayer for Iec104Replayer {
         iteration_starts_ms: &[f64],
     ) -> Option<FleetDriftTimeline> {
         analysis::aggregate_iec104_fleet_drift(per_slave, iteration_starts_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apdu::Apdu;
+    use protoplay::{FlowView, LoadedPcapView};
+
+    fn sp_frame(ns: u16, ioa: u8) -> Vec<u8> {
+        Apdu::I {
+            ns,
+            nr: 0,
+            asdu: vec![1, 1, 3, 0, 1, 0, ioa, 0, 0, 1],
+        }
+        .serialize()
+    }
+
+    /// Mid-flow stream: a leading partial frame with a stray 0x68, ten
+    /// I-frames interleaved with S frames, a truncated tail. One packet
+    /// per I-frame with ts = 1000 * (index + 1) ns.
+    fn midflow_stream() -> (Vec<u8>, Vec<(u64, usize)>) {
+        let mut s = vec![0x12, 0x68, 0x01, 0x00];
+        let mut offs = vec![(0u64, 0usize)];
+        for k in 0..10u16 {
+            offs.push((1000 * (k as u64 + 1), s.len()));
+            s.extend(sp_frame(k, k as u8));
+            if k % 4 == 0 {
+                s.extend(Apdu::S { nr: k }.serialize());
+            }
+        }
+        s.extend(&sp_frame(10, 10)[..5]);
+        (s, offs)
+    }
+
+    #[test]
+    fn counts_and_times_agree_on_midflow_capture() {
+        let (s, offs) = midflow_stream();
+        assert_eq!(count_iframes(&s), 10);
+        let times = Iec104Replayer.extract_message_times_ns(&s, &offs);
+        assert_eq!(times.len(), 10);
+        // Frame k sits in packet k+1, so relative times are 1000*k.
+        let want: Vec<u64> = (0..10).map(|k| 1000 * k).collect();
+        assert_eq!(times, want);
+    }
+
+    #[test]
+    fn lone_start_byte_and_short_garbage() {
+        assert_eq!(count_iframes(&[0x68]), 0);
+        assert_eq!(count_iframes(&[0x68, 0x02, 0x00, 0x00, 0x00, 0x00]), 0);
+        assert!(Iec104Replayer
+            .extract_message_times_ns(&[0x68], &[(0, 0)])
+            .is_empty());
+    }
+
+    struct FakePcap {
+        flows: Vec<(FlowView, Vec<u8>)>,
+    }
+
+    impl LoadedPcapView for FakePcap {
+        fn flows(&self) -> Box<dyn Iterator<Item = FlowView> + '_> {
+            Box::new(self.flows.iter().map(|f| f.0))
+        }
+        fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64) {
+            (0, self.flows[flow_idx].1.len() as u64)
+        }
+        fn flow_server_payload(&self, flow_idx: usize) -> Vec<u8> {
+            self.flows[flow_idx].1.clone()
+        }
+    }
+
+    /// P02 consumer half: an RTU seen in two flows (reconnect) reports
+    /// the sum of both flows' bytes and I-frames, not the last flow's.
+    #[test]
+    fn viability_sums_per_rtu_bytes_across_flows() {
+        let rtu: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let master: std::net::Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let mk = |idx: usize, port: u16, n: u16| {
+            let mut payload = Vec::new();
+            for k in 0..n {
+                payload.extend(sp_frame(k, (idx * 50) as u8 + k as u8));
+            }
+            (
+                FlowView {
+                    flow_idx: idx,
+                    client: Some((master, port)),
+                    server: Some((rtu, 2404)),
+                    saw_syn: true,
+                },
+                payload,
+            )
+        };
+        let pcap = FakePcap {
+            flows: vec![mk(0, 40000, 3), mk(1, 40001, 5)],
+        };
+        let total_bytes: u64 = pcap.flows.iter().map(|f| f.1.len() as u64).sum();
+        let v = Iec104Replayer.quick_viability(&pcap, 1000);
+        assert_eq!(v.slave_rtus.len(), 1);
+        assert_eq!(v.slave_rtus[0].payload_bytes, total_bytes);
+        assert_eq!(v.slave_rtus[0].messages, 8);
+        assert!(
+            v.notes
+                .iter()
+                .any(|n| n.contains("8 unique (CA, IOA) points")),
+            "{:?}",
+            v.notes
+        );
     }
 }

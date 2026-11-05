@@ -22,7 +22,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::apdu::{Apdu, ApduReader};
+use crate::apci;
 use crate::asdu::{common_address, cot_value, element_len, read_ioa, vsq, DUI_LEN, IOA_LEN};
 
 /// One point in the per-slave database.
@@ -60,18 +60,14 @@ const COT_REQCO_GROUP_LAST: u8 = 41; // counter group 4
 
 impl Inventory {
     /// Walk a captured server-side byte stream and update the database
-    /// in place. Tolerates mid-frame leading bytes — the underlying
-    /// `ApduReader` skips them. Unknown ASDU type IDs are silently
+    /// in place. Framing goes through [`apci::frames`], so a leading
+    /// partial frame (mid-flow capture), junk after a gap, or a
+    /// truncated tail is skipped and ingestion continues at the next
+    /// valid frame boundary. Unknown ASDU type IDs are silently
     /// skipped (we have no element layout to walk them with).
     pub fn ingest_payload(&mut self, payload: &[u8]) {
-        let mut reader = ApduReader::new(payload);
-        loop {
-            match reader.next_apdu() {
-                Ok(Some(Apdu::I { asdu, .. })) => self.ingest_asdu(&asdu),
-                Ok(Some(_)) => {}
-                Ok(None) => break,
-                Err(_) => break,
-            }
+        for asdu in apci::frames(payload).filter_map(|f| f.asdu()) {
+            self.ingest_asdu(asdu);
         }
     }
 
@@ -207,5 +203,50 @@ impl Inventory {
                 .collect(),
             _ => Vec::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apdu::Apdu;
+
+    fn sp_stream(n: u32) -> Vec<u8> {
+        let mut s = Vec::new();
+        for i in 0..n {
+            let mut a = vec![1u8, 1, 20, 0, 1, 0, 0, 0, 0, 1];
+            crate::asdu::write_ioa(&mut a, DUI_LEN, 100 + i);
+            s.extend(
+                Apdu::I {
+                    ns: i as u16,
+                    nr: 0,
+                    asdu: a,
+                }
+                .serialize(),
+            );
+        }
+        s
+    }
+
+    #[test]
+    fn mid_flow_prefix_does_not_empty_the_inventory() {
+        // Audit repro: 4 tail bytes with a stray 0x68 / length 1.
+        let mut s = vec![0x12, 0x68, 0x01, 0x00];
+        s.extend(sp_stream(10));
+        let mut inv = Inventory::default();
+        inv.ingest_payload(&s);
+        assert_eq!(inv.len(), 10);
+    }
+
+    #[test]
+    fn junk_mid_stream_and_truncated_tail_are_skipped() {
+        let mut s = sp_stream(5);
+        s.extend([0x68, 0xff, 0x00, 0x68]);
+        s.extend(sp_stream(10).split_off(sp_stream(5).len()));
+        let tail = sp_stream(1);
+        s.extend(&tail[..tail.len() - 2]);
+        let mut inv = Inventory::default();
+        inv.ingest_payload(&s);
+        assert_eq!(inv.len(), 10);
     }
 }
