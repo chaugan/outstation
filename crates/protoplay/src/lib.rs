@@ -66,8 +66,17 @@ pub struct MessageProgress {
     /// Total messages the replayer plans to send for this session.
     /// Filled in by the replayer once it has parsed the pcap payload.
     pub planned: Arc<AtomicU64>,
-    /// Client messages sent on the wire so far.
+    /// Client messages sent on the wire in the current iteration.
     pub sent: Arc<AtomicU64>,
+    /// Sum of `sent` over finished iterations; see
+    /// [`MessageProgress::fold_iteration`].
+    pub sent_done_iters: Arc<AtomicU64>,
+    /// Sum of `bytes_written` over finished iterations.
+    pub bytes_done_iters: Arc<AtomicU64>,
+    /// Sequence counter guarding the fold of the per-iteration counters
+    /// into the `*_done_iters` totals (odd while a fold is under way),
+    /// so readers of a total never see it dip. See [`fold_counters`].
+    pub fold_seq: Arc<AtomicU64>,
     /// Server messages received so far.
     pub received: Arc<AtomicU64>,
     pub bytes_written: Arc<AtomicU64>,
@@ -113,6 +122,68 @@ impl MessageProgress {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || self.run_cancel.load(Ordering::Relaxed)
+    }
+
+    /// Start a new iteration: move `sent` and `bytes_written` into the
+    /// `*_done_iters` totals and restart them at zero. The totals
+    /// ([`MessageProgress::sent_total`]) never dip while this runs.
+    /// Call it only from the thread that sends.
+    pub fn fold_iteration(&self) {
+        fold_counters(
+            &self.fold_seq,
+            &[
+                (&self.sent, &self.sent_done_iters),
+                (&self.bytes_written, &self.bytes_done_iters),
+            ],
+        );
+    }
+
+    /// Messages sent over all iterations, monotonic.
+    pub fn sent_total(&self) -> u64 {
+        read_folded(&self.fold_seq, &self.sent, &self.sent_done_iters)
+    }
+}
+
+/// Move every `current` counter into its `done` total and zero it, as
+/// one step for readers using [`read_folded`] with the same `seq` (a
+/// seqlock: `seq` is odd while the fold runs). A reader of
+/// `done + current` therefore never sees the amount in neither (a dip)
+/// nor in both (a spike). Only one thread may fold a given `seq`, and
+/// nobody else may write the `current` counters during the fold (both
+/// hold when the sending thread folds its own counters).
+pub fn fold_counters(seq: &AtomicU64, pairs: &[(&AtomicU64, &AtomicU64)]) {
+    let s = seq.load(Ordering::Relaxed);
+    seq.store(s.wrapping_add(1), Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    for (current, done) in pairs {
+        let v = current.swap(0, Ordering::Relaxed);
+        done.fetch_add(v, Ordering::Relaxed);
+    }
+    seq.store(s.wrapping_add(2), Ordering::Release);
+}
+
+/// `done + current`, consistent with respect to [`fold_counters`] on
+/// the same `seq`: monotonic as long as the counters only grow between
+/// folds.
+pub fn read_folded(seq: &AtomicU64, current: &AtomicU64, done: &AtomicU64) -> u64 {
+    let mut spins = 0u32;
+    loop {
+        let s1 = seq.load(Ordering::Acquire);
+        if s1 & 1 == 0 {
+            let v = done
+                .load(Ordering::Relaxed)
+                .saturating_add(current.load(Ordering::Relaxed));
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s1 {
+                return v;
+            }
+        }
+        spins += 1;
+        if spins % 64 == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -390,6 +461,8 @@ pub struct ProtoReport {
     pub connected: bool,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    /// Wall-clock length of the session (all iterations when merged),
+    /// idle-serve included. See [`ProtoReport::active_ms`].
     pub elapsed_ms: u64,
     pub messages_sent: u64,
     pub messages_received: u64,
@@ -413,7 +486,8 @@ pub struct ProtoReport {
     pub latency_p99_us: u64,
     pub latency_max_us: u64,
     pub latency_mean_us: u64,
-    /// Client messages per second sustained over the active session.
+    /// Client messages per second over the session's active time
+    /// ([`ProtoReport::active_ms`]), idle-serve excluded.
     pub throughput_msgs_per_sec: f64,
     /// Number of times the send loop blocked waiting for the server
     /// to free the flow-control window.
@@ -686,15 +760,26 @@ impl ProtocolStats {
 }
 
 impl ProtoReport {
+    /// Active time of the session in milliseconds: `elapsed_ms` (the
+    /// total, wall clock) minus the time spent idle-serving the peer
+    /// after the script ([`ProtocolStats::idle_serve_ms`]). Both add up
+    /// when reports are merged, so this stays the sum of the active
+    /// times (N4).
+    pub fn active_ms(&self) -> u64 {
+        self.elapsed_ms.saturating_sub(self.protocol.idle_serve_ms)
+    }
+
     /// Compute latency percentile fields and throughput from the raw
-    /// `latency_samples_us` and the session's active send window.
-    /// Call this once at the end of a session, after all samples have
-    /// been recorded and `elapsed_ms` and `messages_sent` are set.
+    /// `latency_samples_us` and the session's active time
+    /// ([`ProtoReport::active_ms`]). Call this once at the end of a
+    /// session, after all samples have been recorded and `elapsed_ms`,
+    /// `protocol.idle_serve_ms` and `messages_sent` are set.
     pub fn finalize_latency(&mut self) {
         // Throughput does not depend on the latency samples; a session
         // that never saw an ACK still sent messages.
-        self.throughput_msgs_per_sec = if self.elapsed_ms > 0 {
-            (self.messages_sent as f64) * 1000.0 / (self.elapsed_ms as f64)
+        let active_ms = self.active_ms();
+        self.throughput_msgs_per_sec = if active_ms > 0 {
+            (self.messages_sent as f64) * 1000.0 / (active_ms as f64)
         } else {
             0.0
         };

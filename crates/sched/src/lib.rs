@@ -160,6 +160,10 @@ pub struct SourceProgress {
     pub sent_done_iters: Arc<AtomicU64>,
     /// Sum of `bytes` over completed iterations.
     pub bytes_done_iters: Arc<AtomicU64>,
+    /// Seqlock counter of the fold of `sent`/`bytes` into the
+    /// `*_done_iters` totals (see [`protoplay::fold_counters`]), shared
+    /// with the protocol module's [`protoplay::MessageProgress`].
+    pub fold_seq: Arc<AtomicU64>,
     /// Benchmark-only: server messages received by this session.
     pub received: Arc<AtomicU64>,
     /// Benchmark-only: messages sent but not yet acknowledged.
@@ -208,6 +212,7 @@ impl SourceProgress {
             bytes: Default::default(),
             sent_done_iters: Default::default(),
             bytes_done_iters: Default::default(),
+            fold_seq: Default::default(),
             received: Default::default(),
             unacked: Default::default(),
             ready: Arc::new(AtomicBool::new(ready)),
@@ -227,13 +232,14 @@ impl SourceProgress {
     pub fn snapshot_bytes(&self) -> u64 {
         self.bytes.load(Ordering::Relaxed)
     }
-    /// Monotonic total across iterations.
+    /// Monotonic total across iterations (never dips, also not while
+    /// an iteration starts).
     pub fn snapshot_sent_total(&self) -> u64 {
-        self.sent_done_iters.load(Ordering::Relaxed) + self.sent.load(Ordering::Relaxed)
+        protoplay::read_folded(&self.fold_seq, &self.sent, &self.sent_done_iters)
     }
     /// Monotonic total across iterations.
     pub fn snapshot_bytes_total(&self) -> u64 {
-        self.bytes_done_iters.load(Ordering::Relaxed) + self.bytes.load(Ordering::Relaxed)
+        protoplay::read_folded(&self.fold_seq, &self.bytes, &self.bytes_done_iters)
     }
     pub fn snapshot_planned(&self) -> u64 {
         self.planned.load(Ordering::Relaxed)
@@ -274,14 +280,16 @@ impl SourceProgress {
 
     /// Start iteration `iter` (1-based): fold the previous iteration's
     /// counters into the `*_done_iters` totals and reset the
-    /// per-iteration ones. A concurrent reader may briefly see the
-    /// folded amount twice; samplers should take deltas with a floor
-    /// of zero.
+    /// per-iteration ones, as one step for readers of the totals (N5:
+    /// they never see a dip). Called by the sending thread.
     pub fn begin_iteration(&self, iter: u64) {
-        let s = self.sent.swap(0, Ordering::Relaxed);
-        self.sent_done_iters.fetch_add(s, Ordering::Relaxed);
-        let b = self.bytes.swap(0, Ordering::Relaxed);
-        self.bytes_done_iters.fetch_add(b, Ordering::Relaxed);
+        protoplay::fold_counters(
+            &self.fold_seq,
+            &[
+                (&self.sent, &self.sent_done_iters),
+                (&self.bytes, &self.bytes_done_iters),
+            ],
+        );
         self.received.store(0, Ordering::Relaxed);
         self.unacked.store(0, Ordering::Relaxed);
         self.iter_current.store(iter, Ordering::Relaxed);
@@ -291,6 +299,9 @@ impl SourceProgress {
         protoplay::MessageProgress {
             planned: Arc::clone(&self.planned),
             sent: Arc::clone(&self.sent),
+            sent_done_iters: Arc::clone(&self.sent_done_iters),
+            bytes_done_iters: Arc::clone(&self.bytes_done_iters),
+            fold_seq: Arc::clone(&self.fold_seq),
             received: Arc::clone(&self.received),
             bytes_written: Arc::clone(&self.bytes),
             bytes_read: Arc::new(AtomicU64::new(0)),
@@ -901,8 +912,10 @@ impl SessionAccumulator {
 /// samples go through the shared bounded reservoir, the first error
 /// wins, and percentiles/throughput are recomputed with
 /// [`protoplay::ProtoReport::finalize_latency`] so the merged report is
-/// always self-consistent. `elapsed_ms` is the sum of the iterations'
-/// active times, so throughput is messages per second of activity.
+/// always self-consistent. `elapsed_ms` (total) and
+/// `protocol.idle_serve_ms` both add up, so throughput stays messages
+/// per second of active time ([`protoplay::ProtoReport::active_ms`]),
+/// whatever the idle-serve tails (N4).
 pub fn merge_proto_report(acc: &mut SessionAccumulator, mut new: protoplay::ProtoReport) {
     let r = &mut acc.report;
     r.protocol

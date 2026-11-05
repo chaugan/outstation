@@ -194,6 +194,81 @@ fn progress_counters_do_not_exceed_iteration_and_stay_monotonic() {
     assert_eq!(p.iter_current.load(Ordering::Relaxed), 3);
 }
 
+/// N5: a reader sampling the total while iterations start never sees
+/// it dip (before, `sent` was zeroed before its amount reached
+/// `sent_done_iters`), and the protocol's own within-session fold
+/// (shared counters) keeps it monotonic as well.
+#[test]
+fn totals_never_dip_while_iterations_start() {
+    let p = SourceProgress::new(None, [0; 6], "x".into(), 0, true);
+    let mp = p.message_progress(&Arc::new(AtomicBool::new(false)));
+    let stop = Arc::new(AtomicBool::new(false));
+    let reader = {
+        let p = p.clone();
+        let stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut last = 0u64;
+            let mut samples = 0u64;
+            while !stop.load(Ordering::Relaxed) {
+                let t = p.snapshot_sent_total();
+                assert!(t >= last, "total dipped from {last} to {t}");
+                last = t;
+                samples += 1;
+            }
+            (last, samples)
+        })
+    };
+    for k in 1..=20_000u64 {
+        if k % 2 == 0 {
+            p.begin_iteration(k);
+        } else {
+            mp.fold_iteration();
+        }
+        for _ in 0..3 {
+            p.sent.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let (last, samples) = reader.join().unwrap();
+    assert!(samples > 0);
+    assert!(last <= 60_000);
+    assert_eq!(p.snapshot_sent_total(), 60_000);
+    assert_eq!(mp.sent_total(), 60_000);
+    assert_eq!(p.snapshot_sent(), 3);
+}
+
+/// N4 (scratchpad/reaudit/mergeprobe): one slave iteration sends 1000
+/// messages in 10 s of activity and then idle-serves 30 s. Throughput
+/// is 100 msg/s per iteration and stays 100 msg/s once merged; the
+/// merged report keeps the total and the active time apart.
+#[test]
+fn merged_throughput_is_over_active_time() {
+    let iteration = || {
+        let mut r = protoplay::ProtoReport {
+            messages_sent: 1000,
+            latency_samples_us: (1..=1000).collect(),
+            elapsed_ms: 40_000,
+            connected: true,
+            ..Default::default()
+        };
+        r.protocol.idle_serve_ms = 30_000;
+        r.finalize_latency();
+        r
+    };
+    let one = iteration();
+    assert_eq!(one.throughput_msgs_per_sec, 100.0);
+    assert_eq!(one.active_ms(), 10_000);
+    let mut acc = SessionAccumulator::new();
+    merge_proto_report(&mut acc, iteration());
+    assert_eq!(acc.report().throughput_msgs_per_sec, 100.0);
+    merge_proto_report(&mut acc, iteration());
+    let r = acc.report();
+    assert_eq!(r.throughput_msgs_per_sec, 100.0);
+    assert_eq!(r.elapsed_ms, 80_000);
+    assert_eq!(r.protocol.idle_serve_ms, 60_000);
+    assert_eq!(r.active_ms(), 20_000);
+}
+
 #[test]
 fn cancel_all_flips_every_session() {
     let ctx = RunContext::new();

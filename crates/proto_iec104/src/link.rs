@@ -74,6 +74,10 @@ pub(crate) const SERVICE_SLICE_NS: u64 = 50_000_000;
 /// Socket read timeout of the reader thread; bounds how long it takes
 /// to notice the stop flag if a shutdown did not wake it.
 const READ_TIMEOUT: Duration = Duration::from_millis(200);
+/// Send timeout (SO_SNDTIMEO) of a session socket. A write that cannot
+/// go out within it is retried after a cancel check, so a peer that
+/// stops reading cannot hang a STOP; it fails after t1.
+const WRITE_SLICE: Duration = Duration::from_millis(200);
 /// Sequence numbers are 15 bits.
 const SEQ_MASK: u16 = 0x7fff;
 
@@ -589,6 +593,7 @@ impl Link {
             }
         };
         read_stream.set_read_timeout(Some(READ_TIMEOUT)).ok();
+        stream.set_write_timeout(Some(WRITE_SLICE)).ok();
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let stop_r = stop.clone();
@@ -739,6 +744,11 @@ impl Link {
     /// Service the link until `deadline_ns`.
     pub fn wait_until(&mut self, deadline_ns: u64) -> Result<(), LinkEnd> {
         self.service(Some(deadline_ns), |_| false)
+    }
+
+    /// I-frames sent and not yet acknowledged by the peer.
+    pub fn unacked_sent(&self) -> usize {
+        self.pending.len()
     }
 
     /// Service the link until every I-frame we sent is acknowledged
@@ -1232,7 +1242,9 @@ impl Link {
                 self.check_nr(nr, "I")?;
                 self.retire(nr, recv_ns);
                 self.vr = (self.vr + 1) & SEQ_MASK;
-                self.unacked_rx += 1;
+                // Saturating: while acks are withheld, a peer that
+                // ignores its own k could otherwise overflow it (N3).
+                self.unacked_rx = self.unacked_rx.saturating_add(1);
                 self.oldest_unacked_rx_ns.get_or_insert(recv_ns);
                 if let Some(f) = self.faults.as_mut() {
                     if let Some(rec) = f.withholding(recv_ns) {
@@ -1446,15 +1458,50 @@ impl Link {
     }
 
     fn write_raw(&mut self, bytes: &[u8], what: &str) -> Result<u64, LinkEnd> {
-        if let Err(e) = self.writer.write_all(bytes) {
-            if e.kind() == io::ErrorKind::ConnectionReset {
-                self.peer_reset_seen = true;
+        // The socket's send timeout is WRITE_SLICE: a blocked write
+        // returns, the cancel flag is checked, and after t1 without
+        // progress the peer is given up on (F028).
+        let mut off = 0usize;
+        let mut stalled_since: Option<u64> = None;
+        while off < bytes.len() {
+            match self.writer.write(&bytes[off..]) {
+                Ok(0) => return Err(LinkEnd::Io(format!("send {what}: wrote 0 bytes"))),
+                Ok(n) => {
+                    off += n;
+                    stalled_since = None;
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    if self.cancelled() {
+                        return Err(LinkEnd::Cancelled);
+                    }
+                    let now = now_ns();
+                    let since = *stalled_since.get_or_insert(now);
+                    if now.saturating_sub(since) >= self.params.t1_ns {
+                        let msg = format!(
+                            "t1 expired: could not send {what} for {:.1} s (the peer is not reading)",
+                            self.params.t1_ns as f64 / 1e9
+                        );
+                        self.violation("send_stalled", msg.clone(), true);
+                        return Err(LinkEnd::Timeout(msg));
+                    }
+                }
+                Err(e) => {
+                    if e.kind() == io::ErrorKind::ConnectionReset {
+                        self.peer_reset_seen = true;
+                    }
+                    return Err(if is_peer_close(e.kind()) {
+                        LinkEnd::PeerClosed
+                    } else {
+                        LinkEnd::Io(format!("send {what}: {e}"))
+                    });
+                }
             }
-            return Err(if is_peer_close(e.kind()) {
-                LinkEnd::PeerClosed
-            } else {
-                LinkEnd::Io(format!("send {what}: {e}"))
-            });
         }
         let len = bytes.len() as u64;
         self.report.bytes_written += len;
