@@ -317,3 +317,81 @@ function fillNicSelect(sel, placeholder) {
   if (current && S.nics.some(n => n.name === current)) sel.value = current;
   else if (current) sel.dataset.want = current;
 }
+
+// ---------------------------------------------------------------------------
+// Keyboard shortcuts: "g" then a letter switches view, "/" focuses the
+// current view's filter, "?" opens the help. Never while typing in a
+// field, with a modifier held, or while a dialog is open.
+
+const GO_KEYS = { l: 'library', c: 'configure', r: 'runs', a: 'analysis', m: 'compare' };
+// The filter "/" focuses, per view (the first visible one wins).
+const VIEW_FILTERS = {
+  library: ['#lib-filter'],
+  configure: ['#rtu-filter', '#cfg-pcap'],
+  runs: ['#runs-filter'],
+  analysis: ['#an-ep-q', '#an-run'],
+  compare: ['#cmp-q', '#cmp-a'],
+};
+let _gPending = 0;
+
+function isTypingTarget(t) {
+  if (!t || t === document.body) return false;
+  if (t.isContentEditable) return true;
+  const tag = t.tagName;
+  if (tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  return tag === 'INPUT' && !['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'range', 'color'].includes(t.type);
+}
+
+function focusViewFilter() {
+  for (const sel of VIEW_FILTERS[S.view] || []) {
+    const n = qs(sel);
+    if (n && n.getClientRects().length && !n.disabled) {
+      for (let d = n.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) d.open = true;
+      n.focus();
+      if (n.select && n.type === 'search') n.select();
+      return true;
+    }
+  }
+  announce('This view has no filter right now');
+  return false;
+}
+
+function showKbdHelp() {
+  const d = el('kbd-dlg');
+  if (!d || d.open) return;
+  d._opener = document.activeElement;
+  if (typeof d.showModal === 'function') d.showModal(); else d.setAttribute('open', '');
+  el('kbd-close').focus();
+}
+function closeKbdHelp() {
+  const d = el('kbd-dlg');
+  if (!d || !d.open) return;
+  d.close();
+}
+
+document.addEventListener('keydown', e => {
+  if (e.defaultPrevented || e.ctrlKey || e.metaKey || e.altKey) return;
+  if (isTypingTarget(e.target)) { _gPending = 0; return; }
+  if (qs('dialog[open]')) return;
+  const k = e.key;
+  if (_gPending && Date.now() - _gPending < 1500) {
+    _gPending = 0;
+    const v = GO_KEYS[k.toLowerCase()];
+    if (v) { e.preventDefault(); go(v); }
+    return;
+  }
+  _gPending = 0;
+  if (k === 'g') { _gPending = Date.now(); return; }
+  if (k === '/') { e.preventDefault(); focusViewFilter(); return; }
+  if (k === '?') { e.preventDefault(); showKbdHelp(); }
+});
+
+actions({ 'kbd-help': showKbdHelp });
+
+function initShell() {
+  applyTheme(false);
+  const d = el('kbd-dlg');
+  el('kbd-close').addEventListener('click', closeKbdHelp);
+  d.addEventListener('close', () => { if (d._opener && d._opener.isConnected) d._opener.focus(); });
+  d.addEventListener('click', e => { if (e.target === d) closeKbdHelp(); });
+}

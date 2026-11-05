@@ -62,7 +62,9 @@ if (mode === 'live') {
   await open(`#/runs/${run}`);
   await page.waitForSelector('#diagram-section:not([hidden])', { timeout: 30000 });
   await page.waitForTimeout(4000); // a few diagram frames
-  await page.evaluate(() => document.getElementById('diagram-section').scrollIntoView({ block: 'start' }));
+  // The live dashboard strip and the diagram below it.
+  await page.evaluate(() => (document.querySelector('#live-strip:not([hidden])') || document.getElementById('diagram-section')).scrollIntoView({ block: 'start' }));
+  await page.evaluate(() => window.scrollBy(0, -64));
   await shot('ui-runs-live.jpg');
 } else {
   const [a, b, pcapId, analysisId] = ids;

@@ -4,6 +4,8 @@
 // while the server is still analysing an upload.
 'use strict';
 
+const slugId = s => String(s).replace(/[^A-Za-z0-9_-]/g, '_');
+
 function pcapBadges(p) {
   let b = '';
   if (p.viability && p.viability.verdict) {
@@ -49,12 +51,24 @@ async function refreshLibrary() {
   return true;
 }
 
+let _libFilter = '';
 function renderLibrary() {
   const list = el('pcap-list');
   const n = S.library.length;
   setText(el('lib-meta'), n ? plural(n, 'pcap') : '—');
-  el('lib-empty').hidden = n > 0 || !S.libraryLoaded;
-  reconcile(list, S.library, p => p.id, (li, p) => {
+  const empty = el('lib-empty');
+  empty.hidden = n > 0 || !S.libraryLoaded;
+  if (!empty.hidden) {
+    setHTML(empty, emptyStateHtml({
+      step: 1,
+      title: 'Start with a capture',
+      body: 'Drop a Wireshark capture (.pcap or .pcapng) of the IEC 104 traffic you want to replay on the Upload pcap box, or press the box to browse. The server then checks how heavy it is to replay and which RTUs and masters it contains.',
+    }));
+  }
+  el('lib-filter-wrap').hidden = n < 2;
+  const q = _libFilter.toLowerCase();
+  const shown = q ? S.library.filter(p => p.name.toLowerCase().includes(q)) : S.library;
+  reconcile(list, shown, p => p.id, (li, p) => {
     li.className = 'pcap-row' + (p.id === S.selectedPcapId ? ' selected' : '');
     const range = pcapRange(p);
     const html =
@@ -65,12 +79,16 @@ function renderLibrary() {
       '</button>' +
       '<span class="row-actions">' +
         `<button type="button" class="btn btn-text" data-act="pcap-use" data-id="${esc(p.id)}" data-fk="pcap-use-${esc(p.id)}" aria-label="Configure a run with ${esc(p.name)}">Use</button>` +
-        `<button type="button" class="btn btn-text" data-act="pcap-rename" data-id="${esc(p.id)}" data-fk="pcap-rename-${esc(p.id)}" aria-label="Rename ${esc(p.name)}">Rename</button>` +
-        `<a class="btn btn-text" href="/api/pcaps/${encodeURIComponent(p.id)}/download" download aria-label="Download ${esc(p.name)}">Download</a>` +
-        `<button type="button" class="btn btn-text danger" data-act="pcap-delete" data-id="${esc(p.id)}" data-fk="pcap-delete-${esc(p.id)}" aria-label="Delete ${esc(p.name)}">Delete</button>` +
+        menuHtml(`pcap-menu-${slugId(p.id)}`, `More actions for ${p.name}`, [
+          `<button type="button" role="menuitem" tabindex="-1" class="menu-item" data-act="pcap-rename" data-id="${esc(p.id)}" data-fk="pcap-rename-${esc(p.id)}">Rename…</button>`,
+          `<a role="menuitem" tabindex="-1" class="menu-item" href="/api/pcaps/${encodeURIComponent(p.id)}/download" download>Download</a>`,
+          `<button type="button" role="menuitem" tabindex="-1" class="menu-item danger" data-act="pcap-delete" data-id="${esc(p.id)}" data-fk="pcap-delete-${esc(p.id)}">Delete…</button>`,
+        ]) +
       '</span>';
-    setHTML(li, html);
+    // An open menu is not rebuilt under the user's pointer.
+    if (!menuIsOpenIn(li)) setHTML(li, html);
   }, { tag: 'li' });
+  if (n && !shown.length) list.innerHTML = '<li class="empty-cell">No pcap matches the filter.</li>';
   renderLibraryDetail();
 }
 
@@ -81,7 +99,7 @@ function renderLibraryDetail() {
   let h = `<div class="card"><h3 class="card-title">${esc(p.name)}</h3>`;
   h += `<p class="meta-line">${pcapMeta(p)}</p>`;
   if (p.viability) {
-    h += viabilityHtml(p.viability);
+    h += viabilityHtml(p.viability, p);
   } else {
     h += '<p class="hint">The server is still analysing this pcap; this panel updates by itself.</p>';
   }
@@ -92,12 +110,34 @@ function renderLibraryDetail() {
   setHTML(box, h);
 }
 
-function viabilityHtml(v) {
-  let h = `<div class="viability v-${esc(v.verdict)}">`;
-  h += `<p class="reason"><span class="badge v-${esc(v.verdict)}">${esc(v.verdict.replace(/_/g, ' '))}</span> ${esc(v.verdict_reason)}</p>`;
-  h += `<p class="note">Estimated peak RAM ${fmtInt(v.estimated_peak_mb)} MB · ${fmtInt(v.sessions_master_mode)} master sessions · ${fmtInt(v.sessions_slave_mode)} slave sessions</p>`;
+// Viability in plain language: a headline per verdict, the server's
+// reason, the key figures as stat chips, and the analyser's raw notes
+// behind a disclosure.
+const VIABILITY_HEADLINE = {
+  ok: 'Ready to replay',
+  caution: 'Replayable, with caveats',
+  heavy: 'Heavy: needs a capable host',
+  not_recommended: 'Not recommended as it is',
+};
+function viabilityHtml(v, p) {
+  const vd = String(v.verdict || '');
+  const head = VIABILITY_HEADLINE[vd] || vd.replace(/_/g, ' ');
+  let h = `<div class="via v-${esc(vd)}">`;
+  h += `<p class="via-verdict"><span class="badge v-${esc(vd)}">${esc(vd.replace(/_/g, ' '))}</span> <b>${esc(head)}.</b> <span class="via-reason">${esc(v.verdict_reason)}</span></p>`;
+  const chips = [];
+  const chip = (k, val, title) => chips.push(`<li class="chip"${title ? ` title="${esc(title)}"` : ''}><span class="k">${esc(k)}</span><span class="v">${val}</span></li>`);
+  chip('RTUs (slave role)', fmtInt(v.sessions_slave_mode), 'Listeners a slave-role run starts: one per RTU in the capture');
+  chip('Masters (master role)', fmtInt(v.sessions_master_mode), 'Sessions a master-role run starts: one per captured master');
+  chip('Peak memory', `~${fmtInt(v.estimated_peak_mb)} MB`, 'Rough working-set estimate for replaying this capture');
+  if (p) {
+    chip('Duration', esc(fmtDuration(p.duration_ms)));
+    chip('Packets', fmtInt(p.packets));
+  }
+  const load = (v.client_payload_bytes || 0) + (v.server_payload_bytes || 0);
+  if (load) chip('IEC 104 payload', esc(fmtBytes(load)), `master to RTU ${fmtBytes(v.client_payload_bytes || 0)}, RTU to master ${fmtBytes(v.server_payload_bytes || 0)}`);
+  h += `<ul class="chips" aria-label="Key figures">${chips.join('')}</ul>`;
   if (v.notes && v.notes.length) {
-    h += '<ul class="notes">' + v.notes.map(n => `<li>${esc(n)}</li>`).join('') + '</ul>';
+    h += `<details class="via-notes"><summary>Analyser notes (${v.notes.length})</summary><ul class="notes">${v.notes.map(n => `<li>${esc(n)}</li>`).join('')}</ul></details>`;
   }
   return h + '</div>';
 }
@@ -276,6 +316,8 @@ function kickAnalyzePoll() {
 
 function initLibrary() {
   wireDropzone(el('dropzone'), uploadFiles);
+  el('lib-filter').addEventListener('input', e => { _libFilter = e.target.value.trim(); renderLibrary(); });
+  on('runs', () => { if (S.view === 'library' && !S.library.length) renderLibrary(); });
   S.selectedPcapId = prefs.get('selectedPcap', null);
   on('library', renderLibrary);
   on('selected', renderLibrary);

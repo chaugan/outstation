@@ -171,7 +171,7 @@ function setProfError(html) {
 
 function selectedProfile() {
   const id = Number(el('prof-select').value);
-  return prof.list.find(p => p.id === id) || null;
+  return prof.list.find(p => p.id === id && !isPendingDelete('profile-' + p.id)) || null;
 }
 
 function renderProfiles() {
@@ -179,13 +179,16 @@ function renderProfiles() {
   const want = sel.value || String(prefs.get('profileSel', '') || '');
   let h = prof.list.length ? '' : `<option value="">${prof.loaded ? 'No saved profiles yet' : 'Loading…'}</option>`;
   for (const p of prof.list) {
+    if (isPendingDelete('profile-' + p.id)) continue;
     const pc = p.request && p.request.pcap_id ? ` · ${libraryName(p.request.pcap_id)}` : '';
     const mode = p.request ? (p.request.mode === 'raw' ? 'raw' : `${p.request.proto_name || 'iec104'} ${p.request.role || ''}`) : '';
     h += `<option value="${p.id}">${esc(p.name)} (${esc(mode.trim())}${esc(pc)}, saved ${esc(fmtClock(p.updated_at))})</option>`;
   }
   if (sel._html !== h) { sel.innerHTML = h; sel._html = h; }
-  if (prof.list.some(p => String(p.id) === want)) sel.value = want;
-  else if (prof.list.length) sel.value = String(prof.list[0].id);
+  const live = prof.list.filter(p => !isPendingDelete('profile-' + p.id));
+  if (!live.length && prof.list.length) { h = '<option value="">No saved profiles</option>'; sel.innerHTML = h; sel._html = h; }
+  if (live.some(p => String(p.id) === want)) sel.value = want;
+  else if (live.length) sel.value = String(live[0].id);
   const has = !!selectedProfile();
   for (const id of ['prof-load', 'prof-overwrite', 'prof-rename', 'prof-delete']) el(id).disabled = !has || prof.busy;
   el('prof-save').disabled = prof.busy;
@@ -338,25 +341,35 @@ async function renameProfile() {
   });
 }
 
-async function deleteProfile() {
+// Delete with Undo: the profile leaves the list at once and the DELETE
+// is sent when the toast ends (or the page is left).
+function deleteProfile() {
   const p = selectedProfile();
   if (!p) return;
   setProfError('');
-  const ok = await askDialog({
-    title: `Delete profile “${p.name}”?`,
-    body: 'Runs started from it are not affected. This cannot be undone.',
-    confirm: 'Delete profile',
-    danger: true,
-  });
-  if (!ok) return;
-  await profBusy(async () => {
-    const res = await api(`/api/profiles/${p.id}`, 'DELETE');
-    if (!res.ok && res.code !== 'not_found') { setProfError(`Not deleted: ${esc(res.error)}`); return; }
-    prefs.del('profileSel');
-    el('prof-select').value = '';
-    await refreshProfiles();
-    setProfStatus(`Deleted profile “${p.name}”.`, 'ok');
-    announce(`Profile ${p.name} deleted`);
+  deferDelete({
+    key: 'profile-' + p.id,
+    url: `/api/profiles/${p.id}`,
+    message: `Deleted profile “${p.name}”.`,
+    returnFocus: el('prof-select'),
+    hide: () => {
+      prefs.del('profileSel');
+      el('prof-select').value = '';
+      renderProfiles();
+      setProfStatus(`Deleted profile “${p.name}”. Undo is in the notice at the bottom right.`, 'ok');
+      el('prof-select').focus();
+    },
+    restore: () => {
+      el('prof-select').value = String(p.id);
+      renderProfiles();
+      el('prof-select').value = String(p.id);
+      setProfStatus(`Kept profile “${p.name}”.`, 'ok');
+    },
+    commit: async () => {
+      const res = await api(`/api/profiles/${p.id}`, 'DELETE');
+      if (!res.ok && res.code !== 'not_found') { setProfError(`Profile “${esc(p.name)}” was not deleted: ${esc(res.error)}`); }
+      await refreshProfiles();
+    },
   });
 }
 

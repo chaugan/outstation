@@ -147,25 +147,94 @@ async function apiAction(label, path, method = 'POST', body = null) {
 // ---------------------------------------------------------------------------
 // Notifications (toasts) and screen-reader announcements.
 
+// opts.action = {label, fn}: an extra button (e.g. Undo) that runs fn
+// and closes the toast. opts.onClose(reason) runs once when the toast
+// goes away: 'action', 'dismiss' or 'timeout'. Returns the toast node.
 function notify(msg, kind = 'error', opts = {}) {
   const box = el('toasts');
-  if (!box) return;
+  if (!box) return null;
   const t = document.createElement('div');
   t.className = `toast ${kind}`;
   if (kind === 'error') t.setAttribute('role', 'alert');
   const p = document.createElement('p');
   p.textContent = msg;
+  let closed = false;
+  let timer = null;
+  const close = reason => {
+    if (closed) return;
+    closed = true;
+    clearTimeout(timer);
+    const hadFocus = t.contains(document.activeElement);
+    t.remove();
+    if (hadFocus && opts.returnFocus && opts.returnFocus.isConnected) opts.returnFocus.focus();
+    if (opts.onClose) opts.onClose(reason);
+  };
+  t._close = close;
+  t.append(p);
+  if (opts.action) {
+    const a = document.createElement('button');
+    a.type = 'button';
+    a.className = 'btn btn-secondary toast-action';
+    a.textContent = opts.action.label;
+    if (opts.action.fk) a.dataset.fk = opts.action.fk;
+    a.addEventListener('click', () => { try { opts.action.fn(); } finally { close('action'); } });
+    t.append(a);
+  }
   const b = document.createElement('button');
   b.type = 'button';
   b.className = 'btn btn-text';
   b.textContent = 'Dismiss';
-  b.addEventListener('click', () => t.remove());
-  t.append(p, b);
+  b.addEventListener('click', () => close('dismiss'));
+  t.append(b);
   box.append(t);
-  while (box.children.length > 4) box.firstChild.remove();
+  while (box.children.length > 4) {
+    const old = box.firstChild;
+    if (old._close) old._close('timeout'); else old.remove();
+  }
   const ttl = opts.timeout ?? (kind === 'error' ? 15000 : 5000);
-  if (ttl) setTimeout(() => t.remove(), ttl);
+  if (ttl) timer = setTimeout(() => close('timeout'), ttl);
+  return t;
 }
+
+// ---------------------------------------------------------------------------
+// Deferred deletes with Undo (instead of a confirm dialog, where an
+// accidental click is cheap to reverse). The item is hidden at once;
+// the DELETE is sent when the toast times out or is dismissed, or when
+// the page is left. `?undo_ms=N` in the URL shortens the delay (tests).
+
+const UNDO_MS = (() => {
+  const n = Number(new URLSearchParams(location.search).get('undo_ms'));
+  return Number.isInteger(n) && n >= 200 && n <= 60000 ? n : 8000;
+})();
+const _pendingDeletes = new Map();   // key -> {commit, url}
+
+// o: {key, message, hide(), restore(), commit() -> Promise, url (for
+// keepalive on unload), returnFocus}
+function deferDelete(o) {
+  _pendingDeletes.set(o.key, { commit: o.commit, url: o.url });
+  o.hide();
+  announce(`${o.message} Undo is available for ${Math.round(UNDO_MS / 1000)} seconds.`);
+  notify(o.message, 'info', {
+    timeout: UNDO_MS,
+    returnFocus: o.returnFocus,
+    action: { label: 'Undo', fk: `undo-${o.key}`, fn: () => { _pendingDeletes.delete(o.key); o.restore(); announce('Undone'); } },
+    onClose: reason => {
+      if (reason === 'action' || !_pendingDeletes.has(o.key)) return;
+      _pendingDeletes.delete(o.key);
+      o.commit();
+    },
+  });
+}
+function isPendingDelete(key) { return _pendingDeletes.has(key); }
+// Leaving the page commits what is pending; keepalive lets the
+// request outlive the page.
+window.addEventListener('pagehide', () => {
+  for (const [, e] of _pendingDeletes) {
+    if (!e.url) continue;
+    try { fetch(e.url, { method: 'DELETE', keepalive: true, headers: { 'X-Client-Id': CLIENT_ID } }); } catch (_) { /* best effort */ }
+  }
+  _pendingDeletes.clear();
+});
 
 function announce(msg) {
   const n = el('sr-status');
@@ -447,4 +516,171 @@ function explainRunError(msg) {
     return 'The run touched a protected NIC or address. Pick another interface, or enable "Override NIC and address protection" in Configure and confirm.';
   }
   return '';
+}
+
+// ---------------------------------------------------------------------------
+// Colour theme. 'auto' follows prefers-color-scheme; 'light' and 'dark'
+// are explicit and persisted. <html data-theme> always holds the
+// resolved theme (index.html sets an explicit choice before first
+// paint); the CSS also follows the media query on its own, so the page
+// is right before any script runs. Charts read the CSS tokens, so they
+// re-render on the 'theme' event.
+
+const THEMES = ['auto', 'light', 'dark'];
+const _darkMq = window.matchMedia ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+const theme = {
+  choice: (() => { const v = prefs.get('theme', 'auto'); return THEMES.includes(v) ? v : 'auto'; })(),
+  resolved() { return this.choice === 'auto' ? (_darkMq && _darkMq.matches ? 'dark' : 'light') : this.choice; },
+};
+function applyTheme(announceIt) {
+  const r = theme.resolved();
+  const changed = document.documentElement.dataset.theme !== r;
+  document.documentElement.dataset.theme = r;
+  const b = el('theme-btn');
+  if (b) {
+    const word = { auto: `Auto (${r})`, light: 'Light', dark: 'Dark' }[theme.choice];
+    setText(qs('.theme-word', b), word);
+    b.setAttribute('aria-label', `Colour theme: ${word}. Press to change.`);
+    b.dataset.choice = theme.choice;
+  }
+  if (announceIt) announce(`Colour theme: ${theme.choice === 'auto' ? 'automatic, now ' + r : r}`);
+  if (changed) emit('theme', r);
+}
+function cycleTheme() {
+  theme.choice = THEMES[(THEMES.indexOf(theme.choice) + 1) % THEMES.length];
+  if (theme.choice === 'auto') prefs.del('theme'); else prefs.set('theme', theme.choice);
+  applyTheme(true);
+}
+if (_darkMq) {
+  const onMq = () => { if (theme.choice === 'auto') applyTheme(false); };
+  if (_darkMq.addEventListener) _darkMq.addEventListener('change', onMq); else if (_darkMq.addListener) _darkMq.addListener(onMq);
+}
+actions({ 'theme-cycle': cycleTheme });
+
+// ECharts themes built from the CSS tokens of the resolved theme, so
+// axis labels, legends, tooltips and grid lines follow the page.
+function chartTheme() {
+  if (typeof echarts === 'undefined') return null;
+  const name = 'outstation-' + theme.resolved();
+  const v = n => getCssVar(n);
+  echarts.registerTheme(name, {
+    backgroundColor: 'transparent',
+    textStyle: { color: v('--ink-2'), fontFamily: v('--sans') },
+    title: { textStyle: { color: v('--ink') } },
+    legend: { textStyle: { color: v('--ink-2') }, inactiveColor: v('--rule-strong') },
+    tooltip: {
+      backgroundColor: v('--surface'), borderColor: v('--rule'), textStyle: { color: v('--ink') },
+      extraCssText: `box-shadow: 0 2px 8px ${v('--shadow')};`,
+    },
+    categoryAxis: {
+      axisLine: { lineStyle: { color: v('--rule-strong') } }, axisTick: { lineStyle: { color: v('--rule-strong') } },
+      axisLabel: { color: v('--dim') }, splitLine: { lineStyle: { color: v('--ch-grid') } }, nameTextStyle: { color: v('--dim') },
+    },
+    valueAxis: {
+      axisLine: { lineStyle: { color: v('--rule-strong') } }, axisTick: { lineStyle: { color: v('--rule-strong') } },
+      axisLabel: { color: v('--dim') }, splitLine: { lineStyle: { color: v('--ch-grid') } }, nameTextStyle: { color: v('--dim') },
+    },
+    toolbox: { iconStyle: { borderColor: v('--dim') }, emphasis: { iconStyle: { borderColor: v('--accent') } } },
+    dataZoom: { textStyle: { color: v('--dim') }, borderColor: v('--rule'), fillerColor: v('--blue-soft'), handleStyle: { color: v('--surface-2'), borderColor: v('--rule-strong') } },
+  });
+  return name;
+}
+
+// ---------------------------------------------------------------------------
+// Menu button (WAI-ARIA menu button pattern): a button with
+// aria-haspopup="menu" that opens a role="menu" list of role="menuitem"
+// buttons or links. Enter, Space and ArrowDown open it on the first
+// item, ArrowUp on the last; arrows, Home and End move; Escape closes
+// it and returns focus to the button; Tab and outside clicks close it.
+// Items keep their data-act, so the delegated actions run as usual.
+
+let _openMenu = null;   // {btn, menu}
+function menuHtml(id, label, items) {
+  if (!items.length) return '';
+  return `<span class="menu-wrap"><button type="button" class="btn btn-secondary menu-btn" id="${id}-btn" data-menu="${id}" data-fk="${id}-btn" aria-haspopup="menu" aria-expanded="false" aria-controls="${id}" aria-label="${esc(label)}"><span aria-hidden="true">⋯</span></button>` +
+    `<span class="menu" role="menu" id="${id}" aria-labelledby="${id}-btn" hidden>${items.join('')}</span></span>`;
+}
+function menuItems(menu) { return qsa('[role="menuitem"]', menu).filter(n => !n.disabled); }
+function openMenu(btn, focusLast) {
+  const menu = el(btn.getAttribute('aria-controls'));
+  if (!menu) return;
+  if (_openMenu && _openMenu.menu !== menu) closeMenu(false);
+  menu.hidden = false;
+  btn.setAttribute('aria-expanded', 'true');
+  _openMenu = { btn, menu };
+  // Open upwards when there is no room below.
+  menu.classList.remove('up');
+  const r = menu.getBoundingClientRect();
+  if (r.bottom > window.innerHeight - 8 && r.top - r.height - btn.offsetHeight > 8) menu.classList.add('up');
+  const items = menuItems(menu);
+  const t = focusLast ? items[items.length - 1] : items[0];
+  if (t) t.focus();
+}
+function closeMenu(refocus) {
+  if (!_openMenu) return;
+  const { btn, menu } = _openMenu;
+  _openMenu = null;
+  menu.hidden = true;
+  btn.setAttribute('aria-expanded', 'false');
+  if (refocus && btn.isConnected) btn.focus();
+  emit('menu-closed', btn);
+}
+function menuIsOpenIn(node) { return !!(_openMenu && node.contains(_openMenu.menu)); }
+document.addEventListener('click', e => {
+  const btn = e.target.closest && e.target.closest('[data-menu]');
+  if (btn) {
+    const open = btn.getAttribute('aria-expanded') === 'true';
+    if (open) closeMenu(true); else openMenu(btn, false);
+    return;
+  }
+  if (!_openMenu) return;
+  const item = e.target.closest && e.target.closest('[role="menuitem"]');
+  // An item ran its action (delegated handler above): close, and give
+  // focus back to the button unless the action moved it on purpose.
+  if (item && _openMenu.menu.contains(item)) {
+    const btnRef = _openMenu.btn;
+    closeMenu(false);
+    setTimeout(() => { if (document.activeElement === document.body && btnRef.isConnected) btnRef.focus(); }, 0);
+    return;
+  }
+  if (!_openMenu.menu.contains(e.target)) closeMenu(false);
+});
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  if (t && t.dataset && t.dataset.menu && (e.key === 'ArrowDown' || e.key === 'ArrowUp')) {
+    e.preventDefault();
+    openMenu(t, e.key === 'ArrowUp');
+    return;
+  }
+  if (!_openMenu || !_openMenu.menu.contains(t)) return;
+  const items = menuItems(_openMenu.menu);
+  const i = items.indexOf(t);
+  let n = null;
+  if (e.key === 'ArrowDown') n = items[(i + 1) % items.length];
+  else if (e.key === 'ArrowUp') n = items[(i - 1 + items.length) % items.length];
+  else if (e.key === 'Home') n = items[0];
+  else if (e.key === 'End') n = items[items.length - 1];
+  else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); closeMenu(true); return; }
+  else if (e.key === 'Tab') { closeMenu(false); return; }
+  else if (e.key === ' ' && t.tagName === 'A') { e.preventDefault(); t.click(); return; }
+  if (n) { e.preventDefault(); n.focus(); }
+});
+
+// ---------------------------------------------------------------------------
+// First-run guidance: upload → configure → run, with the current step
+// marked. `o`: {title, body, action (html), step (1..3)}.
+
+function emptyStateHtml(o) {
+  const steps = [['Upload a capture', '#/library'], ['Configure a run', '#/configure'], ['Run and analyse', '#/runs']];
+  const done = [S.library.length > 0, S.runs.length > 0, S.runs.some(r => r.latest_analysis)];
+  let h = `<div class="empty-state"><ol class="steps" aria-label="Getting started">`;
+  steps.forEach(([label, href], i) => {
+    const n = i + 1;
+    const st = n === o.step ? 'current' : (done[i] ? 'done' : 'todo');
+    h += `<li class="step step-${st}"${st === 'current' ? ' aria-current="step"' : ''}><span class="step-n" aria-hidden="true">${st === 'done' ? '✓' : n}</span>` +
+      `<a href="${href}">${esc(label)}</a><span class="sr-only"> (${st === 'done' ? 'done' : st === 'current' ? 'this step' : 'to do'})</span></li>`;
+  });
+  h += `</ol><h3 class="es-title">${esc(o.title)}</h3><p class="es-body">${o.body}</p>`;
+  if (o.action) h += `<div class="btn-row es-action">${o.action}</div>`;
+  return h + '</div>';
 }

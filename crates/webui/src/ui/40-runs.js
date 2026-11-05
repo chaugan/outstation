@@ -91,6 +91,7 @@ async function loadOlderRuns() {
 // second without waiting for the (thinned) list poll.
 let _liveCardAt = 0;
 function onLiveFrame(frame) {
+  recordLiveFrame(frame);
   const r = S.runs.find(x => x.id === frame.run_id);
   if (!r || r.status !== 'running') return;
   r.sent = frame.sent;
@@ -177,6 +178,10 @@ function stateBarHtml(r) {
     return `<p class="state-line"><b>${plural(n, 'session')}</b>${failed ? ` · <span class="s-failed-text">${failed} failed</span>` : ' · none failed'}</p>`;
   }
   const c = rows.length ? stateCounts(rows) : counts;
+  const kinds = STATE_ORDER.filter(s => c[s]);
+  if (r.status !== 'running' && kinds.length === 1) {
+    return `<p class="state-line"><b>${plural(n, 'session')}</b> <span class="st-item"><span class="sw st-${kinds[0]}"></span>all ${kinds[0]}</span></p>`;
+  }
   let bar = '<div class="state-bar" aria-hidden="true">';
   let legend = '';
   for (const s of STATE_ORDER) {
@@ -191,25 +196,40 @@ function stateBarHtml(r) {
 // ---------------------------------------------------------------------------
 // Runs list.
 
+// Title: run number and capture. Where the traffic goes is on the
+// status line, in words that fit the run's state (a stopped slave run
+// is not "listening").
 function runTitle(r) {
   const name = libraryName(r.pcap_id, r.pcap);
-  const tgt = r.mode === 'benchmark' && r.role === 'slave' ? 'listening' : r.target_ip;
-  return `<span class="num">${runNum(r.id)}</span> <span class="name" title="library id ${esc(r.pcap_id || '—')}">${esc(name)}</span> <span class="arrow" aria-hidden="true">→</span><span class="sr-only">to</span> ${esc(tgt)}`;
+  return `<span class="num">${runNum(r.id)}</span> <span class="name" title="library id ${esc(r.pcap_id || '—')}">${esc(name)}</span>`;
 }
 
-function runSubmeta(r) {
-  const parts = [];
-  if (r.rerun_of != null) parts.push(`re-run of <a href="#/runs/${esc(r.rerun_of)}">${runNum(r.rerun_of)}</a>`);
+const STATUS_WORD = { running: 'Running', completed: 'Completed', partial: 'Partial', stopped: 'Stopped', failed: 'Failed' };
+
+// One plain sentence: what the run does or did, to whom, and how long.
+function runStatusLine(r) {
+  const live = r.status === 'running';
+  const n = r.sources || (r.benchmark && r.benchmark.sessions) || 0;
+  let what;
   if (r.mode === 'benchmark') {
-    parts.push(`${esc(r.proto)} ${esc(r.role)}`);
-    if (r.target_port) parts.push(r.role === 'slave' ? `listening on port ${r.target_port}` : `port ${r.target_port}`);
+    const proto = esc(String(r.proto || 'iec104').toUpperCase().replace('IEC104', 'IEC 104'));
+    if (r.role === 'slave') {
+      const rtus = n ? plural(n, 'RTU') : 'RTUs';
+      const port = r.target_port ? ` on port ${esc(r.target_port)}` : '';
+      what = live ? `${proto} slave: ${rtus} listening${port} for the master` : `${proto} slave: simulated ${rtus}${port}`;
+    } else {
+      const ms = n ? plural(n, 'master session') : 'master sessions';
+      what = `${proto} master: ${ms} ${live ? 'to' : 'against'} <code>${esc(r.target_ip)}${r.target_port ? ':' + esc(r.target_port) : ''}</code>`;
+    }
   } else {
-    parts.push('raw L2');
-    parts.push(`speed ${esc(r.speed)}×${r.top_speed ? ' (top)' : ''}`);
-    if (r.realtime) parts.push('SCHED_FIFO');
+    what = `Raw L2 replay to <code>${esc(r.target_ip)}</code> at ${esc(r.speed)}×${r.top_speed ? ' (top speed)' : ''}${r.realtime ? ', SCHED_FIFO' : ''}`;
   }
-  parts.push(`started ${fmtClock(r.started_at)}${r.started_by ? ' by ' + esc(r.started_by) : ''}`);
-  if (r.finished_at) parts.push(`took ${fmtDuration((r.finished_at - r.started_at) * 1000)}`);
+  const when = live
+    ? `started ${fmtClock(r.started_at)}${r.started_at ? ', running ' + fmtDuration(Date.now() - r.started_at * 1000) : ''}`
+    : `started ${fmtClock(r.started_at)}${r.finished_at ? ', took ' + fmtDuration((r.finished_at - r.started_at) * 1000) : ''}`;
+  const parts = [what, when];
+  if (r.started_by) parts.push(`by ${esc(r.started_by)}`);
+  if (r.rerun_of != null) parts.push(`re-run of <a href="#/runs/${esc(r.rerun_of)}">${runNum(r.rerun_of)}</a>`);
   const v = r.benchmark && r.benchmark.protocol_violations;
   if (v) parts.push(`<span class="bad">${plural(v, 'protocol violation')}</span>`);
   return parts.join(' · ');
@@ -218,6 +238,7 @@ function runSubmeta(r) {
 function filteredRuns() {
   const q = runUi.filter.toLowerCase();
   return S.runs.filter(r => {
+    if (isPendingDelete('run-' + r.id)) return false;
     if (runUi.status && r.status !== runUi.status) return false;
     if (!q) return true;
     const hay = `${r.id} ${runNum(r.id)} ${libraryName(r.pcap_id, r.pcap)} ${r.target_ip} ${r.status} ${r.role} ${r.proto}`.toLowerCase();
@@ -227,11 +248,24 @@ function filteredRuns() {
 
 function renderRuns() {
   if (S.view !== 'runs') return;
-  const all = S.runs;
+  const all = S.runs.filter(r => !isPendingDelete('run-' + r.id));
   const running = all.filter(r => r.status === 'running').length;
   setText(el('runs-meta'), all.length ? `${all.length} total · ${running} running` : '—');
-  el('runs-empty').hidden = !S.runsLoaded || all.length > 0;
+  const empty = el('runs-empty');
+  empty.hidden = !S.runsLoaded || all.length > 0;
+  if (!empty.hidden) {
+    const have = S.library.length > 0;
+    setHTML(empty, emptyStateHtml({
+      step: have ? 2 : 1,
+      title: 'No runs yet',
+      body: have
+        ? 'Pick a scenario in Configure: simulate RTUs to test a SCADA master, or act as the master to test an RTU. Runs show up here while they play, with a live diagram.'
+        : 'Upload a capture in the Library first; then configure and start a run.',
+      action: have ? '<a class="btn btn-primary" href="#/configure">Configure a run</a>' : '<a class="btn btn-primary" href="#/library">Upload a capture</a>',
+    }));
+  }
   el('runs-toolbar').hidden = all.length < 2;
+  renderLiveStrip();
   const list = filteredRuns();
   const pages = Math.max(1, Math.ceil(list.length / RUNS_PER_PAGE));
   runUi.page = Math.min(runUi.page, pages - 1);
@@ -254,6 +288,12 @@ function pagerHtml(act, page, pages, total, what, extra = '') {
 }
 
 const RUN_PARTS = ['head', 'err', 'warn', 'progress', 'states', 'spark', 'analysis', 'actions', 'msg', 'sessions', 'detail'];
+// Progress means something only with a plan: never "0% · 0 / 0".
+function runProgress(r) {
+  const total = r.planned || (r.report ? r.report.total_packets : 0) || (r.benchmark ? r.benchmark.total_messages_sent : 0);
+  const cur = r.status === 'running' ? r.sent : (r.report ? r.report.total_packets : (r.benchmark ? r.benchmark.total_messages_sent : r.sent));
+  return { total: total || 0, cur: cur || 0 };
+}
 
 // Latest stored analysis and the auto-analysis state of a run.
 const AUTO_TEXT = { queued: 'Auto-analysis queued', running: 'Auto-analysis running…', done: 'Auto-analysis done', failed: 'Auto-analysis failed', skipped: 'Auto-analysis skipped' };
@@ -286,8 +326,8 @@ function renderRunCard(li, r, isNew) {
   const part = p => li.querySelector(`[data-part="${p}"]`);
   li.className = `run run-st-${r.status}`;
   setHTML(part('head'),
-    `<h3 class="run-title">${runTitle(r)}</h3><span class="status s-${esc(r.status)}">${esc(r.status)}</span>` +
-    `<p class="submeta">${runSubmeta(r)}</p>`);
+    `<h3 class="run-title">${runTitle(r)}</h3><span class="status s-${esc(r.status)}">${esc(STATUS_WORD[r.status] || r.status)}</span>` +
+    `<p class="submeta run-line">${runStatusLine(r)}</p>`);
   const expanded = runUi.expanded.has(r.id);
   const hint = r.error ? explainRunError(r.error) : '';
   setHTML(part('err'), r.error && !expanded
@@ -299,38 +339,28 @@ function renderRunCard(li, r, isNew) {
   setHTML(part('warn'), warns.length
     ? `<div class="warn-box run-warnings"><b>${warns.length === 1 ? 'Warning' : `${warns.length} warnings`}:</b><ul>${warns.slice(0, 5).map(w => `<li>${esc(w)}</li>`).join('')}${warns.length > 5 ? `<li>… ${warns.length - 5} more in the details</li>` : ''}</ul></div>` : '');
 
-  const total = r.planned || (r.report ? r.report.total_packets : 0) || (r.benchmark ? r.benchmark.total_messages_sent : 0);
-  const cur = r.status === 'running' ? r.sent : (r.report ? r.report.total_packets : (r.benchmark ? r.benchmark.total_messages_sent : r.sent));
-  const p = total ? pct(cur, total) : (r.status === 'completed' ? 100 : 0);
-  setHTML(part('progress'),
-    `<div class="pbar s-${esc(r.status)}"><span class="plabel" id="plabel-${r.id}">Progress</span>` +
-    `<div class="ptrack" role="progressbar" aria-labelledby="plabel-${r.id}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p}"><div class="pfill" style="width:${p}%"></div></div>` +
-    `<span class="pcount">${p}% · ${fmtInt(cur || 0)} / ${fmtInt(total || 0)}${r.mode === 'benchmark' ? ' messages' : ' packets'}</span></div>`);
+  const { total, cur } = runProgress(r);
+  const p = pct(cur, total);
+  const unit = r.mode === 'benchmark' ? 'messages' : 'packets';
+  setHTML(part('progress'), total > 0
+    ? `<div class="pbar s-${esc(r.status)}"><span class="plabel" id="plabel-${r.id}">${r.status === 'running' ? 'Progress' : 'Sent'}</span>` +
+      `<div class="ptrack" role="progressbar" aria-labelledby="plabel-${r.id}" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${p}"><div class="pfill" style="width:${p}%"></div></div>` +
+      `<span class="pcount">${r.status !== 'running' && cur >= total ? `${fmtInt(cur)} ${unit}<span class="muted"> (plan ${fmtInt(total)})</span>` : `${p}% · ${fmtInt(cur)} / ${fmtInt(total)} ${unit}`}</span></div>`
+    : (r.status === 'running' ? `<p class="hint pbar-wait">Waiting for the first ${r.mode === 'benchmark' && r.role === 'slave' ? 'master connection' : 'messages'}…</p>` : ''));
 
   setHTML(part('states'), stateBarHtml(r));
 
   const th = r.throughput_history || [];
-  setHTML(part('spark'), r.status === 'running' && th.length > 1
-    ? `<div class="sparkrow"><span class="lbl">Throughput</span>${sparklineSvg(th)}<span class="val">${fmtInt(th[th.length - 1])} pkt/s</span></div>` : '');
+  // While the live strip shows this run, its sparkline is not repeated.
+  const strip = r.status === 'running' && liveFrameFor(r.id);
+  setHTML(part('spark'), r.status === 'running' && th.length > 1 && !strip
+    ? `<div class="sparkrow"><span class="lbl">Throughput</span>${sparklineSvg(th)}<span class="val">${fmtInt(th[th.length - 1])} pkt/s</span></div>` : finishedStatsHtml(r));
   setHTML(part('analysis'), analysisStateHtml(r));
 
-  const acts = [];
-  if (r.status === 'running') {
-    acts.push(`<button type="button" class="btn btn-danger" data-act="run-stop" data-id="${r.id}" data-fk="run-${r.id}-stop">Stop</button>`);
-    const rows = sessionRowsFor(r);
-    const pending = rows.length
-      ? rows.filter(x => x.state === 'pending' && !x.cancelled).length
-      : ((r.source_states || {}).pending || 0);
-    if (pending && (r.role === 'slave' || rows.some(x => x.listen_port > 0))) {
-      acts.push(`<button type="button" class="btn btn-secondary" data-act="run-start-all" data-id="${r.id}" data-fk="run-${r.id}-startall">Start all pending (${pending})</button>`);
-    }
-  }
-  acts.push(`<button type="button" class="btn btn-secondary" data-act="run-toggle" data-id="${r.id}" data-fk="run-${r.id}-toggle" aria-expanded="${expanded}" aria-controls="run-detail-${r.id}">${expanded ? 'Hide details' : 'Details'}</button>`);
-  if (r.has_capture) acts.push(`<a class="btn btn-secondary" href="/api/runs/${r.id}/download" download>Download capture</a>`);
-  if (r.mode === 'benchmark' && r.status !== 'running') acts.push(`<a class="btn btn-secondary" href="#/analysis/${r.id}">Analyze</a>`);
-  acts.push(...runReuseButtons(r, 'card'));
-  if (r.status !== 'running') acts.push(`<button type="button" class="btn btn-text danger" data-act="run-delete" data-id="${r.id}" data-fk="run-${r.id}-delete" aria-label="Delete run ${r.id}">Delete</button>`);
-  setHTML(part('actions'), `<div class="btn-row">${acts.join('')}</div>`);
+  // One primary action, the details toggle, and everything else in a
+  // menu. An open menu is not rebuilt under the user (it updates when
+  // it closes).
+  if (!menuIsOpenIn(part('actions'))) setHTML(part('actions'), runActionsHtml(r, expanded));
   const m = runUi.msg.get(r.id);
   setHTML(part('msg'), m ? `<p class="run-msg ${esc(m.cls)}" role="status">${m.html}</p>` : '');
 
@@ -338,14 +368,34 @@ function renderRunCard(li, r, isNew) {
   renderDetail(part('detail'), r, expanded);
 }
 
-// Re-run, load into Configure, compare: on the card and in the detail.
-function runReuseButtons(r, where) {
-  const b = [];
-  const fk = `run-${r.id}-${where}`;
-  if (r.status !== 'running') b.push(`<button type="button" class="btn btn-secondary" data-act="run-rerun" data-id="${r.id}" data-fk="${fk}-rerun" aria-label="Re-run run ${r.id}">Re-run</button>`);
-  b.push(`<button type="button" class="btn btn-secondary" data-act="run-load" data-id="${r.id}" data-fk="${fk}-load" aria-label="Load the settings of run ${r.id} into Configure">Load into Configure</button>`);
-  if (r.mode === 'benchmark' && r.status !== 'running') b.push(`<button type="button" class="btn btn-secondary" data-act="run-compare" data-id="${r.id}" data-fk="${fk}-compare" aria-label="Compare run ${r.id} with another run">Compare with…</button>`);
-  return b;
+function runActionsHtml(r, expanded) {
+  const acts = [];
+  const live = r.status === 'running';
+  const la = r.latest_analysis;
+  if (live) {
+    acts.push(`<button type="button" class="btn btn-danger" data-act="run-stop" data-id="${r.id}" data-fk="run-${r.id}-stop">Stop run</button>`);
+    const rows = sessionRowsFor(r);
+    const pending = rows.length
+      ? rows.filter(x => x.state === 'pending' && !x.cancelled).length
+      : ((r.source_states || {}).pending || 0);
+    if (pending && (r.role === 'slave' || rows.some(x => x.listen_port > 0))) {
+      acts.push(`<button type="button" class="btn btn-secondary" data-act="run-start-all" data-id="${r.id}" data-fk="run-${r.id}-startall">Start all pending (${pending})</button>`);
+    }
+  } else if (r.mode === 'benchmark' && la) {
+    acts.push(`<a class="btn btn-primary" href="#/analysis/${r.id}/${esc(la.id)}" data-fk="run-${r.id}-primary">View analysis</a>`);
+  } else if (r.mode === 'benchmark') {
+    acts.push(`<a class="btn btn-primary" href="#/analysis/${r.id}" data-fk="run-${r.id}-primary">Analyze</a>`);
+  }
+  acts.push(`<button type="button" class="btn btn-secondary disclosure" data-act="run-toggle" data-id="${r.id}" data-fk="run-${r.id}-toggle" aria-expanded="${expanded}" aria-controls="run-detail-${r.id}">Details</button>`);
+  const items = [];
+  const mi = (act, label, extra = '') => `<button type="button" role="menuitem" tabindex="-1" class="menu-item" data-act="${act}" data-id="${r.id}" data-fk="run-${r.id}-card-${act.replace('run-', '')}"${extra}>${label}</button>`;
+  if (!live) items.push(mi('run-rerun', 'Re-run…'));
+  items.push(mi('run-load', 'Load into Configure'));
+  if (r.mode === 'benchmark' && !live) items.push(mi('run-compare', 'Compare with…'));
+  if (r.mode === 'benchmark' && !live && la) items.push(`<a role="menuitem" tabindex="-1" class="menu-item" href="#/analysis/${r.id}">New analysis…</a>`);
+  if (r.has_capture) items.push(`<a role="menuitem" tabindex="-1" class="menu-item" href="/api/runs/${r.id}/download" download>Download capture</a>`);
+  if (!live) items.push(`<button type="button" role="menuitem" tabindex="-1" class="menu-item danger" data-act="run-delete" data-id="${r.id}" data-fk="run-${r.id}-delete">Delete run</button>`);
+  return `<div class="btn-row">${acts.join('')}${menuHtml(`run-menu-${r.id}`, `More actions for run ${r.id}`, items)}</div>`;
 }
 
 function setRunMsg(id, cls, html) {
@@ -872,23 +922,36 @@ actions({
     if (res.ok && res.data && typeof res.data.started === 'number') announce(`${res.data.started} sessions started`);
     pollRunsSoon();
   },
-  'run-delete': async b => {
+  // Finished runs are deleted with Undo instead of a confirmation: the
+  // card disappears at once and the DELETE is sent when the toast ends.
+  'run-delete': b => {
     const id = Number(b.dataset.id);
-    const ok = await askDialog({
-      title: `Delete run #${id}?`,
-      body: 'This removes it from the history and deletes its captured pcap.',
-      confirm: 'Delete run',
-      danger: true,
+    const r = S.runs.find(x => x.id === id);
+    if (!r || r.status === 'running') return;
+    const card = qs(`#runs-list > li[data-key="${id}"]`);
+    const next = card && (card.nextElementSibling || card.previousElementSibling);
+    deferDelete({
+      key: 'run-' + id,
+      url: `/api/runs/${id}`,
+      message: `Run #${id} deleted, with its capture.`,
+      returnFocus: el('runs-filter'),
+      hide: () => {
+        renderRuns();
+        const f = next && qs('[data-act="run-toggle"]', next);
+        if (f) f.focus(); else el('h-runs').focus();
+      },
+      restore: () => { renderRuns(); },
+      commit: async () => {
+        const res = await apiAction(`Delete run #${id}`, `/api/runs/${id}`, 'DELETE');
+        if (res.ok) {
+          runUi.expanded.delete(id);
+          S.runDetail.delete(id);
+          S.runs = S.runs.filter(x => x.id !== id);
+        }
+        pollRunsSoon();
+        renderRuns();
+      },
     });
-    if (!ok) return;
-    const res = await apiAction(`Delete run #${id}`, `/api/runs/${id}`, 'DELETE');
-    if (res.ok) {
-      runUi.expanded.delete(id);
-      S.runDetail.delete(id);
-      S.runs = S.runs.filter(r => r.id !== id);
-      announce(`Run ${id} deleted`);
-    }
-    pollRunsSoon();
   },
   'slave-start': async b => {
     await apiAction('Start listening', `/api/runs/${b.dataset.run}/slaves/${b.dataset.idx}/start`, 'POST');
@@ -1024,13 +1087,13 @@ function latencyChart(uid, hist, p50, p99) {
     svg += `<rect class="bucket-bg" x="${x}" y="${padT}" width="${bw}" height="${ih}" fill="transparent" data-idx="${i}" data-uid="${uid}"/>`;
     svg += `<rect x="${x + 2}" y="${padT + ih - bh}" width="${bw - 4}" height="${bh}" fill="var(--blue)" opacity="0.85"/>`;
   }
-  const marker = (v, color, label) => {
+  const marker = (v, color, label, row) => {
     if (!v) return '';
     const f = Math.max(0, Math.min(1, (Math.log10(Math.max(1, v)) - logMin) / (logMax - logMin)));
     const x = padL + f * iw;
-    return `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + ih}" stroke="${color}" stroke-width="1.5" stroke-dasharray="3,3"/><text x="${x + 4}" y="${padT + 12}" font-size="11" fill="${color}">${label} ${usFmt(v)}</text>`;
+    return `<line x1="${x}" y1="${padT}" x2="${x}" y2="${padT + ih}" stroke="${color}" stroke-width="1.5" stroke-dasharray="3,3"/><text x="${x + 4}" y="${padT + 12 + row * 14}" font-size="11" fill="${color}">${label} ${usFmt(v)}</text>`;
   };
-  svg += marker(p50, 'var(--ok)', 'p50') + marker(p99, 'var(--accent)', 'p99');
+  svg += marker(p50, 'var(--ok)', 'p50', 0) + marker(p99, 'var(--accent)', 'p99', 1);
   svg += `<line x1="${padL}" y1="${padT + ih}" x2="${w - padR}" y2="${padT + ih}" stroke="var(--ink)"/>`;
   const tick = l => (l < 3 ? `${Math.round(10 ** l)} µs` : l < 6 ? `${Math.round(10 ** (l - 3))} ms` : `${Math.round(10 ** (l - 6))} s`);
   const ticks = [];
@@ -1073,11 +1136,96 @@ document.addEventListener('mouseout', e => { if (e.target.classList && e.target.
 
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Live dashboard strip: throughput sparkline (uplink and downlink),
+// messages in flight, ack latency and the session-state bar, fed by
+// the running run's WebSocket frames (see 50-diagram.js). Ack latency
+// percentiles are computed by the sessions when they finish, so they
+// appear for finished runs; while running the strip says so.
+
+const liveHist = { runId: null, up: [], down: [], lastAt: 0 };
+const LIVE_HIST_N = 120;
+
+function recordLiveFrame(frame) {
+  if (liveHist.runId !== frame.run_id) { liveHist.runId = frame.run_id; liveHist.up = []; liveHist.down = []; liveHist.lastAt = 0; }
+  const now = Date.now();
+  if (now - liveHist.lastAt < 900) return;   // about one sample per second
+  liveHist.lastAt = now;
+  liveHist.up.push(frame.pps_sent || 0);
+  liveHist.down.push(frame.pps_recv || 0);
+  if (liveHist.up.length > LIVE_HIST_N) { liveHist.up.shift(); liveHist.down.shift(); }
+}
+
+function dualSparkSvg(up, down) {
+  const w = 300, h = 44, pad = 2;
+  const n = Math.max(up.length, 2);
+  const max = Math.max(1, ...up, ...down);
+  const pts = arr => arr.map((v, i) => `${(pad + (i / (n - 1)) * (w - 2 * pad)).toFixed(1)},${(h - pad - (v / max) * (h - 2 * pad)).toFixed(1)}`).join(' ');
+  const last = up.length ? up[up.length - 1] : 0;
+  return `<svg class="chart-svg ls-spark" viewBox="0 0 ${w} ${h}" preserveAspectRatio="none" role="img" aria-label="Throughput over the last ${up.length} seconds: now ${fmtInt(last)} messages per second sent, peak ${fmtInt(max)}">` +
+    (up.length > 1 ? `<polyline points="${pts(down)}" fill="none" stroke="var(--blue)" stroke-width="1.5" vector-effect="non-scaling-stroke"/>` +
+      `<polyline points="${pts(up)}" fill="none" stroke="var(--accent)" stroke-width="1.75" vector-effect="non-scaling-stroke"/>` : '') +
+    '</svg>';
+}
+
+function stateBarFromRows(rows) {
+  const c = stateCounts(rows);
+  let bar = '<div class="state-bar" aria-hidden="true">';
+  const words = [];
+  for (const s of STATE_ORDER) {
+    if (!c[s]) continue;
+    bar += `<span class="sb-seg st-${s}" style="flex:${c[s]}"></span>`;
+    words.push(`<span class="st-item"><span class="sw st-${s}"></span>${fmtInt(c[s])} ${s}</span>`);
+  }
+  return bar + `</div><p class="state-line">${words.join('')}</p>`;
+}
+
+function renderLiveStrip() {
+  const box = el('live-strip');
+  const running = S.runs.find(r => r.status === 'running');
+  const f = running ? liveFrameFor(running.id) : null;
+  if (!running) { box.hidden = true; return; }
+  box.hidden = false;
+  const rows = f ? (f.per_session || []) : sessionRowsFor(running);
+  const inflight = rows.reduce((a, p) => a + (p.unacked || 0), 0);
+  const up = f ? (f.pps_sent || 0) : 0;
+  const down = f ? (f.pps_recv || 0) : 0;
+  const hist = liveHist.runId === running.id ? liveHist : { up: [], down: [] };
+  const peak = hist.up.length ? Math.max(...hist.up) : 0;
+  const tile = (k, v, sub, cls = '') => `<div class="ls-tile ${cls}"><span class="k">${k}</span><span class="v">${v}</span>${sub ? `<span class="sub">${sub}</span>` : ''}</div>`;
+  let h = `<div class="ls-head"><span class="ls-live" aria-hidden="true"></span><b>${runNum(running.id)}</b> live · ${esc(libraryName(running.pcap_id, running.pcap))}` +
+    `${f ? '' : ' <span class="hint">(connecting to the live stream…)</span>'}</div>`;
+  h += '<div class="ls-tiles">';
+  h += `<div class="ls-tile ls-tp"><span class="k">Throughput <span class="ls-key"><span class="lk-up"></span>sent <span class="lk-down"></span>received</span></span>` +
+    `<span class="v">${fmtInt(up)} <span class="u">msg/s</span> <span class="ls-down">↓ ${fmtInt(down)}</span></span>${dualSparkSvg(hist.up, hist.down)}<span class="sub">peak ${fmtInt(peak)} msg/s, last ${hist.up.length} s</span></div>`;
+  h += tile('In flight', fmtInt(inflight), 'sent, not yet acknowledged');
+  h += tile('Ack latency p50 / p99', '—', 'measured per session; shown when the run ends', 'muted');
+  h += `<div class="ls-tile ls-states"><span class="k">Sessions · ${fmtInt(rows.length || running.sources || 0)}</span>${rows.length ? stateBarFromRows(rows) : '<span class="sub">no session data yet</span>'}</div>`;
+  h += '</div>';
+  setHTML(el('ls-grid'), h);
+}
+
+// After the run: the final figures, including the ack-latency
+// percentiles the sessions computed, on the run's card.
+function finishedStatsHtml(r) {
+  const b = r.benchmark;
+  if (!b || r.status === 'running' || !b.total_messages_sent) return '';
+  const lat = us => (us ? usFmt(us) : '—');
+  return `<dl class="run-stats">` +
+    `<div><dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd></div>` +
+    `<div><dt>Ack p50</dt><dd>${lat(b.aggregate_latency_p50_us)}</dd></div>` +
+    `<div><dt>Ack p99</dt><dd>${lat(b.aggregate_latency_p99_us)}</dd></div>` +
+    (b.sessions_failed ? `<div><dt>Failed sessions</dt><dd class="bad">${fmtInt(b.sessions_failed)} of ${fmtInt(b.sessions)}</dd></div>` : '') +
+    `<div><dt>Messages</dt><dd>${fmtInt(b.total_messages_sent)} sent · ${fmtInt(b.total_messages_received)} received</dd></div></dl>`;
+}
+
 function initRuns() {
   el('runs-filter').addEventListener('input', e => { runUi.filter = e.target.value.trim(); runUi.page = 0; renderRuns(); });
   el('runs-status').addEventListener('change', e => { runUi.status = e.target.value; runUi.page = 0; renderRuns(); });
   on('runs', updateRerunWatch);
   on('runs', renderRuns);
+  // A card's actions skip updates while its menu is open; catch up.
+  on('menu-closed', () => { if (S.view === 'runs') renderRuns(); });
   on('library', renderRuns);
   on('route', ({ view, arg }) => {
     if (view !== 'runs') return;

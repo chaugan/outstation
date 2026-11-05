@@ -485,7 +485,8 @@ function initCompare() {
   });
   on('route', r => { if (r.view === 'compare') onCmpRoute(r); });
   on('runs', () => { if (S.view === 'compare') renderCmpPickers(); });
-  on('library', () => { if (S.view === 'compare') renderCmpPickers(); });
+  // Capture names come from the library, which may load after the result.
+  on('library', () => { if (S.view === 'compare') { renderCmpPickers(); if (cmp.data && !isBusyIn(el('cmp-result'))) renderCmpResult(); } });
   on('analysis-event', ({ data }) => {
     // An analysis finished for a run whose comparison is waiting on it.
     if (S.view !== 'compare' || cmp.data || cmp.a == null || cmp.b == null) return;

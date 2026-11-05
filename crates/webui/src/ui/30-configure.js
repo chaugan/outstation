@@ -158,7 +158,7 @@ function renderPcapSummary() {
   } else if (!p.viability) {
     setHTML(box, `<p class="meta-line">${fmtBytes(p.size_bytes)} · <span class="badge analyzing">analysing</span> The server is still parsing this pcap; this updates by itself.</p>`);
   } else {
-    setHTML(box, `<p class="meta-line">${pcapMeta(p)}</p>` + viabilityHtml(p.viability));
+    setHTML(box, `<p class="meta-line">${pcapMeta(p)}</p>` + viabilityHtml(p.viability, p));
   }
   renderPicker();
   renderStartSummary();
@@ -552,11 +552,136 @@ function renderStartSummary() {
   }
   parts.push(p ? p.name : 'no pcap selected');
   setText(el('start-summary'), parts.join(' · '));
+  renderCfgSummary();
   const caps = S.status && S.status.capabilities;
   const w = el('caps-warn');
   const missing = caps && !(caps.net_admin && caps.net_raw);
   w.hidden = !missing;
   if (missing) setText(w, 'This server lacks CAP_NET_ADMIN / CAP_NET_RAW, so runs will fail when they set up the network. Start it through the systemd unit, or grant those capabilities.');
+}
+
+// ---------------------------------------------------------------------------
+// "What will run": a summary of the form, sticky beside it on wide
+// screens and collapsed above the start bar on phones.
+
+function linkParamsText() {
+  const parts = [];
+  for (const [id, k, unit] of [['cfg-k', 'k', ''], ['cfg-w', 'w', ''], ['cfg-t0', 't0', ' s'], ['cfg-t1', 't1', ' s'], ['cfg-t2', 't2', ' s'], ['cfg-t3', 't3', ' s']]) {
+    const v = val(id);
+    if (v !== '') parts.push(`${k} ${v}${unit}`);
+  }
+  return parts.length ? parts.join(', ') : 'defaults (k 12, w 8, t1 15 s, t2 10 s, t3 20 s)';
+}
+
+function renderCfgSummary() {
+  const list = el('cfg-sum-list');
+  if (!list) return;
+  const c = cfg();
+  const bench = c.mode === 'benchmark';
+  const p = S.library.find(x => x.id === S.selectedPcapId);
+  const rows = [];
+  const row = (k, v, cls) => rows.push(`<dt>${esc(k)}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`);
+  // <wbr> after separators, so a long file name breaks at a sensible place.
+  row('Capture', p ? `<code class="wrap">${esc(p.name).replace(/([._-])/g, '$1<wbr>')}</code>` : 'none selected', p ? '' : 'warn');
+  if (bench) {
+    row('Role', c.role === 'slave' ? 'We simulate the RTUs (slave); the SCADA master connects to us' : 'We act as the master and connect to the target');
+    const ip = val('cfg-target-ip');
+    if (c.role === 'master') {
+      row('Target', ip ? `<code>${esc(ip)}:${esc(val('cfg-target-port') || '?')}</code>` : 'not set', ip ? '' : 'warn');
+    } else {
+      row('Listeners', `port ${esc(val('cfg-listen-port-base') || '?')}, one IP per RTU${ip ? ` · master <code>${esc(ip)}</code>` : ''}`);
+    }
+    const set = pickerSel.get(picker.key);
+    const what = c.role === 'slave' ? 'RTUs' : 'Masters';
+    row(what, set && picker.key ? `${fmtInt(set.size)} of ${fmtInt(picker.rows.length)}` : (p ? 'all in the capture' : '—'), set && set.size === 0 ? 'bad' : '');
+    row('Pacing', c.pacing === 'original' ? `captured pace × ${esc(val('cfg-speed') || '1')}` : 'as fast as possible');
+  } else {
+    row('Target', `<code>${esc(val('cfg-target-ip') || '?')}</code> · <code>${esc(val('cfg-target-mac') || 'no MAC')}</code>`);
+    row('Pacing', el('cfg-top-speed').checked ? 'top speed' : `captured pace × ${esc(val('cfg-speed') || '1')}`);
+  }
+  const it = Number(val('cfg-iterations'));
+  let iters = val('cfg-iterations') === '' ? '?' : (it === 0 ? 'until stopped' : fmtInt(it));
+  if (bench && c.role === 'master' && it !== 1) iters += `, ${esc(val('cfg-iteration-gap') || '0')} ms apart`;
+  if (bench && c.role === 'slave' && el('cfg-loop-within-session').checked) iters += ', in one TCP session';
+  row('Iterations', iters);
+  if (bench && c.proto === 'iec104') {
+    row('Link', esc(linkParamsText()));
+    row('Timestamps', el('cfg-fresh-ts').checked ? `fresh (${(radio('cp56-zone') || 'local') === 'utc' ? 'UTC' : 'local time'})` : 'as captured');
+    row('Faults', faultRows.length ? esc(faultPlanSummary()) : 'none', faultRows.length ? 'warn' : '');
+  }
+  const nic = val('cfg-nic');
+  row('Network', nic ? `egress via <code>${esc(nic)}</code>` : 'isolated bridge on this host');
+  if (el('cfg-force').checked) row('Protection', 'override on: you will be asked to confirm', 'warn');
+  setHTML(list, rows.join(''));
+  // Presets show which scenario the form is in.
+  for (const [name, pr] of Object.entries(PRESETS)) {
+    const b = el('preset-' + name);
+    if (b) b.setAttribute('aria-pressed', String(bench && c.role === pr.role));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Scenario presets: the two jobs people come here for. They set the
+// scenario fields only; the pcap, addresses, NICs, link parameters and
+// fault plan are left as they are.
+
+const PRESETS = {
+  scada: {
+    title: 'Test a SCADA master', role: 'slave',
+    what: 'slave role, captured pace, one iteration, GI/CI and commands answered live, fresh timestamps',
+    apply() {
+      setRadio('role', 'slave');
+      setField('cfg-listen-port-base', val('cfg-listen-port-base') || 2404);
+      setField('cfg-loop-within-session', false);
+      setField('cfg-gi-ci-synth', true);
+      setField('cfg-cmd-enabled', true);
+    },
+  },
+  rtu: {
+    title: 'Test an RTU or server', role: 'master',
+    what: 'master role, port 2404, captured pace, all sessions at once, one iteration, fresh timestamps',
+    apply() {
+      setRadio('role', 'master');
+      setField('cfg-target-port', 2404);
+      setRadio('concurrency', 'all_at_once');
+      setField('cfg-iteration-gap', 1000);
+    },
+  },
+};
+
+function applyPreset(name) {
+  const pr = PRESETS[name];
+  if (!pr) return;
+  setRadio('mode', 'benchmark');
+  setRadio('pacing', 'original');
+  setField('cfg-speed', 1);
+  setField('cfg-iterations', 1);
+  setField('cfg-fresh-ts', true);
+  pr.apply();
+  for (const n of qsa('#run-form [aria-invalid="true"]')) fieldError(n.id, '');
+  applyVisibility();
+  saveForm();
+  const st = el('preset-status');
+  setText(st, `${pr.title}: ${pr.what}. Your capture, addresses, NICs, link parameters and fault plan are unchanged.`);
+  announce(`${pr.title} preset applied`);
+}
+
+actions({ preset: b => applyPreset(b.dataset.preset) });
+
+function renderCfgEmpty() {
+  const none = S.libraryLoaded && !S.library.length;
+  const box = el('cfg-empty');
+  box.hidden = !none;
+  qs('#view-configure .presets').hidden = none;
+  qs('#view-configure .cfg-layout').hidden = none;
+  if (none) {
+    setHTML(box, emptyStateHtml({
+      step: 1,
+      title: 'Upload a capture first',
+      body: 'A run replays a capture from the library. Upload the IEC 104 capture you want to replay, then come back here.',
+      action: '<a class="btn btn-primary" href="#/library">Go to the Library</a>',
+    }));
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -716,7 +841,7 @@ function initConfigure() {
     if (t.id === 'cfg-proto-config' || _touched.has(t.id) || t.getAttribute('aria-invalid') === 'true') validateField(t.id);
     saveFormSoon();
   });
-  on('library', () => { renderPcapSelect(); renderPcapSummary(); });
+  on('library', () => { renderPcapSelect(); renderPcapSummary(); renderCfgEmpty(); });
   on('selected', () => { renderPcapSelect(); renderPcapSummary(); validateField('cfg-pcap'); });
   on('protocols', renderProtoSelect);
   on('nics', renderNicSelects);
@@ -725,4 +850,7 @@ function initConfigure() {
   renderNicSelects();
   applyVisibility();
   initProfiles();
+  // Phones: the summary starts collapsed (it sits above the start bar).
+  if (window.matchMedia && window.matchMedia('(max-width: 1099px)').matches) el('cfg-summary').open = false;
+  form.addEventListener('input', () => renderCfgSummary());
 }

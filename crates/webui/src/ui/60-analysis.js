@@ -36,7 +36,24 @@ function analysableRuns() {
   return S.runs.filter(r => r.mode === 'benchmark');
 }
 
+function renderAnEmpty() {
+  const none = S.runsLoaded && !analysableRuns().length;
+  const box = el('an-empty');
+  box.hidden = !none;
+  el('an-input').hidden = none;
+  if (none) {
+    const have = S.library.length > 0;
+    setHTML(box, emptyStateHtml({
+      step: have ? (S.runs.length ? 3 : 2) : 1,
+      title: 'Nothing to analyse yet',
+      body: 'An analysis compares a stateful (benchmark) run with what arrived at the target: delivery, content, handshake, GI/CI answers and timing, per endpoint. Finished runs with a replay capture are analysed by themselves.',
+      action: have ? '<a class="btn btn-primary" href="#/configure">Configure a run</a>' : '<a class="btn btn-primary" href="#/library">Upload a capture</a>',
+    }));
+  }
+}
+
 function renderRunPicker() {
+  renderAnEmpty();
   const sel = el('an-run');
   const runs = analysableRuns();
   const want = sel.value || sel.dataset.want || '';
@@ -191,8 +208,25 @@ function showReport(report, analysisId) {
   an.report = report;
   an.analysisId = analysisId;
   an.details = new Map(Object.entries(report.details_by_ip || {}));
-  el('an-download-json').hidden = false;
+  an.filter = '';
+  an.verdict = '';
+  // The result takes the screen; the input card folds into one line.
+  el('an-input').open = false;
+  setText(el('an-input-sum'), `showing ${runNum(report.run_id)}${analysisId != null ? ', analysis #' + analysisId : ''}; open to analyse another capture`);
   renderAnalysis();
+}
+
+// Theme change: charts are canvases with resolved colours, so the
+// report is rebuilt; open sections and endpoint rows stay open.
+function rerenderAnalysisForTheme() {
+  if (!an.report || !el('an-result').firstChild) return;
+  const openSecs = qsa('#an-result details.an-sec[open]').map(d => d.id);
+  const openRows = qsa('#an-result .an-slave-row[open]').map(d => d.dataset.ip);
+  const y = window.scrollY;
+  renderAnalysis();
+  for (const id of openSecs) { const d = el(id); if (d) d.open = true; }
+  for (const ip of openRows) { const d = qs(`.an-slave-row[data-ip="${CSS.escape(ip)}"]`); if (d) d.open = true; }
+  window.scrollTo(0, y);
 }
 
 // The JSON is built on click and the object URL revoked right after,
@@ -232,59 +266,230 @@ function renderAnalysis() {
   _resetAnalysisCharts();
   const f = r.fleet || {};
   const run = S.runs.find(x => x.id === r.run_id);
-  let h = '<div class="card an-card">';
-  h += `<h3 class="card-title">Result for ${runNum(r.run_id)}</h3>`;
+  const slaves = r.slaves || [];
+  const vc = verdictCls(r.verdict);
+  let h = '<div class="an-report">';
+
+  // 1. Verdict hero: the answer first.
+  h += `<section class="card an-hero tone-${vc}" aria-labelledby="an-hero-title">`;
+  h += `<div class="an-hero-top"><h3 class="an-hero-title" id="an-hero-title">Result for ${runNum(r.run_id)}</h3>`;
+  h += '<div class="btn-row an-export">';
   if (an.analysisId != null) {
     // Self-contained, printable HTML export of the stored analysis (F131).
     const rep = `/api/analyses/${encodeURIComponent(an.analysisId)}/report.html`;
-    h += `<p class="btn-row an-export"><a class="btn btn-secondary" id="an-report-html" href="${rep}?download=1" download>Download HTML report</a>` +
-      `<a class="btn btn-text" href="${rep}" target="_blank" rel="noopener">Open printable report</a></p>`;
+    h += `<a class="btn btn-secondary" id="an-report-html" href="${rep}?download=1" download>Download HTML report</a>` +
+      `<a class="btn btn-text" href="${rep}" target="_blank" rel="noopener">Printable report</a>`;
   }
-  h += `<p class="meta-line">Compared against ${runNum(r.run_id)} (${esc(run ? libraryName(run.pcap_id, run.pcap) : basename(r.original_pcap))}, ${esc(r.role)} role${run && run.target_port ? ', port ' + esc(run.target_port) : ''}, ${esc(r.mode)} mode)` +
-    `${r.run_selection ? ` · run chosen ${r.run_selection === 'explicit' ? 'explicitly' : 'as the latest finished run'}` : ''}` +
-    `${r.run_status ? ` · run status <span class="status s-${esc(r.run_status)}">${esc(r.run_status)}</span>` : ''}</p>`;
+  h += '<button type="button" class="btn btn-text" data-act="analysis-download">JSON</button></div></div>';
+  h += `<div class="an-summary">${verdictHtml(r.verdict)}<span class="an-score ${vc}">${Number(r.score_pct).toFixed(1)}%</span>`;
+  if (f.frame_weighted_score_pct != null) h += `<span class="hint">frame-weighted ${Number(f.frame_weighted_score_pct).toFixed(1)}%</span>`;
+  h += `<p class="reason">${esc(r.verdict_reason)}</p></div>`;
+  const facts = [];
+  const judged = f.slave_count != null ? f.slave_count : slaves.length;
+  facts.push(`<b>${fmtInt(f.fully_correct || 0)}</b> of ${fmtInt(judged)} endpoints all correct`);
+  if (f.worst && slaves.length > 1 && (Number(f.worst.score_pct) < 99.95 || (f.fully_correct || 0) < judged)) facts.push(`worst <code>${esc(f.worst.slave_ip)}</code> ${Number(f.worst.score_pct).toFixed(1)}%`);
+  const capName = run ? libraryName(run.pcap_id, run.pcap) : basename(r.original_pcap);
+  facts.push(`${capName ? esc(capName) + ', ' : ''}${esc(r.role)} role, ${esc(r.mode)} mode`);
+  if (r.run_status) facts.push(`run <span class="status s-${esc(r.run_status)}">${esc(r.run_status)}</span>`);
+  h += `<p class="an-facts">${facts.join(' · ')}</p>`;
   if (r.run_warning) h += `<div class="err-box" role="alert"><b>Run warning:</b> ${esc(r.run_warning)}</div>`;
   const warns = (r.warnings || []).filter(w => !(r.run_warning && String(w).includes(r.run_warning)));
   if (warns.length) h += '<div class="warn-box"><ul>' + warns.map(w => `<li>${esc(w)}</li>`).join('') + '</ul></div>';
-  h += `<div class="an-summary">${verdictHtml(r.verdict)}<span class="an-score ${verdictCls(r.verdict)}">${Number(r.score_pct).toFixed(1)}%</span>`;
-  if (f.frame_weighted_score_pct != null) h += `<span class="hint">frame-weighted ${Number(f.frame_weighted_score_pct).toFixed(1)}%</span>`;
-  h += `<p class="reason">${esc(r.verdict_reason)}</p></div>`;
-  const bucket = (n, label, cls) => `<li class="an-bucket ${cls}"><b>${fmtInt(n || 0)}</b> ${label}</li>`;
-  h += '<ul class="an-fleet-strip" aria-label="Endpoint outcomes">' +
-    bucket(f.slave_count, 'total', '') + bucket(f.fully_correct, 'all correct', 'ok') + bucket(f.partial, 'partial', 'warn') +
-    bucket(f.failed, 'failed', 'bad') + bucket(f.not_attempted, 'silent', 'muted');
-  if (f.never_connected != null) h += bucket(f.never_connected, 'never connected', 'bad');
-  if (f.unpaired != null) h += bucket(f.unpaired, 'unpaired', 'warn');
-  if (f.inconclusive != null) h += bucket(f.inconclusive, 'inconclusive', 'muted');
-  if (f.reconnects != null) h += bucket(f.reconnects, 'reconnects', f.reconnects ? 'warn' : '');
-  h += '</ul>';
-  if (f.best || f.worst) {
-    h += '<p class="meta-line">';
-    if (f.worst) h += `Worst <code>${esc(f.worst.slave_ip)}</code> at <b>${Number(f.worst.score_pct).toFixed(1)}%</b>. `;
-    if (f.best) h += `Best <code>${esc(f.best.slave_ip)}</code> at <b>${Number(f.best.score_pct).toFixed(1)}%</b>.`;
-    h += '</p>';
-  }
+  h += '</section>';
+
+  // 2. Overview: heatmap of every endpoint, and the dimension summary.
+  h += '<div class="an-overview">';
+  h += heatmapHtml(slaves);
+  h += dimensionsHtml(r);
+  h += '</div>';
+
+  // 3. Detail sections, collapsed.
+  const sec = (id, title, body, extra = '') => `<details class="card an-sec" id="an-sec-${id}"${extra}><summary><h4>${title}</h4></summary><div class="an-sec-body">${body}</div></details>`;
+  h += sec('endpoints', `Endpoint table <span class="opt">${fmtInt(slaves.length)} endpoints, worst first; open a row for its drill-down</span>`, endpointTableShell(r));
+  const timing = fleetChartBlock(r.fleet_pacing_timeline, 'fleet-pacing', 'Fleet pacing drift', 'Each dot is one I-frame, plotted at how many ms later the replay sent it than the original pace. Orange: mean per time bucket (flat near zero = pacing held). Dashed: p95 and p05.', 'X: seconds since capture start · Y: pacing drift in ms, positive = late') +
+    fleetChartBlock(r.fleet_drift_timeline, 'fleet-drift', 'Fleet CP56 drift', 'Each dot is one CP56 sample. Orange: mean per time bucket (flat = constant offset, slope = cumulative drift). Dashed: p95 and p05.', 'X: seconds since capture start · Y: signed drift in ms');
+  if (timing) h += sec('timing', 'Fleet timing <span class="opt">pacing and CP56 drift charts</span>', timing);
   const pr = (window.PROTOCOL_RENDERERS || {})[r.protocol];
-  if (pr && typeof pr.renderFleetExtras === 'function' && (an.details.size || r.fleet_gi_ci_audit)) h += pr.renderFleetExtras(r);
-  h += fleetChartBlock(r.fleet_pacing_timeline, 'fleet-pacing', 'Fleet pacing drift', 'Each dot is one I-frame, plotted at how many ms later the replay sent it than the original pace. Orange: mean per time bucket (flat near zero = pacing held). Dashed: p95 and p05.', 'X: seconds since capture start · Y: pacing drift in ms, positive = late');
-  h += fleetChartBlock(r.fleet_drift_timeline, 'fleet-drift', 'Fleet CP56 drift', 'Each dot is one CP56 sample. Orange: mean per time bucket (flat = constant offset, slope = cumulative drift). Dashed: p95 and p05.', 'X: seconds since capture start · Y: signed drift in ms');
-  h += '<dl class="kv">';
-  h += `<dt>Source pcap</dt><dd>${esc(run ? libraryName(run.pcap_id, r.original_pcap) : basename(r.original_pcap))}</dd>`;
-  h += `<dt>Captured file</dt><dd>${fmtBytes(r.captured_size_bytes)} · ${fmtInt(r.captured_total_packets)} packets</dd>`;
+  const extras = pr && typeof pr.renderFleetExtras === 'function' && (an.details.size || r.fleet_gi_ci_audit) ? pr.renderFleetExtras(r) : '';
+  if (extras) h += sec('gici', 'Interrogation audit <span class="opt">GI and CI across the fleet</span>', extras);
+  let info = '<dl class="kv">';
+  info += `<dt>Compared against</dt><dd>${runNum(r.run_id)}${run && run.target_port ? ', port ' + esc(run.target_port) : ''}${r.run_selection ? ` · run chosen ${r.run_selection === 'explicit' ? 'explicitly' : 'as the latest finished run'}` : ''}</dd>`;
+  info += `<dt>Source pcap</dt><dd>${esc(run ? libraryName(run.pcap_id, r.original_pcap) : basename(r.original_pcap))}</dd>`;
+  info += `<dt>Captured file</dt><dd>${fmtBytes(r.captured_size_bytes)} · ${fmtInt(r.captured_total_packets)} packets</dd>`;
   if (r.master_ip_mapping) {
     const m = r.master_ip_mapping;
-    h += `<dt>Master IP</dt><dd>${m.captured ? 'captured <code>' + esc(m.captured) + '</code>' : ''}${m.live ? ' · live <code>' + esc(m.live) + '</code>' : ''}${m.renamed ? ' (renamed)' : ''}</dd>`;
+    info += `<dt>Master IP</dt><dd>${m.captured ? 'captured <code>' + esc(m.captured) + '</code>' : ''}${m.live ? ' · live <code>' + esc(m.live) + '</code>' : ''}${m.renamed ? ' (renamed)' : ''}</dd>`;
   }
-  h += '</dl>';
-  if (r.notes && r.notes.length) h += '<h4>Notes</h4><ul class="notes">' + r.notes.map(n => `<li>${esc(n)}</li>`).join('') + '</ul>';
-  h += endpointTableShell(r);
+  if (f.best) info += `<dt>Best endpoint</dt><dd><code>${esc(f.best.slave_ip)}</code> ${Number(f.best.score_pct).toFixed(1)}%</dd>`;
+  info += '</dl>';
+  if (r.notes && r.notes.length) info += '<h5>Analyser notes</h5><ul class="notes">' + r.notes.map(n => `<li>${esc(n)}</li>`).join('') + '</ul>';
+  h += sec('info', 'Capture and run <span class="opt">files, addresses and analyser notes</span>', info);
   h += '</div>';
   setHTML(el('an-result'), h, { force: true });
   renderEndpointRows();
-  setTimeout(() => {
-    initFleetTimelineChart(r.fleet_pacing_timeline, 'fleet-pacing');
-    initFleetTimelineChart(r.fleet_drift_timeline, 'fleet-drift');
-  }, 0);
+}
+
+// ---------------------------------------------------------------------------
+// Heatmap: one tile per endpoint in IP order, coloured (and patterned,
+// so colour is not the only cue) by outcome. Tiles are buttons with a
+// roving tabindex: Tab enters the map once, arrow keys move, Home/End
+// jump, Enter or Space opens that endpoint in the table below. The
+// legend counts and the endpoint table are the text alternative.
+
+const TONE_WORD = { ok: 'pass', warn: 'warning', bad: 'fail', muted: 'not judged' };
+const TONE_MARK = { ok: '✓', warn: '!', bad: '✗', muted: '·' };
+
+function heatmapHtml(slaves) {
+  if (!slaves.length) return '<section class="card an-heat"><h4>Endpoints</h4><p class="hint">No endpoints to report.</p></section>';
+  const rows = slaves.slice().sort((a, b) => ipToInt(a.slave_ip) - ipToInt(b.slave_ip));
+  const counts = { ok: 0, warn: 0, bad: 0, muted: 0 };
+  let tiles = '';
+  rows.forEach((s, i) => {
+    const t = outcomeCls(s.outcome, s.verdict);
+    counts[t]++;
+    const label = `${s.slave_ip}: ${String(s.verdict || 'unknown').replace(/_/g, ' ')}, ${Number(s.score_pct).toFixed(1)}%, ${TONE_WORD[t]}`;
+    tiles += `<button type="button" class="hm-t t-${t}" data-ip="${esc(s.slave_ip)}" tabindex="${i === 0 ? 0 : -1}" aria-label="${esc(label)}" title="${esc(label)}"></button>`;
+  });
+  const legend = ['ok', 'warn', 'bad', 'muted'].filter(t => counts[t]).map(t =>
+    `<li><span class="hm-sw t-${t}" aria-hidden="true"></span><b>${fmtInt(counts[t])}</b> ${TONE_WORD[t]}</li>`).join('');
+  const summary = ['ok', 'warn', 'bad', 'muted'].filter(t => counts[t]).map(t => `${counts[t]} ${TONE_WORD[t]}`).join(', ');
+  return `<section class="card an-heat" aria-labelledby="an-heat-title"><div class="an-heat-head"><h4 id="an-heat-title">Endpoints <span class="opt">${fmtInt(rows.length)}, in IP order</span></h4>` +
+    `<ul class="hm-legend" aria-label="Outcome counts">${legend}</ul></div>` +
+    `<div class="hm ${rows.length <= 60 ? 'hm-l' : rows.length <= 400 ? 'hm-m' : 'hm-s'}" id="an-hm" role="group" aria-label="Endpoint map, ${rows.length} endpoints: ${esc(summary)}. Arrow keys move between endpoints; Enter opens one in the endpoint table." aria-describedby="an-hm-hint">${tiles}</div>` +
+    `<p class="hint" id="an-hm-hint">Select a tile to open that endpoint. ${rows.length > 1 ? 'Arrow keys move between tiles.' : ''}</p></section>`;
+}
+
+function hmColumns(box) {
+  const cols = getComputedStyle(box).gridTemplateColumns.split(' ').filter(Boolean).length;
+  return Math.max(1, cols);
+}
+
+document.addEventListener('keydown', e => {
+  const t = e.target;
+  if (!t.classList || !t.classList.contains('hm-t')) return;
+  const box = t.parentElement;
+  const tiles = Array.from(box.children);
+  const i = tiles.indexOf(t);
+  const cols = hmColumns(box);
+  let n = -1;
+  switch (e.key) {
+    case 'ArrowRight': n = Math.min(tiles.length - 1, i + 1); break;
+    case 'ArrowLeft': n = Math.max(0, i - 1); break;
+    case 'ArrowDown': n = Math.min(tiles.length - 1, i + cols); break;
+    case 'ArrowUp': n = i - cols >= 0 ? i - cols : i; break;
+    case 'Home': n = e.ctrlKey ? 0 : i - (i % cols); break;
+    case 'End': n = e.ctrlKey ? tiles.length - 1 : Math.min(tiles.length - 1, i - (i % cols) + cols - 1); break;
+    case 'PageDown': n = Math.min(tiles.length - 1, i + cols * 5); break;
+    case 'PageUp': n = Math.max(0, i - cols * 5); break;
+    default: return;
+  }
+  e.preventDefault();
+  if (n >= 0 && n !== i) {
+    t.tabIndex = -1;
+    tiles[n].tabIndex = 0;
+    tiles[n].focus();
+  }
+});
+document.addEventListener('click', e => {
+  const t = e.target.closest && e.target.closest('.hm-t');
+  if (!t) return;
+  for (const x of t.parentElement.children) x.tabIndex = x === t ? 0 : -1;
+  openEndpoint(t.dataset.ip);
+});
+
+// Open one endpoint's drill-down in the table: open the section, clear
+// a filter that hides it, open its row and move focus there.
+function openEndpoint(ip) {
+  const secEl = el('an-sec-endpoints');
+  if (!secEl) return;
+  secEl.open = true;
+  let row = qs(`.an-slave-row[data-ip="${CSS.escape(ip)}"]`);
+  if (!row) {
+    an.filter = '';
+    an.verdict = '';
+    const q = el('an-ep-q');
+    const v = el('an-ep-verdict');
+    if (q) q.value = '';
+    if (v) v.value = '';
+    renderEndpointRows();
+    row = qs(`.an-slave-row[data-ip="${CSS.escape(ip)}"]`);
+  }
+  if (!row) return;
+  row.open = true;
+  const sum = qs('summary', row);
+  row.scrollIntoView({ block: 'start', behavior: 'auto' });
+  if (sum) sum.focus({ preventScroll: true });
+  announce(`Endpoint ${ip} opened`);
+}
+
+// ---------------------------------------------------------------------------
+// Dimension summary from the report's summary data (no endpoint detail
+// is needed): how many endpoints pass each check.
+
+function pctile(arr, f) {
+  if (!arr.length) return 0;
+  const a = arr.slice().sort((x, y) => x - y);
+  return a[Math.min(a.length - 1, Math.floor(f * a.length))];
+}
+
+function dimensionsHtml(r) {
+  const slaves = r.slaves || [];
+  const f = r.fleet || {};
+  const n = slaves.length;
+  const rows = [];
+  // {label, pass, of, tone, value, note}
+  const add = o => rows.push(o);
+  if (n) {
+    const connected = slaves.filter(s => (s.sessions || 0) > 0 || s.packets > 0).length;
+    add({ label: 'Connected', pass: connected, of: n, note: f.never_connected ? `${fmtInt(f.never_connected)} never connected` : 'every endpoint connected' });
+    const hs = slaves.filter(s => s.startdt_handshake_ok).length;
+    add({ label: 'STARTDT handshake', pass: hs, of: connected || n, note: hs === connected ? 'completed everywhere it connected' : `${fmtInt(connected - hs)} missing` });
+    const withExp = slaves.filter(s => s.expected_iframes > 0);
+    const full = withExp.filter(s => s.delivered_iframes >= s.expected_iframes).length;
+    const exp = withExp.reduce((a, s) => a + s.expected_iframes, 0);
+    const del = withExp.reduce((a, s) => a + Math.min(s.delivered_iframes, s.expected_iframes), 0);
+    add({ label: 'Delivery', pass: full, of: withExp.length || n, note: `${fmtInt(del)} of ${fmtInt(exp)} messages delivered${exp ? ` (${(100 * del / exp).toFixed(1)}%)` : ''}` });
+    const exact = slaves.filter(s => Number(s.score_pct) >= 99.95).length;
+    add({ label: 'Content', pass: exact, of: n, note: `mean score ${Number(f.aggregate_score_pct != null ? f.aggregate_score_pct : r.score_pct).toFixed(1)}%` });
+    const outcomePass = slaves.filter(s => outcomeCls(s.outcome, s.verdict) === 'ok').length;
+    add({ label: 'Verdict', pass: outcomePass, of: n, note: 'every dimension of the endpoint passed' });
+  }
+  const g = r.fleet_gi_ci_audit;
+  if (g && ((g.gi_total || 0) + (g.ci_total || 0)) > 0) {
+    const tot = (g.gi_total || 0) + (g.ci_total || 0);
+    const ok = (g.gi_compliant || 0) + (g.ci_compliant || 0);
+    add({ label: 'GI / CI answers', pass: ok, of: tot, unit: 'events', note: `${fmtInt(g.gi_total || 0)} GI, ${fmtInt(g.ci_total || 0)} CI requests` });
+  }
+  if (f.reconnects != null) add({ label: 'Reconnects', value: fmtInt(f.reconnects), tone: f.reconnects ? 'warn' : 'ok', note: f.reconnects ? 'extra TCP sessions beyond the expected count' : 'no extra TCP sessions' });
+  const tl = (t, label, what) => {
+    if (!t || !t.samples || !t.samples.length) return;
+    const ys = t.samples.map(x => Number(x[1])).filter(Number.isFinite);
+    const p50 = pctile(ys, 0.5);
+    const p95 = pctile(ys.map(Math.abs), 0.95);
+    add({ label, value: `${p50 >= 0 ? '+' : ''}${p50.toFixed(1)} ms`, tone: 'muted', note: `median ${what}; 95% within ±${p95.toFixed(1)} ms` });
+  };
+  tl(r.fleet_pacing_timeline, 'Pacing', 'lateness against the captured pace');
+  tl(r.fleet_drift_timeline, 'CP56 time tags', 'stamp minus wire time');
+  let h = '<section class="card an-dimsum" aria-labelledby="an-dimsum-title"><h4 id="an-dimsum-title">Dimensions</h4>';
+  if (!rows.length) return h + '<p class="hint">Nothing to summarise.</p></section>';
+  h += '<ul class="dim-list">';
+  for (const d of rows) {
+    let tone = d.tone;
+    let val = d.value;
+    let bar = '';
+    if (d.of != null) {
+      const frac = d.of ? d.pass / d.of : 0;
+      tone = tone || (d.of === 0 ? 'muted' : frac >= 1 ? 'ok' : (d.pass === 0 ? 'bad' : 'warn'));
+      val = `${fmtInt(d.pass)}<span class="of"> / ${fmtInt(d.of)}</span>`;
+      // Passing share in green, the rest in the row's tone.
+      bar = `<span class="dim-bar" aria-hidden="true"><span class="seg-pass" style="flex:${d.pass}"></span><span class="seg-rest t-${tone === 'ok' ? 'muted' : tone}" style="flex:${Math.max(0, d.of - d.pass)}"></span></span>`;
+    }
+    const sr = d.of != null ? `<span class="sr-only">${TONE_WORD[tone] || ''}: ${d.pass} of ${d.of} ${d.unit || 'endpoints'}</span>` : '';
+    h += `<li class="dim-row tone-${tone}"><span class="dim-mark ${tone}" aria-hidden="true">${TONE_MARK[tone] || ''}</span>` +
+      `<span class="dim-label">${esc(d.label)}</span>${bar || '<span class="dim-bar dim-bar-none" aria-hidden="true"></span>'}<span class="dim-val ${tone}"${d.of != null ? ' aria-hidden="true"' : ''}>${val}</span>${sr}` +
+      `<span class="dim-note">${esc(d.note || '')}</span></li>`;
+  }
+  return h + '</ul></section>';
 }
 
 function fleetChartBlock(tl, key, heading, legend, axes) {
@@ -306,12 +511,10 @@ function endpointTableShell(r) {
   const n = (r.slaves || []).length;
   if (!n) return '<p class="hint">No endpoints to report.</p>';
   const verdicts = Array.from(new Set(r.slaves.map(s => s.verdict)));
-  return `<h4>Endpoints (${n})</h4>` +
-    '<div class="sess-toolbar">' +
+  return '<div class="sess-toolbar">' +
       `<div class="field"><label for="an-ep-q">Find</label><input id="an-ep-q" type="search" placeholder="IP" value="${esc(an.filter)}" spellcheck="false" autocomplete="off"></div>` +
       `<div class="field"><label for="an-ep-verdict">Verdict</label><select id="an-ep-verdict"><option value="">All</option>${verdicts.map(v => `<option value="${esc(v)}"${an.verdict === v ? ' selected' : ''}>${esc(v.replace(/_/g, ' '))}</option>`).join('')}</select></div>` +
     '</div>' +
-    '<p class="hint">Open a row for its detail; it is loaded when opened.</p>' +
     '<div class="an-slave-table" role="list"><div class="an-slave-row an-slave-head" aria-hidden="true"><span></span><span>Endpoint</span><span>Packets</span><span>Delivered</span><span>Handshake</span><span>Score</span><span>Verdict</span></div>' +
     '<div id="an-ep-rows"></div></div>';
 }
@@ -346,6 +549,16 @@ document.addEventListener('change', e => { if (e.target.id === 'an-ep-verdict') 
 // Drill-down HTML is built only when a row is opened (F115). Details
 // come from the analyze reply when present, else from the stored
 // analysis (GET /api/analyses/:id/endpoints/:ip).
+// Fleet charts are built when their section is first opened (a closed
+// <details> has no size to draw into).
+document.addEventListener('toggle', e => {
+  const node = e.target;
+  if (node.id !== 'an-sec-timing' || !node.open || node.dataset.charts || !an.report) return;
+  node.dataset.charts = '1';
+  initFleetTimelineChart(an.report.fleet_pacing_timeline, 'fleet-pacing');
+  initFleetTimelineChart(an.report.fleet_drift_timeline, 'fleet-drift');
+}, true);
+
 document.addEventListener('toggle', async e => {
   const node = e.target;
   if (!node.classList || !node.classList.contains('an-slave-row') || !node.open || node.dataset.loaded) return;
@@ -403,6 +616,9 @@ function initAnalysis() {
     const aid = args && args[1];
     if (aid && /^\d+$/.test(aid) && an.analysisId !== Number(aid)) openStoredAnalysis(aid);
   });
+  on('theme', rerenderAnalysisForTheme);
+  // Capture names come from the library; it may load after the report.
+  on('library', () => { if (S.view === 'analysis' && !isBusyIn(el('an-result'))) rerenderAnalysisForTheme(); });
   on('analysis-event', ({ data }) => {
     if (S.view !== 'analysis') return;
     const r = selectedRun();
@@ -424,7 +640,8 @@ function initFleetTimelineChart(tl, key) {
   if (!tl || !tl.samples || tl.samples.length === 0) return;
   const node = document.getElementById('an-' + key + '-chart');
   if (!node) return;
-  const chart = echarts.init(node, null, { renderer: 'canvas' });
+  const chart = echarts.init(node, chartTheme(), { renderer: 'canvas' });
+  const C = n => getCssVar(n);
   // Convert wall_ms → seconds for the axis label readability.
   const data = tl.samples.map(s => [s[0] / 1000, s[1]]);
 
@@ -467,8 +684,8 @@ function initFleetTimelineChart(tl, key) {
   const markLines = iters.length > 1 ? {
     silent: true,
     symbol: ['none', 'none'],
-    lineStyle: { type: 'dashed', color: '#888', width: 1 },
-    label: { color: '#888', fontSize: 11, formatter: p => p.data.label },
+    lineStyle: { type: 'dashed', color: C('--dim'), width: 1 },
+    label: { color: C('--dim'), fontSize: 11, formatter: p => p.data.label },
     data: iters.map((ms, i) => ({
       xAxis: ms / 1000,
       label: { formatter: `iter ${i + 1}`, position: 'insideStartTop' }
@@ -521,8 +738,8 @@ function initFleetTimelineChart(tl, key) {
         type: 'cross',
         snap: true,
         label: {
-          backgroundColor: '#333',
-          color: '#fff',
+          backgroundColor: C('--ink'),
+          color: C('--on-ink'),
           fontSize: 11,
           formatter: (p) => {
             // axis label on the cross hair lines.
@@ -532,16 +749,13 @@ function initFleetTimelineChart(tl, key) {
           },
         },
       },
-      backgroundColor: 'rgba(255,255,255,0.97)',
-      borderColor: '#d8d7d0',
       borderWidth: 1,
       padding: [8, 12],
-      extraCssText: 'box-shadow: 0 2px 8px rgba(0,0,0,0.15);',
       formatter: tooltipFmt,
     },
     legend: {
       top: 6, left: 8,
-      textStyle: { fontSize: 11, color: '#444' },
+      textStyle: { fontSize: 11 },
       itemWidth: 18,
       itemHeight: 8,
       itemGap: 14,
@@ -554,14 +768,14 @@ function initFleetTimelineChart(tl, key) {
       name: 'seconds since capture start',
       nameLocation: 'middle',
       nameGap: 30,
-      nameTextStyle: { fontSize: 11, color: '#777' },
+      nameTextStyle: { fontSize: 11 },
     },
     yAxis: {
       type: 'value',
       name: 'ms',
       nameLocation: 'middle',
       nameGap: 48,
-      nameTextStyle: { fontSize: 11, color: '#777' },
+      nameTextStyle: { fontSize: 11 },
     },
     dataZoom: [
       { type: 'inside', xAxisIndex: 0 },
@@ -577,7 +791,7 @@ function initFleetTimelineChart(tl, key) {
         name: '• samples',
         type: 'scatter',
         symbolSize: 3,
-        itemStyle: { color: '#4a90e2', opacity: 0.35 },
+        itemStyle: { color: C('--ch-sample'), opacity: 0.35 },
         data,
         large: true,
         largeThreshold: 1000,
@@ -587,8 +801,8 @@ function initFleetTimelineChart(tl, key) {
         name: '┄┄ p95 upper',
         type: 'line',
         data: p95Line,
-        lineStyle: { color: '#3c8a4a', width: 1.2, type: 'dashed' },
-        itemStyle: { color: '#3c8a4a' },
+        lineStyle: { color: C('--ch-p95'), width: 1.2, type: 'dashed' },
+        itemStyle: { color: C('--ch-p95') },
         showSymbol: false,
         smooth: true,
         z: 2,
@@ -597,8 +811,8 @@ function initFleetTimelineChart(tl, key) {
         name: '┄┄ p05 lower',
         type: 'line',
         data: p05Line,
-        lineStyle: { color: '#a4453c', width: 1.2, type: 'dashed' },
-        itemStyle: { color: '#a4453c' },
+        lineStyle: { color: C('--ch-p05'), width: 1.2, type: 'dashed' },
+        itemStyle: { color: C('--ch-p05') },
         showSymbol: false,
         smooth: true,
         z: 3,
@@ -607,8 +821,8 @@ function initFleetTimelineChart(tl, key) {
         name: '── mean (per-bucket)',
         type: 'line',
         data: meanLine,
-        lineStyle: { color: '#d8741a', width: 2.5 },
-        itemStyle: { color: '#d8741a' },
+        lineStyle: { color: C('--ch-mean'), width: 2.5 },
+        itemStyle: { color: C('--ch-mean') },
         showSymbol: false,
         smooth: true,
         markLine: markLines,
