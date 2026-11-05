@@ -226,8 +226,8 @@ Slim summaries, newest first. `S` is one of `running`, `completed`, `partial`, `
 - identity and request echo: `id, status, started_at, finished_at, started_by, pcap, pcap_id, target_ip, target_mac, speed, top_speed, realtime, error, mode, role, target_port, proto`;
 - progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s), `per_source_progress` (only while running);
 - counts: `sources, sources_failed, sources_cancelled, has_capture`;
-- `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes}`;
-- `benchmark` (benchmark runs): `{total_messages_sent, total_messages_received, aggregate_latency_{min,p50,p90,p99,max}_us, aggregate_throughput_msgs_per_sec, capture_path, captured_packets, captured_bytes, sessions, sessions_failed, sessions_cancelled, protocol_violations}`;
+- `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes, captured_dropped}`;
+- `benchmark` (benchmark runs): `{total_messages_sent, total_messages_received, aggregate_latency_{min,p50,p90,p99,max}_us, aggregate_throughput_msgs_per_sec, capture_path, captured_packets, captured_bytes, captured_dropped, sessions, sessions_failed, sessions_cancelled, protocol_violations}`. `captured_dropped` counts frames the kernel dropped from the capture socket (it should be 0; non-zero adds a run warning and an analysis note that "missing" frames may be capture loss);
 - `rerun_of`, `latest_analysis` (`{id, verdict, score, source, created_at}` or `null`), `auto_analysis` (`{state, error, analysis_id}` or `null`; `state` is `queued`, `running`, `done`, `failed` or `skipped`).
 
 Run status values: `running`, `completed`, `partial` (some but not all sessions failed), `stopped`, `failed`.

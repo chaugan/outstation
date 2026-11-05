@@ -9,7 +9,7 @@
 
 const CFG_INPUTS = [
   'cfg-proto', 'cfg-target-ip', 'cfg-target-port', 'cfg-listen-port-base', 'cfg-master-bind-ip',
-  'cfg-target-mac', 'cfg-nic', 'cfg-alias-iface', 'cfg-tcp-nodelay', 'cfg-speed', 'cfg-iterations',
+  'cfg-target-mac', 'cfg-nic', 'cfg-alias-iface', 'cfg-tcp-nodelay', 'cfg-speed', 'cfg-iterations', 'cfg-iteration-gap',
   'cfg-warmup', 'cfg-loop-within-session', 'cfg-top-speed', 'cfg-realtime', 'cfg-skip-non-ip',
   'cfg-fresh-ts', 'cfg-proto-config', 'cfg-k', 'cfg-w', 'cfg-t0', 'cfg-t1', 'cfg-t2', 'cfg-t3',
   'cfg-idle-serve', 'cfg-gi-ci-synth', 'cfg-scada-gw', 'cfg-scada-gw-ip', 'cfg-scada-gw-iface',
@@ -435,6 +435,9 @@ function validators() {
     v['cfg-speed'] = () => numIn('cfg-speed', 0.001, 1000, { integer: false, label: 'the speed factor' });
   }
   v['cfg-iterations'] = () => numIn('cfg-iterations', 0, 1e9, { label: 'the number of iterations' });
+  if (c.mode === 'benchmark' && c.role === 'master') {
+    v['cfg-iteration-gap'] = () => numIn('cfg-iteration-gap', 0, 3600000, { label: 'the gap between iterations' });
+  }
   v['cfg-warmup'] = () => numIn('cfg-warmup', 0, 3600, { label: 'the warmup' });
   return v;
 }
@@ -510,6 +513,7 @@ function buildBody(force) {
       body.target_port = Number(val('cfg-target-port'));
       body.concurrency = radio('concurrency') || 'all_at_once';
       body.master_bind_ip = val('cfg-master-bind-ip') || null;
+      body.iteration_gap_ms = Number(val('cfg-iteration-gap'));
     } else {
       body.listen_port_base = Number(val('cfg-listen-port-base'));
       body.loop_within_session = el('cfg-loop-within-session').checked;
@@ -565,6 +569,7 @@ const FIELD_FOR_PARAM = {
   warmup_secs: 'cfg-warmup', target_port: 'cfg-target-port', listen_port_base: 'cfg-listen-port-base',
   proto_config: 'cfg-proto-config', scada_gateway_ip: 'cfg-scada-gw-ip', scada_gateway_iface: 'cfg-scada-gw-iface',
   master_bind_ip: 'cfg-master-bind-ip', proto_name: 'cfg-proto', iterations: 'cfg-iterations',
+  iteration_gap_ms: 'cfg-iteration-gap',
 };
 
 function showRunError(msg, extraHtml) {

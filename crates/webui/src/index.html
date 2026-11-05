@@ -226,6 +226,12 @@
           <p class="hint" id="cfg-iterations-hint">0 = loop until stopped</p>
           <p class="field-err" id="cfg-iterations-err"></p>
         </div>
+        <div class="field" data-mode="benchmark" data-role="master">
+          <label for="cfg-iteration-gap">Gap between iterations (ms)</label>
+          <input id="cfg-iteration-gap" type="number" step="100" min="0" max="3600000" value="1000" aria-describedby="cfg-iteration-gap-hint cfg-iteration-gap-err">
+          <p class="hint" id="cfg-iteration-gap-hint">Pause before reconnecting for the next pass; failed connects back off up to 30 s.</p>
+          <p class="field-err" id="cfg-iteration-gap-err"></p>
+        </div>
         <div class="field">
           <label for="cfg-warmup">Warmup (s)</label>
           <input id="cfg-warmup" type="number" step="1" min="0" max="3600" value="5" aria-describedby="cfg-warmup-err">

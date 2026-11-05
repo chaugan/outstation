@@ -759,6 +759,32 @@ async function compareFlow(browser, pcapId) {
   if (!(runs.find(r => r.id === A) || {}).latest_analysis) await uploadAnalysis(A);
   const B = await stoppedSlaveRun(pcapId);
   if (!B) { check(false, 'could not create a second benchmark run'); return; }
+  // With auto-analysis on (the server default) every finished
+  // benchmark run that has a capture is analysed by itself, so the
+  // comparison must render without any user action. The
+  // analysis_missing -> "Analyze run" -> retry path is only reachable
+  // on a server started with --no-auto-analyze; run the smoke against
+  // one of those as well to cover it.
+  const st = await apiGet('/api/status');
+  if (st.auto_analyze) {
+    const done = await waitRun(B, x => x.auto_analysis && x.auto_analysis.state !== 'queued' && x.auto_analysis.state !== 'running', 60000);
+    const aa = done && done.auto_analysis;
+    check(!!aa, `auto-analysis of run ${B} reached a final state (${aa ? aa.state : 'timeout'})`);
+    const ctxA = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+    const pageA = await ctxA.newPage();
+    const errsA = [];
+    trackConsole(pageA, errsA);
+    await pageA.goto(`${BASE}/#/compare/${A}/${B}?score_drop=2`);
+    await pageA.waitForSelector('#view-compare:not([hidden])');
+    await pageA.waitForSelector('.cmp-fleet', { timeout: 30000 }).catch(() => {});
+    check(await pageA.isVisible('.cmp-fleet'), 'with auto-analysis on, the comparison renders without an Analyze step');
+    check(await pageA.inputValue('#cmp-th-score_drop') === '2', 'threshold from the hash fills its input');
+    await audit(pageA, 'compare (auto-analysed)', 'compare-auto');
+    check(!errsA.length, `no console errors${errsA.length ? ': ' + errsA.slice(0, 3).join(' | ') : ''}`);
+    notes.push('compare: analysis_missing/Analyze path not exercised (server has auto-analysis on; rerun against a --no-auto-analyze server to cover it)');
+    await ctxA.close();
+    return;
+  }
   let liveCapture = false;
   if (CAPTURES_DIR) {
     try { fs.copyFileSync(PCAP, path.join(CAPTURES_DIR, `run_${B}.pcap`)); liveCapture = true; } catch (e) { notes.push(`could not seed a capture: ${e.message}`); }

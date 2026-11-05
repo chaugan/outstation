@@ -88,6 +88,7 @@ function applyRequestToForm(req) {
   setField('cfg-tcp-nodelay', req.tcp_nodelay === true ? 'on' : req.tcp_nodelay === false ? 'off' : '');
   setField('cfg-speed', req.speed ?? 1);
   setField('cfg-iterations', req.iterations ?? 1);
+  setField('cfg-iteration-gap', req.iteration_gap_ms ?? 1000);
   setField('cfg-warmup', req.warmup_secs ?? 5);
   setField('cfg-loop-within-session', req.loop_within_session);
   setField('cfg-top-speed', req.top_speed);
