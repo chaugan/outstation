@@ -474,16 +474,7 @@ impl Topology {
         harden::quiet_iface(name)?;
         ip(["link", "set", "dev", name, "up"])?;
         let ports: Vec<String> = self.taps.iter().filter(|t| *t != name).cloned().collect();
-        for r in par_map(&ports, |p| {
-            let r = mirror_port(p, name);
-            let ok = r.is_ok();
-            (r, ok)
-        })
-        .into_iter()
-        .flatten()
-        {
-            r?;
-        }
+        mirror_ports(&ports, name)?;
         self.mirror = Some(name.to_string());
         Ok(())
     }
@@ -696,6 +687,48 @@ fn build_port(
         Ok(m)
     };
     (true, rest())
+}
+
+/// [`mirror_port`] for many ports in one `tc -batch` process (T17c):
+/// every `tc` start dumps all host links, which made one process per
+/// port quadratic in the session count (5 s for 400 ports). Stops at
+/// the first failing command and reports it.
+fn mirror_ports(ports: &[String], cap: &str) -> Result<()> {
+    use std::io::Write;
+    if ports.is_empty() {
+        return Ok(());
+    }
+    names::validate_owned_ifname(cap)?;
+    let mut script = String::new();
+    for p in ports {
+        names::validate_owned_ifname(p)?;
+        script.push_str(&format!(
+            "qdisc add dev {p} clsact\nfilter add dev {p} ingress matchall action mirred egress mirror dev {cap}\n"
+        ));
+    }
+    debug!(ports = ports.len(), cap, "tc -batch");
+    let mut child = Command::new("tc")
+        .args(["-batch", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn `tc -batch`")?;
+    let wrote = child
+        .stdin
+        .take()
+        .context("tc stdin")?
+        .write_all(script.as_bytes());
+    let out = child.wait_with_output().context("wait for tc")?;
+    wrote.context("write to tc")?;
+    if !out.status.success() {
+        bail!(
+            "`tc -batch` (mirror {} ports to {cap}) failed: {}",
+            ports.len(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Mirror the ingress of `port` to `cap` with tc. Only ingress: a
