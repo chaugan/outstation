@@ -29,8 +29,8 @@
 //!
 //! # Report size and persistence
 //!
-//! [`AnalysisReport`] still carries `details_by_ip` for the current UI,
-//! but every per-endpoint detail is bounded by the protocol's caps
+//! [`AnalysisReport`] carries `details_by_ip` while it is built, but
+//! the API only ever returns the summary (F067): every per-endpoint detail is bounded by the protocol's caps
 //! (IEC 104: 200 mismatches, 2 000-entry sequences, strided samples).
 //! [`AnalysisReport::split`] separates it into a small serializable
 //! [`AnalysisSummary`] (verdicts, scores, fleet rollup, timelines) and
@@ -248,14 +248,58 @@ pub struct AnalysisSummary {
     pub fleet_drift_timeline: Option<FleetDriftTimeline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_pacing_timeline: Option<FleetPacingTimeline>,
+    /// Sum of every endpoint's `protocol_specific.gi_ci_audit` counters
+    /// (IEC 104), so the fleet audit panel needs no endpoint details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_gi_ci_audit: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Sum the numeric fields of each detail's `protocol_specific.gi_ci_audit`.
+fn fleet_gi_ci_audit(
+    details: &BTreeMap<String, SlaveDetail>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+    let mut with_events = 0u64;
+    for d in details.values() {
+        let Some(a) = d
+            .protocol_specific
+            .get("gi_ci_audit")
+            .and_then(|a| a.as_object())
+        else {
+            continue;
+        };
+        let mut events = 0.0;
+        for (k, v) in a {
+            if let Some(n) = v.as_f64() {
+                *sums.entry(k.clone()).or_default() += n;
+                if k == "gi_total" || k == "ci_total" {
+                    events += n;
+                }
+            }
+        }
+        if events > 0.0 {
+            with_events += 1;
+        }
+    }
+    if sums.is_empty() {
+        return None;
+    }
+    let mut m: serde_json::Map<String, serde_json::Value> = sums
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::json!(v)))
+        .collect();
+    m.insert("endpoints_with_events".into(), with_events.into());
+    Some(m)
 }
 
 impl AnalysisReport {
     /// Split into the persistable summary and the per-endpoint detail
     /// map (keyed like `SlaveSummary::slave_ip`).
     pub fn split(self) -> (AnalysisSummary, BTreeMap<String, SlaveDetail>) {
+        let fleet_gi_ci_audit = fleet_gi_ci_audit(&self.details_by_ip);
         (
             AnalysisSummary {
+                fleet_gi_ci_audit,
                 run_id: self.run_id,
                 run_status: self.run_status,
                 run_warning: self.run_warning,
@@ -2345,5 +2389,37 @@ mod tests {
         for bad in [-1.0, f64::NAN, f64::INFINITY, MAX_CP56_TOLERANCE_MS + 1.0] {
             assert!(check_cp56_tolerance(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn fleet_gi_ci_audit_sums_endpoint_counters() {
+        let detail = |ps: serde_json::Value| SlaveDetail {
+            tcp_flow: None,
+            sessions: Vec::new(),
+            sessions_total: 0,
+            protocol_specific: ps,
+            verdict: "good_delivery",
+            verdict_reason: String::new(),
+            score_pct: 100.0,
+            notes: Vec::new(),
+            pacing_samples: Vec::new(),
+            pacing_weight: 1.0,
+        };
+        let mut d = BTreeMap::new();
+        d.insert(
+            "a".to_string(),
+            detail(serde_json::json!({"gi_ci_audit": {"gi_total": 2, "gi_compliant": 1, "gi_partial": 1, "events": []}})),
+        );
+        d.insert(
+            "b".to_string(),
+            detail(serde_json::json!({"gi_ci_audit": {"gi_total": 0, "ci_total": 0}})),
+        );
+        d.insert("c".to_string(), detail(serde_json::Value::Null));
+        let m = fleet_gi_ci_audit(&d).unwrap();
+        assert_eq!(m["gi_total"], 2.0);
+        assert_eq!(m["gi_partial"], 1.0);
+        assert_eq!(m["endpoints_with_events"], 1);
+        assert!(!m.contains_key("events"));
+        assert!(fleet_gi_ci_audit(&BTreeMap::new()).is_none());
     }
 }

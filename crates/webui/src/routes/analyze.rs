@@ -41,8 +41,14 @@ pub(crate) struct AnalyzeQuery {
 /// Analysis report plus how the run was chosen and any warnings.
 #[derive(Serialize)]
 pub(crate) struct AnalyzeResponse {
+    /// The stored summary; endpoint details are fetched lazily from
+    /// `GET /api/analyses/:id/endpoints/:endpoint` (F067).
     #[serde(flatten)]
-    report: analysis::AnalysisReport,
+    summary: analysis::AnalysisSummary,
+    /// Only when the analysis could not be stored (no `analysis_id`):
+    /// then there is nowhere to fetch the details from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details_by_ip: Option<std::collections::BTreeMap<String, analysis::SlaveDetail>>,
     /// `"explicit"` when the caller named the run, `"latest"` when the
     /// newest finished benchmark run was picked.
     run_selection: &'static str,
@@ -214,8 +220,10 @@ pub(crate) async fn api_analyze(
     // `tmp` drops here (and on every early return above), removing the
     // uploaded capture.
     drop(tmp);
+    let (summary, details) = report.split();
     Ok(Json(AnalyzeResponse {
-        report,
+        summary,
+        details_by_ip: analysis_id.is_none().then_some(details),
         run_selection: selection,
         warnings,
         analysis_id,

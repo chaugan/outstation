@@ -335,7 +335,7 @@ Analyse a capture you took yourself (for example with Wireshark on the target si
 | `run_id` | The run to compare against; may also be given in the query string (both must agree) |
 | `cp56_tolerance_ms` | CP56Time2a drift tolerance in ms (0 to 3 600 000); default the server's `--cp56-tolerance-ms` |
 
-Without `run_id` the newest finished benchmark run is used, and a warning says so. The response is the full analysis report plus `run_selection` (`explicit` or `latest`), `warnings[]` and `analysis_id`.
+Without `run_id` the newest finished benchmark run is used, and a warning says so. The response is the stored analysis summary (the same shape as `GET /api/analyses/:id`, without per-endpoint detail) plus `run_selection` (`explicit` or `latest`), `warnings[]` and `analysis_id`. Fetch an endpoint's detail with `GET /api/analyses/:id/endpoints/:endpoint`. Only when the analysis could not be stored (`analysis_id` is null, and `warnings` says why) does the reply include `details_by_ip`. The summary's `fleet_gi_ci_audit` sums the endpoints' IEC 104 GI/CI audit counters.
 
 ```sh
 curl -H "Origin: $B" -F file=@target-side.pcap -F mode=generic "$B/api/analyze?run_id=7"

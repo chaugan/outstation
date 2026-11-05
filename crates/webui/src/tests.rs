@@ -1087,7 +1087,10 @@ async fn analyze_temp_file_removed_on_error_and_success() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{detail}");
-    assert_eq!(detail["verdict"], v["details_by_ip"][&endpoint]["verdict"]);
+    assert_eq!(detail["verdict"], v["slaves"][0]["verdict"]);
+    // F067: the reply itself is the summary, without endpoint details.
+    assert!(v.get("details_by_ip").is_none(), "{v}");
+    assert_eq!(v["fleet"], summary["fleet"]);
     let (s, _) = h
         .call(
             Method::GET,

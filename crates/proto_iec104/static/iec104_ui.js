@@ -680,15 +680,22 @@
     }
   }
 
-  // Fleet-level rollup of GI/CI events across every slave. Walks
-  // `r.details_by_ip[*].protocol_specific.gi_ci_audit` so the backend
-  // doesn't need a parallel aggregator. Renders headline counts plus
-  // two stacked bars (GI / CI) split by verdict bucket.
+  // Fleet-level rollup of GI/CI events across every slave. The summary
+  // carries the summed counters (`fleet_gi_ci_audit`, F067), so no
+  // endpoint detail has to be fetched; older replies with
+  // `details_by_ip` are summed here. Renders headline counts plus two
+  // stacked bars (GI / CI) split by verdict bucket.
   function renderFleetExtras(r) {
-    const details = r.details_by_ip || {};
     let giOk = 0, giPt = 0, giNc = 0, giTot = 0;
     let ciOk = 0, ciPt = 0, ciNc = 0, ciTot = 0;
     let slavesWithEvents = 0;
+    const fa = r.fleet_gi_ci_audit;
+    if (fa) {
+      giOk = fa.gi_compliant || 0; giPt = fa.gi_partial || 0; giNc = fa.gi_non_compliant || 0; giTot = fa.gi_total || 0;
+      ciOk = fa.ci_compliant || 0; ciPt = fa.ci_partial || 0; ciNc = fa.ci_non_compliant || 0; ciTot = fa.ci_total || 0;
+      slavesWithEvents = fa.endpoints_with_events || 0;
+    }
+    const details = fa ? {} : (r.details_by_ip || {});
     for (const ip of Object.keys(details)) {
       const a = ((details[ip] || {}).protocol_specific || {}).gi_ci_audit;
       if (!a) continue;
