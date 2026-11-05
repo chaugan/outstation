@@ -370,7 +370,8 @@ function renderCmpResult() {
   // Regressions.
   if (regs.length) {
     const head = regs.slice(0, 20);
-    const item = r => `<li><span class="reg-metric">${esc(r.rtu ? 'RTU' : 'Fleet')}</span> ${esc(r.message)}` +
+    // RTU messages start with "RTU <ip>:"; fleet ones get a tag.
+    const item = r => `<li>${r.rtu ? '' : '<span class="reg-metric">Fleet</span> '}${esc(r.message)}` +
       (r.rtu ? ` <button type="button" class="btn btn-text" data-act="cmp-show-rtu" data-rtu="${esc(r.rtu)}" aria-label="Show RTU ${esc(r.rtu)} in the table">show</button>` : '') + '</li>';
     h += `<h3 class="card-title cmp-h">Regressions (${regs.length})</h3><ol class="cmp-regs">${head.map(item).join('')}</ol>`;
     if (regs.length > head.length) {
