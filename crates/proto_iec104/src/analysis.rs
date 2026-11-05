@@ -29,6 +29,11 @@
 //!   (COT 11) is not expected either; local (COT 12) is. The expected
 //!   side is filtered by the replayer's own rule,
 //!   [`interrogation::CaptureStrip`].
+//! * **Command-driven state**: a command executed with return
+//!   information changes the point's value in the slave's inventory,
+//!   and later GI/CI answers carry the new value. The identification
+//!   and audit of those answers replay the same changes in stream
+//!   order (`InventoryTimeline`).
 //! * **Injected faults** (`proto_config.faults`): frames the replayer
 //!   deliberately dropped (an N(S) gap on the wire), duplicated (a
 //!   repeated N(S) with identical content) or sent with a corrupted
@@ -78,7 +83,7 @@ use crate::asdu::{
 use crate::commands;
 use crate::faults::FaultPlan;
 use crate::interrogation;
-use crate::inventory::Inventory;
+use crate::inventory::{Inventory, CA_BROADCAST};
 use crate::responder::{
     respond_ci, respond_gi, InterrogationResponse, RequestEcho, COT_ACT_CON, COT_ACT_TERM,
     COT_INROGEN_STATION, COT_REQCOGEN, COT_REQCO_GROUP_BASE, COT_UNKNOWN_CA,
@@ -565,7 +570,7 @@ pub fn analyze_iec104_flow(
     } else {
         Vec::new()
     };
-    let mut synth_flags = identify_synthesized(&live_requests, &cap_frames, &inventory);
+    let mut synth_flags = vec![false; cap_frames.len()];
     let live_commands: Vec<&IFrame> = if echo_on {
         cap_tg
             .iframes
@@ -577,8 +582,14 @@ pub fn analyze_iec104_flow(
     } else {
         Vec::new()
     };
-    let command_responses_excluded =
+    // Command answers first: the commands the slave executed change the
+    // point values its later GI/CI answers carry (return information),
+    // and both the identification and the audit below replay them.
+    let (command_responses_excluded, executed) =
         identify_command_responses(&live_commands, &cap_frames, &command_cfg, &mut synth_flags);
+    let mut timeline =
+        InventoryTimeline::new(&inventory, &command_cfg, cp56_zone, executed.clone());
+    identify_synthesized(&live_requests, &cap_frames, &mut timeline, &mut synth_flags);
     let synthesized_excluded = synth_flags.iter().filter(|&&s| s).count();
     if synthesized_excluded > command_responses_excluded {
         notes.push(format!(
@@ -711,9 +722,21 @@ pub fn analyze_iec104_flow(
 
     // --- GI / CI audit (slave role: the master interrogates, the
     // slave-replayer synthesizes responses) ---
+    // The audit walks the whole slave-side stream (fault duplicates
+    // included), so the executed commands are re-indexed into it.
     let gi_ci_audit = match (ctx.role, cap_target.as_ref(), cap_playback.as_ref()) {
         (Role::Slave, Some(_), Some(_)) => {
-            Some(audit_requests(&live_requests, &cap.iframes, &inventory))
+            let kept: Vec<usize> = scan
+                .keep
+                .iter()
+                .enumerate()
+                .filter(|(_, &k)| k)
+                .map(|(i, _)| i)
+                .collect();
+            let executed = executed.iter().map(|&(at, cmd)| (kept[at], cmd)).collect();
+            let mut timeline =
+                InventoryTimeline::new(&inventory, &command_cfg, cp56_zone, executed);
+            Some(audit_requests(&live_requests, &cap.iframes, &mut timeline))
         }
         _ => None,
     };
@@ -2487,19 +2510,26 @@ fn compute_cp56_drift(
 /// first unflagged answer after it ([`commands::answers`]); after a
 /// positive ActCon to an executed process command also the return
 /// information (when configured) and the ActTerm; for a broadcast,
-/// every station's answer. Returns the number of frames flagged.
-fn identify_command_responses(
-    cmds: &[&IFrame],
+/// every station's answer.
+///
+/// Returns the number of frames flagged and the commands the slave
+/// accepted: (index in `frames` of the first positive ActCon, command
+/// ASDU), in stream order. The slave applies a command to its point
+/// inventory when it queues that ActCon, so the index places the state
+/// change among the other synthesized answers ([`InventoryTimeline`]).
+fn identify_command_responses<'a>(
+    cmds: &[&IFrame<'a>],
     frames: &[IFrame],
     cfg: &commands::CommandsConfig,
     synth: &mut [bool],
-) -> usize {
+) -> (usize, Vec<(usize, &'a [u8])>) {
     let ri_cot = match cfg.return_info {
         commands::ReturnInfo::None => None,
         commands::ReturnInfo::Spontaneous => Some(commands::COT_SPONTANEOUS),
         commands::ReturnInfo::Retrem => Some(commands::COT_RETREM),
     };
     let mut flagged = 0usize;
+    let mut executed = Vec::new();
     for cmd in cmds {
         let c = cmd.asdu;
         let start = frames.partition_point(|f| f.ts_ms() + 0.5 < cmd.ts_ms());
@@ -2520,6 +2550,9 @@ fn identify_command_responses(
                 if first || (want_term && part == commands::Part::ActTerm) || broadcast {
                     synth[j] = true;
                     flagged += 1;
+                    if first && part == commands::Part::ActCon && !broadcast {
+                        executed.push((j, c));
+                    }
                     if part == commands::Part::ActTerm {
                         break;
                     }
@@ -2548,7 +2581,8 @@ fn identify_command_responses(
             j += 1;
         }
     }
-    flagged
+    executed.sort_by_key(|&(at, _)| at);
+    (flagged, executed)
 }
 
 /// A first answer is anything but an ActTerm.
@@ -2909,6 +2943,111 @@ fn collect_master_requests(frames: &[IFrame]) -> Vec<RequestRec> {
         .collect()
 }
 
+/// The slave's point inventory as it evolves during the run.
+///
+/// The slave answers GI/CI from an inventory built from the capture,
+/// but a command it executes with return information on updates the
+/// commanded point ([`commands::respond_command`]), and a later
+/// interrogation answers with the new value. To judge those answers
+/// against what the slave really held, the analyzer replays the same
+/// state changes: every command the slave accepted (a positive ActCon
+/// was delivered) is run through `respond_command` on the analyzer's
+/// copy of the inventory, in delivered-stream order. The slave queues
+/// all its answers in one FIFO, so a command whose ActCon precedes an
+/// interrogation's ActCon was applied before that interrogation was
+/// answered, and one whose ActCon follows it was not.
+///
+/// The replay accepts what the slave accepted: the time-tag age and
+/// unknown-IOA checks are off (the positive ActCon shows the command
+/// passed them) and the return information's time tag is irrelevant
+/// (interrogation answers carry no time tag).
+struct InventoryTimeline<'a> {
+    base: &'a Inventory,
+    /// (frame index of the positive ActCon, command), in index order.
+    /// Empty when the run synthesized no return information.
+    executed: Vec<(usize, &'a [u8])>,
+    cfg: commands::CommandsConfig,
+    zone: Cp56Zone,
+    /// `base` with `executed[..applied]` applied; built on first use.
+    current: Option<Inventory>,
+    applied: usize,
+}
+
+impl<'a> InventoryTimeline<'a> {
+    fn new(
+        base: &'a Inventory,
+        cfg: &commands::CommandsConfig,
+        zone: Cp56Zone,
+        mut executed: Vec<(usize, &'a [u8])>,
+    ) -> Self {
+        // Without return information a command never changes a point.
+        if !cfg.enabled || cfg.return_info == commands::ReturnInfo::None {
+            executed.clear();
+        }
+        executed.sort_by_key(|&(at, _)| at);
+        Self {
+            base,
+            executed,
+            cfg: commands::CommandsConfig {
+                enabled: true,
+                return_info: cfg.return_info,
+                max_age_ms: 0,
+                unknown_ioa: commands::UnknownIoa::Accept,
+            },
+            zone,
+            current: None,
+            applied: 0,
+        }
+    }
+
+    /// A timeline without state changes.
+    fn fixed(base: &'a Inventory) -> Self {
+        Self::new(
+            base,
+            &commands::CommandsConfig::default(),
+            Cp56Zone::Utc,
+            Vec::new(),
+        )
+    }
+
+    /// The inventory as the slave held it when it queued frame `idx`:
+    /// every command confirmed before `idx` applied.
+    fn before(&mut self, idx: usize) -> &Inventory {
+        if self.executed.is_empty() {
+            return self.base;
+        }
+        let n = self.executed.partition_point(|&(at, _)| at < idx);
+        if n < self.applied {
+            // Requests are audited in order, so this is rare: start over.
+            self.current = None;
+            self.applied = 0;
+        }
+        let inv = self.current.get_or_insert_with(|| self.base.clone());
+        let book = commands::CommandBook::default();
+        let ctx = commands::CommandContext {
+            cfg: &self.cfg,
+            book: &book,
+            now_unix_ns: 0,
+            zone: self.zone,
+        };
+        for &(_, cmd) in &self.executed[self.applied..n] {
+            commands::respond_command(inv, &ctx, cmd);
+        }
+        self.applied = n;
+        inv
+    }
+}
+
+/// Is `asdu` a confirmation (ActCon, negative or not, or an unknown-CA
+/// rejection) of interrogation `req`? Its position in the stream is
+/// where the slave built the answer.
+fn confirms_request(req: &RequestRec, asdu: &[u8]) -> bool {
+    asdu.len() >= DUI_LEN
+        && asdu[0] == req.type_id
+        && matches!(cot_value(asdu), COT_ACT_CON | COT_UNKNOWN_CA)
+        && (req.ca == CA_BROADCAST || common_address(asdu) == req.ca)
+}
+
 /// Flag the delivered frames the slave synthesized in answer to live
 /// master requests.
 ///
@@ -2922,18 +3061,30 @@ fn collect_master_requests(frames: &[IFrame]) -> Vec<RequestRec> {
 /// audited window is used instead: the first ActCon for the request's
 /// (type, CA) up to its ActTerm, keeping only frames of that CA in the
 /// request's COT bucket.
-fn identify_synthesized(requests: &[RequestRec], frames: &[IFrame], inv: &Inventory) -> Vec<bool> {
-    let mut synth = vec![false; frames.len()];
+///
+/// The expected response comes from the inventory as it stood when the
+/// slave answered (`timeline`), so values changed by earlier commands
+/// match. Frames already flagged in `synth` are skipped.
+fn identify_synthesized(
+    requests: &[RequestRec],
+    frames: &[IFrame],
+    timeline: &mut InventoryTimeline,
+    synth: &mut [bool],
+) {
     for req in requests {
-        let response = req.expected_response(inv);
+        let start = frames.partition_point(|f| f.ts_ms() + 0.5 < req.ts_ms);
+        let horizon = req.ts_ms + SYNTH_SEARCH_MS;
+        let answered_at = (start..frames.len())
+            .take_while(|&j| frames[j].ts_ms() <= horizon)
+            .find(|&j| !synth[j] && confirms_request(req, frames[j].asdu))
+            .unwrap_or(start);
+        let response = req.expected_response(timeline.before(answered_at));
         let cas: Vec<u16> = if response.per_ca.is_empty() {
             vec![req.ca]
         } else {
             response.per_ca.iter().map(|r| r.ca).collect()
         };
         let expected: Vec<Vec<u8>> = response.into_asdus();
-        let start = frames.partition_point(|f| f.ts_ms() + 0.5 < req.ts_ms);
-        let horizon = req.ts_ms + SYNTH_SEARCH_MS;
         let mut p = 0usize;
         for j in start..frames.len() {
             if p == expected.len() || frames[j].ts_ms() > horizon {
@@ -2951,10 +3102,9 @@ fn identify_synthesized(requests: &[RequestRec], frames: &[IFrame], inv: &Invent
             }
         }
         if p < expected.len() {
-            mark_audited_window(req, &cas, frames, start, horizon, &mut synth);
+            mark_audited_window(req, &cas, frames, start, horizon, synth);
         }
     }
-    synth
 }
 
 fn mark_audited_window(
@@ -3034,11 +3184,25 @@ pub fn audit_master_commands(
     src_inv: &Inventory,
 ) -> GiCiAudit {
     let requests = collect_master_requests(&parse_flow(cap_target).iframes);
-    audit_requests(&requests, &parse_flow(cap_playback).iframes, src_inv)
+    audit_requests(
+        &requests,
+        &parse_flow(cap_playback).iframes,
+        &mut InventoryTimeline::fixed(src_inv),
+    )
 }
 
-fn audit_requests(requests: &[RequestRec], frames: &[IFrame], src_inv: &Inventory) -> GiCiAudit {
+/// Judge every request's answer. Each request is checked against the
+/// inventory as the slave held it when it answered (`timeline`): the
+/// state changes of the commands confirmed before the request's ActCon
+/// are applied first.
+fn audit_requests(
+    requests: &[RequestRec],
+    frames: &[IFrame],
+    timeline: &mut InventoryTimeline,
+) -> GiCiAudit {
     struct SlaveFrame<'a> {
+        /// Index in `frames`.
+        idx: usize,
         ts_ms: f64,
         type_id: u8,
         cot_low: u8,
@@ -3048,8 +3212,10 @@ fn audit_requests(requests: &[RequestRec], frames: &[IFrame], src_inv: &Inventor
     }
     let slave_frames: Vec<SlaveFrame> = frames
         .iter()
-        .filter(|f| f.asdu.len() >= DUI_LEN)
-        .map(|f| SlaveFrame {
+        .enumerate()
+        .filter(|(_, f)| f.asdu.len() >= DUI_LEN)
+        .map(|(idx, f)| SlaveFrame {
+            idx,
             ts_ms: f.ts_ms(),
             type_id: f.asdu[0],
             cot_low: cot_value(f.asdu),
@@ -3063,7 +3229,14 @@ fn audit_requests(requests: &[RequestRec], frames: &[IFrame], src_inv: &Inventor
 
     for req in requests {
         let kind: &'static str = if req.type_id == 100 { "GI" } else { "CI" };
-        let response = req.expected_response(src_inv);
+        let answered_at = (search_cursor..slave_frames.len())
+            .find(|&i| {
+                let f = &slave_frames[i];
+                f.ts_ms + 0.5 >= req.ts_ms && confirms_request(req, f.asdu)
+            })
+            .map(|i| slave_frames[i].idx)
+            .unwrap_or_else(|| frames.partition_point(|f| f.ts_ms() + 0.5 < req.ts_ms));
+        let response = req.expected_response(timeline.before(answered_at));
         let mut event = GiCiEvent {
             kind,
             request_ts_ms: req.ts_ms,
@@ -3567,6 +3740,130 @@ mod tests {
             }),
             c,
         )
+    }
+
+    /// Frames at explicit times (ns), numbered from 0.
+    fn timed(frames: &[(u64, Vec<u8>)]) -> (Vec<u8>, Vec<(u64, usize)>) {
+        let mut p = Vec::new();
+        let mut offs = Vec::new();
+        for (i, (t, a)) in frames.iter().enumerate() {
+            offs.push((*t, p.len()));
+            p.extend_from_slice(&wrap_iframe(a, i as u16, 0));
+        }
+        (p, offs)
+    }
+
+    /// Slave-role analysis with a timed delivered stream and a timed
+    /// master stream (after STARTDT act at 0).
+    fn run_timed(
+        script: &[Vec<u8>],
+        delivered: &[(u64, Vec<u8>)],
+        master: &[(u64, Vec<u8>)],
+        cfg: Option<&str>,
+    ) -> ProtoSlaveAnalysis {
+        let (ep, eo) = stream(script);
+        let (gp, go) = timed(delivered);
+        let mut tp = vec![0x68, 4, 0x07, 0, 0, 0];
+        let mut to = vec![(0u64, 0usize)];
+        for (i, (t, a)) in master.iter().enumerate() {
+            to.push((*t, tp.len()));
+            tp.extend_from_slice(&wrap_iframe(a, i as u16, 0));
+        }
+        analyze_iec104_flow(
+            Some(FlowSnapshot {
+                payload: &ep,
+                packet_offsets: &eo,
+            }),
+            Some(FlowSnapshot {
+                payload: &gp,
+                packet_offsets: &go,
+            }),
+            None,
+            Some(FlowSnapshot {
+                payload: &tp,
+                packet_offsets: &to,
+            }),
+            &ctx_with(RunFacts::default(), cfg),
+        )
+    }
+
+    /// T12b: a GI answered before a command carries the capture's value,
+    /// one answered after it the commanded value; the audit replays the
+    /// command between the two and judges each against what the slave
+    /// held at the time.
+    #[test]
+    fn gi_audit_follows_command_driven_inventory_changes() {
+        const RI_SPONT: &str = r#"{"commands":{"return_info":"spontaneous"}}"#;
+        let script = vec![sp(3, 100, 0), me(3, 1, 5)];
+        let inv = inventory_of(&script);
+        let echo = RequestEcho {
+            ca: 1,
+            oa: 0,
+            test: false,
+        };
+        let gi_old = build_gi_response(&inv, echo, 20);
+        let mut after = inv.clone();
+        after.ingest_asdu(&sp(3, 100, 1));
+        let gi_new = build_gi_response(&after, echo, 20);
+        assert_ne!(gi_old, gi_new);
+        let cmd = vec![45, 1, 6, 0, 1, 0, 100, 0, 0, 1];
+        let reply = |cot: u8| {
+            let mut a = cmd.clone();
+            a[2] = cot;
+            a
+        };
+        let master = vec![
+            (900_000_000, gi_request()),
+            (1_400_000_000, cmd.clone()),
+            (2_000_000_000, gi_request()),
+        ];
+        let ms = |n: u64| n * 1_000_000;
+        let build = |second_gi: &[Vec<u8>]| {
+            let mut d: Vec<(u64, Vec<u8>)> = Vec::new();
+            for (i, a) in gi_old.iter().enumerate() {
+                d.push((ms(1000 + 10 * i as u64), a.clone()));
+            }
+            d.push((ms(1200), script[0].clone()));
+            d.push((ms(1300), script[1].clone()));
+            d.push((ms(1410), reply(7)));
+            d.push((ms(1420), sp(3, 100, 1)));
+            d.push((ms(1430), reply(10)));
+            for (i, a) in second_gi.iter().enumerate() {
+                d.push((ms(2010 + 10 * i as u64), a.clone()));
+            }
+            d
+        };
+
+        let r = run_timed(&script, &build(&gi_new), &master, Some(RI_SPONT));
+        let audit = &r.protocol_specific["gi_ci_audit"];
+        assert_eq!(audit["gi_total"], 2, "{audit:#}");
+        assert_eq!(audit["gi_compliant"], 2, "{audit:#}");
+        assert_eq!(
+            r.verdict, "good_delivery",
+            "{} {:?}",
+            r.verdict_reason, r.notes
+        );
+        assert_eq!(r.score_pct, 100.0);
+        let pb = &r.protocol_specific["playback"];
+        assert_eq!(pb["command_responses_excluded"], 3);
+        assert_eq!(pb["synthesized_excluded"], 3 + 2 * gi_old.len());
+        assert_eq!(pb["delivered_iframes"], 2);
+
+        // A slave that kept the old value after the command is caught.
+        let r = run_timed(&script, &build(&gi_old), &master, Some(RI_SPONT));
+        let audit = &r.protocol_specific["gi_ci_audit"];
+        assert_eq!(audit["gi_compliant"], 1, "{audit:#}");
+        assert_eq!(audit["events"][1]["verdict"], "partial", "{audit:#}");
+        assert_eq!(audit["events"][1]["bytewise_matches_inventory"], false);
+
+        // Without return information a command changes nothing, so the
+        // unchanged answer is the right one.
+        let no_ri = r#"{"commands":{"return_info":"none"}}"#;
+        let mut d = build(&gi_old);
+        d.retain(|(_, a)| a != &sp(3, 100, 1));
+        let r = run_timed(&script, &d, &master, Some(no_ri));
+        assert_eq!(r.protocol_specific["gi_ci_audit"]["gi_compliant"], 2);
+        assert_eq!(r.score_pct, 100.0, "{} {:?}", r.verdict_reason, r.notes);
     }
 
     /// T12b: with command echo and return information on, captured COT 11

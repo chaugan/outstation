@@ -283,15 +283,124 @@ fn flow_of(log: &[(u64, Vec<u8>)]) -> (Vec<u8>, Vec<(u64, usize)>) {
     (payload, offsets)
 }
 
+/// Run the analyzer over a slave session the mock peer recorded.
+fn analyze_slave_run(
+    config: &str,
+    script: &[Vec<u8>],
+    rx: &[(u64, Vec<u8>)],
+    tx: &[(u64, Vec<u8>)],
+) -> protoplay::ProtoSlaveAnalysis {
+    use crate::analysis::analyze_iec104_flow;
+    use protoplay::{AnalyzeCtx, FlowSnapshot, RunFacts};
+
+    let src = blob(script);
+    let src_offsets: Vec<(u64, usize)> = crate::apci::frames(&src)
+        .enumerate()
+        .map(|(i, f)| (i as u64 * 1_000_000, f.offset))
+        .collect();
+    let (pb, pb_off) = flow_of(rx);
+    let (tg, tg_off) = flow_of(tx);
+    let ctx = AnalyzeCtx {
+        role: Role::Slave,
+        mode_correct: false,
+        captured_first_ts_ns: 0,
+        target_port: 2404,
+        proto_config: Some(config.into()),
+        cp56_tolerance_ms: 50.0,
+        run: RunFacts::default(),
+    };
+    analyze_iec104_flow(
+        Some(FlowSnapshot {
+            payload: &src,
+            packet_offsets: &src_offsets,
+        }),
+        Some(FlowSnapshot {
+            payload: &pb,
+            packet_offsets: &pb_off,
+        }),
+        None,
+        Some(FlowSnapshot {
+            payload: &tg,
+            packet_offsets: &tg_off,
+        }),
+        &ctx,
+    )
+}
+
+/// T12b: a command with return information changes the point's value
+/// in the slave's inventory, so a later GI answers with the new value.
+/// The analyzer replays the same state change before auditing that GI
+/// (it is compliant, not a mismatch against the capture's value), and
+/// the captured remote return information (COT 11) is neither replayed
+/// nor expected, while local return information (COT 12) is both.
+#[test]
+fn gi_after_command_with_return_info_is_compliant() {
+    let config = r#"{"session":{"t1":3,"t2":0.5,"idle_serve_secs":5},"commands":{"return_info":"spontaneous"}}"#;
+    let script = vec![
+        sp_asdu(100, 1),
+        vec![45, 1, 7, 0, 1, 0, 100, 0, 0, 0], // captured ActCon (OFF)
+        vec![1, 1, 11, 0, 1, 0, 100, 0, 0, 0], // captured return info: OFF
+        vec![45, 1, 10, 0, 1, 0, 100, 0, 0, 0], // captured ActTerm
+        vec![13, 1, 3, 0, 1, 0, 0x2c, 1, 0, 0, 0, 0, 0, 0],
+        vec![1, 1, 12, 0, 1, 0, 101, 0, 0, 1], // local command at the RTU
+    ];
+    let port = free_port();
+    let mut c = cfg(Role::Slave, port, blob(&script));
+    c.proto_config = Some(config.into());
+    let run = Running::spawn(c);
+    let mut p = Peer::connect(port);
+    master_handshake(&mut p);
+    let mut replayed = Vec::new();
+    for _ in 0..3 {
+        let a = p.recv_until(ms(1000), is_i).expect("script frame");
+        replayed.push(asdu_of(&a).unwrap().to_vec());
+    }
+    p.ack();
+    assert_eq!(
+        replayed,
+        vec![script[0].clone(), script[4].clone(), script[5].clone()]
+    );
+    // The capture leaves IOA 100 OFF; switch it ON.
+    let r = exchange(&mut p, vec![45, 1, 6, 0, 1, 0, 100, 0, 0, 1], 3);
+    assert_eq!(cots(&r), vec![7, 3, 10]);
+    assert_eq!(r[1], sp_asdu(100, 1));
+    // GI: ActCon, the two single points, the float, ActTerm.
+    let r = exchange(&mut p, gi_act(), 4);
+    assert_eq!(cots(&r), vec![7, 20, 20, 10]);
+    assert_eq!(r[1], vec![1, 2, 20, 0, 1, 0, 100, 0, 0, 1, 101, 0, 0, 1]);
+    let (rx, tx) = (p.rx_log.clone(), p.tx_log.clone());
+    drop(p);
+    let (rep, _, _) = run.join_within(ms(3000));
+    assert!(rep.error.is_none(), "{:?}", rep.error);
+    assert_eq!(rep.protocol.stripped_capture_frames, 3);
+
+    let a = analyze_slave_run(config, &script, &rx, &tx);
+    let audit = &a.protocol_specific["gi_ci_audit"];
+    assert_eq!(audit["gi_total"], 1, "{audit:#}");
+    assert_eq!(audit["gi_compliant"], 1, "{audit:#}");
+    assert_eq!(audit["events"][0]["bytewise_matches_inventory"], true);
+    assert_eq!(
+        a.verdict, "good_delivery",
+        "{} {:?}",
+        a.verdict_reason, a.notes
+    );
+    assert_eq!(a.score_pct, 100.0);
+    let pb = &a.protocol_specific["playback"];
+    assert_eq!(pb["source_command_stripped"], 2);
+    assert_eq!(pb["source_return_info_stripped"], 1);
+    assert_eq!(pb["command_responses_excluded"], 3);
+    assert_eq!(pb["synthesized_excluded"], 7);
+    assert_eq!(pb["expected_iframes"], 3);
+    assert_eq!(pb["delivered_iframes"], 3);
+    assert_eq!(pb["byte_identical_count"], 3);
+}
+
 /// T11: a slave replay with live commands still scores 100%: the
 /// captured confirmations are not expected and every synthesized
 /// command answer (ActCon, return information, ActTerm, read reply,
 /// rejections) is removed from the delivered side, next to a live GI.
 #[test]
 fn replay_with_live_commands_scores_100() {
-    use crate::analysis::analyze_iec104_flow;
-    use protoplay::{AnalyzeCtx, FlowSnapshot, RunFacts};
-
     let config =
         r#"{"session":{"t1":3,"t2":0.5,"idle_serve_secs":5},"commands":{"return_info":"retrem"}}"#;
     let port = free_port();
@@ -318,38 +427,7 @@ fn replay_with_live_commands_scores_100() {
     let (rep, _, _) = run.join_within(ms(3000));
     assert!(rep.error.is_none(), "{:?}", rep.error);
 
-    let src = blob(&command_script());
-    let src_offsets: Vec<(u64, usize)> = crate::apci::frames(&src)
-        .enumerate()
-        .map(|(i, f)| (i as u64 * 1_000_000, f.offset))
-        .collect();
-    let (pb, pb_off) = flow_of(&rx);
-    let (tg, tg_off) = flow_of(&tx);
-    let ctx = AnalyzeCtx {
-        role: Role::Slave,
-        mode_correct: false,
-        captured_first_ts_ns: 0,
-        target_port: 2404,
-        proto_config: Some(config.into()),
-        cp56_tolerance_ms: 50.0,
-        run: RunFacts::default(),
-    };
-    let a = analyze_iec104_flow(
-        Some(FlowSnapshot {
-            payload: &src,
-            packet_offsets: &src_offsets,
-        }),
-        Some(FlowSnapshot {
-            payload: &pb,
-            packet_offsets: &pb_off,
-        }),
-        None,
-        Some(FlowSnapshot {
-            payload: &tg,
-            packet_offsets: &tg_off,
-        }),
-        &ctx,
-    );
+    let a = analyze_slave_run(config, &command_script(), &rx, &tx);
     assert_eq!(
         a.verdict, "good_delivery",
         "{} {:?}",
