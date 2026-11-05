@@ -1751,6 +1751,99 @@ pub fn run_benchmark(
     Ok(report)
 }
 
+/// Capture of a slave run (T18): one AF_PACKET socket per interface
+/// that carries a listener's sessions, each with a kernel filter that
+/// admits only TCP to or from `(listen ip, listen port)` of this run's
+/// listeners. Listen IPs are only final once a slave is started (the
+/// user may edit them), so each slave registers its address with
+/// [`SlaveCapture::watch`] right before it binds.
+struct SlaveCapture {
+    cap: Capture,
+    port: u16,
+    /// The SCADA master, when known: the route to it names the
+    /// interface the sessions use.
+    peer: Option<Ipv4Addr>,
+    ips: Mutex<Vec<Ipv4Addr>>,
+    warnings: Mutex<Vec<String>>,
+}
+
+impl SlaveCapture {
+    fn start(path: &Path, port: u16, peer: Ipv4Addr) -> Result<Self> {
+        let cap = Capture::start_filtered(path, raw_replay::bpf::reject_all())?;
+        info!(path = %path.display(), port, "slave capture started");
+        Ok(Self {
+            cap,
+            port,
+            peer: (!peer.is_unspecified()).then_some(peer),
+            ips: Mutex::new(Vec::new()),
+            warnings: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn warn(&self, msg: String) {
+        warn!("{msg}");
+        let mut w = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+        if w.len() < 16 && !w.contains(&msg) {
+            w.push(msg);
+        }
+    }
+
+    /// Record the sessions of a listener on `listen_ip`. Never fails
+    /// the session: problems become run warnings.
+    fn watch(&self, listen_ip: Ipv4Addr) {
+        if listen_ip.is_unspecified() {
+            self.warn(format!(
+                "capture: a listener on {listen_ip} (any address) is not recorded;                  give each RTU its own listen IP"
+            ));
+            return;
+        }
+        let ifaces = netctl::session_ifaces(listen_ip, self.peer);
+        let mut ips = self.ips.lock().unwrap_or_else(|e| e.into_inner());
+        if !ips.contains(&listen_ip) {
+            ips.push(listen_ip);
+            let filter = match raw_replay::bpf::tcp_endpoints_filter(&ips, self.port) {
+                Ok(f) => f,
+                Err(e) => {
+                    ips.pop();
+                    drop(ips);
+                    self.warn(format!("capture: {listen_ip} not recorded: {e:#}"));
+                    return;
+                }
+            };
+            if let Err(e) = self.cap.set_filter(filter) {
+                self.warn(format!("capture filter update for {listen_ip}: {e:#}"));
+            }
+        }
+        drop(ips);
+        if ifaces.is_empty() {
+            self.warn(format!(
+                "capture: no interface found that carries {listen_ip}; its sessions are not recorded"
+            ));
+        }
+        for i in ifaces {
+            if let Err(e) = self.cap.add_iface(&i) {
+                self.warn(format!("capture on {i} for {listen_ip}: {e:#}"));
+            }
+        }
+    }
+
+    /// Stop after a short flush delay; `(path, packets, bytes, warnings)`.
+    fn finish(self) -> (PathBuf, u64, u64, Vec<String>) {
+        std::thread::sleep(Duration::from_millis(200));
+        let packets = self.cap.packets.load(Ordering::Relaxed);
+        let bytes = self.cap.bytes.load(Ordering::Relaxed);
+        let path = self.cap.path.clone();
+        let ifaces = self.cap.ifaces();
+        self.cap.stop();
+        info!(packets, bytes, ?ifaces, "slave capture stopped");
+        let w = self
+            .warnings
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        (path, packets, bytes, w)
+    }
+}
+
 /// Make `listen_ip` bindable: nothing to do if it is unspecified or
 /// already local; otherwise add a `/32 noprefixroute` alias on the
 /// configured alias NIC (or the default-route NIC, which is protected
@@ -1908,6 +2001,20 @@ fn run_benchmark_slave(
         ..Default::default()
     };
 
+    // Capture of the listeners' sessions (T18). A capture that cannot
+    // start costs the run its analysis, not the run itself.
+    let mut start_warnings: Vec<String> = Vec::new();
+    let capture: Option<Arc<SlaveCapture>> = cfg.capture_path.as_deref().and_then(|path| {
+        match SlaveCapture::start(path, cfg.listen_port_base, cfg.target_ip) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "slave capture failed to start");
+                start_warnings.push(format!("capture failed to start: {e:#}"));
+                None
+            }
+        }
+    });
+
     // 3. Warmup.
     if cfg.startup_delay_secs > 0 {
         info!(
@@ -1949,6 +2056,7 @@ fn run_benchmark_slave(
         let session_progress = sp.message_progress(&ctx.cancel);
         let state_dir_w = state_dir.clone();
         let prot_w = prot.clone();
+        let capture_w = capture.clone();
         let ident = SessionIdent {
             src_ip,
             src_mac,
@@ -2013,6 +2121,12 @@ fn run_benchmark_slave(
                         return early_report(&format!("{e:#}"), protoplay::session_state::FAILED);
                     }
                 };
+
+                // Record this listener's sessions from its first SYN.
+                if let Some(c) = &capture_w {
+                    c.watch(listen_ip);
+                }
+                drop(capture_w);
 
                 let started_at_ns = now_ns();
                 info!(%src_ip, %listen_ip, listen_port, bytes = payload.len(),
@@ -2110,6 +2224,23 @@ fn run_benchmark_slave(
 
     // 5. Join all and aggregate.
     let mut report = join_sessions(handles, run_start_ns);
+    report.warnings.extend(start_warnings);
+    if let Some(c) = capture {
+        match Arc::try_unwrap(c) {
+            Ok(c) => {
+                let (path, packets, bytes, w) = c.finish();
+                report.capture_path = Some(path);
+                report.captured_packets = packets;
+                report.captured_bytes = bytes;
+                report.warnings.extend(w);
+            }
+            // Only a session thread that never returned still holds it;
+            // dropping the last reference stops the capture.
+            Err(_) => report
+                .warnings
+                .push("capture still referenced by a session; not reported".into()),
+        }
+    }
     res.finish(&mut report.warnings);
     Ok(report)
 }
