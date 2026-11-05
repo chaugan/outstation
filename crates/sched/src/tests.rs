@@ -717,3 +717,148 @@ fn connect_failures_back_off_and_recover() {
     assert!(out.report.error.is_some());
     assert!(!out.cancelled_mid_run);
 }
+
+/// F079: worker and session threads run inside the caller's span (the
+/// webui's `run{id}`), so their log lines carry the run id.
+#[test]
+fn spawned_threads_inherit_the_run_span() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let subscriber =
+        tracing_subscriber::registry().with(tracing_subscriber::fmt::layer().with_test_writer());
+    tracing::subscriber::with_default(subscriber, || {
+        let span = tracing::info_span!("run", id = 7);
+        let _g = span.enter();
+        let h = spawn_named("t".into(), || {
+            tracing::Span::current()
+                .metadata()
+                .map(|m| m.name().to_string())
+        })
+        .unwrap();
+        assert_eq!(h.join().unwrap().as_deref(), Some("run"));
+    });
+}
+
+/// N15: `capture_ok` is false when a requested capture could not open
+/// every interface it needed, or holds nothing although traffic was
+/// sent; the byte cap shows as `capture_truncated`.
+#[test]
+fn capture_ok_and_truncation_reach_the_reports() {
+    let stats = |packets: u64, truncated: bool| raw_replay::CaptureStats {
+        path: PathBuf::from("/x.pcap"),
+        packets,
+        bytes: packets * 60,
+        dropped: 0,
+        truncated,
+    };
+    let none = CaptureOutcome::default();
+    assert!(none.ok(true), "no capture requested");
+    let good = CaptureOutcome {
+        stats: Some(stats(10, false)),
+        open_failed: false,
+        requested: true,
+    };
+    assert!(good.ok(true));
+    let partial = CaptureOutcome {
+        open_failed: true,
+        ..CaptureOutcome {
+            stats: Some(stats(10, false)),
+            open_failed: false,
+            requested: true,
+        }
+    };
+    assert!(!partial.ok(true));
+    let header_only = CaptureOutcome {
+        stats: Some(stats(0, false)),
+        open_failed: false,
+        requested: true,
+    };
+    assert!(!header_only.ok(true));
+    assert!(header_only.ok(false), "nothing sent, nothing to record");
+    let never_started = CaptureOutcome {
+        stats: None,
+        open_failed: true,
+        requested: true,
+    };
+    assert!(!never_started.ok(false));
+
+    let mut r = RunReport {
+        total_packets: 5,
+        ..Default::default()
+    };
+    r.set_capture(&CaptureOutcome {
+        stats: Some(stats(3, true)),
+        open_failed: false,
+        requested: true,
+    });
+    assert!(r.capture_ok && r.capture_truncated);
+    assert_eq!(r.captured_packets, 3);
+    let mut b = BenchmarkReport {
+        total_messages_received: 2,
+        ..Default::default()
+    };
+    b.set_capture(&header_only);
+    assert!(!b.capture_ok);
+}
+
+/// N8: a benchmark's capture reader runs at RT priority only with
+/// realtime on; the byte cap is passed through.
+#[test]
+fn benchmark_capture_is_realtime_only_on_request() {
+    let cfg = BenchmarkConfig {
+        capture_max_bytes: Some(1 << 20),
+        ..Default::default()
+    };
+    assert_eq!(
+        bench_capture_opts(&cfg),
+        CaptureOpts {
+            rt_priority: None,
+            max_bytes: Some(1 << 20),
+        }
+    );
+    let rt = BenchmarkConfig {
+        realtime: true,
+        ..cfg
+    };
+    assert_eq!(
+        bench_capture_opts(&rt).rt_priority,
+        Some(CAPTURE_RT_PRIORITY)
+    );
+}
+
+/// N15: a slave run stopped during its warmup still reports why its
+/// capture failed (the warning used to be dropped on that path).
+#[test]
+fn warmup_cancel_keeps_the_capture_warning() {
+    let pcap = Arc::new(
+        pcapload::load(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/synth_iec104_rtus200_ts.pcap"),
+        )
+        .unwrap(),
+    );
+    let state = tempfile_dir();
+    let cfg = BenchmarkConfig {
+        role: protoplay::Role::Slave,
+        startup_delay_secs: 30,
+        capture_path: Some(PathBuf::from("/proc/no-such-dir/cap.pcap")),
+        state_dir: Some(state.clone()),
+        ..Default::default()
+    };
+    let ctx = RunContext::new();
+    let c = ctx.clone();
+    let h =
+        thread::spawn(move || run_benchmark_slave(pcap, cfg, Arc::new(ListenUntilCancelled), c));
+    thread::sleep(Duration::from_millis(300));
+    ctx.cancel_all();
+    let report = h.join().unwrap().unwrap();
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("capture failed to start")),
+        "{:?}",
+        report.warnings
+    );
+    assert!(!report.capture_ok);
+    let _ = std::fs::remove_dir_all(state);
+}

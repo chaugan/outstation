@@ -597,10 +597,15 @@ impl Link {
         let stop = Arc::new(AtomicBool::new(false));
         let (tx, rx) = mpsc::channel();
         let stop_r = stop.clone();
+        // The session's span (the run's), so the reader's log lines
+        // carry the run id (F079).
+        let span = tracing::Span::current();
         let reader = match thread::Builder::new()
             .name(opts.reader_name)
-            .spawn(move || reader_loop(read_stream, tx, stop_r))
-        {
+            .spawn(move || {
+                let _entered = span.enter();
+                reader_loop(read_stream, tx, stop_r)
+            }) {
             Ok(h) => h,
             Err(e) => {
                 report.error = Some(format!("spawn reader thread: {e}"));

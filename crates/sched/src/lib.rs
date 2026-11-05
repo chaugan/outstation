@@ -328,12 +328,23 @@ fn warmup_elapsed(ctx: &RunContext, secs: u64) -> bool {
     !ctx.is_cancelled()
 }
 
-/// Spawn a named worker or session thread.
+/// Spawn a named worker or session thread inside the caller's tracing
+/// span (the webui's `run{id}`), so its log lines carry the run id
+/// (F079).
 fn spawn_named<T: Send + 'static>(
     name: String,
     body: impl FnOnce() -> T + Send + 'static,
 ) -> std::io::Result<thread::JoinHandle<T>> {
-    thread::Builder::new().name(name).spawn(body)
+    // The caller's dispatcher too, so a scoped (thread-local)
+    // subscriber, as in tests, also sees the thread's events.
+    let dispatch = tracing::dispatcher::get_default(|d| d.clone());
+    let span = tracing::Span::current();
+    thread::Builder::new().name(name).spawn(move || {
+        tracing::dispatcher::with_default(&dispatch, || {
+            let _entered = span.enter();
+            body()
+        })
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -372,6 +383,10 @@ pub struct RunConfig {
     /// If Some, capture every frame that flows through the bridge to
     /// this pcap file.
     pub capture_path: Option<PathBuf>,
+    /// Largest capture file in bytes; at the cap the capture stops
+    /// recording and the report says `capture_truncated`. `None` = no
+    /// cap.
+    pub capture_max_bytes: Option<u64>,
     /// Number of times to replay the pcap. `0` means loop forever
     /// until cancelled. Passes are aligned on the shared epoch:
     /// pass `k` starts at `epoch + k * (pcap span / speed + 1 ms)`.
@@ -402,6 +417,7 @@ impl Default for RunConfig {
             include_non_ip: true,
             startup_delay_secs: 0,
             capture_path: None,
+            capture_max_bytes: None,
             iterations: 1,
             state_dir: None,
             protected_addrs: Vec::new(),
@@ -440,8 +456,17 @@ pub struct RunReport {
     /// Frames the capture lost to a full kernel queue (the capture file
     /// is missing them; its analysis under-counts delivery).
     pub captured_dropped: u64,
+    /// The capture reached [`RunConfig::capture_max_bytes`] and holds
+    /// only the start of the run.
+    pub capture_truncated: bool,
+    /// The capture recorded what it had to: `false` when one was
+    /// requested but could not be opened on every interface it needed,
+    /// or holds no frame although frames were sent. `true` when no
+    /// capture was requested.
+    pub capture_ok: bool,
     /// Non-fatal problems (guard warnings, realtime policy, worker
-    /// errors) worth showing in the run's status.
+    /// errors, capture and teardown failures) worth showing in the
+    /// run's status.
     pub warnings: Vec<String>,
 }
 
@@ -530,13 +555,16 @@ fn bring_up_topology(
     Ok(())
 }
 
+/// Start the run's mirror capture. Returns `false` if it could not
+/// record everything it should (no capture, or the replies on an
+/// enslaved NIC are not recorded); the reason is in `warnings`.
 fn start_capture(
     res: &mut RunResources,
     names: &IfaceNames,
     path: &Path,
-    rt_priority: Option<i32>,
+    opts: CaptureOpts,
     warnings: &mut Vec<String>,
-) {
+) -> bool {
     // Two vantage points, so that every wire frame of the run is
     // recorded exactly once (B1):
     // * a dedicated dummy device every run port mirrors its *ingress*
@@ -552,25 +580,28 @@ fn start_capture(
         Ok(p) => p,
         Err(e) => {
             warnings.push(format!("capture disabled: {e:#}"));
-            return;
+            return false;
         }
     };
     let Some(topo) = res.topo.as_mut() else {
-        return;
+        warnings.push("capture disabled: no topology".into());
+        return false;
     };
     if let Err(e) = topo.add_capture_mirror(&port) {
         warn!(error = %format!("{e:#}"), "could not create capture mirror");
         warnings.push(format!("could not create capture mirror: {e:#}"));
-        return;
+        return false;
     }
-    let cap = match Capture::start_with_priority(&port, path, rt_priority) {
+    let cap = match Capture::start_with_priority(&port, path, opts.rt_priority) {
         Ok(c) => c,
         Err(e) => {
             warn!(error = %e, path = %path.display(), "capture failed to start");
             warnings.push(format!("capture failed to start: {e:#}"));
-            return;
+            return false;
         }
     };
+    cap.set_max_bytes(opts.max_bytes);
+    let mut complete = true;
     let filter = raw_replay::bpf::incoming_to_macs_filter(topo.port_macs());
     for nic in topo.enslaved() {
         if let Err(e) = cap.add_iface_with_filter(nic, &filter) {
@@ -578,10 +609,41 @@ fn start_capture(
             warnings.push(format!(
                 "capture records no replies from the target: capture on {nic} failed: {e:#}"
             ));
+            complete = false;
         }
     }
     info!(path = %path.display(), ifaces = ?cap.ifaces(), "capture started");
     res.capture = Some(cap);
+    complete
+}
+
+/// Capture settings of a run.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct CaptureOpts {
+    /// SCHED_FIFO priority of the reader thread, if any.
+    rt_priority: Option<i32>,
+    /// Byte cap of the capture file.
+    max_bytes: Option<u64>,
+}
+
+/// What became of a run's capture, for the report.
+#[derive(Debug, Default)]
+struct CaptureOutcome {
+    stats: Option<raw_replay::CaptureStats>,
+    /// Requested but not (fully) opened.
+    open_failed: bool,
+    requested: bool,
+}
+
+impl CaptureOutcome {
+    /// `capture_ok` given whether frames or messages were sent.
+    fn ok(&self, traffic_sent: bool) -> bool {
+        if !self.requested {
+            return true;
+        }
+        let header_only = self.stats.as_ref().is_none_or(|st| st.packets == 0);
+        !self.open_failed && !(traffic_sent && header_only)
+    }
 }
 
 /// Stop the capture (after a short delay for frames still in flight)
@@ -602,7 +664,43 @@ fn finish_capture(c: Capture, warnings: &mut Vec<String>) -> raw_replay::Capture
             st.dropped
         ));
     }
+    if st.truncated {
+        warnings.push(format!(
+            "capture stopped at its byte cap after {} frames ({} bytes); it holds only the \
+             start of the run",
+            st.packets, st.bytes
+        ));
+    }
     st
+}
+
+impl RunReport {
+    /// Record the capture's outcome (counters, truncation, `capture_ok`).
+    fn set_capture(&mut self, c: &CaptureOutcome) {
+        if let Some(st) = &c.stats {
+            self.capture_path = Some(st.path.clone());
+            self.captured_packets = st.packets;
+            self.captured_bytes = st.bytes;
+            self.captured_dropped = st.dropped;
+            self.capture_truncated = st.truncated;
+        }
+        self.capture_ok = c.ok(self.total_packets > 0);
+    }
+}
+
+impl BenchmarkReport {
+    /// Record the capture's outcome (counters, truncation, `capture_ok`).
+    fn set_capture(&mut self, c: &CaptureOutcome) {
+        if let Some(st) = &c.stats {
+            self.capture_path = Some(st.path.clone());
+            self.captured_packets = st.packets;
+            self.captured_bytes = st.bytes;
+            self.captured_dropped = st.dropped;
+            self.capture_truncated = st.truncated;
+        }
+        let traffic = self.total_messages_sent + self.total_messages_received > 0;
+        self.capture_ok = c.ok(traffic);
+    }
 }
 
 /// [`finish_capture`] for a run's mirror capture.
@@ -643,6 +741,12 @@ pub struct BenchmarkConfig {
     pub connect_timeout_secs: u64,
     pub startup_delay_secs: u64,
     pub capture_path: Option<PathBuf>,
+    /// Largest capture file in bytes; see [`RunConfig::capture_max_bytes`].
+    pub capture_max_bytes: Option<u64>,
+    /// Run the capture reader at SCHED_FIFO (as raw mode's `realtime`
+    /// does). Off by default: a benchmark's sessions are not real-time
+    /// threads, so the capture has no business outranking the host.
+    pub realtime: bool,
     /// Free-form JSON/YAML passed through to the ProtoReplayer.
     pub proto_config: Option<String>,
     /// Which side of the captured conversation the tool plays.
@@ -836,6 +940,8 @@ impl Default for BenchmarkConfig {
             connect_timeout_secs: 5,
             startup_delay_secs: 0,
             capture_path: None,
+            capture_max_bytes: None,
+            realtime: false,
             proto_config: None,
             role: protoplay::Role::Master,
             listen_port_base: 2404,
@@ -1024,7 +1130,15 @@ pub struct BenchmarkReport {
     /// Frames the capture lost to a full kernel queue (the capture file
     /// is missing them; its analysis under-counts delivery).
     pub captured_dropped: u64,
-    /// Non-fatal problems worth showing in the run's status.
+    /// The capture reached [`BenchmarkConfig::capture_max_bytes`] and
+    /// holds only the start of the run.
+    pub capture_truncated: bool,
+    /// See [`RunReport::capture_ok`]: `false` when the capture could
+    /// not record every session it had to, or holds no frame although
+    /// the sessions exchanged messages.
+    pub capture_ok: bool,
+    /// Non-fatal problems (capture, guard-restore, alias and teardown
+    /// failures, panicked sessions) worth showing in the run's status.
     pub warnings: Vec<String>,
 }
 

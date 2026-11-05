@@ -142,15 +142,17 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
     let workers = add_raw_ports(&pcap, &cfg, &names, &mut res)?;
     info!(sources = workers.len(), bridge = %names.bridge, "topology up");
     let rt_plan = raw_realtime_plan(&cfg, workers.len(), &mut warnings);
+    let mut capture = CaptureOutcome {
+        requested: cfg.capture_path.is_some(),
+        ..Default::default()
+    };
     if let Some(path) = &cfg.capture_path {
         let rt_active = rt_plan.iter().any(|b| *b);
-        start_capture(
-            &mut res,
-            &names,
-            path,
-            rt_active.then_some(CAPTURE_RT_PRIORITY),
-            &mut warnings,
-        );
+        let opts = CaptureOpts {
+            rt_priority: rt_active.then_some(CAPTURE_RT_PRIORITY),
+            max_bytes: cfg.capture_max_bytes,
+        };
+        capture.open_failed = !start_capture(&mut res, &names, path, opts, &mut warnings);
     }
     let progress = init_raw_progress(&ctx, &workers, cfg.iterations);
 
@@ -164,6 +166,9 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         if !warmup_elapsed(&ctx, cfg.startup_delay_secs) {
             info!("run cancelled during warmup, tearing down");
             let mut report = RunReport::default();
+            capture.stats = collect_capture(&mut res, &mut warnings);
+            report.set_capture(&capture);
+            report.warnings = warnings;
             res.finish(&mut report.warnings);
             return Ok(report);
         }
@@ -188,12 +193,8 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
     let mut report = join_raw_workers(handles);
 
     // 5. Stop the capture (flush first), then tear everything down.
-    if let Some(st) = collect_capture(&mut res, &mut warnings) {
-        report.capture_path = Some(st.path);
-        report.captured_packets = st.packets;
-        report.captured_bytes = st.bytes;
-        report.captured_dropped = st.dropped;
-    }
+    capture.stats = collect_capture(&mut res, &mut warnings);
+    report.set_capture(&capture);
     report.warnings.extend(warnings);
     res.finish(&mut report.warnings);
     Ok(report)

@@ -176,6 +176,15 @@ pub(crate) fn finish_session(
     state == protoplay::session_state::CANCELLED
 }
 
+/// Capture settings of a benchmark run, either role: the reader runs
+/// at RT priority only with `realtime` on (N8).
+pub(crate) fn bench_capture_opts(cfg: &BenchmarkConfig) -> CaptureOpts {
+    CaptureOpts {
+        rt_priority: cfg.realtime.then_some(CAPTURE_RT_PRIORITY),
+        max_bytes: cfg.capture_max_bytes,
+    }
+}
+
 /// Handles of the running session threads, with the identity the
 /// coordinator needs to report a thread that died.
 pub(crate) type SessionHandles = Vec<(SessionIdent, thread::JoinHandle<SessionReport>)>;
@@ -275,8 +284,13 @@ pub fn run_benchmark(
     let bindings = add_session_ports(&mut res, &names, &picks, cfg.master_bind_ip, &prot)?;
 
     // 4. Mirror capture.
+    let mut capture = CaptureOutcome {
+        requested: cfg.capture_path.is_some(),
+        ..Default::default()
+    };
     if let Some(path) = &cfg.capture_path {
-        start_capture(&mut res, &names, path, None, &mut warnings);
+        let opts = bench_capture_opts(&cfg);
+        capture.open_failed = !start_capture(&mut res, &names, path, opts, &mut warnings);
     }
 
     // 5. Per-session progress.
@@ -288,6 +302,9 @@ pub fn run_benchmark(
             "benchmark warmup: interfaces are live");
         if !warmup_elapsed(&ctx, cfg.startup_delay_secs) {
             let mut report = BenchmarkReport::default();
+            capture.stats = collect_capture(&mut res, &mut warnings);
+            report.set_capture(&capture);
+            report.warnings = warnings;
             res.finish(&mut report.warnings);
             return Ok(report);
         }
@@ -309,12 +326,8 @@ pub fn run_benchmark(
     let mut report = join_sessions(handles, run_start_ns);
 
     // 9. Stop capture, teardown.
-    if let Some(st) = collect_capture(&mut res, &mut warnings) {
-        report.capture_path = Some(st.path);
-        report.captured_packets = st.packets;
-        report.captured_bytes = st.bytes;
-        report.captured_dropped = st.dropped;
-    }
+    capture.stats = collect_capture(&mut res, &mut warnings);
+    report.set_capture(&capture);
     report.warnings.extend(warnings);
     res.finish(&mut report.warnings);
     Ok(report)

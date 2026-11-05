@@ -18,17 +18,16 @@ struct SlaveCapture {
     peer: Option<Ipv4Addr>,
     ips: Mutex<Vec<Ipv4Addr>>,
     warnings: Mutex<Vec<String>>,
+    /// Some listener's sessions could not be (fully) recorded.
+    incomplete: AtomicBool,
 }
 
 impl SlaveCapture {
-    fn start(path: &Path, port: u16, peer: Ipv4Addr) -> Result<Self> {
-        // The reader only blocks in poll and drains bursts; at RT
-        // priority a loaded host cannot starve it into dropping frames.
-        let cap = Capture::start_filtered(
-            path,
-            raw_replay::bpf::reject_all(),
-            Some(CAPTURE_RT_PRIORITY),
-        )?;
+    fn start(path: &Path, port: u16, peer: Ipv4Addr, opts: CaptureOpts) -> Result<Self> {
+        // The reader only blocks in poll and drains bursts. It runs at
+        // RT priority only when the run asks for realtime (N8).
+        let cap = Capture::start_filtered(path, raw_replay::bpf::reject_all(), opts.rt_priority)?;
+        cap.set_max_bytes(opts.max_bytes);
         info!(path = %path.display(), port, "slave capture started");
         Ok(Self {
             cap,
@@ -36,10 +35,13 @@ impl SlaveCapture {
             peer: (!peer.is_unspecified()).then_some(peer),
             ips: Mutex::new(Vec::new()),
             warnings: Mutex::new(Vec::new()),
+            incomplete: AtomicBool::new(false),
         })
     }
 
+    /// A listener's sessions are not (fully) recorded: a run warning.
     fn warn(&self, msg: String) {
+        self.incomplete.store(true, Ordering::Relaxed);
         warn!("{msg}");
         let mut w = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
         if w.len() < 16 && !w.contains(&msg) {
@@ -52,7 +54,8 @@ impl SlaveCapture {
     fn watch(&self, listen_ip: Ipv4Addr) {
         if listen_ip.is_unspecified() {
             self.warn(format!(
-                "capture: a listener on {listen_ip} (any address) is not recorded;                  give each RTU its own listen IP"
+                "capture: a listener on {listen_ip} (any address) is not recorded; \
+                 give each RTU its own listen IP"
             ));
             return;
         }
@@ -86,16 +89,18 @@ impl SlaveCapture {
         }
     }
 
-    /// Stop after a short flush delay: the counters and the warnings.
-    fn finish(self) -> (raw_replay::CaptureStats, Vec<String>) {
+    /// Stop after a short flush delay: the counters, the warnings and
+    /// whether some listener was not (fully) recorded.
+    fn finish(self) -> (raw_replay::CaptureStats, Vec<String>, bool) {
         let ifaces = self.cap.ifaces();
+        let incomplete = self.incomplete.load(Ordering::Relaxed);
         let mut w = self
             .warnings
             .into_inner()
             .unwrap_or_else(|e| e.into_inner());
         let st = finish_capture(self.cap, &mut w);
         info!(?ifaces, "slave capture stopped");
-        (st, w)
+        (st, w, incomplete)
     }
 }
 
@@ -183,6 +188,11 @@ pub(crate) fn run_benchmark_slave(
     // start costs the run its analysis, not the run itself.
     let mut start_warnings: Vec<String> = Vec::new();
     let capture = start_slave_capture(&cfg, &mut start_warnings);
+    let mut outcome = CaptureOutcome {
+        requested: cfg.capture_path.is_some(),
+        open_failed: cfg.capture_path.is_some() && capture.is_none(),
+        ..Default::default()
+    };
 
     // 3. Warmup.
     if cfg.startup_delay_secs > 0 {
@@ -191,7 +201,12 @@ pub(crate) fn run_benchmark_slave(
             "slave warmup: listeners not yet bound — attach tooling to target side"
         );
         if !warmup_elapsed(&ctx, cfg.startup_delay_secs) {
-            let mut report = BenchmarkReport::default();
+            let mut report = BenchmarkReport {
+                warnings: start_warnings,
+                ..Default::default()
+            };
+            finish_slave_capture(capture, &mut report, &mut outcome);
+            report.set_capture(&outcome);
             res.finish(&mut report.warnings);
             return Ok(report);
         }
@@ -208,7 +223,9 @@ pub(crate) fn run_benchmark_slave(
         state_dir,
         prot,
         capture: capture.clone(),
+        warnings: Arc::default(),
     };
+    let session_warnings = Arc::clone(&env.warnings);
     let handles = match spawn_slave_sessions(picks, &progress, &env) {
         Ok(h) => h,
         Err(e) => {
@@ -222,7 +239,11 @@ pub(crate) fn run_benchmark_slave(
     // 5. Join all and aggregate.
     let mut report = join_sessions(handles, run_start_ns);
     report.warnings.extend(start_warnings);
-    finish_slave_capture(capture, &mut report);
+    report.warnings.extend(std::mem::take(
+        &mut *session_warnings.lock().unwrap_or_else(|e| e.into_inner()),
+    ));
+    finish_slave_capture(capture, &mut report, &mut outcome);
+    report.set_capture(&outcome);
     res.finish(&mut report.warnings);
     Ok(report)
 }
@@ -319,7 +340,12 @@ fn start_slave_capture(
     warnings: &mut Vec<String>,
 ) -> Option<Arc<SlaveCapture>> {
     let path = cfg.capture_path.as_deref()?;
-    match SlaveCapture::start(path, cfg.listen_port_base, cfg.target_ip) {
+    match SlaveCapture::start(
+        path,
+        cfg.listen_port_base,
+        cfg.target_ip,
+        bench_capture_opts(cfg),
+    ) {
         Ok(c) => Some(Arc::new(c)),
         Err(e) => {
             warn!(error = %format!("{e:#}"), "slave capture failed to start");
@@ -329,26 +355,31 @@ fn start_slave_capture(
     }
 }
 
-/// Stop the slave capture and put its counters and warnings in the
-/// report.
-fn finish_slave_capture(capture: Option<Arc<SlaveCapture>>, report: &mut BenchmarkReport) {
+/// Stop the slave capture: its warnings go into the report, its
+/// counters and completeness into `outcome`.
+fn finish_slave_capture(
+    capture: Option<Arc<SlaveCapture>>,
+    report: &mut BenchmarkReport,
+    outcome: &mut CaptureOutcome,
+) {
     let Some(c) = capture else {
         return;
     };
     match Arc::try_unwrap(c) {
         Ok(c) => {
-            let (st, w) = c.finish();
-            report.capture_path = Some(st.path);
-            report.captured_packets = st.packets;
-            report.captured_bytes = st.bytes;
-            report.captured_dropped = st.dropped;
+            let (st, w, incomplete) = c.finish();
+            outcome.stats = Some(st);
+            outcome.open_failed |= incomplete;
             report.warnings.extend(w);
         }
         // Only a session thread that never returned still holds it;
         // dropping the last reference stops the capture.
-        Err(_) => report
-            .warnings
-            .push("capture still referenced by a session; not reported".into()),
+        Err(_) => {
+            outcome.open_failed = true;
+            report
+                .warnings
+                .push("capture still referenced by a session; not reported".into());
+        }
     }
 }
 
@@ -361,6 +392,8 @@ struct SlaveEnv {
     state_dir: PathBuf,
     prot: Protection,
     capture: Option<Arc<SlaveCapture>>,
+    /// Run warnings raised inside sessions (alias cleanup failures).
+    warnings: Arc<Mutex<Vec<String>>>,
 }
 
 /// Everything one slave session thread owns.
@@ -431,6 +464,7 @@ fn slave_session(job: SlaveJob) -> SessionReport {
         state_dir,
         prot,
         capture,
+        warnings,
     } = env;
     let src_ip = pick.server_ip;
     let listen_port = cfg.listen_port_base;
@@ -487,6 +521,10 @@ fn slave_session(job: SlaveJob) -> SessionReport {
     if let Some(a) = alias {
         if let Err(e) = a.release() {
             warn!(%listen_ip, error = %format!("{e:#}"), "alias cleanup failed");
+            warnings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(format!("alias cleanup for {listen_ip} failed: {e:#}"));
         }
     }
 
