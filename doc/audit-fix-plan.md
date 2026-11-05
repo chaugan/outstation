@@ -137,7 +137,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Fix the µs label.
   - Concurrent-run banner, using the T04 event channel.
 
-- [ ] **T07b Backend issues found by the frontend lane.**
+- [~] **T07b Backend issues found by the frontend lane.**
   1. Slave listen IPs in 127.0.0.0/8 are treated as non-local and aliased; all of 127/8 is local on Linux.
   2. `per_source_progress` has no per-session failure reason.
   3. Stopping a slave run counts pending sessions as failed.
@@ -158,8 +158,8 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 - [x] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
 - [x] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
-- [ ] **T18 Slave-mode capture.** Slave runs (the main "test a SCADA master" scenario) have no mirror capture, so auto-analysis and `bench` score assertions cannot cover them. Capture the RTU listen-IP traffic on the alias NIC with a BPF filter limited to the run's listen IPs and port, store it like the other captures, and enable auto-analysis and bench scoring for slave runs.
-- [ ] **T19 UI for the wave-3 features.**
+- [~] **T18 Slave-mode capture.** Slave runs (the main "test a SCADA master" scenario) have no mirror capture, so auto-analysis and `bench` score assertions cannot cover them. Capture the RTU listen-IP traffic on the alias NIC with a BPF filter limited to the run's listen IPs and port, store it like the other captures, and enable auto-analysis and bench scoring for slave runs.
+- [~] **T19 UI for the wave-3 features.**
   - Re-run and "Load config" from a run, plus named profiles (save, load, delete).
   - Compare view with a run picker, regression highlighting and thresholds; when an analysis is missing, POST `/api/runs/:id/analyze` and retry.
   - Auto-analysis state on run cards; SSE `analysis_finished` and `analysis_failed` trigger a refresh.
@@ -274,3 +274,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
 - 2026-11-05: New tasks.
   - T18: slave runs have no mirror capture (an existing gap).
   - T19: UI for the wave-3 features.
+- 2026-11-05: Started backend2 (T07b, T18) and ui2 (T19) in parallel.
