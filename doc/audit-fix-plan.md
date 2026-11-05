@@ -209,13 +209,188 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - The Compare regression list shows raw metric names and µs ("p99_us rose from 245242 µs"); show friendly labels with ms.
   - Configure must hide the SCADA-gateway section in master role; the server now refuses it with 400 `gateway_requires_slave`.
   - The flaky test `uploads_respect_disk_reserve_and_library_quota` derives its reserve from live free space, so parallel tests change the result; inject a free-space provider.
-- [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
+- [x] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
 
 ## Finding → task map
 
 F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05 · F007 T15 · F008 T05 · F009 T05/T11 · F010 T05 · F011 T02 · F012 T06 · F013 T05 · F014 T02 · F015 T02 · F016 T02 · F017 T02 (done early) · F018 T05 · F019 T02 · F020 T02 · F021 T02 · F022 T02 · F023 T05 · F024 T05 · F025 T05 · F026 T03 · F027 T04 · F028 T03 · F029 T04 · F030 T03/T04 · F031 T03 · F032 T03 · F033 T03 · F034 T03 · F035 T03 · F036 T04 · F037 T04 · F038 T03 · F039 T03 · F040 T03 · F041 T03 · F042 T04 · F043 T03 · F044 T04 · F045 T03 · F046 T04 · F047 T03 · F048 T04 · F049 T04 · F050 T04 · F051 T04 · F052 T04 · F053 T04 · F054 T04 · F055 T04 · F056 T04 · F057 T04 · F058 T06 · F059 T06 · F060 T06 · F061 T06 · F062 T06 · F063 T06 · F064 T06 · F065 T06 · F066 T06 · F067 T06 · F068 T06/T15 · F069 T06 · F070 T04 · F071 T04 · F072 T04 · F073 T04 · F074 T04 · F075 T03 · F076 T04 · F077 T04 · F078 T04 · F079 T04 · F080 T00/T16 · F081 T02 · F082 T04/T05 (tests) · F083 T02 · F084 T00/T16 · F085 T00 · F086 T04 · F087 T04 · F088 T04/T07 · F089 T04 · F090 T04 · F091 T04 · F092 T04 · F093 T06/T08 · F094 T04 · F095 T07 · F096 T07 · F097 T07 · F098 T07 · F099 T07 · F100 T07/T08 · F101 T04/T07 · F102 T07 · F103 T07 · F104 T07 · F105 T07 · F106 T07 · F107 T07 · F108 T04/T08 · F109 T07 · F110 T07 · F111 T07 · F112 T07 · F113 T07 · F114 T07 · F115 T07 · F116 T07 · F117 T07 · F118 T07 · F119 T07 · F120 T07 · F121 T07 · F122 T07 · F123 T07 · F124 T07 · F125 T07 · F126 T07 · F127 T14 · F128 T15 · F129 T15 · F130 T15 · F131 T08/T09 · F132 T04 · F133 T04/T15 · F134 T00 · F135 T15 · F136 T04/T06 · F137 T03/T04 · F138 T15 · F139 T11/T12 · F140 T05 · F141 T05 · F142 T05 · F143 T05 · F144 T05 · F145 T05 · F146 T04 · F147 T05 · F148 T04 · F149 T04 · F150 T05 · F151 T04 · P01–P12 T01 (P02 consumer parts in T02/T03, P04 raw-pacing guard in T03, P09 in T02)
+
+## Finding accounting (T17)
+
+Every finding is accounted for: **163 fixed, 1 won't fix** (of 164).
+
+- An independent re-audit (six agents, snapshot `7750eae`) found nothing unfixed: 146 fixed and 18 partly fixed. F148 was one of the 18; its gap is the missing authentication, which stays by decision.
+- Every partial remainder was then closed (fx1, fx2, T17c and the F009 follow-up). The last column names the closing commits.
+- The re-audit's 26 new defects (N1–N26) were fixed in T17a/T17b.
+
+| ID | Task | Status | Evidence |
+|---|---|---|---|
+| F000 | T05 | fixed | Confirmed by re-audit |
+| F001 | T05 | fixed | Confirmed by re-audit |
+| F002 | T05 | fixed | Confirmed by re-audit |
+| F003 | T05 | fixed | Confirmed by re-audit |
+| F004 | T05 | fixed | Confirmed by re-audit |
+| F005 | T05 | fixed | Confirmed by re-audit |
+| F006 | T05 | fixed | Confirmed by re-audit |
+| F007 | T15 | fixed | Confirmed by re-audit |
+| F008 | T05 | fixed | Confirmed by re-audit |
+| F009 | T05/T11 | fixed | Partly fixed at re-audit; remainder closed: ack-latency label and command round trip (T11); peer ack cadence (F009 follow-up, `67cb85c`, `dffe8b6`) |
+| F010 | T05 | fixed | Confirmed by re-audit |
+| F011 | T02 | fixed | Confirmed by re-audit |
+| F012 | T06 | fixed | Confirmed by re-audit |
+| F013 | T05 | fixed | Confirmed by re-audit |
+| F014 | T02 | fixed | Confirmed by re-audit |
+| F015 | T02 | fixed | Confirmed by re-audit |
+| F016 | T02 | fixed | Confirmed by re-audit |
+| F017 | T02 (done early) | fixed | Confirmed by re-audit |
+| F018 | T05 | fixed | Confirmed by re-audit |
+| F019 | T02 | fixed | Confirmed by re-audit |
+| F020 | T02 | fixed | Confirmed by re-audit |
+| F021 | T02 | fixed | Confirmed by re-audit |
+| F022 | T02 | fixed | Confirmed by re-audit |
+| F023 | T05 | fixed | Confirmed by re-audit |
+| F024 | T05 | fixed | Confirmed by re-audit |
+| F025 | T05 | fixed | Confirmed by re-audit |
+| F026 | T03 | fixed | Confirmed by re-audit |
+| F027 | T04 | fixed | Confirmed by re-audit |
+| F028 | T03 | fixed | Partly fixed at re-audit; remainder closed: cancellable connect and send timeout (fx1 `501135d`) |
+| F029 | T04 | fixed | Confirmed by re-audit |
+| F030 | T03/T04 | fixed | Confirmed by re-audit |
+| F031 | T03 | fixed | Confirmed by re-audit |
+| F032 | T03 | fixed | Confirmed by re-audit |
+| F033 | T03 | fixed | Confirmed by re-audit |
+| F034 | T03 | fixed | Confirmed by re-audit |
+| F035 | T03 | fixed | Confirmed by re-audit |
+| F036 | T04 | fixed | Confirmed by re-audit |
+| F037 | T04 | fixed | Confirmed by re-audit |
+| F038 | T03 | fixed | Confirmed by re-audit |
+| F039 | T03 | fixed | Confirmed by re-audit |
+| F040 | T03 | fixed | Confirmed by re-audit |
+| F041 | T03 | fixed | Confirmed by re-audit |
+| F042 | T04 | fixed | Confirmed by re-audit |
+| F043 | T03 | fixed | Confirmed by re-audit |
+| F044 | T04 | fixed | Partly fixed at re-audit; remainder closed: `MemoryDenyWriteExecute=yes`; `SystemCallFilter` deliberately omitted, with the reason in the unit (fx2 `8ebb48e`) |
+| F045 | T03 | fixed | Confirmed by re-audit |
+| F046 | T04 | fixed | Confirmed by re-audit |
+| F047 | T03 | fixed | Confirmed by re-audit |
+| F048 | T04 | fixed | Confirmed by re-audit |
+| F049 | T04 | fixed | Confirmed by re-audit |
+| F050 | T04 | fixed | Confirmed by re-audit |
+| F051 | T04 | fixed | Partly fixed at re-audit; remainder closed: reserve enforced while streaming and an atomic library quota (fx2 `693b5aa`) |
+| F052 | T04 | fixed | Confirmed by re-audit |
+| F053 | T04 | fixed | Partly fixed at re-audit; remainder closed: inspect and run-start pcap loads take a heavy-work permit (fx2 `b728d9e`) |
+| F054 | T04 | fixed | Partly fixed at re-audit; remainder closed: `/api/runs` paging and in-memory retention (fx2 `d9501f9`) |
+| F055 | T04 | fixed | Partly fixed at re-audit; remainder closed: per-run capture byte cap and `capture_truncated` (fx1 `323524c`, fx2 `b5011e6`) |
+| F056 | T04 | fixed | Partly fixed at re-audit; remainder closed: arp and verify-ip return 503 when arping cannot run (fx2 `eb8b841`) |
+| F057 | T04 | fixed | Confirmed by re-audit |
+| F058 | T06 | fixed | Confirmed by re-audit |
+| F059 | T06 | fixed | Confirmed by re-audit |
+| F060 | T06 | fixed | Confirmed by re-audit |
+| F061 | T06 | fixed | Confirmed by re-audit |
+| F062 | T06 | fixed | Confirmed by re-audit |
+| F063 | T06 | fixed | Confirmed by re-audit |
+| F064 | T06 | fixed | Confirmed by re-audit |
+| F065 | T06 | fixed | Confirmed by re-audit |
+| F066 | T06 | fixed | Confirmed by re-audit |
+| F067 | T06 | fixed | Partly fixed at re-audit; remainder closed: `POST /api/analyze` returns the summary; details load lazily (fx2 `bac9170`) |
+| F068 | T06/T15 | fixed | Confirmed by re-audit |
+| F069 | T06 | fixed | Confirmed by re-audit |
+| F070 | T04 | fixed | Confirmed by re-audit |
+| F071 | T04 | fixed | Confirmed by re-audit |
+| F072 | T04 | fixed | Partly fixed at re-audit; remainder closed: same as F055 |
+| F073 | T04 | fixed | Confirmed by re-audit |
+| F074 | T04 | fixed | Confirmed by re-audit |
+| F075 | T03 | fixed | Confirmed by re-audit |
+| F076 | T04 | fixed | Confirmed by re-audit |
+| F077 | T04 | fixed | Confirmed by re-audit |
+| F078 | T04 | fixed | Confirmed by re-audit |
+| F079 | T04 | fixed | Confirmed by re-audit |
+| F080 | T00/T16 | fixed | Confirmed by re-audit |
+| F081 | T02 | fixed | Confirmed by re-audit |
+| F082 | T04/T05 (tests) | fixed | Partly fixed at re-audit; remainder closed: sched god-functions split, with helper tests (fx1 `d4ee1c8`, `1aee798`) |
+| F083 | T02 | fixed | Confirmed by re-audit |
+| F084 | T00/T16 | fixed | Confirmed by re-audit |
+| F085 | T00 | fixed | Confirmed by re-audit |
+| F086 | T04 | fixed | Confirmed by re-audit |
+| F087 | T04 | fixed | Confirmed by re-audit |
+| F088 | T04/T07 | fixed | Confirmed by re-audit |
+| F089 | T04 | fixed | Confirmed by re-audit |
+| F090 | T04 | fixed | Confirmed by re-audit |
+| F091 | T04 | fixed | Confirmed by re-audit |
+| F092 | T04 | fixed | Confirmed by re-audit |
+| F093 | T06/T08 | fixed | Confirmed by re-audit |
+| F094 | T04 | fixed | Confirmed by re-audit |
+| F095 | T07 | fixed | Confirmed by re-audit |
+| F096 | T07 | fixed | Confirmed by re-audit |
+| F097 | T07 | fixed | Confirmed by re-audit |
+| F098 | T07 | fixed | Confirmed by re-audit |
+| F099 | T07 | fixed | Confirmed by re-audit |
+| F100 | T07/T08 | fixed | Confirmed by re-audit |
+| F101 | T04/T07 | fixed | Confirmed by re-audit |
+| F102 | T07 | fixed | Confirmed by re-audit |
+| F103 | T07 | fixed | Confirmed by re-audit |
+| F104 | T07 | fixed | Confirmed by re-audit |
+| F105 | T07 | fixed | Confirmed by re-audit |
+| F106 | T07 | fixed | Partly fixed at re-audit; remainder closed: the live WebSocket ends on client Close (fx2 `3216e11`) |
+| F107 | T07 | fixed | Confirmed by re-audit |
+| F108 | T04/T08 | fixed | Confirmed by re-audit |
+| F109 | T07 | fixed | Confirmed by re-audit |
+| F110 | T07 | fixed | Confirmed by re-audit |
+| F111 | T07 | fixed | Confirmed by re-audit |
+| F112 | T07 | fixed | Confirmed by re-audit |
+| F113 | T07 | fixed | Confirmed by re-audit |
+| F114 | T07 | fixed | Confirmed by re-audit |
+| F115 | T07 | fixed | Confirmed by re-audit |
+| F116 | T07 | fixed | Confirmed by re-audit |
+| F117 | T07 | fixed | Confirmed by re-audit |
+| F118 | T07 | fixed | Confirmed by re-audit |
+| F119 | T07 | fixed | Confirmed by re-audit |
+| F120 | T07 | fixed | Confirmed by re-audit |
+| F121 | T07 | fixed | Confirmed by re-audit |
+| F122 | T07 | fixed | Confirmed by re-audit |
+| F123 | T07 | fixed | Confirmed by re-audit |
+| F124 | T07 | fixed | Confirmed by re-audit |
+| F125 | T07 | fixed | Confirmed by re-audit |
+| F126 | T07 | fixed | Partly fixed at re-audit; remainder closed: analysis charts get `role="img"`, labels and linked captions (fx2 `7da8dff`) |
+| F127 | T14 | fixed | Confirmed by re-audit |
+| F128 | T15 | fixed | Confirmed by re-audit |
+| F129 | T15 | fixed | Confirmed by re-audit |
+| F130 | T15 | fixed | Confirmed by re-audit |
+| F131 | T08/T09 | fixed | Confirmed by re-audit |
+| F132 | T04 | fixed | Confirmed by re-audit |
+| F133 | T04/T15 | fixed | Confirmed by re-audit |
+| F134 | T00 | fixed | Confirmed by re-audit |
+| F135 | T15 | fixed | Partly fixed at re-audit; remainder closed: measured at 200/400/800 sessions; README Scale rewritten (T17 measurement, T17c) |
+| F136 | T04/T06 | fixed | Confirmed by re-audit |
+| F137 | T03/T04 | fixed | Confirmed by re-audit |
+| F138 | T15 | fixed | Confirmed by re-audit |
+| F139 | T11/T12 | fixed | Confirmed by re-audit |
+| F140 | T05 | fixed | Confirmed by re-audit |
+| F141 | T05 | fixed | Confirmed by re-audit |
+| F142 | T05 | fixed | Confirmed by re-audit |
+| F143 | T05 | fixed | Confirmed by re-audit |
+| F144 | T05 | fixed | Confirmed by re-audit |
+| F145 | T05 | fixed | Confirmed by re-audit |
+| F146 | T04 | fixed | Confirmed by re-audit |
+| F147 | T05 | fixed | Confirmed by re-audit |
+| F148 | T04 | won't fix (by decision) | No authentication, by the user's decision; documented in the README. Concurrent-run notices (409 `run_active` with the client IP, SSE banner) were added instead. |
+| F149 | T04 | fixed | Confirmed by re-audit |
+| F150 | T05 | fixed | Confirmed by re-audit |
+| F151 | T04 | fixed | Confirmed by re-audit |
+| P01 | T01 | fixed | Confirmed by re-audit |
+| P02 | T01 (+T02/T03) | fixed | Partly fixed at re-audit; remainder closed: best flow per endpoint, used by sched, viability and the analyzer (fx1 `4baf1fe`, `0beb832`) |
+| P03 | T01 | fixed | Confirmed by re-audit |
+| P04 | T01 (+T03) | fixed | Confirmed by re-audit |
+| P05 | T01 | fixed | Confirmed by re-audit |
+| P06 | T01 | fixed | Confirmed by re-audit |
+| P07 | T01 | fixed | Partly fixed at re-audit; remainder closed: one reassembly per side; RAM estimate counts per-packet overhead (fx1 `4baf1fe`) |
+| P08 | T01 | fixed | Partly fixed at re-audit; remainder closed: real load error kept in the library sidecar (fx2 `e9c8524`) |
+| P09 | T01 (T02) | fixed | Confirmed by re-audit |
+| P10 | T01 | fixed | Confirmed by re-audit |
+| P11 | T01 | fixed | Confirmed by re-audit |
+| P12 | T01 | fixed | Confirmed by re-audit |
 
 ## Progress log
 
@@ -416,3 +591,11 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - `ServeConfig.free_space` makes the free-space source injectable; the disk-reserve test is deterministic (10/10 consecutive runs).
   - ui-smoke: 560/560 and 580/580 (`--no-auto-analyze`). netns-smoke 10/10, netns-slave 2/2.
   - Note: commit 5ae1786 on the lane branch was made while that flaky test was still red; the next commit (043d76e) fixed it.
+- 2026-11-05: F009 remainder closed: the peer's ack cadence is recorded and shown (full window, below the window or by the t2 timer, piggybacked), along with the longest below-window wait, which reveals the peer's real t2. Workspace tests: 493 passed.
+- 2026-11-05: T17 done. Final verification on `audit-fixes` (`dffe8b6`):
+  - fmt, clippy `-D warnings` and tests: 493 passed, 2 runs green. MSRV 1.85 check clean; SPA JS check and doc link check clean.
+  - Privileged suites, all in `ostest-*` namespaces with none left over: netctl 9/9, bench 3+5, slave 2/2, smoke 10/10 (three runs), gateway-egress 6/6.
+  - Scale, 200 sessions: master 709k msg/s, slave 315k active msg/s; both `all_correct` 100 with 0 dropped. CPU 452% / 203%, peak RSS 566 / 598 MB, fds 414 / 729, setup 0.8 s / 6.1 s.
+  - ui-smoke on the final binary: 560/560 with auto-analysis, 580/580 without (Chromium 1440/390 and WebKit 1440, light and dark).
+  - Every finding accounted for in the table above: 163 fixed, 1 won't fix (F148, no auth, by decision).
+
