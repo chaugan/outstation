@@ -119,3 +119,36 @@ curl -H "Origin: http://10.0.0.5:8080" -H 'Content-Type: application/json' \
 ```
 
 GET requests (including `/api/events` and `/metrics`) need no Origin.
+
+## netns-screenshots.sh
+
+```sh
+cargo build --release -p outstation
+OUTSTATION_BIN=target/release/outstation scripts/netns-screenshots.sh   # writes doc/images/ui-*.jpg
+scripts/netns-screenshots.sh /tmp/shots                                 # somewhere else
+```
+
+Rebuilds the README screenshots from scratch: four namespaces, a real
+`outstation serve`, the 200-RTU example capture played in slave role at
+original timing against a master peer (the live diagram is taken while
+it runs), a re-run at speed 2, a 20-master run, auto-analyses, then
+Chromium (Playwright, run as the invoking user inside the management
+namespace) takes Library, Configure, Runs, Analysis and Compare. It
+needs Playwright with Chromium (`PLAYWRIGHT_DIR`, default
+`/opt/code/tools/browser/node_modules/playwright`). Each image is 1440
+wide, JPEG quality 80; the script fails when one is over 400 KB. Look at
+every image before committing it.
+
+## netns-scale.sh
+
+```sh
+OUTSTATION_BIN=target/release/outstation scripts/netns-scale.sh                  # master-200 slave-200 master-400 slave-400, 3 runs each
+REPEAT=1 scripts/netns-scale.sh slave-200@10 master-800                          # @SPEED = original timing
+PEER=mock scripts/netns-scale.sh master-200                                      # the threaded Python mocks
+NOFILE=1024:65536 REALTIME=1 KEEP_CAPTURES=1 scripts/netns-scale.sh slave-400
+```
+
+Each run gets fresh namespaces; the work directory keeps every bench
+report, log and sample, `results.jsonl` and `results.md` (every run and
+the median per scenario). Run it on an otherwise idle host: outstation
+and its peers share the CPU.

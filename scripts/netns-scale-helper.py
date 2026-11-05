@@ -512,7 +512,7 @@ def cmd_fast_master(argv):
                         st["vr"] = (st["vr"] + 1) & 0x7FFF
                         st["unacked"] += 1
                         if st["ca"] is None and ln >= 10:
-                            st["ca"] = struct.unpack_from("<H", buf, i + 8)[0]
+                            st["ca"] = struct.unpack_from("<H", buf, i + 10)[0]
                     elif c1 == STARTDT_CON:
                         st["con"] = True
                     elif c1 == TESTFR_ACT:
