@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
-# Does SCADA-gateway mode work in master role when the run enslaves an
-# egress NIC? Runs `outstation bench` (release build) in throwaway
-# network namespaces; nothing outside them is touched.
+# SCADA-gateway mode in master role with an egress NIC: it cannot work
+# (scale report §7), so since T17c outstation refuses it with
+# `gateway_requires_slave` before touching the host. This script checks
+# that, next to the two control cases. Runs `outstation bench` (release
+# build) in throwaway network namespaces; nothing outside them is
+# touched.
 #
 #   $NS_M (management)          $NS_A (outstation)              $NS_T (LAN + RTU under test)
 #   os-n 10.66.0.2 <--veth-->   os-m 10.66.0.1 (default route)  bridge "lan" 10.77.0.1/24
@@ -11,24 +14,30 @@
 # The captured master (the session's source address) is 10.20.100.10,
 # off the RTU's subnet. A real RTU then sends its replies to its default
 # gateway, here 10.77.0.254, which does not exist on the isolated LAN:
-# the situation gateway mode is meant for (doc/scada-lab.en.md §4).
+# the situation gateway mode is meant for in slave role
+# (doc/scada-lab.en.md §4).
 #
 # Cases (one `outstation bench` each, master role, nic os-a, one session):
 #   1  control: the RTU routes everything on-link (`default dev lan`),
-#      no gateway mode                                    -> must pass
-#   2  RTU `default via 10.77.0.254`, no gateway mode     -> fails (expected)
-#   3  RTU via .254, gateway mode on the egress NIC os-a  -> ?
-#   4  as 3 with force                                    -> ?
+#      no gateway mode                                    -> must complete
+#   2  RTU `default via 10.77.0.254`, no gateway mode     -> must fail
+#      (connect times out: this is what gateway mode would be for)
+#   3  RTU via .254, gateway mode on the egress NIC os-a  -> refused
+#   4  as 3 with force                                    -> refused
 #   5  RTU via .254, gateway mode on a separate NIC (os-g, a second veth
-#      into the same LAN, not enslaved)                   -> ?
-# For each it prints the bench result, the session error, and what the
-# RTU learned for its gateway (`ip neigh` in $NS_T).
+#      into the same LAN, not enslaved)                   -> refused
+#   6  RTU via .254, upstream_nat_iface alone             -> refused
+# "refused" = bench exit 2 with `gateway_requires_slave`, and the
+# gateway alias never appears. For each case it prints the bench result,
+# the session error, and what the RTU learned for its gateway
+# (`ip neigh` in $NS_T).
 #
 # Usage: scripts/netns-gateway-egress.sh
 # Env:   NS_PREFIX (default ostest-gw; must start with "ostest-"),
 #        OUTSTATION_BIN (default: cargo build --release -p outstation),
 #        WORK (default: mktemp), CARGO_TARGET_DIR honoured by cargo.
 # Needs: sudo, iproute2, iptables, ethtool, python3.
+# Exit:  0 when every case behaved as expected, 1 otherwise.
 set -uo pipefail
 
 NS_PREFIX="${NS_PREFIX:-ostest-gw}"
@@ -118,9 +127,10 @@ setup() {
 }
 
 RESULTS=()
-# case ID NAME ROUTE EXTRA_JSON
+FAILED=0
+# case ID NAME ROUTE EXPECT(completed|failed|refused) EXTRA_JSON
 run_case() {
-  local id=$1 name=$2 route=$3 extra=$4 dir="$WORK/case$1"
+  local id=$1 name=$2 route=$3 expect=$4 extra=$5 dir="$WORK/case$1"
   mkdir -p "$dir"
   echo
   echo "=== case $id: $name"
@@ -147,18 +157,38 @@ run_case() {
   echo "    gateway alias: $(tr '\n' ' ' <"$dir/alias.txt")"
   echo "    RTU neighbour entry for its gateway 10.77.0.254: ${neigh:-none}"
   grep -E ' (WARN|ERROR) ' "$dir/bench.log" | grep -v 'protected NIC used' | head -3 | cut -c1-240 | sed 's/^/    log: /'
-  RESULTS+=("$id|$name|exit $code|$status")
+  local got
+  if [ "$code" = 2 ] && grep -q gateway_requires_slave "$dir/report.json" 2>/dev/null; then
+    got=refused
+  elif [ "$code" = 0 ]; then
+    got=completed
+  else
+    got=failed
+  fi
+  if [ "$got" = refused ] && [ -s "$dir/alias.txt" ]; then
+    got="refused, but the gateway alias appeared"
+  fi
+  local verdict=PASS
+  if [ "$got" != "$expect" ]; then
+    verdict=FAIL
+    FAILED=1
+  fi
+  echo "    expected $expect, got $got: $verdict"
+  RESULTS+=("$verdict|$id|$name|expected $expect|got $got|exit $code|$status")
   teardown
 }
 
-run_case 1 "control: RTU routes on-link, no gateway mode" onlink ''
-run_case 2 "RTU via 10.77.0.254, no gateway mode" via ''
-run_case 3 "RTU via 10.77.0.254, gateway mode on the egress NIC os-a" via \
+run_case 1 "control: RTU routes on-link, no gateway mode" onlink completed ''
+run_case 2 "RTU via 10.77.0.254, no gateway mode" via failed ''
+run_case 3 "RTU via 10.77.0.254, gateway mode on the egress NIC os-a" via refused \
   ',"scada_gateway_ip":"10.77.0.254","scada_gateway_iface":"os-a"'
-run_case 4 "as 3, with force" via \
+run_case 4 "as 3, with force" via refused \
   ',"scada_gateway_ip":"10.77.0.254","scada_gateway_iface":"os-a","force":true'
-run_case 5 "RTU via 10.77.0.254, gateway mode on a second, non-enslaved NIC os-g" via \
+run_case 5 "RTU via 10.77.0.254, gateway mode on a second, non-enslaved NIC os-g" via refused \
   ',"scada_gateway_ip":"10.77.0.254","scada_gateway_iface":"os-g"'
+run_case 6 "RTU via 10.77.0.254, upstream NAT NIC alone" via refused \
+  ',"upstream_nat_iface":"os-g"'
 
 echo
 printf '%s\n' "${RESULTS[@]}"
+exit "$FAILED"

@@ -916,6 +916,13 @@ mod tests {
         assert!(load_profile(r#"{"target_ip":"10.0.0.5","speed":0}"#).is_err());
         assert!(load_profile(r#"{"target_ip":"10.0.0.5","pcap":"/etc/passwd"}"#).is_err());
         assert!(load_profile("[1]").is_err());
+        // T17c: gateway mode in master role is refused with its code.
+        let e = load_profile(
+            r#"{"target_ip":"10.0.0.5","role":"master","scada_gateway_ip":"10.0.0.254","scada_gateway_iface":"eth0"}"#,
+        )
+        .unwrap_err();
+        let re = e.downcast_ref::<runbuild::RequestError>().unwrap();
+        assert_eq!(re.code, "gateway_requires_slave", "{e:#}");
     }
 
     #[test]

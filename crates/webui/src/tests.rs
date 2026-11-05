@@ -523,6 +523,16 @@ async fn invalid_requests_never_create_runs() {
             },
             "invalid_proto_config",
         ),
+        (
+            {
+                // T17c: gateway mode is slave-role only.
+                let mut r = bench_req("pcr_1");
+                r["scada_gateway_ip"] = json!("10.0.0.254");
+                r["scada_gateway_iface"] = json!("eth0");
+                r
+            },
+            "gateway_requires_slave",
+        ),
         (bench_req("../../etc/passwd"), "invalid_id"),
         (bench_req("pcr_404"), "not_found"),
     ];
@@ -1414,6 +1424,11 @@ async fn profiles_crud() {
         (
             json!({"name": "x", "request": {"target_ip": "10.0.0.1", "pcap": "/etc/passwd"}}),
             "raw_path_rejected",
+        ),
+        (
+            json!({"name": "x", "request": {"target_ip": "10.0.0.1", "role": "master",
+                "mode": "benchmark", "upstream_nat_iface": "eth1"}}),
+            "gateway_requires_slave",
         ),
     ] {
         let (s, v) = h
@@ -2436,5 +2451,29 @@ async fn rerun_of_a_stale_config_is_a_clear_400() {
         "{msg}"
     );
     assert!(msg.contains("no_such_section"), "{msg}");
+    assert_eq!(h.state.all_runs().len(), 1, "no run was started");
+}
+
+/// T17c: a stored master-role request with gateway mode (accepted
+/// before the refusal existed) is refused on re-run with
+/// `gateway_requires_slave`.
+#[tokio::test]
+async fn rerun_of_a_master_gateway_request_is_refused() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let id = h.run_to(bench_req("pcr_1"), "completed").await;
+    {
+        let e = h.state.get_run(id).unwrap();
+        let mut rs = e.lock_safe();
+        let req = rs.request.as_mut().unwrap();
+        req["scada_gateway_ip"] = json!("10.0.0.254");
+        req["scada_gateway_iface"] = json!("eth0");
+    }
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "gateway_requires_slave", "{v}");
+    assert!(v["error"].as_str().unwrap().contains("slave role"), "{v}");
     assert_eq!(h.state.all_runs().len(), 1, "no run was started");
 }

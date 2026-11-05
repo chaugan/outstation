@@ -252,6 +252,17 @@ pub fn run_benchmark(
     if matches!(cfg.role, protoplay::Role::Slave) {
         return run_benchmark_slave(pcap, cfg, replayer, ctx);
     }
+    // Gateway mode cannot work in master role (T17c, see the scale
+    // report §7): the gateway alias lands either on the enslaved NIC (a
+    // bridge port, which answers no ARP) or on another NIC (the replies
+    // then miss the session's port). Refused before any host change;
+    // the web/CLI layer refuses it first with `gateway_requires_slave`.
+    if cfg.scada_gateway_ip.is_some()
+        || cfg.scada_gateway_iface.is_some()
+        || cfg.upstream_nat_iface.is_some()
+    {
+        bail!("SCADA-gateway mode works in slave role only; refusing it in master role");
+    }
 
     let names = IfaceNames::custom(
         cfg.run_id,
@@ -274,7 +285,6 @@ pub fn run_benchmark(
         &prot,
         &mut warnings,
     )?;
-    res.gateway = install_gateway(&cfg, &state_dir, &prot)?;
 
     // 2. Select flows: one per client IP whose server port matches.
     let picks = select_master_flows(&pcap, &cfg, &*replayer)?;

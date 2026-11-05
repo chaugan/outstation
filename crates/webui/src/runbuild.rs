@@ -241,6 +241,34 @@ pub fn check_target_ip(ip: Ipv4Addr) -> Result<(), RequestError> {
     })
 }
 
+/// Message of the `gateway_requires_slave` refusal.
+pub const GATEWAY_REQUIRES_SLAVE_MSG: &str =
+    "SCADA-gateway mode (scada_gateway_ip, scada_gateway_iface, upstream_nat_iface) works \
+     in slave role only (target is a master). In master role every session's replies must \
+     come back through that session's own bridge port, which a gateway alias cannot \
+     provide. To reach a device on another subnet in master role, add a route on the device \
+     or the lab router towards outstation's NIC, or use captured masters on the device's own \
+     subnet";
+
+/// SCADA-gateway mode is a slave-role feature (T17c): in master role
+/// the gateway alias either sits on the enslaved NIC (a bridge port,
+/// which answers no ARP) or on another NIC (the replies then miss the
+/// session's port), so the sessions can only time out. Raw replay
+/// ignores the fields.
+fn check_gateway_role(req: &RunRequest) -> Result<(), RequestError> {
+    let set = |v: &Option<String>| v.as_deref().is_some_and(|s| !s.is_empty());
+    let gateway = req.scada_gateway_ip.is_some()
+        || set(&req.scada_gateway_iface)
+        || set(&req.upstream_nat_iface);
+    if gateway && req.mode == RunMode::Benchmark && req.role == RoleReq::Master {
+        return Err(RequestError {
+            code: "gateway_requires_slave",
+            message: GATEWAY_REQUIRES_SLAVE_MSG.into(),
+        });
+    }
+    Ok(())
+}
+
 /// Every check except "which pcap": used for profiles (which may be
 /// pcap-agnostic) and by the CLI (which takes `--pcap`). Raw paths are
 /// still rejected.
@@ -279,6 +307,7 @@ pub fn validate_settings(req: &RunRequest) -> Result<(), RequestError> {
             validate_ifname(field, n, 15)?;
         }
     }
+    check_gateway_role(req)?;
     if req.scada_gateway_ip.is_some()
         != req
             .scada_gateway_iface
@@ -561,6 +590,37 @@ mod tests {
         let r = bench(json!({"target_ip": "0.0.0.0", "role": "slave"}));
         assert!(validate_settings(&r).is_ok());
         let r = bench(json!({"target_ip": "10.0.0.1", "role": "master"}));
+        assert!(validate_settings(&r).is_ok());
+    }
+
+    /// T17c: gateway mode is refused in master role with its own code,
+    /// whichever of the three fields is set; slave role and raw replay
+    /// accept them.
+    #[test]
+    fn gateway_mode_requires_slave_role() {
+        for extra in [
+            json!({"scada_gateway_ip": "10.77.0.254", "scada_gateway_iface": "eth0"}),
+            json!({"scada_gateway_ip": "10.77.0.254"}),
+            json!({"scada_gateway_iface": "eth0"}),
+            json!({"upstream_nat_iface": "eth1"}),
+        ] {
+            let mut v = extra.clone();
+            v["role"] = json!("master");
+            let e = validate_settings(&bench(v)).unwrap_err();
+            assert_eq!(e.code, "gateway_requires_slave", "{extra}");
+            assert!(e.message.contains("slave role"), "{}", e.message);
+        }
+        // Empty strings are "not set" (the UI sends them).
+        let r = bench(json!({"role": "master", "scada_gateway_iface": "",
+            "upstream_nat_iface": ""}));
+        assert!(validate_settings(&r).is_ok());
+        let r = bench(json!({"scada_gateway_ip": "10.77.0.254",
+            "scada_gateway_iface": "eth0", "upstream_nat_iface": "eth1"}));
+        assert!(validate_settings(&r).is_ok());
+        let r = bench(
+            json!({"mode": "raw", "role": "master", "target_mac": "02:00:00:00:00:01",
+            "scada_gateway_ip": "10.77.0.254", "scada_gateway_iface": "eth0"}),
+        );
         assert!(validate_settings(&r).is_ok());
     }
 

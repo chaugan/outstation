@@ -886,3 +886,43 @@ fn replayed_flows_match_the_selection() {
         assert_eq!(slave[&p.server_ip], p.flow_idx, "{}", p.server_ip);
     }
 }
+
+/// T17c: a master-role benchmark with gateway mode is refused before it
+/// touches the host (no privileges needed to reach the refusal).
+#[test]
+fn master_role_refuses_gateway_mode() {
+    let pcap = Arc::new(
+        pcapload::load(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/synth_iec104_rtus200_ts.pcap"),
+        )
+        .unwrap(),
+    );
+    for (ip, iface, nat) in [
+        (Some(Ipv4Addr::new(10, 0, 0, 254)), Some("eth0"), None),
+        (None, None, Some("eth1")),
+    ] {
+        let state = tempfile_dir();
+        let cfg = BenchmarkConfig {
+            role: protoplay::Role::Master,
+            scada_gateway_ip: ip,
+            scada_gateway_iface: iface.map(String::from),
+            upstream_nat_iface: nat.map(String::from),
+            state_dir: Some(state.clone()),
+            ..Default::default()
+        };
+        let e = run_benchmark(
+            Arc::clone(&pcap),
+            cfg,
+            Arc::new(proto_iec104::Iec104Replayer::new()),
+            RunContext::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("slave role only"), "{e:#}");
+        assert!(
+            std::fs::read_dir(&state).map_or(true, |mut d| d.next().is_none()),
+            "nothing journaled"
+        );
+        let _ = std::fs::remove_dir_all(state);
+    }
+}

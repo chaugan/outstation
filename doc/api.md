@@ -67,6 +67,7 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 400 | `raw_path_rejected` | A raw filesystem path (`pcap`, `path`) instead of a library id |
 | 400 | `protocol_not_ready` | A benchmark with a stub protocol |
 | 400 | `invalid_target_ip` | Raw replay or master role with an unspecified, loopback, multicast or broadcast `target_ip` (a slave's `0.0.0.0` means any master and is accepted) |
+| 400 | `gateway_requires_slave` | A benchmark in master role sets `scada_gateway_ip`, `scada_gateway_iface` or `upstream_nat_iface`: gateway mode works in slave role only ([lab guide](scada-lab.en.md#4-gateway-mode-when-the-scada-master-is-on-another-subnet)). Also returned by `POST /api/profiles`, `PUT /api/profiles/:id` and a re-run of a stored request |
 | 400 | `invalid_proto_config` | `proto_config` fails the protocol's validation (also a re-run whose stored settings no longer validate; the message names the run) |
 | 400 | `pcap_unreadable`, `not_a_pcap` | The pcap does not load, or the upload is not a pcap |
 | 400 | `not_benchmark` | Analysis or compare on a raw-replay run |
@@ -424,8 +425,8 @@ The body of `POST /api/run`, the `request` of a stored run and a profile, and th
 | `master_bind_ip` | captured | Master: one source IP for every session instead of each captured master IP |
 | `tcp_nodelay` | by role | `true`/`false`; `null` = on for slave, off for master |
 | `alias_iface` | default-route NIC | Slave: NIC that receives RTU listen IPs that are not already local, as `/32 noprefixroute` aliases |
-| `scada_gateway_ip`, `scada_gateway_iface` | none | SCADA-gateway mode; both or neither ([lab guide](scada-lab.en.md#4-gateway-mode-when-the-scada-master-is-on-another-subnet)) |
-| `upstream_nat_iface` | none | Gateway mode: NAT the SCADA side's other traffic out of this NIC |
+| `scada_gateway_ip`, `scada_gateway_iface` | none | Slave role only: SCADA-gateway mode; both or neither ([lab guide](scada-lab.en.md#4-gateway-mode-when-the-scada-master-is-on-another-subnet)). Refused in master role (400 `gateway_requires_slave`) |
+| `upstream_nat_iface` | none | Slave role only: in gateway mode, NAT the SCADA side's other traffic out of this NIC. Refused in master role like the two above |
 | `force` | false | Override NIC and address protection. Never inherited by a re-run |
 | `top_speed`, `realtime`, `skip_non_ip`, `only_src` | | Raw replay: ignore timing, SCHED_FIFO, skip non-IP frames, replay only these source IPs |
 | `bridge`, `tap_prefix` | | Accepted and ignored: interface names derive from the run id |
