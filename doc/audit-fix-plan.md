@@ -185,7 +185,15 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [x] **T17a Re-audit fixes, core engine (fx1).** New defects N1–N5, N8, N10, N12 and N16–N19 from the independent re-audit, plus the remaining gaps in F028, F039, F055/F072, F079, P06 and P07. The full list is in the session scratchpad, `T17_new_defects.md`.
 - [x] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
-- [ ] **T20 UI polish** (requested by the user 2026-11-05: "no problem with changes to the better"). Starts after the t17 lane lands; README screenshots are then retaken with the t17 screenshot script.
+- [~] **T17c Engine issues found by the scale benchmark (fx3).**
+  1. Gateway mode with an egress NIC in master role cannot work. Refuse `scada_gateway_*` in master role and document it (the repro is `scripts/netns-gateway-egress.sh`).
+  2. The capture writes its two sources in arrival order, so a SYN-ACK can land before its SYN and master sessions get misjudged. Merge the sources by kernel timestamp.
+  3. Regression from N8: with RT priority only when `realtime` is set, full-speed slave capture drops went up 5×. The capture thread should run at RT priority whenever it is allowed to.
+  4. The analysis does not copy capture warnings (filter fallback, truncation, drops) into its notes.
+  5. A slave session whose master closes before STARTDT never listens again.
+  6. Master setup and teardown are serial and grow faster than linear (54 → 95 ms per session). Parallelise and batch the iptables calls.
+  7. The "master IP renamed" note picks an arbitrary session in master role.
+- [~] **T20 UI polish** (requested by the user 2026-11-05: "no problem with changes to the better"). Starts after the t17 lane lands; README screenshots are then retaken with the t17 screenshot script.
   - Analysis overview first: a verdict hero, a 200-tile RTU heatmap coloured by verdict with click-through, and a dimension summary; detail sections collapsed. The current page is about 12,400 px.
   - Run cards: one primary action plus an overflow menu instead of 8 buttons; a clear status line (no "→ listening" on a stopped run); progress hidden when meaningless.
   - Runs: a live dashboard strip (throughput sparkline, p50/p99 ack latency, session-state bar).
@@ -369,3 +377,13 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Phone layout, a11y and UI fixes, unit hardening, and doc fixes.
   - ui-smoke: 212/212 and 233/233. netns-smoke: 10/10.
 - 2026-11-05: Orchestrator closed F066 (configurable drift threshold, `proto_config.analysis`). Workspace tests: 470 passed.
+- 2026-11-05: T17 measurement lane merged. Workspace tests: 471 passed, 3 runs green.
+  - Scale report (`reports/2026-11-05-scale-benchmark.md`), measured as fast as possible, median of 3:
+    - master: 704k I-frames/s at 200 sessions, 641k at 400;
+    - slave: 238k at 200 RTUs, 255k at 400;
+    - 800 RTUs complete in slave role;
+    - paced runs score `all_correct`.
+  - Fixed during measurement: a master capture filter overflow above 527 MACs (fallback to keeping every frame, with a warning); and the open-file soft limit, which is now raised at startup.
+  - New scripts: `netns-scale.sh`, `netns-gateway-egress.sh`, `netns-screenshots.sh`, plus fresh README screenshots from real runs.
+  - README: Scale and Screenshots sections; fx2's six README edits applied.
+  - Remaining engine items are in T17c (fx3). T20 (UI polish) started in parallel.
