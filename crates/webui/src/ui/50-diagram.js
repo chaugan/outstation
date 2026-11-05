@@ -19,17 +19,25 @@ const BUCKET_STICKY_MS = 1500;
 const LABELS_MAX_NODES = 40;
 
 // State → colour + shape, so failed and active differ by more than hue.
+// Colours are CSS tokens (both themes); the canvas gets them resolved.
 const NODE_STYLE = {
-  pending: { color: '#cfcfca', border: '#6a6a65', symbol: 'circle', label: 'pending' },
-  cancelled: { color: '#ebebe6', border: '#6a6a65', symbol: 'roundRect', label: 'cancelled' },
-  listening: { color: '#1f4a78', border: '#0e0e0c', symbol: 'diamond', label: 'listening' },
+  pending: { color: '--st-pending', border: '--dim', symbol: 'circle', label: 'pending' },
+  cancelled: { color: '--st-cancelled', border: '--dim', symbol: 'roundRect', label: 'cancelled' },
+  listening: { color: '--st-listening', border: '--ch-node-border', symbol: 'diamond', label: 'listening' },
   // Connected (handshake not done yet) is a hollow ring, active a
   // filled disc: they differ in shape, not only in shade (N25).
-  connected: { color: '#ffffff', border: '#c15a2b', borderWidth: 2.5, symbol: 'circle', label: 'connected' },
-  active: { color: '#c15a2b', border: '#0e0e0c', symbol: 'circle', label: 'active' },
-  completed: { color: '#5a7a3f', border: '#0e0e0c', symbol: 'rect', label: 'completed' },
-  failed: { color: '#922626', border: '#0e0e0c', symbol: 'triangle', label: 'failed' },
+  connected: { color: '--surface', border: '--st-active', borderWidth: 2.5, symbol: 'circle', label: 'connected' },
+  active: { color: '--st-active', border: '--ch-node-border', symbol: 'circle', label: 'active' },
+  completed: { color: '--st-completed', border: '--ch-node-border', symbol: 'rect', label: 'completed' },
+  failed: { color: '--st-failed', border: '--ch-node-border', symbol: 'triangle', label: 'failed' },
 };
+let _cssCache = { theme: null, map: new Map() };
+function cssc(name) {
+  const t = document.documentElement.dataset.theme || '';
+  if (_cssCache.theme !== t) _cssCache = { theme: t, map: new Map() };
+  if (!_cssCache.map.has(name)) _cssCache.map.set(name, getCssVar(name));
+  return _cssCache.map.get(name);
+}
 const LEGEND_ORDER = ['active', 'connected', 'listening', 'pending', 'completed', 'failed', 'cancelled'];
 
 const diag = {
@@ -128,11 +136,11 @@ function ensureChart() {
   const node = el('diagram-canvas');
   if (!node || node.clientWidth <= 0 || node.clientHeight <= 0) return null;
   if (diag.chart && diag.chart.getDom() === node) return diag.chart;
-  diag.chart = echarts.init(node, null, { renderer: 'canvas' });
+  diag.chart = echarts.init(node, chartTheme(), { renderer: 'canvas' });
   diag.layoutKey = '';
-  const series = [{ id: 'spokes', type: 'lines', coordinateSystem: 'cartesian2d', zlevel: 1, silent: true, lineStyle: { color: '#c9c9c4', width: 1, opacity: 0.5 }, data: [] }];
+  const series = [{ id: 'spokes', type: 'lines', coordinateSystem: 'cartesian2d', zlevel: 1, silent: true, lineStyle: { color: cssc('--rule-strong'), width: 1, opacity: 0.45 }, data: [] }];
   for (const dir of ['up', 'down']) {
-    const color = dir === 'up' ? '#c15a2b' : '#1f4a78';
+    const color = dir === 'up' ? cssc('--st-active') : cssc('--blue');
     SPEED_BUCKETS.forEach((b, bi) => series.push({
       id: `${dir}${bi}`, type: 'lines', coordinateSystem: 'cartesian2d', zlevel: 2 + bi, silent: true,
       effect: { show: true, period: b.period, trailLength: 0.35, color, symbolSize: b.symbolSize },
@@ -254,8 +262,8 @@ function renderDiagram(frame) {
     diag.nodeSig = sig;
     const data = [{
       name: 'target', isTarget: true, value: [L.cx, L.cy], symbol: 'circle', symbolSize: 40,
-      itemStyle: { color: '#0e0e0c', borderColor: '#c15a2b', borderWidth: 3 },
-      label: { show: true, position: 'bottom', color: '#0e0e0c', fontSize: 12, fontWeight: 600, formatter: `target ${diag.target || ''}` },
+      itemStyle: { color: cssc('--ink'), borderColor: cssc('--accent'), borderWidth: 3 },
+      label: { show: true, position: 'bottom', color: cssc('--ink'), fontSize: 12, fontWeight: 600, formatter: `target ${diag.target || ''}` },
     }];
     sessions.forEach((p, i) => {
       const st = liveState(p);
@@ -263,8 +271,8 @@ function renderDiagram(frame) {
       data.push({
         name: p.src_ip || `session ${i}`, state: st, sent: p.sent, received: p.received,
         value: L.pos[i], symbol: ns.symbol, symbolSize: st === 'failed' ? L.size * 1.25 : L.size,
-        itemStyle: { color: ns.color, borderColor: ns.border, borderWidth: ns.borderWidth || 1 },
-        label: { show: L.labels, position: 'right', color: '#0e0e0c', fontSize: 11, formatter: '{b}' },
+        itemStyle: { color: cssc(ns.color), borderColor: cssc(ns.border), borderWidth: ns.borderWidth || 1 },
+        label: { show: L.labels, position: 'right', color: cssc('--ink'), fontSize: 11, formatter: '{b}' },
       });
     });
     update.push({ id: 'nodes', data });
@@ -343,7 +351,7 @@ function renderDiagramText(frame, sessions) {
 
 function shapeSvg(state) {
   const s = nodeStyle(state);
-  const f = `fill="${s.color}" stroke="${s.border}" stroke-width="${s.borderWidth ? 2 : 1}"`;
+  const f = `style="fill:var(${s.color});stroke:var(${s.border})" stroke-width="${s.borderWidth ? 2 : 1}"`;
   switch (s.symbol) {
     case 'diamond': return `<path d="M6 0.5 L11.5 6 L6 11.5 L0.5 6 Z" ${f}/>`;
     case 'rect': return `<rect x="1" y="1" width="10" height="10" ${f}/>`;
@@ -371,6 +379,14 @@ function toggleDiagramFullscreen(b) {
 
 function initDiagram() {
   on('runs', syncDiagram);
+  // New theme: rebuild the canvas with the new colours.
+  on('theme', () => {
+    if (diag.chart) { try { diag.chart.dispose(); } catch (_) { /* gone */ } diag.chart = null; }
+    diag.layoutKey = '';
+    diag.nodeSig = '';
+    diag.lineSig = '';
+    if (diag.latest) renderDiagram(diag.latest);
+  });
   on('route', syncDiagram);
   document.addEventListener('visibilitychange', () => { if (document.hidden) disconnectDiagram(); else syncDiagram(); });
   document.addEventListener('keydown', e => {

@@ -102,7 +102,7 @@
       const ent = [x, y, tids[i] || 0];
       if (Math.abs(y) <= tol) inP.push(ent); else outP.push(ent);
     }
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     c.setOption({
       backgroundColor: 'transparent',
       animation: false,
@@ -133,7 +133,7 @@
                splitLine: { show: false } },
       yAxis: { type: 'value',
                axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
@@ -144,7 +144,7 @@
           large: true, largeThreshold: 1500, itemStyle: { color: okColor },
           markArea: {
             silent: true,
-            itemStyle: { color: 'rgba(63,100,48,0.07)' },
+            itemStyle: { color: getCssVar('--ok-soft') || 'rgba(63,100,48,0.07)' },
             data: [[{ yAxis: -tol }, { yAxis: tol }]],
           },
         },
@@ -165,7 +165,7 @@
     const accColor = getCssVar('--accent') || '#b8441a';
     const dimColor = getCssVar('--dim')    || '#857f70';
     const inkColor = getCssVar('--ink-2')  || '#5a5750';
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     c.setOption({
       backgroundColor: 'transparent',
       animation: false,
@@ -199,7 +199,7 @@
                axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 } },
       yAxis: { type: 'value',
                axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
@@ -208,7 +208,7 @@
       series: [
         { name: 'original', type: 'line', data: orig, showSymbol: false, smooth: false,
           lineStyle: { color: inkColor, width: 1, type: 'dashed' },
-          areaStyle: { color: 'rgba(90,87,80,0.08)' }, sampling: 'lttb' },
+          areaStyle: { color: getCssVar('--ch-grid') || 'rgba(90,87,80,0.08)' }, sampling: 'lttb' },
         { name: 'captured', type: 'line', data: cap, showSymbol: false, smooth: false,
           lineStyle: { color: accColor, width: 1.4 }, sampling: 'lttb' },
       ],
@@ -243,7 +243,7 @@
       const lo = i * step;
       return { value: ct, itemStyle: { color: lo + step <= tol ? okColor : errColor } };
     });
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     const rotate = labels.length > 8;
     c.setOption({
       backgroundColor: 'transparent',
@@ -257,7 +257,7 @@
                axisLabel: { color: dimColor, fontSize: 11, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
       yAxis: { type: 'value',
                axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       series: [{
         type: 'bar', data: bars, barCategoryGap: '20%',
         markLine: { silent: true, symbol: 'none',
@@ -632,10 +632,10 @@
     //   bytes? — byte-for-byte match vs inventory-derived expected
     //   verdict
     s += `<div class="table-scroll audit-scroll">`;
-    s += `<table class="t an-tbl">`;
+    s += `<table class="t an-tbl"><caption class="sr-only">GI and CI events of this endpoint</caption>`;
     s += `<thead><tr>`;
-    s += `<th scope="col">t (ms)</th><th scope="col">kind</th><th scope="col">qual</th><th scope="col">CA</th>`;
-    s += `<th scope="col">ActCon Δ (ms)</th><th scope="col">data (frames / elements)</th><th scope="col">ActTerm Δ (ms)</th>`;
+    s += `<th scope="col" class="num">t (ms)</th><th scope="col">kind</th><th scope="col" class="num">qual</th><th scope="col" class="num">CA</th>`;
+    s += `<th scope="col" class="num">ActCon Δ (ms)</th><th scope="col" class="num">data (frames / elements)</th><th scope="col" class="num">ActTerm Δ (ms)</th>`;
     s += `<th scope="col">COT ok</th><th scope="col">bytes ok</th><th scope="col">verdict</th>`;
     s += `</tr></thead><tbody>`;
     const rowClass = (v) => v === 'compliant' ? 'ev-ok' : (v === 'partial' ? 'ev-partial' : 'ev-bad');
@@ -649,13 +649,13 @@
         (expected !== ev.data_element_count ? ` <span class="muted" title="inventory-derived expected element count">(exp ${expected})</span>` : '');
       const verdictTone = ev.verdict === 'compliant' ? 'ok' : (ev.verdict === 'partial' ? 'warn' : 'bad');
       s += `<tr class="${rowClass(ev.verdict)}">`;
-      s += `<td>${ev.request_ts_ms.toFixed(0)}</td>`;
+      s += `<td class="num">${ev.request_ts_ms.toFixed(0)}</td>`;
       s += `<td>${esc(ev.kind)}</td>`;
-      s += `<td>${ev.qualifier}</td>`;
-      s += `<td>${ev.ca}</td>`;
-      s += `<td class="${ev.actcon_present ? '' : 'bad'}">${ev.actcon_present ? acΔ : '—'}</td>`;
-      s += `<td>${dataCell}</td>`;
-      s += `<td class="${ev.actterm_present ? '' : 'bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
+      s += `<td class="num">${ev.qualifier}</td>`;
+      s += `<td class="num">${ev.ca}</td>`;
+      s += `<td class="num${ev.actcon_present ? '' : ' bad'}">${ev.actcon_present ? acΔ : '—'}</td>`;
+      s += `<td class="num">${dataCell}</td>`;
+      s += `<td class="num${ev.actterm_present ? '' : ' bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
       s += `<td class="${tickClass(ev.all_cots_match_bucket)}">${tick(ev.all_cots_match_bucket)}</td>`;
       s += `<td class="${tickClass(ev.bytewise_matches_inventory)}">${tick(ev.bytewise_matches_inventory)}</td>`;
       s += `<td class="${verdictTone} strong">${esc(ev.verdict)}</td>`;

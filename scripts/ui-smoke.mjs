@@ -37,6 +37,14 @@
 // card fed by the WebSocket with thinned polling (F105), /api/runs
 // pagination and "Load older runs" (F054) and the HTML report export
 // (F131).
+// T20 (ui3): every engine walk also runs in the dark theme; first-run
+// guides on an empty server; viability chips; the ⋯ menu button from
+// the keyboard; scenario presets and the sticky (desktop) / collapsed
+// (phone) summary; the analysis overview (hero, heatmap with keyboard
+// path and text alternative, dimensions, collapsed sections, one screen
+// at 1440x900, 800 endpoints fast, charts on the page theme); the live
+// dashboard strip; run-card status line; delete with Undo for profiles
+// and finished runs; the theme toggle and keyboard shortcuts.
 // Exits non-zero when any check fails. Runs it starts are stopped and
 // deleted at the end; the uploaded pcap is left in the library.
 
@@ -78,6 +86,7 @@ function check(cond, msg) {
 }
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 const MASTER_TARGET = '192.0.2.10';
+const UNDO_MS = 1500;   // ?undo_ms= for the deferred-delete checks
 
 async function apiGet(p) {
   const r = await fetch(BASE + p);
@@ -259,10 +268,10 @@ async function activeRun() {
   return st.active_run || null;
 }
 
-async function engineWalk(browser, name, viewport, deep) {
+async function engineWalk(browser, name, viewport, deep, scheme = 'light') {
   current = name;
   console.log(`\n== ${name} ==`);
-  const ctx = await browser.newContext({ viewport });
+  const ctx = await browser.newContext({ viewport, colorScheme: scheme });
   await ctx.addInitScript(INIT);
   const page = await ctx.newPage();
   const errors = [];
@@ -274,8 +283,11 @@ async function engineWalk(browser, name, viewport, deep) {
   check(!!pcapId, 'pcap is in the library');
 
   await go(page, 'library');
+  const th = await page.evaluate(() => document.documentElement.dataset.theme);
+  check(th === scheme, `theme follows prefers-color-scheme (${th})`);
   await audit(page, 'library', 'library');
-  const missLib = await tabWalk(page, 40, ['#dropzone', '.pcap-select']);
+  await libraryChecks(page);
+  const missLib = await tabWalk(page, 40, ['#dropzone', '.pcap-select', '.pcap-row .menu-btn']);
   check(!missLib.length, `keyboard reaches the upload button and the pcap rows${missLib.length ? ' — missing ' + missLib : ''}`);
   const dz = await page.evaluate(() => getComputedStyle(document.querySelector('#dropzone')).display);
   check(dz !== 'inline', `drop zone is a block-level box (${dz})`);
@@ -286,6 +298,7 @@ async function engineWalk(browser, name, viewport, deep) {
   await page.waitForSelector('#rtu-tbody tr');
   await audit(page, 'configure', 'configure');
   await chromeChecks(page, viewport);
+  await configureChecks(page, viewport);
   const missCfg = await tabWalk(page, 600, ['#cfg-pcap', '#cfg-target-ip', '#start-btn']);
   check(!missCfg.length, `keyboard reaches pcap, target and start${missCfg.length ? ' — missing ' + missCfg : ''}`);
 
@@ -343,9 +356,20 @@ async function engineWalk(browser, name, viewport, deep) {
   await go(page, 'analysis');
   await audit(page, 'analysis', 'analysis');
   await colourChecks(page);
+  await heatmapChecks(page, viewport);
   await go(page, 'library');
-  const selBg = await page.evaluate(() => { const r = document.querySelector('.pcap-row.selected'); return r ? getComputedStyle(r).backgroundColor : null; });
-  if (selBg) check(/\b31, 74, 120\b/.test(selBg), `selected pcap row is tinted neutral blue, not the error family (${selBg})`);
+  // The tint is the theme's --blue (31,74,120 light; 143,184,230 dark).
+  const sel = await page.evaluate(() => {
+    const r = document.querySelector('.pcap-row.selected');
+    if (!r) return null;
+    const probe = document.createElement('span');
+    probe.style.color = 'var(--blue)';
+    document.body.append(probe);
+    const blue = getComputedStyle(probe).color.match(/\d+, \d+, \d+/)[0];
+    probe.remove();
+    return { bg: getComputedStyle(r).backgroundColor, blue };
+  });
+  if (sel) check(sel.bg.includes(sel.blue), `selected pcap row is tinted neutral blue, not the error family (${sel.bg})`);
   if (flow.cmpA && flow.cmpB) {
     await go(page, `compare/${flow.cmpA}/${flow.cmpB}`);
     await page.waitForSelector('#cmp-tbody tr', { timeout: 15000 }).catch(() => {});
@@ -520,6 +544,12 @@ async function runFlows(browser, pcapId) {
   await b.waitForSelector('#diagram-section:not([hidden])', { timeout: 10000 }).catch(() => {});
   await b.waitForTimeout(2500);
   check(await b.isVisible('#diagram-section'), 'live diagram is shown for the running run');
+  const strip = await b.evaluate(() => {
+    const n = document.querySelector('#live-strip');
+    return n && !n.hidden ? { text: n.textContent, spark: !!n.querySelector('.ls-spark'), bar: !!n.querySelector('.state-bar') } : null;
+  });
+  check(strip && strip.spark && strip.bar && /In flight/.test(strip.text) && /Ack latency/.test(strip.text),
+    `live dashboard strip shows throughput, in-flight, ack latency and the session-state bar (${strip ? strip.text.replace(/\s+/g, ' ').slice(0, 90) : 'hidden'})`);
   const legend = await b.textContent('#diagram-legend');
   check(/pending/.test(legend), `diagram legend has state counts (${legend.trim().slice(0, 60)})`);
   const created = await b.evaluate(async id => {
@@ -605,7 +635,10 @@ async function runFlows(browser, pcapId) {
   const anText = (await a.textContent('#an-msg')) + ' ' + (await a.textContent('#an-error'));
   check(new RegExp(`RUN·0*${slaveId}`).test(anText), `analysis names the run it compared against (${anText.trim().slice(0, 140)})`);
   if (await a.$('#an-result .an-slave-row')) {
-    await a.click('#an-result .an-slave-row > summary');
+    // The overview comes first; a heatmap tile opens that endpoint's
+    // row in the (collapsed) endpoint table.
+    check(await a.isVisible('#an-hm') && !(await a.evaluate(() => el('an-sec-endpoints').open)), 'analysis shows the heatmap overview with the endpoint table collapsed');
+    await a.click('#an-hm .hm-t');
     await a.waitForFunction(() => document.querySelector('#an-result .an-slave-row .an-slave-detail').textContent.trim().length > 0, null, { timeout: 10000 }).catch(() => {});
     const filled = await a.evaluate(() => [...document.querySelectorAll('#an-result .an-slave-detail')].filter(d => d.textContent.trim()).length);
     check(filled === 1, `endpoint drill-down rendered only for the opened row (${filled})`);
@@ -627,6 +660,258 @@ async function runFlows(browser, pcapId) {
   check(!errors.length, `no console errors in the run flows${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
   await ctxA.close();
   await ctxB.close();
+}
+
+// ---------------------------------------------------------------------------
+// T20: UI polish.
+
+// Library: viability as chips and a plain verdict, raw notes collapsed;
+// the row's ⋯ menu works from the keyboard.
+async function libraryChecks(page) {
+  const v = await page.evaluate(() => {
+    const via = document.querySelector('#lib-detail .via');
+    if (!via) return null;
+    const notes = via.querySelector('.via-notes');
+    return { chips: via.querySelectorAll('.chip').length, verdict: (via.querySelector('.via-verdict') || {}).textContent || '', notesClosed: !notes || !notes.open, bullets: via.querySelectorAll(':scope > ul.notes').length };
+  });
+  if (v) {
+    check(v.chips >= 3 && /\./.test(v.verdict) && v.notesClosed && !v.bullets, `viability shows stat chips and a verdict sentence, notes collapsed (${v.chips} chips; ${v.verdict.trim().slice(0, 60)})`);
+  } else notes.push('library: no pcap selected, viability panel not checked');
+  const btn = '.pcap-row .menu-btn';
+  if (!(await page.$(btn))) return;
+  await page.focus(btn);
+  await page.keyboard.press('Enter');
+  const m1 = await page.evaluate(() => { const a = document.activeElement; return { role: a && a.getAttribute('role'), open: !!document.querySelector('.pcap-row .menu:not([hidden])') }; });
+  check(m1.open && m1.role === 'menuitem', `Enter on the ⋯ button opens the menu on its first item (${JSON.stringify(m1)})`);
+  await page.keyboard.press('ArrowDown');
+  const m2 = await page.evaluate(() => document.activeElement && document.activeElement.textContent.trim());
+  check(m2 === 'Download', `ArrowDown moves to the next menu item (${m2})`);
+  await page.keyboard.press('Escape');
+  const m3 = await page.evaluate(() => ({ closed: !document.querySelector('.pcap-row .menu:not([hidden])'), onBtn: document.activeElement && document.activeElement.classList.contains('menu-btn'), exp: document.activeElement && document.activeElement.getAttribute('aria-expanded') }));
+  check(m3.closed && m3.onBtn && m3.exp === 'false', `Escape closes the menu and returns focus to its button (${JSON.stringify(m3)})`);
+}
+
+// Configure: scenario presets and the "what will run" summary.
+async function configureChecks(page, viewport) {
+  await page.click('#preset-scada');
+  const a = await page.evaluate(() => ({ role: radio('role'), pacing: radio('pacing'), fresh: el('cfg-fresh-ts').checked, pressed: el('preset-scada').getAttribute('aria-pressed'), sum: el('cfg-sum-list').textContent }));
+  check(a.role === 'slave' && a.pacing === 'original' && a.fresh && a.pressed === 'true' && /simulate the RTUs/.test(a.sum),
+    `"Test a SCADA master" fills slave role, captured pace, fresh timestamps (${JSON.stringify({ role: a.role, pacing: a.pacing, fresh: a.fresh, pressed: a.pressed })})`);
+  await page.click('#preset-rtu');
+  const b = await page.evaluate(() => ({ role: radio('role'), port: el('cfg-target-port').value, sum: el('cfg-sum-list').textContent, pressed: el('preset-rtu').getAttribute('aria-pressed') }));
+  check(b.role === 'master' && b.port === '2404' && /act as the master/.test(b.sum) && b.pressed === 'true', `"Test an RTU" fills master role on port 2404 (${b.role}, ${b.port})`);
+  const sm = await page.evaluate(() => {
+    const t = el('cfg-sum-list').textContent;
+    return { pos: getComputedStyle(document.querySelector('.cfg-aside')).position, open: el('cfg-summary').open, keys: ['Role', 'Target', 'Pacing', 'Iterations', 'Link', 'Faults'].filter(k => !t.includes(k)) };
+  });
+  if (viewport.width >= 1100) check(sm.pos === 'sticky' && sm.open, `summary is sticky beside the form (${sm.pos})`);
+  else check(sm.pos !== 'sticky' && !sm.open, `summary is collapsed and not sticky on a narrow screen (${sm.pos}, open ${sm.open})`);
+  check(!sm.keys.length, `summary lists role, target, pacing, iterations, link and faults${sm.keys.length ? ' — missing ' + sm.keys : ''}`);
+}
+
+// A synthetic report of N endpoints with mixed outcomes and timelines.
+function synthReport(n) {
+  const slaves = [];
+  for (let i = 0; i < n; i++) {
+    const kind = i % 37 === 5 ? 'fail' : (i % 23 === 3 ? 'warn' : (i % 91 === 7 ? 'muted' : 'ok'));
+    const verdict = { ok: 'good_delivery', warn: 'partial_delivery', fail: 'no_delivery', muted: 'never_connected' }[kind];
+    slaves.push({ slave_ip: `10.${100 + (i >> 16)}.${(i >> 8) & 255}.${i & 255}`, outcome: kind === 'ok' ? 'pass' : (kind === 'muted' ? 'not_attempted' : 'fail'), verdict,
+      score_pct: kind === 'ok' ? 100 : (kind === 'warn' ? 62.5 : 0), packets: kind === 'muted' ? 0 : 40, delivered_iframes: kind === 'ok' ? 10 : (kind === 'warn' ? 6 : 0),
+      expected_iframes: 10, startdt_handshake_ok: kind !== 'muted' && kind !== 'fail', sessions: kind === 'muted' ? 0 : 1, verdict_reason: 'synthetic' });
+  }
+  const samples = Array.from({ length: 400 }, (_, i) => [i * 50, Math.sin(i / 20) * 3]);
+  return {
+    run_id: 999998, verdict: 'partial', score_pct: 91.2, verdict_reason: 'synthetic overview', protocol: 'iec104', role: 'slave', mode: 'generic', notes: ['a note'],
+    fleet: { slave_count: n, fully_correct: slaves.filter(s => s.outcome === 'pass').length, partial: 0, failed: 0, not_attempted: 0, reconnects: 2, aggregate_score_pct: 91.2, frame_weighted_score_pct: 90.1 },
+    slaves, fleet_pacing_timeline: { samples, total_samples: samples.length, iteration_starts_ms: [] },
+    fleet_gi_ci_audit: { gi_total: n, gi_compliant: n - 3, gi_partial: 2, gi_non_compliant: 1, ci_total: 0, endpoints_with_events: n },
+  };
+}
+
+// Analysis overview: hero, heatmap (keyboard path, text alternative),
+// dimension summary; detail sections collapsed; one screen at 1440x900;
+// fast at 800 endpoints.
+async function heatmapChecks(page, viewport) {
+  const rep200 = synthReport(200);
+  const m = await page.evaluate(rep => {
+    an.report = rep; an.analysisId = null; an.details = new Map();
+    renderAnalysis();
+    const res = el('an-result');
+    const hero = res.querySelector('.an-hero').getBoundingClientRect();
+    const ov = res.querySelector('.an-overview').getBoundingClientRect();
+    return {
+      height: Math.round(ov.bottom - hero.top), tiles: res.querySelectorAll('#an-hm .hm-t').length, tab0: res.querySelectorAll('#an-hm .hm-t[tabindex="0"]').length,
+      dims: res.querySelectorAll('.dim-row').length, label: el('an-hm').getAttribute('aria-label'), closed: [...res.querySelectorAll('details.an-sec')].every(d => !d.open),
+      legend: res.querySelectorAll('.hm-legend li').length,
+    };
+  }, rep200);
+  check(m.tiles === 200 && m.tab0 === 1, `heatmap has one tile per endpoint and a single tab stop (${m.tiles} tiles, ${m.tab0} in tab order)`);
+  check(/200 endpoints: .*pass/.test(m.label || '') && m.legend >= 3, `heatmap has a text alternative with outcome counts (${(m.label || '').slice(0, 70)})`);
+  check(m.dims >= 6 && m.closed, `dimension summary shown, detail sections collapsed (${m.dims} rows)`);
+  if (viewport.width >= 1400) check(m.height <= 760, `overview (hero, heatmap, dimensions) fits one 1440x900 screen (${m.height}px)`);
+  await audit(page, 'analysis (overview)', 'analysis-overview');
+  // Keyboard: Tab reaches the map, arrows move, Enter opens the row.
+  const miss = await tabWalk(page, 80, ['#an-hm .hm-t']);
+  check(!miss.length, 'keyboard reaches the heatmap');
+  await page.keyboard.press('ArrowRight');
+  const k1 = await page.evaluate(() => [...el('an-hm').children].indexOf(document.activeElement));
+  await page.keyboard.press('ArrowDown');
+  const k2 = await page.evaluate(() => ({ i: [...el('an-hm').children].indexOf(document.activeElement), cols: hmColumns(el('an-hm')) }));
+  check(k1 === 1 && k2.i === 1 + k2.cols, `arrow keys move across and down the heatmap (${k1}, ${k2.i}, ${k2.cols} columns)`);
+  await page.keyboard.press('Enter');
+  await page.waitForTimeout(300);
+  const k3 = await page.evaluate(() => {
+    const a = document.activeElement;
+    const row = a && a.closest('.an-slave-row');
+    return { open: el('an-sec-endpoints').open, row: row ? row.dataset.ip : null, rowOpen: !!(row && row.open) };
+  });
+  check(k3.open && k3.rowOpen && k3.row === rep200.slaves.slice().sort((x, y) => ipToIntN(x.slave_ip) - ipToIntN(y.slave_ip))[1 + k2.cols].slave_ip,
+    `Enter on a tile opens that endpoint in the table and focuses it (${JSON.stringify(k3)})`);
+  // Fleet charts render when their section opens, with the page theme.
+  await page.evaluate(() => { el('an-sec-timing').open = true; });
+  await page.waitForTimeout(400);
+  const ch = await page.evaluate(() => {
+    const n = el('an-fleet-pacing-chart');
+    const c = n && echarts.getInstanceByDom(n);
+    let legend = null;
+    try { legend = c && c._theme && c._theme.legend.textStyle.color; } catch (_) { /* internal */ }
+    return { ok: !!c, legend, want: getCssVar('--ink-2') };
+  });
+  check(ch.ok && ch.legend === ch.want, `fleet charts use the page theme (${ch.legend} vs ${ch.want})`);
+  // 800 endpoints: rendering stays fast.
+  const t = await page.evaluate(rep => {
+    const t0 = performance.now();
+    an.report = rep; an.details = new Map();
+    renderAnalysis();
+    const ms = performance.now() - t0;
+    return { ms: Math.round(ms), tiles: document.querySelectorAll('#an-hm .hm-t').length };
+  }, synthReport(800));
+  check(t.tiles === 800 && t.ms < 400, `800-endpoint report renders quickly (${t.ms} ms, ${t.tiles} tiles)`);
+  await audit(page, 'analysis (800 endpoints)', 'analysis-800');
+  await page.evaluate(() => { _resetAnalysisCharts(); el('an-result').innerHTML = ''; an.report = null; });
+}
+function ipToIntN(ip) { return ip.split('.').reduce((a, o) => a * 256 + Number(o), 0); }
+
+// First-run guidance on an empty server: upload → configure → run.
+async function firstRunChecks(browser) {
+  current = 'first-run';
+  console.log('\n== first-run empty states ==');
+  const lib = await apiGet('/api/pcaps');
+  const runs = await apiGet('/api/runs');
+  if (lib.length || runs.length) { notes.push('first-run empty states not checked: the server already has pcaps or runs'); return; }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  for (const [view, sel, want] of [['library', '#lib-empty', /Upload a capture/], ['configure', '#cfg-empty', /Go to the Library/], ['runs', '#runs-empty', /Upload a capture/], ['analysis', '#an-empty', /Upload a capture/]]) {
+    await go(page, view);
+    const g = await page.evaluate(s => {
+      const n = document.querySelector(s);
+      return n && !n.hidden ? { text: n.textContent, cur: (n.querySelector('.step-current') || {}).textContent || '' } : null;
+    }, sel);
+    check(g && want.test(g.text) && /Upload a capture/.test(g.cur), `${view}: first-run guide points at the next step (${g ? g.cur.trim() : 'not shown'})`);
+    await audit(page, `${view} (empty)`, `${view}-empty`);
+  }
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+// Theme toggle (persisted) and keyboard shortcuts.
+async function themeAndShortcutChecks(browser, pcapId) {
+  current = 'theme-keys';
+  console.log('\n== theme toggle, keyboard shortcuts ==');
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 }, colorScheme: 'light' });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await go(page, 'library');
+  await page.click('#theme-btn');
+  await page.click('#theme-btn');
+  const t1 = await page.evaluate(() => ({ th: document.documentElement.dataset.theme, bg: getComputedStyle(document.body).backgroundColor, lbl: el('theme-btn').getAttribute('aria-label') }));
+  check(t1.th === 'dark' && /\b(18|1[0-9]|2[0-9]), /.test(t1.bg) && /Dark/.test(t1.lbl), `the toggle switches to dark (${t1.th}, ${t1.bg}, "${t1.lbl}")`);
+  await page.reload();
+  await page.waitForTimeout(600);
+  const t2 = await page.evaluate(() => document.documentElement.dataset.theme);
+  check(t2 === 'dark', `the theme choice persists across a reload (${t2})`);
+  await audit(page, 'library (toggled dark)', 'library-toggled-dark');
+  await page.click('#theme-btn');
+  const t3 = await page.evaluate(() => ({ th: document.documentElement.dataset.theme, stored: localStorage.getItem('outstation.theme') }));
+  check(t3.th === 'light' && t3.stored === null, `back to automatic: follows the system again (${JSON.stringify(t3)})`);
+  // Shortcuts.
+  const hash = () => page.evaluate(() => location.hash);
+  for (const [k, v] of [['r', 'runs'], ['a', 'analysis'], ['m', 'compare'], ['c', 'configure'], ['l', 'library']]) {
+    await page.keyboard.press('g');
+    await page.keyboard.press(k);
+    await page.waitForTimeout(150);
+    check((await hash()) === `#/${v}`, `g ${k} opens ${v} (${await hash()})`);
+  }
+  await go(page, 'configure');
+  if (pcapId) await page.selectOption('#cfg-pcap', pcapId);
+  await page.click('#cfg-target-ip');
+  await page.keyboard.type('gr');
+  await page.waitForTimeout(150);
+  check((await hash()) === '#/configure' && (await page.inputValue('#cfg-target-ip')).endsWith('gr'), 'shortcuts do not fire while typing in a field');
+  await page.fill('#cfg-target-ip', '');
+  await page.evaluate(() => document.activeElement.blur());
+  await page.keyboard.press('/');
+  const f = await page.evaluate(() => document.activeElement && document.activeElement.id);
+  check(f === 'rtu-filter', `"/" focuses the current view's filter (${f})`);
+  await page.evaluate(() => document.activeElement.blur());
+  await page.keyboard.press('?');
+  check(await page.isVisible('#kbd-dlg[open]'), '"?" opens the shortcut help');
+  await audit(page, 'shortcut help', 'kbd-help');
+  await page.keyboard.press('Escape');
+  check(!(await page.isVisible('#kbd-dlg[open]')), 'Escape closes the shortcut help');
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+// Run cards: a clear status line, the ⋯ menu from the keyboard, and
+// delete with Undo (deferred).
+async function runCardChecks(browser, pcapId) {
+  current = 'run-cards';
+  console.log('\n== run cards ==');
+  if (NO_RUNS) return;
+  if (await activeRun()) { notes.push('run card checks skipped: a run is active'); return; }
+  const D = await stoppedSlaveRun(pcapId);
+  if (!D) { check(false, 'could not create a stopped run'); return; }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await page.goto(`${BASE}/?undo_ms=${UNDO_MS}#/runs`);
+  const card = `#runs-list > li[data-key="${D}"]`;
+  await page.waitForSelector(card);
+  await page.waitForTimeout(600);
+  const c = await page.evaluate(sel => {
+    const n = document.querySelector(sel);
+    return { line: n.querySelector('.run-line').textContent, text: n.textContent, buttons: n.querySelectorAll('.run-actions .btn-row > .btn, .run-actions .btn-row > a.btn').length };
+  }, card);
+  check(!/listening/.test(c.line), `a stopped slave run does not say "listening" (${c.line.trim().slice(0, 90)})`);
+  check(!/0% · 0 \/ 0/.test(c.text), 'no meaningless "0% · 0 / 0" progress');
+  check(c.buttons <= 3, `the card has at most a primary action, Details and the ⋯ menu (${c.buttons} buttons)`);
+  const missMenu = await tabWalk(page, 80, [`#run-menu-${D}-btn`]);
+  check(!missMenu.length, 'keyboard reaches the run card menu');
+  await page.keyboard.press('ArrowDown');
+  const items = await page.evaluate(id => [...document.querySelectorAll(`#run-menu-${id} [role="menuitem"]`)].map(x => x.textContent.trim()), D);
+  const first = await page.evaluate(() => document.activeElement && document.activeElement.textContent.trim());
+  check(first === items[0] && items.includes('Delete run') && items.includes('Re-run…'), `ArrowDown opens the run menu on its first item (${items.join(', ')})`);
+  await page.keyboard.press('End');
+  const last = await page.evaluate(() => document.activeElement && document.activeElement.textContent.trim());
+  check(last === items[items.length - 1], `End moves to the last item (${last})`);
+  await page.keyboard.press('Enter');   // Delete run
+  await page.waitForTimeout(300);
+  check(!(await page.isVisible('#dlg[open]')) && !(await page.$(card)), 'deleting a finished run asks no confirmation and hides the card');
+  const undoSel = `.toast [data-fk="undo-run-${D}"]`;
+  check(await page.isVisible(undoSel), 'an Undo toast is offered for the run');
+  await page.click(undoSel);
+  await page.waitForTimeout(UNDO_MS + 800);
+  check(!!(await page.$(card)) && (await apiGet('/api/runs')).some(r => r.id === D), 'Undo brings the run back and it is not deleted');
+  await runMenu(page, D, `run-${D}-delete`);
+  await page.waitForTimeout(UNDO_MS + 2000);
+  check(!(await apiGet('/api/runs')).some(r => r.id === D), 'the deferred delete is committed when the toast ends');
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
 }
 
 // ---------------------------------------------------------------------------
@@ -664,6 +949,13 @@ async function healthChecks(browser) {
   await ctx.close();
 }
 
+// Open the ⋯ menu of a run card and pick an item.
+async function runMenu(page, id, fk) {
+  await page.click(`#run-menu-${id}-btn`);
+  await page.waitForSelector(`#run-menu-${id}:not([hidden])`);
+  await page.click(`[data-fk="${fk}"]`);
+}
+
 async function dialogInput(page, value) {
   await page.waitForSelector('#dlg[open] #dlg-input');
   await page.fill('#dlg-input', value);
@@ -684,7 +976,9 @@ async function profileFlow(browser, pcapId) {
   const page = await ctx.newPage();
   const errors = [];
   trackConsole(page, errors);
-  await go(page, 'configure');
+  await page.goto(`${BASE}/?undo_ms=${UNDO_MS}#/configure`);
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await page.waitForTimeout(900);
   await page.selectOption('#cfg-pcap', pcapId);
   await page.click('label[for="mode-benchmark"]');
   await page.click('label[for="role-master"]');
@@ -731,12 +1025,23 @@ async function profileFlow(browser, pcapId) {
   check(ow && ow.request.iterations === 9, `overwrite stores the current form (iterations ${ow && ow.request.iterations})`);
   await audit(page, 'configure (profiles)', 'profiles');
 
-  // Delete (with confirmation).
+  // Delete with Undo (no confirmation dialog): Undo keeps it, a second
+  // delete is committed when the toast ends.
   await page.click('#prof-delete');
-  await dialogConfirm(page);
-  await page.waitForFunction(() => /Deleted/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  check(!(await page.isVisible('#dlg[open]')), 'deleting a profile asks no confirmation');
+  const undoSel = '.toast [data-fk^="undo-profile-"]';
+  await page.waitForSelector(undoSel, { timeout: 5000 }).catch(() => {});
+  check(await page.isVisible(undoSel), 'an Undo toast is offered');
+  check(!(await page.textContent('#prof-select')).includes(SMOKE_PROFILE), 'the profile leaves the list at once');
+  await page.click(undoSel);
+  await page.waitForTimeout(UNDO_MS + 800);
+  const kept = (await apiGet('/api/profiles')).some(p => p.name.startsWith(SMOKE_PROFILE));
+  check(kept && (await page.textContent('#prof-select')).includes(SMOKE_PROFILE), 'Undo keeps the profile (on the server and in the list)');
+  await page.selectOption('#prof-select', { label: (await page.locator('#prof-select option', { hasText: SMOKE_PROFILE }).first().textContent()).trim() });
+  await page.click('#prof-delete');
+  await page.waitForTimeout(UNDO_MS + 1500);
   const gone = !(await apiGet('/api/profiles')).some(p => p.name.startsWith(SMOKE_PROFILE));
-  check(gone, 'delete removes the profile');
+  check(gone, 'delete is committed when the Undo toast ends');
   await page.fill('#cfg-iterations', '1');
   await page.fill('#cfg-target-ip', '10.9.8.7');
   check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
@@ -847,7 +1152,7 @@ async function rerunFlow(browser) {
   const st = await page.textContent(`${card} .run-analysis`);
   const runRow = (await apiGet('/api/runs')).find(r => r.id === id);
   if (runRow && runRow.auto_analysis) check(new RegExp(`Auto-analysis ${runRow.auto_analysis.state}`).test(st), `card shows the auto-analysis state (${st.trim().slice(0, 80)})`);
-  await page.click(`[data-fk="run-${id}-card-rerun"]`);
+  await runMenu(page, id, `run-${id}-card-rerun`);
   await page.waitForSelector('#dlg[open]');
   const dlgText = await page.textContent('#dlg');
   check(new RegExp(`Re-run #${id}`).test(dlgText) && dlgText.includes(MASTER_TARGET), `re-run asks for confirmation with the settings (${dlgText.trim().replace(/\s+/g, ' ').slice(0, 100)})`);
@@ -870,7 +1175,7 @@ async function rerunFlow(browser) {
   }
   await page.screenshot({ path: path.join(OUT, 'flow-rerun.png'), fullPage: false });
   // Load into Configure.
-  await page.click(`[data-fk="run-${id}-card-load"]`);
+  await runMenu(page, id, `run-${id}-card-load`);
   await page.waitForSelector('#view-configure:not([hidden])', { timeout: 10000 });
   await page.waitForTimeout(500);
   const ip = await page.inputValue('#cfg-target-ip');
@@ -930,7 +1235,7 @@ async function compareFlow(browser, pcapId) {
 
   // "Compare with…" on B's card pre-selects a baseline and B.
   await go(page, 'runs');
-  await page.click(`[data-fk="run-${B}-card-compare"]`);
+  await runMenu(page, B, `run-${B}-card-compare`);
   await page.waitForSelector('#view-compare:not([hidden])');
   const h1 = await page.evaluate(() => location.hash);
   check(new RegExp(`^#/compare/\\d+/${B}$`).test(h1), `"Compare with…" opens the compare view with B preselected (${h1})`);
@@ -1036,15 +1341,20 @@ async function cleanup() {
   let pcapId = null;
   try {
     const cr = await chromium.launch();
+    await firstRunChecks(cr);
     pcapId = await engineWalk(cr, 'chromium-1440', { width: 1440, height: 900 }, true);
+    await engineWalk(cr, 'chromium-1440-dark', { width: 1440, height: 900 }, false, 'dark');
     await engineWalk(cr, 'chromium-390', { width: 390, height: 844 }, false);
+    await engineWalk(cr, 'chromium-390-dark', { width: 390, height: 844 }, false, 'dark');
     await healthChecks(cr);
+    await themeAndShortcutChecks(cr, pcapId);
     if (pcapId) {
       await profileFlow(cr, pcapId);
       await faultEditorFlow(cr, pcapId, { width: 1440, height: 900 }, '1440');
       await faultEditorFlow(cr, pcapId, { width: 390, height: 844 }, '390');
       await runFlows(cr, pcapId);
       if (!NO_RUNS) {
+        await runCardChecks(cr, pcapId);
         await rerunFlow(cr);
         await compareFlow(cr, pcapId);
         await paginationFlow(cr);
@@ -1053,6 +1363,7 @@ async function cleanup() {
     await cr.close();
     const wk = await webkit.launch();
     await engineWalk(wk, 'webkit-1440', { width: 1440, height: 900 }, false);
+    await engineWalk(wk, 'webkit-1440-dark', { width: 1440, height: 900 }, false, 'dark');
     await wk.close();
   } catch (e) {
     failures.push(`[${current}] crashed: ${e.stack || e}`);

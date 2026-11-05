@@ -3,6 +3,7 @@
 'use strict';
 
 function boot() {
+  initShell();
   initLibrary();
   initConfigure();
   initRuns();
