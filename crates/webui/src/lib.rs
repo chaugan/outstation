@@ -273,6 +273,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
 
     let state = AppState::open(cfg)?;
     restore(&state)?;
+    // Runs that finished during the last shutdown (or crash) were never
+    // analysed (O3).
+    analysis_run::queue_startup_backlog(&state, analysis_run::STARTUP_BACKLOG_LIMIT);
     if !state.cfg.allow_hosts.is_empty() {
         info!(hosts = ?state.cfg.allow_hosts, "extra allowed Host names");
     }

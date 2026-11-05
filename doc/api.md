@@ -317,7 +317,7 @@ curl -s "$B/api/profiles/1" > rtu-fleet-slave.json   # usable with outstation be
 
 Analysis compares a capture of a benchmark run against the run's source pcap. The report format is described in [IEC 104 configuration](iec104-config.md#analysis-report). Raw-replay runs cannot be analysed (400 `not_benchmark`).
 
-Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
+Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. A run that finished while the server was shutting down (SIGTERM), or was cut off by a crash, is analysed after the next start: the newest 20 finished benchmark runs with a capture and no analysis are queued, older ones get `auto_analysis` `skipped` and can be analysed on demand. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
 
 ### `POST /api/runs/:id/analyze`
 
