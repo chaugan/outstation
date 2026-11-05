@@ -13,6 +13,11 @@
 //! | GET | `/api/runs[?status=running]` | slim summaries |
 //! | GET/DELETE | `/api/runs/:id` | full detail / delete |
 //! | POST | `/api/runs/:id/stop` | stop |
+//! | POST | `/api/runs/:id/rerun[?force=true]` | new run with the stored request |
+//! | GET | `/api/runs/:a/compare/:b` | run-to-run deltas and regression flags |
+//! | GET/POST | `/api/profiles` | named run requests |
+//! | GET/PUT/DELETE | `/api/profiles/:id` | one profile |
+//! | GET | `/metrics` | Prometheus text exposition |
 //! | GET | `/api/runs/:id/live` | WebSocket progress |
 //! | GET | `/api/runs/:id/download`, `/gaps` | capture, gap histogram |
 //! | POST | `/api/analyze[?run_id=N]` | fidelity analysis upload |
@@ -25,16 +30,21 @@
 //! same-origin/Host guard in [`security`].
 
 mod analysis;
+mod analysis_run;
 mod captures;
 mod cleanup;
+mod compare;
 mod db;
 mod dto;
 mod error;
 mod events;
+mod health;
 mod library;
+mod metrics;
 mod netprobe;
 mod persist;
 mod routes;
+pub mod runbuild;
 mod runs;
 mod security;
 mod state;
@@ -60,15 +70,17 @@ pub use dto::{
 };
 pub use events::RunEvent;
 pub use state::{
-    default_library_dir, default_state_dir, split_hosts, ActiveRun, AppState, ServeConfig,
+    default_library_dir, default_state_dir, env_flag, split_hosts, ActiveRun, AppState, ServeConfig,
 };
 
 use error::LockExt;
 use routes::analyze::*;
+use routes::compare::*;
 use routes::library::*;
 use routes::live::*;
 use routes::misc::*;
 use routes::net::*;
+use routes::profiles::*;
 use routes::runs::*;
 use routes::slaves::*;
 
@@ -89,6 +101,19 @@ pub fn router(state: AppState) -> Router {
         .route("/api/runs", get(api_runs))
         .route("/api/runs/:id", get(api_run_by_id).delete(api_run_delete))
         .route("/api/runs/:id/stop", post(api_run_stop))
+        .route("/api/runs/:id/rerun", post(api_run_rerun))
+        .route("/api/runs/:a/compare/:b", get(api_run_compare))
+        .route(
+            "/api/profiles",
+            get(api_profiles_list).post(api_profile_create),
+        )
+        .route(
+            "/api/profiles/:id",
+            get(api_profile_get)
+                .put(api_profile_update)
+                .delete(api_profile_delete),
+        )
+        .route("/metrics", get(api_metrics))
         .route("/api/runs/:id/live", get(api_run_live_ws))
         .route("/api/runs/:id/slaves/:idx/start", post(api_run_start_slave))
         .route("/api/runs/:id/slaves/:idx/stop", post(api_run_stop_slave))
@@ -162,6 +187,14 @@ pub(crate) fn restore(state: &AppState) -> Result<()> {
         }
     }
     info!(restored, next_id = max_id + 1, "restored runs from sqlite");
+    match state.db.latest_analyses() {
+        Ok(list) => {
+            for a in &list {
+                analysis_run::note_analysis(state, a);
+            }
+        }
+        Err(e) => warn!(error = %e, "could not read stored analyses"),
+    }
 
     let parts = library::sweep_part_files(&state.cfg.library_dir);
     let tmps = library::sweep_tmp_dir(&state.cfg.tmp_dir());

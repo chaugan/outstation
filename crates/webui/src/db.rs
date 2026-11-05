@@ -12,6 +12,11 @@
 //!   analysis, linked to its run) and `analysis_details` (one bounded
 //!   per-endpoint detail per row, fetched lazily) (F067).
 //!
+//! * v3 → v4: `runs.request_json` (the canonical validated run request,
+//!   for re-runs and analysis facts), `runs.rerun_of`,
+//!   `analyses.source` (`manual`, `auto`, `on_demand`) and the
+//!   `profiles` table of named run requests (T08).
+//!
 //! A fresh database is created directly at the latest version.
 //!
 //! All operations are synchronous rusqlite calls behind one mutex.
@@ -27,7 +32,7 @@ use tracing::{info, warn};
 use crate::error::LockExt;
 
 /// Latest schema version understood by this binary.
-pub const SCHEMA_VERSION: i64 = 3;
+pub const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone)]
 pub struct Db {
@@ -69,6 +74,11 @@ pub struct StoredRun {
     pub benchmark_json: Option<String>,
     pub per_source_json: Option<String>,
     pub throughput_json: Option<String>,
+    /// Canonical JSON of the validated run request (v4). `None` for
+    /// runs that predate it.
+    pub request_json: Option<String>,
+    /// Id of the run this one re-ran (v4).
+    pub rerun_of: Option<u64>,
 }
 
 const CREATE_RUNS_V2: &str = r#"
@@ -121,6 +131,48 @@ const CREATE_ANALYSES_V3: &str = r#"
     );
 "#;
 
+const CREATE_PROFILES_V4: &str = r#"
+    CREATE TABLE profiles (
+        id           INTEGER PRIMARY KEY AUTOINCREMENT,
+        name         TEXT NOT NULL UNIQUE,
+        request_json TEXT NOT NULL,
+        created_at   INTEGER NOT NULL,
+        updated_at   INTEGER NOT NULL
+    );
+"#;
+
+/// Apply the v4 additions; each step is skipped when already present,
+/// so a fresh database and a migrated one end up identical.
+fn apply_v4(conn: &Connection) -> Result<()> {
+    for (table, col, ddl) in [
+        (
+            "runs",
+            "request_json",
+            "ALTER TABLE runs ADD COLUMN request_json TEXT",
+        ),
+        (
+            "runs",
+            "rerun_of",
+            "ALTER TABLE runs ADD COLUMN rerun_of INTEGER",
+        ),
+        (
+            "analyses",
+            "source",
+            "ALTER TABLE analyses ADD COLUMN source TEXT NOT NULL DEFAULT 'manual'",
+        ),
+    ] {
+        if !column_exists(conn, table, col)? {
+            conn.execute(ddl, [])
+                .with_context(|| format!("migrate v4: {ddl}"))?;
+        }
+    }
+    if !table_exists(conn, "profiles")? {
+        conn.execute_batch(CREATE_PROFILES_V4)
+            .context("migrate v4: create profiles")?;
+    }
+    Ok(())
+}
+
 /// One stored fidelity analysis, without its JSON bodies.
 #[derive(Debug, Clone, PartialEq)]
 pub struct StoredAnalysis {
@@ -129,6 +181,27 @@ pub struct StoredAnalysis {
     pub created_at: u64,
     pub verdict: String,
     pub score_pct: f64,
+    /// How it was started: `manual` (upload), `auto` (after the run
+    /// finished) or `on_demand` (by a compare request).
+    pub source: String,
+}
+
+/// One named run profile.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StoredProfile {
+    pub id: u64,
+    pub name: String,
+    pub request_json: String,
+    pub created_at: u64,
+    pub updated_at: u64,
+}
+
+/// Outcome of a profile write that can collide on the unique name.
+#[derive(Debug)]
+pub enum ProfileWrite {
+    Ok(StoredProfile),
+    NameTaken,
+    NotFound,
 }
 
 fn now_secs() -> i64 {
@@ -174,6 +247,7 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         let tx = conn.transaction()?;
         tx.execute_batch(CREATE_RUNS_V2)?;
         tx.execute_batch(CREATE_ANALYSES_V3)?;
+        apply_v4(&tx)?;
         tx.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION}"))?;
         tx.commit()?;
         return Ok(());
@@ -235,7 +309,15 @@ fn migrate(conn: &mut Connection) -> Result<()> {
         }
         tx.execute_batch("PRAGMA user_version = 3")?;
         tx.commit()?;
+        version = 3;
         info!("runs db migrated to schema v3");
+    }
+    if version < 4 {
+        let tx = conn.transaction()?;
+        apply_v4(&tx)?;
+        tx.execute_batch("PRAGMA user_version = 4")?;
+        tx.commit()?;
+        info!("runs db migrated to schema v4");
     }
     Ok(())
 }
@@ -291,9 +373,9 @@ impl Db {
             "INSERT INTO runs
              (id, started_at, status, pcap, target_ip, target_mac, mode, role,
               target_port, speed, top_speed, realtime, planned, sent, bytes,
-              proto_config, proto, started_by, pcap_id)
+              proto_config, proto, started_by, pcap_id, request_json, rerun_of)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15,
-                     ?16, ?17, ?18, ?19)",
+                     ?16, ?17, ?18, ?19, ?20, ?21)",
             params![
                 run.id as i64,
                 run.started_at as i64,
@@ -314,6 +396,8 @@ impl Db {
                 run.proto,
                 run.started_by,
                 run.pcap_id,
+                run.request_json,
+                run.rerun_of.map(|v| v as i64),
             ],
         )?;
         Ok(())
@@ -376,7 +460,7 @@ impl Db {
                     target_port, speed, top_speed, realtime, planned, sent, bytes,
                     error, report_json, benchmark_json, per_source_json, throughput_json,
                     proto_config, rewrite_cp56_to_now, cp56_zone, proto, finished_at,
-                    started_by, pcap_id
+                    started_by, pcap_id, request_json, rerun_of
              FROM runs
              ORDER BY id",
         )?;
@@ -416,20 +500,30 @@ impl Db {
 
     /// Store one fidelity analysis: its bounded summary JSON and one
     /// detail JSON per endpoint `(endpoint, json)`. Returns its id.
-    pub fn insert_analysis(
+    /// `source` records how the analysis was started (`manual`, `auto`,
+    /// `on_demand`).
+    pub fn insert_analysis_from(
         &self,
         run_id: u64,
         verdict: &str,
         score_pct: f64,
         summary_json: &str,
         details: &[(String, String)],
+        source: &str,
     ) -> Result<u64> {
         let mut conn = self.conn.lock_safe();
         let tx = conn.transaction()?;
         tx.execute(
-            "INSERT INTO analyses (run_id, created_at, verdict, score_pct, summary_json)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            params![run_id as i64, now_secs(), verdict, score_pct, summary_json],
+            "INSERT INTO analyses (run_id, created_at, verdict, score_pct, summary_json, source)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                run_id as i64,
+                now_secs(),
+                verdict,
+                score_pct,
+                summary_json,
+                source
+            ],
         )?;
         let id = tx.last_insert_rowid();
         {
@@ -449,19 +543,114 @@ impl Db {
     pub fn analyses_for_run(&self, run_id: u64) -> Result<Vec<StoredAnalysis>> {
         let conn = self.conn.lock_safe();
         let mut stmt = conn.prepare(
-            "SELECT id, run_id, created_at, verdict, score_pct FROM analyses
+            "SELECT id, run_id, created_at, verdict, score_pct, source FROM analyses
              WHERE run_id = ?1 ORDER BY id DESC",
         )?;
-        let rows = stmt.query_map(params![run_id as i64], |r| {
-            Ok(StoredAnalysis {
-                id: r.get::<_, i64>(0)? as u64,
-                run_id: r.get::<_, i64>(1)? as u64,
-                created_at: r.get::<_, i64>(2)? as u64,
-                verdict: r.get(3)?,
-                score_pct: r.get(4)?,
-            })
-        })?;
+        let rows = stmt.query_map(params![run_id as i64], decode_analysis)?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The newest analysis of every run that has one.
+    pub fn latest_analyses(&self) -> Result<Vec<StoredAnalysis>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT id, run_id, created_at, verdict, score_pct, source FROM analyses
+             WHERE id IN (SELECT MAX(id) FROM analyses GROUP BY run_id)",
+        )?;
+        let rows = stmt.query_map([], decode_analysis)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Number of stored analyses per source.
+    pub fn analysis_counts(&self) -> Result<Vec<(String, u64)>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt =
+            conn.prepare("SELECT source, COUNT(*) FROM analyses GROUP BY source ORDER BY source")?;
+        let rows = stmt.query_map([], |r| Ok((r.get(0)?, r.get::<_, i64>(1)? as u64)))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    // -- profiles ----------------------------------------------------------
+
+    pub fn list_profiles(&self) -> Result<Vec<StoredProfile>> {
+        let conn = self.conn.lock_safe();
+        let mut stmt = conn.prepare(
+            "SELECT id, name, request_json, created_at, updated_at FROM profiles
+             ORDER BY name COLLATE NOCASE, id",
+        )?;
+        let rows = stmt.query_map([], decode_profile)?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    pub fn get_profile(&self, id: u64) -> Result<Option<StoredProfile>> {
+        let conn = self.conn.lock_safe();
+        Ok(conn
+            .query_row(
+                "SELECT id, name, request_json, created_at, updated_at FROM profiles
+                 WHERE id = ?1",
+                params![id as i64],
+                decode_profile,
+            )
+            .optional()?)
+    }
+
+    /// Create a profile. A taken name is reported, not an error.
+    pub fn insert_profile(&self, name: &str, request_json: &str) -> Result<ProfileWrite> {
+        let conn = self.conn.lock_safe();
+        let now = now_secs();
+        let r = conn.execute(
+            "INSERT INTO profiles (name, request_json, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?3)",
+            params![name, request_json, now],
+        );
+        match r {
+            Ok(_) => {
+                let id = conn.last_insert_rowid() as u64;
+                Ok(ProfileWrite::Ok(StoredProfile {
+                    id,
+                    name: name.to_string(),
+                    request_json: request_json.to_string(),
+                    created_at: now as u64,
+                    updated_at: now as u64,
+                }))
+            }
+            Err(e) if is_unique_violation(&e) => Ok(ProfileWrite::NameTaken),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Replace a profile's name and/or request (`None` keeps it).
+    pub fn update_profile(
+        &self,
+        id: u64,
+        name: Option<&str>,
+        request_json: Option<&str>,
+    ) -> Result<ProfileWrite> {
+        let conn = self.conn.lock_safe();
+        let r = conn.execute(
+            "UPDATE profiles SET name = COALESCE(?2, name),
+                 request_json = COALESCE(?3, request_json), updated_at = ?4
+             WHERE id = ?1",
+            params![id as i64, name, request_json, now_secs()],
+        );
+        match r {
+            Ok(0) => Ok(ProfileWrite::NotFound),
+            Ok(_) => Ok(conn
+                .query_row(
+                    "SELECT id, name, request_json, created_at, updated_at FROM profiles
+                     WHERE id = ?1",
+                    params![id as i64],
+                    decode_profile,
+                )
+                .map(ProfileWrite::Ok)?),
+            Err(e) if is_unique_violation(&e) => Ok(ProfileWrite::NameTaken),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    pub fn delete_profile(&self, id: u64) -> Result<bool> {
+        let conn = self.conn.lock_safe();
+        Ok(conn.execute("DELETE FROM profiles WHERE id = ?1", params![id as i64])? > 0)
     }
 
     /// The summary JSON of one stored analysis.
@@ -511,6 +700,35 @@ impl Db {
     }
 }
 
+fn is_unique_violation(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(f, _)
+            if f.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+    )
+}
+
+fn decode_analysis(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredAnalysis> {
+    Ok(StoredAnalysis {
+        id: r.get::<_, i64>(0)? as u64,
+        run_id: r.get::<_, i64>(1)? as u64,
+        created_at: r.get::<_, i64>(2)? as u64,
+        verdict: r.get(3)?,
+        score_pct: r.get(4)?,
+        source: r.get(5)?,
+    })
+}
+
+fn decode_profile(r: &rusqlite::Row<'_>) -> rusqlite::Result<StoredProfile> {
+    Ok(StoredProfile {
+        id: r.get::<_, i64>(0)? as u64,
+        name: r.get(1)?,
+        request_json: r.get(2)?,
+        created_at: r.get::<_, i64>(3)? as u64,
+        updated_at: r.get::<_, i64>(4)? as u64,
+    })
+}
+
 fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun> {
     let proto_config_raw: Option<String> = row.get(20)?;
     let proto: Option<String> = row.get(23)?;
@@ -555,6 +773,8 @@ fn decode_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRun> {
         finished_at: row.get::<_, Option<i64>>(24)?.map(|v| v as u64),
         started_by: row.get(25)?,
         pcap_id: row.get(26)?,
+        request_json: row.get(27)?,
+        rerun_of: row.get::<_, Option<i64>>(28)?.map(|v| v as u64),
     })
 }
 
@@ -678,7 +898,14 @@ mod tests {
             ),
         ];
         let id = db
-            .insert_analysis(1, "partial", 50.0, r#"{"verdict":"partial"}"#, &details)
+            .insert_analysis_from(
+                1,
+                "partial",
+                50.0,
+                r#"{"verdict":"partial"}"#,
+                &details,
+                "manual",
+            )
             .unwrap();
         let list = db.analyses_for_run(1).unwrap();
         assert_eq!(list.len(), 1);
@@ -709,14 +936,116 @@ mod tests {
         }
         let db = Db::open(&path).unwrap();
         db.insert_run_start(&sample(1)).unwrap();
-        db.insert_analysis(1, "all_correct", 100.0, "{}", &[])
+        db.insert_analysis_from(1, "all_correct", 100.0, "{}", &[], "manual")
             .unwrap();
         let v: i64 = db
             .conn
             .lock_safe()
             .query_row("PRAGMA user_version", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(v, 3);
+        assert_eq!(v, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn migrates_v3_to_v4_keeping_analyses() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("runs.sqlite");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(CREATE_RUNS_V2).unwrap();
+            conn.execute_batch(CREATE_ANALYSES_V3).unwrap();
+            conn.execute_batch(
+                "INSERT INTO runs (id, started_at, status, pcap, target_ip, target_mac, mode,
+                    role, target_port, speed, top_speed, realtime)
+                 VALUES (1, 1, 'completed', '/p', '10.0.0.1', '', 'benchmark', 'slave',
+                    2404, 1.0, 0, 0);
+                 INSERT INTO analyses (run_id, created_at, verdict, score_pct, summary_json)
+                 VALUES (1, 5, 'partial', 50.0, '{}');
+                 PRAGMA user_version = 3;",
+            )
+            .unwrap();
+        }
+        let db = Db::open(&path).unwrap();
+        let r = &db.load_all().unwrap()[0];
+        assert_eq!((r.request_json.as_deref(), r.rerun_of), (None, None));
+        let a = db.latest_analyses().unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].source, "manual");
+        let mut s = sample(2);
+        s.request_json = Some(r#"{"mode":"benchmark"}"#.into());
+        s.rerun_of = Some(1);
+        db.insert_run_start(&s).unwrap();
+        let rows = db.load_all().unwrap();
+        assert_eq!(rows[1].rerun_of, Some(1));
+        assert_eq!(
+            rows[1].request_json.as_deref(),
+            Some(r#"{"mode":"benchmark"}"#)
+        );
+        drop(db);
+        Db::open(&path).unwrap();
+    }
+
+    #[test]
+    fn profiles_crud_and_unique_names() {
+        let db = Db::open_in_memory().unwrap();
+        let ProfileWrite::Ok(p) = db.insert_profile("smoke", "{}").unwrap() else {
+            panic!("insert")
+        };
+        assert!(matches!(
+            db.insert_profile("smoke", "{}").unwrap(),
+            ProfileWrite::NameTaken
+        ));
+        let ProfileWrite::Ok(q) = db.insert_profile("load", r#"{"a":1}"#).unwrap() else {
+            panic!("insert")
+        };
+        assert!(matches!(
+            db.update_profile(q.id, Some("smoke"), None).unwrap(),
+            ProfileWrite::NameTaken
+        ));
+        let ProfileWrite::Ok(u) = db.update_profile(p.id, None, Some(r#"{"b":2}"#)).unwrap() else {
+            panic!("update")
+        };
+        assert_eq!(
+            (u.name.as_str(), u.request_json.as_str()),
+            ("smoke", r#"{"b":2}"#)
+        );
+        assert!(matches!(
+            db.update_profile(99, Some("x"), None).unwrap(),
+            ProfileWrite::NotFound
+        ));
+        let names: Vec<String> = db
+            .list_profiles()
+            .unwrap()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        assert_eq!(names, ["load", "smoke"]);
+        assert!(db.delete_profile(p.id).unwrap());
+        assert!(!db.delete_profile(p.id).unwrap());
+        assert!(db.get_profile(p.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn latest_analysis_per_run_and_counts() {
+        let db = Db::open_in_memory().unwrap();
+        db.insert_run_start(&sample(1)).unwrap();
+        db.insert_run_start(&sample(2)).unwrap();
+        db.insert_analysis_from(1, "failed", 0.0, "{}", &[], "auto")
+            .unwrap();
+        let newest = db
+            .insert_analysis_from(1, "all_correct", 100.0, "{}", &[], "manual")
+            .unwrap();
+        db.insert_analysis_from(2, "partial", 50.0, "{}", &[], "auto")
+            .unwrap();
+        let mut l = db.latest_analyses().unwrap();
+        l.sort_by_key(|a| a.run_id);
+        assert_eq!(l.len(), 2);
+        assert_eq!(l[0].id, newest);
+        assert_eq!(l[0].source, "manual");
+        assert_eq!(
+            db.analysis_counts().unwrap(),
+            vec![("auto".to_string(), 2), ("manual".to_string(), 1)]
+        );
     }
 
     #[test]

@@ -75,6 +75,20 @@ pub struct ServeConfig {
     pub capture_max_count: usize,
     /// Concurrent heavy requests (analysis, uploads, gap histograms).
     pub heavy_concurrency: usize,
+    /// Analyse every finished benchmark run's own capture automatically
+    /// and store the result (T08). `serve --no-auto-analyze` or
+    /// `OUTSTATION_AUTO_ANALYZE=0` turns it off.
+    pub auto_analyze: bool,
+}
+
+/// Parse a boolean environment switch: `0`, `false`, `no` and `off`
+/// (any case) are false, anything else non-empty is true.
+pub fn env_flag(v: &str) -> Option<bool> {
+    match v.trim().to_ascii_lowercase().as_str() {
+        "" => None,
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => Some(true),
+    }
 }
 
 impl ServeConfig {
@@ -109,6 +123,10 @@ impl ServeConfig {
                 .map(|v| v as usize)
                 .unwrap_or(200),
             heavy_concurrency: 2,
+            auto_analyze: std::env::var("OUTSTATION_AUTO_ANALYZE")
+                .ok()
+                .and_then(|v| env_flag(&v))
+                .unwrap_or(true),
         }
     }
 
@@ -168,6 +186,10 @@ pub struct AppState {
     pub(crate) host_names: Arc<Vec<String>>,
     pub(crate) gap_cache: Arc<Mutex<HashMap<u64, Arc<serde_json::Value>>>>,
     pub(crate) started: std::time::Instant,
+    /// Runtime that background work (auto-analysis) is spawned on;
+    /// captured when the state is opened inside one.
+    pub(crate) rt: Option<tokio::runtime::Handle>,
+    pub(crate) metrics: Arc<crate::metrics::Metrics>,
 }
 
 impl AppState {
@@ -210,6 +232,8 @@ impl AppState {
             host_names: Arc::new(crate::security::local_host_names()),
             gap_cache: Arc::new(Mutex::new(HashMap::new())),
             started: std::time::Instant::now(),
+            rt: tokio::runtime::Handle::try_current().ok(),
+            metrics: Arc::new(crate::metrics::Metrics::default()),
             cfg: Arc::new(cfg),
         })
     }

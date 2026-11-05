@@ -18,10 +18,14 @@ use axum::http::HeaderMap;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis::{self, analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
+use std::sync::atomic::Ordering;
+
+use crate::analysis::{self, AnalysisMode, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis_run::{analyze_run, note_analysis, store_blocking};
 use crate::db::StoredAnalysis;
 use crate::dto::*;
 use crate::error::{ApiPath, ApiQuery, AppError, LockExt};
+use crate::metrics::AnalysisSource;
 use crate::routes::library::{
     check_free_space, declared_length, multipart_error, stream_field_to_file,
 };
@@ -180,67 +184,29 @@ pub(crate) async fn api_analyze(
             (rs, "latest")
         }
     };
-    if rs.mode != "benchmark" {
-        return Err(AppError::BadRequest(
-            "analysis currently targets benchmark runs only",
-        ));
-    }
-    if !rs.status.is_terminal() {
-        return Err(AppError::Conflict(
-            "run_running",
-            format!(
-                "run {} is still running; analyse it once it has finished",
-                rs.id
-            ),
-        ));
-    }
-    if !rs.pcap.is_file() {
-        return Err(AppError::NotFound(format!(
-            "source pcap of run {} is no longer in the library (pcap_id {})",
-            rs.id,
-            rs.pcap_id.as_deref().unwrap_or("?")
-        ))
-        .code("source_pcap_missing"));
-    }
-
-    let role_hint = match rs.role {
-        "slave" => RoleHint::Slave,
-        _ => RoleHint::Master,
-    };
-    let replayer = proto_registry::lookup(&rs.proto)
-        .ok_or_else(|| AppError::BadRequest(format!("unknown protocol: {}", rs.proto)))?;
-    let run_info = run_info_of(&rs);
+    crate::analysis_run::check_analyzable(&rs)?;
     let tmp_path = tmp.path().to_path_buf();
-    let report = tokio::task::spawn_blocking({
-        let original_pcap = rs.pcap.clone();
-        let proto_config = rs.proto_config.clone();
-        let run_id = rs.id;
-        let target_port = rs.target_port;
-        move || {
-            analyze(
-                replayer.as_ref(),
-                &analysis::AnalyzeRequest {
-                    original_pcap_path: &original_pcap,
-                    captured_pcap_path: &tmp_path,
-                    run_id,
-                    target_port,
-                    role: role_hint,
-                    mode,
-                    proto_config,
-                    cp56_tolerance_ms,
-                    run: run_info,
-                },
-            )
-        }
+    let m = state.metrics.clone();
+    m.analyses_running.fetch_add(1, Ordering::Relaxed);
+    let res = tokio::task::spawn_blocking({
+        let rs = rs.clone();
+        move || analyze_run(&rs, &tmp_path, mode, cp56_tolerance_ms)
     })
-    .await
-    .map_err(|e| AppError::Internal(format!("analyze task: {e}")))?
-    .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
+    .await;
+    m.analyses_running.fetch_sub(1, Ordering::Relaxed);
+    let report = res
+        .map_err(|e| AppError::Internal(format!("analyze task: {e}")))
+        .and_then(|r| r.map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id))));
+    m.count_analysis(AnalysisSource::Manual, report.is_ok());
+    let report = report?;
     if let Some(w) = &report.run_warning {
         warnings.push(format!("run #{}: {w}", rs.id));
     }
     let analysis_id = match persist(&state, report.clone()).await {
-        Ok(id) => Some(id),
+        Ok(a) => {
+            note_analysis(&state, &a);
+            Some(a.id)
+        }
         Err(e) => {
             warnings.push(format!("analysis not saved: {e:#}"));
             None
@@ -257,70 +223,13 @@ pub(crate) async fn api_analyze(
     }))
 }
 
-/// Run facts the analysis judges against (F060, F062, F093).
-fn run_info_of(rs: &RunState) -> analysis::RunInfo {
-    analysis::RunInfo {
-        status: match rs.status {
-            RunStatus::Completed => analysis::RunStatusHint::Completed,
-            RunStatus::Partial => analysis::RunStatusHint::Partial,
-            RunStatus::Stopped => analysis::RunStatusHint::Stopped,
-            RunStatus::Failed => analysis::RunStatusHint::Failed,
-            RunStatus::Running => analysis::RunStatusHint::Running,
-        },
-        error: rs.error.clone(),
-        messages_sent: Some(
-            rs.benchmark
-                .as_ref()
-                .map(|b| b.total_messages_sent)
-                .unwrap_or(rs.sent),
-        ),
-        endpoints: rs
-            .per_source_progress
-            .iter()
-            .filter_map(|p| {
-                Some(analysis::SelectedEndpoint {
-                    source_ip: p.src_ip.as_deref()?.parse().ok()?,
-                    listen_ip: p.listen_ip.parse().ok(),
-                    listen_port: (p.listen_port != 0).then_some(p.listen_port),
-                    state: p.state.clone(),
-                    cancelled: p.cancelled,
-                    sent: p.sent,
-                })
-            })
-            .collect(),
-        iterations: rs
-            .per_source_progress
-            .iter()
-            .map(|p| p.iter_total)
-            .max()
-            .unwrap_or(1),
-        // Not persisted on RunState yet (T08 stores the full request).
-        loop_within_session: None,
-        paced_speed: None,
-        source_port: None,
-    }
-}
-
 /// Store the bounded summary and per-endpoint details.
-async fn persist(state: &AppState, report: analysis::AnalysisReport) -> anyhow::Result<u64> {
+async fn persist(
+    state: &AppState,
+    report: analysis::AnalysisReport,
+) -> anyhow::Result<StoredAnalysis> {
     let db = state.db.clone();
-    tokio::task::spawn_blocking(move || {
-        let run_id = report.run_id;
-        let (summary, details) = report.split();
-        let summary_json = serde_json::to_string(&summary)?;
-        let details: Vec<(String, String)> = details
-            .into_iter()
-            .map(|(ep, d)| Ok((ep, serde_json::to_string(&d)?)))
-            .collect::<anyhow::Result<_>>()?;
-        db.insert_analysis(
-            run_id,
-            summary.verdict,
-            summary.score_pct,
-            &summary_json,
-            &details,
-        )
-    })
-    .await?
+    tokio::task::spawn_blocking(move || store_blocking(&db, report, AnalysisSource::Manual)).await?
 }
 
 fn parse_stored(json: Option<String>, what: &str) -> Result<Json<serde_json::Value>, AppError> {
@@ -351,6 +260,8 @@ pub(crate) struct StoredAnalysisJson {
     created_at: u64,
     verdict: String,
     score_pct: f64,
+    /// `manual`, `auto` or `on_demand`.
+    source: String,
 }
 
 impl From<StoredAnalysis> for StoredAnalysisJson {
@@ -361,6 +272,7 @@ impl From<StoredAnalysis> for StoredAnalysisJson {
             created_at: a.created_at,
             verdict: a.verdict,
             score_pct: a.score_pct,
+            source: a.source,
         }
     }
 }

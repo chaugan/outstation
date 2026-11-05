@@ -116,6 +116,16 @@ pub(crate) async fn stream_field_to_file(
 pub(crate) async fn api_library_upload(
     State(state): State<AppState>,
     headers: HeaderMap,
+    mp: Multipart,
+) -> Result<Json<LibraryEntry>, AppError> {
+    let r = library_upload(&state, headers, mp).await;
+    state.metrics.count_upload(r.is_ok());
+    r
+}
+
+async fn library_upload(
+    state: &AppState,
+    headers: HeaderMap,
     mut mp: Multipart,
 ) -> Result<Json<LibraryEntry>, AppError> {
     let _permit = state
@@ -123,7 +133,7 @@ pub(crate) async fn api_library_upload(
         .clone()
         .try_acquire_owned()
         .map_err(|_| crate::routes::runs::busy())?;
-    check_free_space(&state, declared_length(&headers))?;
+    check_free_space(state, declared_length(&headers))?;
     let dir: &StdPath = state.library_dir.as_ref();
     let mut field = mp
         .next_field()

@@ -33,6 +33,14 @@ enum Behaviour {
     Panic,
     /// One session per entry; `Some(err)` marks it failed.
     Sessions(&'static [Option<&'static str>]),
+    /// Like `Sessions`, and writes the IEC 104 fixture as the run's
+    /// mirror capture (so it can be analysed).
+    SessionsWithCapture(&'static [Option<&'static str>]),
+}
+
+/// The 200-RTU IEC 104 fixture.
+fn fixture() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/synth_iec104_rtus200_ts.pcap")
 }
 
 /// Host-safety fields of the last job handed to the executor:
@@ -62,7 +70,7 @@ impl Fake {
                 Ok(BenchmarkReport::default())
             }
             Behaviour::Panic => panic!("boom in sched"),
-            Behaviour::Sessions(s) => Ok(BenchmarkReport {
+            Behaviour::Sessions(s) | Behaviour::SessionsWithCapture(s) => Ok(BenchmarkReport {
                 per_session: s
                     .iter()
                     .enumerate()
@@ -112,6 +120,9 @@ impl RunExecutor for Fake {
             c.bridge_name.clone(),
             c.tap_prefix.clone(),
         ));
+        if let (Behaviour::SessionsWithCapture(_), Some(cap)) = (self.behaviour, &c.capture_path) {
+            std::fs::copy(fixture(), cap).unwrap();
+        }
         self.bench(&ctx)
     }
 }
@@ -177,6 +188,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
         heavy_concurrency: 2,
+        auto_analyze: true,
     }
 }
 
@@ -1138,4 +1150,655 @@ async fn run_protects_ui_address_and_derives_names_from_run_id() {
     );
     assert!(force);
     assert_eq!((bridge, tap), (None, None), "names derived from run id");
+}
+
+// ---------------------------------------------------------------------------
+// T08: persisted requests, re-run, profiles, auto-analysis
+
+/// Library entry `id` holding the IEC 104 fixture.
+fn add_fixture(h: &H, id: &str) {
+    std::fs::copy(fixture(), h.state.library_dir.join(format!("{id}.pcap"))).unwrap();
+}
+
+fn slave_req(pcap_id: &str) -> Value {
+    let mut r = bench_req(pcap_id);
+    r["role"] = json!("slave");
+    r
+}
+
+impl H {
+    /// Wait until run `id` has a `latest_analysis`.
+    async fn wait_analysis(&self, id: u64) -> Value {
+        for _ in 0..1000 {
+            let (_, v) = self
+                .call(Method::GET, &format!("/api/runs/{id}"), None)
+                .await;
+            if !v["latest_analysis"].is_null() {
+                return v;
+            }
+            let st = v["auto_analysis"]["state"].as_str().unwrap_or("");
+            assert!(
+                st != "failed" && st != "skipped",
+                "auto-analysis of run {id} ended {st}: {v}"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("run {id} never got an analysis");
+    }
+
+    async fn run_to(&self, req: Value, want: &str) -> u64 {
+        let (s, v) = self.call(Method::POST, "/api/run", Some(req)).await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        let id = v["id"].as_u64().unwrap();
+        self.wait_status(id, want).await;
+        id
+    }
+}
+
+#[tokio::test]
+async fn request_is_persisted_and_rerun_links_back() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let mut req = bench_req("pcr_1");
+    req["force"] = json!(true);
+    req["bridge"] = json!("br0");
+    req["iterations"] = json!(3);
+    let id = h.run_to(req, "completed").await;
+    let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+    let r = &v["request"];
+    assert_eq!(r["pcap_id"], "pcr_1");
+    assert_eq!(r["iterations"], 3);
+    assert_eq!(r["force"], true);
+    assert_eq!(r["listen_port_base"], 2404, "defaults filled in");
+    assert!(r.get("bridge").is_none(), "ignored fields are dropped");
+    assert_eq!(v["rerun_of"], Value::Null);
+
+    // Re-run: same request, linked back, force NOT inherited.
+    let (s, rr) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{rr}");
+    let id2 = rr["id"].as_u64().unwrap();
+    assert_eq!(rr["rerun_of"], id);
+    assert_eq!(rr["request"]["force"], false);
+    let v2 = h.wait_status(id2, "completed").await;
+    assert_eq!(v2["rerun_of"], id);
+    assert_eq!(v2["request"]["iterations"], 3);
+    assert!(
+        !h.seen.lock().unwrap().clone().unwrap().2,
+        "force re-confirmed only"
+    );
+    let (_, list) = h.call(Method::GET, "/api/runs", None).await;
+    assert_eq!(list[0]["rerun_of"], id);
+    assert!(list[0].get("request").is_none(), "slim list has no request");
+
+    // ?force=true re-confirms it.
+    let (s, rr) = h
+        .call(
+            Method::POST,
+            &format!("/api/runs/{id}/rerun?force=true"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{rr}");
+    assert_eq!(rr["request"]["force"], true);
+    h.wait_status(rr["id"].as_u64().unwrap(), "completed").await;
+
+    // Unknown run: 404. A run without a stored request: 409.
+    let (s, _) = h.call(Method::POST, "/api/runs/99/rerun", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    h.state.get_run(id).unwrap().lock_safe().request = None;
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("request_missing"))
+    );
+
+    // The request and the link survive a restart.
+    let H { dir, .. } = h;
+    let state = AppState::open(cfg_for(dir.path())).unwrap();
+    crate::restore(&state).unwrap();
+    let rs = state.get_run(id2).unwrap().lock_safe().clone();
+    assert_eq!(rs.rerun_of, Some(id));
+    assert_eq!(rs.request.unwrap()["iterations"], 3);
+}
+
+#[tokio::test]
+async fn rerun_follows_single_run_rule() {
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (_, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    let id = v["id"].as_u64().unwrap();
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::CONFLICT);
+    assert_eq!(v["code"], "run_active");
+    assert_eq!(v["active_run_id"], id);
+    h.call(Method::POST, &format!("/api/runs/{id}/stop"), None)
+        .await;
+    h.wait_status(id, "stopped").await;
+    // The pcap is gone from the library: the re-run validates again.
+    std::fs::remove_file(h.state.library_dir.join("pcr_1.pcap")).unwrap();
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "{v}");
+}
+
+#[tokio::test]
+async fn profiles_crud() {
+    let h = harness(Behaviour::BlockUntilCancel);
+    let mut req = slave_req("pcr_1");
+    req.as_object_mut().unwrap().remove("pcap_id");
+    let (s, p) = h
+        .call(
+            Method::POST,
+            "/api/profiles",
+            Some(json!({"name": " nightly ", "request": req})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::CREATED, "{p}");
+    let pid = p["id"].as_u64().unwrap();
+    assert_eq!(p["name"], "nightly");
+    assert_eq!(p["request"]["role"], "slave");
+    assert_eq!(p["request"]["iterations"], 1, "canonical form");
+    assert!(p["created_at"].as_u64().is_some());
+
+    let (s, v) = h
+        .call(
+            Method::POST,
+            "/api/profiles",
+            Some(json!({"name": "nightly", "request": req})),
+        )
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("profile_exists"))
+    );
+    for (body, code) in [
+        (json!({"name": "", "request": req}), "invalid_request"),
+        (json!({"name": "x"}), "invalid_request"),
+        (
+            json!({"name": "x", "request": {"target_ip": "10.0.0.1", "speed": 0}}),
+            "invalid_request",
+        ),
+        (
+            json!({"name": "x", "request": {"target_ip": "10.0.0.1", "pcap": "/etc/passwd"}}),
+            "raw_path_rejected",
+        ),
+    ] {
+        let (s, v) = h
+            .call(Method::POST, "/api/profiles", Some(body.clone()))
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{body}: {v}");
+        assert_eq!(v["code"], code, "{body}: {v}");
+    }
+
+    let mut req2 = req.clone();
+    req2["iterations"] = json!(7);
+    let (s, u) = h
+        .call(
+            Method::PUT,
+            &format!("/api/profiles/{pid}"),
+            Some(json!({"request": req2})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{u}");
+    assert_eq!(u["request"]["iterations"], 7);
+    assert_eq!(u["name"], "nightly");
+    let (_, g) = h
+        .call(Method::GET, &format!("/api/profiles/{pid}"), None)
+        .await;
+    assert_eq!(g, u);
+    let (_, l) = h.call(Method::GET, "/api/profiles", None).await;
+    assert_eq!(l.as_array().unwrap().len(), 1);
+    let (s, _) = h
+        .call(Method::DELETE, &format!("/api/profiles/{pid}"), None)
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    for m in [Method::GET, Method::DELETE] {
+        let (s, _) = h.call(m, &format!("/api/profiles/{pid}"), None).await;
+        assert_eq!(s, StatusCode::NOT_FOUND);
+    }
+    let (s, _) = h
+        .call(
+            Method::PUT,
+            &format!("/api/profiles/{pid}"),
+            Some(json!({"name": "y"})),
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn finished_benchmark_is_analysed_automatically() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.capture_max_total_bytes = u64::MAX,
+    );
+    add_fixture(&h, "pcr_1");
+    let mut req = slave_req("pcr_1");
+    req["pacing"] = json!("original");
+    req["speed"] = json!(2.0);
+    let id = h.run_to(req, "completed").await;
+    let v = h.wait_analysis(id).await;
+    let la = &v["latest_analysis"];
+    assert!(la["id"].as_u64().is_some(), "{v}");
+    assert!(la["verdict"].is_string() && la["score"].is_number(), "{v}");
+    assert_eq!(la["source"], "auto");
+    assert_eq!(v["auto_analysis"]["state"], "done");
+    assert_eq!(v["auto_analysis"]["analysis_id"], la["id"]);
+    let (_, list) = h
+        .call(Method::GET, &format!("/api/runs/{id}/analyses"), None)
+        .await;
+    assert_eq!(list[0]["source"], "auto");
+    let (_, runs) = h.call(Method::GET, "/api/runs", None).await;
+    assert_eq!(runs[0]["latest_analysis"], *la);
+    let (s, sum) = h
+        .call(Method::GET, &format!("/api/analyses/{}", la["id"]), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{sum}");
+    assert_eq!(sum["run_id"], id);
+
+    // The newest analysis is found again after a restart.
+    let st = AppState::open(h.state.cfg.as_ref().clone()).unwrap();
+    crate::restore(&st).unwrap();
+    let rs = st.get_run(id).unwrap().lock_safe().clone();
+    assert_eq!(rs.latest_analysis.unwrap().id, la["id"].as_u64().unwrap());
+}
+
+#[tokio::test]
+async fn auto_analysis_can_be_disabled_and_is_skipped_without_capture() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.auto_analyze = false,
+    );
+    add_fixture(&h, "pcr_1");
+    let id = h.run_to(slave_req("pcr_1"), "completed").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+    assert_eq!(v["latest_analysis"], Value::Null);
+    assert_eq!(v["auto_analysis"], Value::Null);
+    let (_, st) = h.call(Method::GET, "/api/status", None).await;
+    assert_eq!(st["auto_analyze"], false);
+
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let id = h.run_to(bench_req("pcr_1"), "completed").await;
+    let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+    assert_eq!(v["auto_analysis"]["state"], "skipped", "{v}");
+    assert!(v["auto_analysis"]["error"]
+        .as_str()
+        .unwrap()
+        .contains("capture"));
+}
+
+#[test]
+fn auto_analyze_env_switch() {
+    assert_eq!(crate::state::env_flag("0"), Some(false));
+    assert_eq!(crate::state::env_flag(" OFF "), Some(false));
+    assert_eq!(crate::state::env_flag("false"), Some(false));
+    assert_eq!(crate::state::env_flag("1"), Some(true));
+    assert_eq!(crate::state::env_flag(""), None);
+}
+
+// ---------------------------------------------------------------------------
+// T10: compare
+
+#[tokio::test]
+async fn compare_runs() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.auto_analyze = false,
+    );
+    add_fixture(&h, "pcr_1");
+    let a = h.run_to(slave_req("pcr_1"), "completed").await;
+    let b = h.run_to(slave_req("pcr_1"), "completed").await;
+
+    // analyze=false and no stored analysis: 409.
+    let (s, v) = h
+        .call(
+            Method::GET,
+            &format!("/api/runs/{a}/compare/{b}?analyze=false"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("analysis_missing"))
+    );
+    assert_eq!(v["run_id"], a);
+    assert_eq!(v["has_capture"], true);
+
+    // On demand: both sides analysed and stored.
+    let (s, v) = h
+        .call(Method::GET, &format!("/api/runs/{a}/compare/{b}"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["a"]["run_id"], a);
+    assert_eq!(v["a"]["analyzed_now"], true);
+    assert_eq!(v["b"]["analysis_source"], "on_demand");
+    assert_eq!(v["regressed"], false, "{}", v["regressions"]);
+    assert_eq!(v["regressions"], json!([]));
+    let scored: Vec<&Value> = v["rtus"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["a"]["score"].is_number())
+        .collect();
+    assert!(!scored.is_empty(), "{v}");
+    assert!(scored.iter().all(|r| r["delta"]["score"] == 0.0));
+    assert_eq!(v["fleet"]["delta"]["score"], 0.0);
+    assert_eq!(v["fleet"]["verdict_changed"], false);
+    assert_eq!(v["only_in_a"], json!([]));
+    assert_eq!(v["thresholds"]["score_drop"], 1.0);
+
+    // Second time the stored analyses are reused.
+    let (s, v) = h
+        .call(
+            Method::GET,
+            &format!("/api/runs/{a}/compare/{b}?score_drop=5&p99_increase_pct=50"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    assert_eq!(v["a"]["analyzed_now"], false);
+    assert_eq!(v["thresholds"]["score_drop"], 5.0);
+    assert_eq!(v["thresholds"]["p99_increase_pct"], 50.0);
+    let aid = v["a"]["analysis_id"].as_u64().unwrap();
+    let (s, v) = h
+        .call(
+            Method::GET,
+            &format!("/api/runs/{a}/compare/{b}?analysis_b={aid}"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND, "analysis of another run: {v}");
+
+    for (q, code) in [
+        ("score_drop=-1", "invalid_query"),
+        ("score_drop=abc", "invalid_query"),
+    ] {
+        let (s, v) = h
+            .call(Method::GET, &format!("/api/runs/{a}/compare/{b}?{q}"), None)
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{q}: {v}");
+        assert_eq!(v["code"], code);
+    }
+    let (s, _) = h
+        .call(Method::GET, &format!("/api/runs/{a}/compare/77"), None)
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn compare_refuses_running_raw_and_captureless_runs() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let bench = h.run_to(bench_req("pcr_1"), "completed").await;
+    let raw = h
+        .run_to(
+            json!({"pcap_id": "pcr_1", "target_ip": "10.0.0.50",
+                   "target_mac": "02:00:00:00:00:01", "warmup_secs": 0}),
+            "completed",
+        )
+        .await;
+    let (s, v) = h
+        .call(
+            Method::GET,
+            &format!("/api/runs/{bench}/compare/{raw}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("not_benchmark"))
+    );
+    let (s, v) = h
+        .call(
+            Method::GET,
+            &format!("/api/runs/{bench}/compare/{bench}"),
+            None,
+        )
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("analysis_missing"))
+    );
+    assert_eq!(v["has_capture"], false);
+
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (_, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    let id = v["id"].as_u64().unwrap();
+    let (s, v) = h
+        .call(Method::GET, &format!("/api/runs/{id}/compare/{id}"), None)
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::CONFLICT, Some("run_running"))
+    );
+    h.call(Method::POST, &format!("/api/runs/{id}/stop"), None)
+        .await;
+}
+
+// ---------------------------------------------------------------------------
+// T13: metrics and degraded health
+
+/// Check the Prometheus text format line by line and return the
+/// samples as `name{labels} -> value`.
+fn parse_prom(text: &str) -> std::collections::HashMap<String, f64> {
+    let mut out = std::collections::HashMap::new();
+    let mut typed = std::collections::HashSet::new();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            let mut it = rest.split(' ');
+            let name = it.next().unwrap();
+            let kind = it.next().unwrap();
+            assert!(
+                ["counter", "gauge", "histogram", "summary"].contains(&kind),
+                "{line}"
+            );
+            assert!(typed.insert(name.to_string()), "duplicate TYPE {name}");
+            continue;
+        }
+        if line.starts_with("# HELP ") {
+            continue;
+        }
+        assert!(
+            !line.is_empty() && !line.starts_with('#'),
+            "stray line {line:?}"
+        );
+        let (key, val) = line.rsplit_once(' ').unwrap();
+        let name = key.split('{').next().unwrap();
+        assert!(
+            name.chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':'),
+            "{line}"
+        );
+        let base = ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|s| name.strip_suffix(s).filter(|b| typed.contains(*b)))
+            .unwrap_or(name);
+        assert!(typed.contains(base), "sample before TYPE: {line}");
+        let v: f64 = match val {
+            "+Inf" => f64::INFINITY,
+            "-Inf" => f64::NEG_INFINITY,
+            v => v.parse().unwrap_or_else(|_| panic!("bad value in {line}")),
+        };
+        assert!(out.insert(key.to_string(), v).is_none(), "duplicate {key}");
+    }
+    out
+}
+
+impl H {
+    async fn metrics(&self) -> (std::collections::HashMap<String, f64>, String) {
+        let req = Request::builder()
+            .uri("/metrics")
+            .header("host", HOST)
+            .body(Body::empty())
+            .unwrap();
+        let (s, headers, body) = self.send(req).await;
+        assert_eq!(s, StatusCode::OK);
+        assert!(headers["content-type"]
+            .to_str()
+            .unwrap()
+            .starts_with("text/plain; version=0.0.4"));
+        let text = String::from_utf8(body).unwrap();
+        (parse_prom(&text), text)
+    }
+}
+
+#[tokio::test]
+async fn metrics_expose_runs_latency_and_health() {
+    let h = harness(Behaviour::Sessions(&[None, Some("bind failed")]));
+    h.add_pcap("pcr_1");
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"completed\"}"], 0.0);
+    assert_eq!(m["outstation_active_run_id"], 0.0);
+    assert!(m.contains_key(&format!(
+        "outstation_build_info{{version=\"{}\"}}",
+        env!("CARGO_PKG_VERSION")
+    )));
+
+    let id = h.run_to(bench_req("pcr_1"), "partial").await;
+    let (m, text) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"partial\"}"], 1.0);
+    assert_eq!(m["outstation_frames_sent_total"], 20.0);
+    assert_eq!(m["outstation_run_duration_seconds_count"], 1.0);
+    // The fleet histogram of the run: 2 sessions x 10 samples of 100 µs.
+    assert_eq!(m["outstation_benchmark_latency_seconds_count"], 20.0);
+    assert_eq!(
+        m["outstation_benchmark_latency_seconds_bucket{le=\"+Inf\"}"],
+        20.0
+    );
+    assert_eq!(
+        m["outstation_benchmark_latency_seconds_bucket{le=\"0.00001\"}"],
+        0.0
+    );
+    let le_100us = m
+        .iter()
+        .filter(|(k, _)| k.starts_with("outstation_benchmark_latency_seconds_bucket"))
+        .filter(|(k, _)| {
+            let le: f64 = k
+                .split('"')
+                .nth(1)
+                .unwrap()
+                .parse()
+                .unwrap_or(f64::INFINITY);
+            le > 1e-4
+        })
+        .all(|(_, v)| *v == 20.0);
+    assert!(le_100us, "{text}");
+    assert_eq!(m["outstation_last_benchmark_run_id"], id as f64);
+    assert_eq!(m["outstation_db_writable"], 1.0);
+    assert!(m.contains_key("outstation_free_disk_bytes"));
+    assert_eq!(
+        m["outstation_guard_journal_entries{journal=\"guards\"}"],
+        0.0
+    );
+    assert!(m.contains_key("outstation_uptime_seconds"));
+    assert!(m.contains_key("outstation_analyses_total{source=\"auto\",result=\"ok\"}"));
+
+    // Deleting the run keeps the counters monotonic.
+    let (s, _) = h
+        .call(Method::DELETE, &format!("/api/runs/{id}"), None)
+        .await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"partial\"}"], 0.0);
+    assert_eq!(m["outstation_frames_sent_total"], 20.0);
+    assert_eq!(m["outstation_benchmark_latency_seconds_count"], 20.0);
+    assert_eq!(m["outstation_run_duration_seconds_count"], 1.0);
+
+    // Uploads are counted.
+    let (s, _) = h
+        .multipart("/api/pcaps", &[("file", Some("a.pcap"), tiny_pcap(2))])
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    let (s, _) = h
+        .multipart("/api/pcaps", &[("file", Some("b.pcap"), b"nope".to_vec())])
+        .await;
+    assert!(s.is_client_error());
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_uploads_total{result=\"ok\"}"], 1.0);
+    assert_eq!(m["outstation_uploads_total{result=\"error\"}"], 1.0);
+}
+
+#[tokio::test]
+async fn active_run_shows_in_metrics() {
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (_, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    let id = v["id"].as_u64().unwrap();
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_active_run_id"], id as f64);
+    assert_eq!(m["outstation_runs{status=\"running\"}"], 1.0);
+    assert!(m.contains_key("outstation_active_run_sessions{state=\"active\"}"));
+    h.call(Method::POST, &format!("/api/runs/{id}/stop"), None)
+        .await;
+    h.wait_status(id, "stopped").await;
+}
+
+#[tokio::test]
+async fn status_reports_pending_cleanup_and_low_disk() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| c.min_free_bytes = u64::MAX,
+    );
+    std::fs::write(
+        h.state.cfg.state_dir.join("state-guards.txt"),
+        "sysctl net.ipv4.ip_forward 0\n",
+    )
+    .unwrap();
+    let (s, v) = h.call(Method::GET, "/api/status", None).await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(v["ok"], false);
+    let codes: Vec<&str> = v["degraded_detail"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"cleanup_pending"), "{v}");
+    assert!(codes.contains(&"low_disk"), "{v}");
+    assert_eq!(
+        v["degraded"].as_array().unwrap().len(),
+        codes.len(),
+        "messages and codes line up"
+    );
+    assert_eq!(v["journal_pending"]["guards"], 1);
+    assert_eq!(v["journal_pending"]["aliases"], 0);
+    let (m, _) = h.metrics().await;
+    assert_eq!(
+        m["outstation_guard_journal_entries{journal=\"guards\"}"],
+        1.0
+    );
+    assert_eq!(m["outstation_degraded{reason=\"cleanup_pending\"}"], 1.0);
+    assert_eq!(m["outstation_up"], 0.0);
+
+    // While a run is active its journal entries are expected.
+    h.add_pcap("pcr_1");
+    let (_, r) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    let (_, v) = h.call(Method::GET, "/api/status", None).await;
+    assert!(!v["degraded_detail"].to_string().contains("cleanup_pending"));
+    let id = r["id"].as_u64().unwrap();
+    h.call(Method::POST, &format!("/api/runs/{id}/stop"), None)
+        .await;
+    h.wait_status(id, "stopped").await;
 }

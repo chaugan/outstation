@@ -51,6 +51,8 @@ pub(crate) fn runstate_to_stored(rs: &RunState) -> StoredRun {
             .and_then(|b| to_json(rs.id, "benchmark", b)),
         per_source_json: to_json(rs.id, "per_source", &rs.per_source_progress),
         throughput_json: to_json(rs.id, "throughput", &rs.throughput_history),
+        request_json: rs.request.as_ref().map(|v| v.to_string()),
+        rerun_of: rs.rerun_of,
     }
 }
 
@@ -144,6 +146,10 @@ pub(crate) fn stored_to_runstate(
             s.id,
             recorded_capture.as_deref(),
         ),
+        request: from_json(s.id, "request", s.request_json.as_deref()),
+        rerun_of: s.rerun_of,
+        latest_analysis: None,
+        auto_analysis: None,
         ctx: RunContext::new(),
     })
 }
