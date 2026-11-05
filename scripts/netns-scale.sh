@@ -64,8 +64,8 @@
 #        SLAVE_DURATION=300  SLAVE_INTERVAL=0.2  SLAVE_ITERATIONS=5
 #        PEER_QUIET=0.5  quiet time after which the master peer closes
 #        REALTIME=1      set "realtime": true in the profiles (SCHED_FIFO
-#                        replay threads; the slave capture thread gets RT
-#                        priority only then)
+#                        replay threads in raw mode; since T17c the
+#                        capture thread gets RT priority in every run)
 #        NOFILE=SOFT[:HARD]  run outstation with this open-file limit
 #                        (e.g. 1024, the soft limit systemd gives services)
 #        CARGO_TARGET_DIR honoured by cargo

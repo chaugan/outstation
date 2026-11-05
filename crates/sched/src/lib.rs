@@ -633,6 +633,25 @@ fn start_capture(
     complete
 }
 
+/// SCHED_FIFO priority of every run's capture reader, whatever the
+/// run's `realtime` setting (T17c, reverting N8). The promotion is best
+/// effort: without `CAP_SYS_NICE` (or with no RT budget)
+/// [`try_set_realtime`] fails quietly and the reader keeps the default
+/// policy.
+///
+/// Why always: the reader only ever blocks in `poll` and then drains
+/// what the kernel queued, and its kernel filter limits that to the
+/// run's own traffic, so the CPU it can take is bounded by the run's
+/// frame rate and it cannot spin; the kernel's RT throttling
+/// (`sched_rt_runtime_us`) bounds it further. The risk of starving
+/// other tasks is therefore small, while a reader that loses the CPU to
+/// the run's own sessions overflows its socket queue, and every frame
+/// lost there corrupts the analysis verdict (full-speed slave-200: 46 k
+/// frames dropped at RT priority, 237 k without; scale report §6.5).
+pub(crate) fn capture_rt_priority() -> Option<i32> {
+    Some(CAPTURE_RT_PRIORITY)
+}
+
 /// Capture settings of a run.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 struct CaptureOpts {
@@ -759,9 +778,9 @@ pub struct BenchmarkConfig {
     pub capture_path: Option<PathBuf>,
     /// Largest capture file in bytes; see [`RunConfig::capture_max_bytes`].
     pub capture_max_bytes: Option<u64>,
-    /// Run the capture reader at SCHED_FIFO (as raw mode's `realtime`
-    /// does). Off by default: a benchmark's sessions are not real-time
-    /// threads, so the capture has no business outranking the host.
+    /// Accepted for symmetry with raw mode; a benchmark's sessions are
+    /// not real-time threads. The capture reader runs at SCHED_FIFO
+    /// whether or not this is set ([`capture_rt_priority`]).
     pub realtime: bool,
     /// Free-form JSON/YAML passed through to the ProtoReplayer.
     pub proto_config: Option<String>,

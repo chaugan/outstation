@@ -177,10 +177,11 @@ pub(crate) fn finish_session(
 }
 
 /// Capture settings of a benchmark run, either role: the reader runs
-/// at RT priority only with `realtime` on (N8).
+/// at RT priority whenever the process may use it, `realtime` or not
+/// (T17c; see [`capture_rt_priority`]).
 pub(crate) fn bench_capture_opts(cfg: &BenchmarkConfig) -> CaptureOpts {
     CaptureOpts {
-        rt_priority: cfg.realtime.then_some(CAPTURE_RT_PRIORITY),
+        rt_priority: capture_rt_priority(),
         max_bytes: cfg.capture_max_bytes,
     }
 }

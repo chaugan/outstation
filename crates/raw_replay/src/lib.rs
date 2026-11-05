@@ -121,10 +121,10 @@ pub const MAX_SPEED: f64 = 1e6;
 /// and for the capture thread above it.
 pub const REPLAY_RT_PRIORITY: i32 = 10;
 
-/// SCHED_FIFO priority for the mirror-capture thread when a run uses
-/// realtime replay. One above [`REPLAY_RT_PRIORITY`] so the capture
-/// reader, which only ever blocks in `recv`, is never starved by the
-/// replay workers it is recording.
+/// SCHED_FIFO priority for a run's capture thread (every run, when the
+/// process may use RT scheduling). One above [`REPLAY_RT_PRIORITY`] so
+/// the capture reader, which only ever blocks in `poll` and drains, is
+/// never starved by the replay workers or sessions it is recording.
 pub const CAPTURE_RT_PRIORITY: i32 = REPLAY_RT_PRIORITY + 1;
 
 /// Clamp a user-supplied speed into `[MIN_SPEED, MAX_SPEED]`. Non-finite

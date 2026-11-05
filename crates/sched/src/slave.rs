@@ -24,8 +24,9 @@ struct SlaveCapture {
 
 impl SlaveCapture {
     fn start(path: &Path, port: u16, peer: Ipv4Addr, opts: CaptureOpts) -> Result<Self> {
-        // The reader only blocks in poll and drains bursts. It runs at
-        // RT priority only when the run asks for realtime (N8).
+        // The reader only blocks in poll and drains bursts; it runs at
+        // RT priority when the process may use it (T17c,
+        // `capture_rt_priority`).
         let cap = Capture::start_filtered(path, raw_replay::bpf::reject_all(), opts.rt_priority)?;
         cap.set_max_bytes(opts.max_bytes);
         info!(path = %path.display(), port, "slave capture started");

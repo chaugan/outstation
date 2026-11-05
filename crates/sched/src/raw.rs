@@ -147,9 +147,8 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         ..Default::default()
     };
     if let Some(path) = &cfg.capture_path {
-        let rt_active = rt_plan.iter().any(|b| *b);
         let opts = CaptureOpts {
-            rt_priority: rt_active.then_some(CAPTURE_RT_PRIORITY),
+            rt_priority: capture_rt_priority(),
             max_bytes: cfg.capture_max_bytes,
         };
         capture.open_failed = !start_capture(&mut res, &names, path, opts, &mut warnings);

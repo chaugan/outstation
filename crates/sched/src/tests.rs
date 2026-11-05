@@ -800,10 +800,11 @@ fn capture_ok_and_truncation_reach_the_reports() {
     assert!(!b.capture_ok);
 }
 
-/// N8: a benchmark's capture reader runs at RT priority only with
-/// realtime on; the byte cap is passed through.
+/// T17c (reverting N8): a benchmark's capture reader asks for RT
+/// priority whether or not `realtime` is set; the byte cap is passed
+/// through.
 #[test]
-fn benchmark_capture_is_realtime_only_on_request() {
+fn benchmark_capture_is_realtime_whenever_allowed() {
     let cfg = BenchmarkConfig {
         capture_max_bytes: Some(1 << 20),
         ..Default::default()
@@ -811,7 +812,7 @@ fn benchmark_capture_is_realtime_only_on_request() {
     assert_eq!(
         bench_capture_opts(&cfg),
         CaptureOpts {
-            rt_priority: None,
+            rt_priority: Some(CAPTURE_RT_PRIORITY),
             max_bytes: Some(1 << 20),
         }
     );
