@@ -16,9 +16,17 @@
 //!     latest t2 after the first unacknowledged one (or after w);
 //!   - t3: after t3 without receiving anything a TESTFR act is sent;
 //!   - cancellation, checked at least every 50 ms;
-//!   - in slave mode, synthesized GI/CI responses are sent from the
-//!     response queue as soon as the transfer state and the k-window
-//!     allow.
+//!   - in slave mode, synthesized GI/CI and command responses are
+//!     sent from the response queue as soon as the transfer state and
+//!     the k-window allow;
+//!   - the fault plan ([`crate::faults`]): faults fire from here, at a
+//!     time or before the N-th I-frame, and act on the send, ack and
+//!     keep-alive paths below.
+//!
+//! Command round trips are measured per command type in both roles
+//! (slave: master command → our ActCon / ActTerm; master: replayed
+//! command → the live slave's ActCon / ActTerm), see
+//! [`protoplay::CommandTypeStats`].
 //!
 //! Received sequence numbers are validated (N(S) against V(R), N(R)
 //! against the unacknowledged window up to V(S), modulo 2^15). A
@@ -29,7 +37,7 @@
 //! peer sees FIN even though the reader thread holds a duplicate fd)
 //! and joins the reader thread.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,9 +47,10 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
 use protoplay::{
-    progress_cancelled, LatencyReservoir, MessageProgress, ProtoReport, ProtocolError, Role,
-    COMMAND_RESPONSE_SAMPLES_CAP, LATENCY_RESERVOIR_CAP, PROTOCOL_ERRORS_CAP,
-    SYNTHESIZED_INDICES_CAP,
+    progress_cancelled, CommandTypeStats, FaultReaction, LatencyReservoir, MessageProgress,
+    NegativeConfirmation, ProtoReport, ProtocolError, Role, COMMAND_LATENCY_SAMPLES_CAP,
+    COMMAND_RESPONSE_SAMPLES_CAP, LATENCY_RESERVOIR_CAP, NEGATIVE_CONFIRMATIONS_CAP,
+    PROTOCOL_ERRORS_CAP, SYNTHESIZED_INDICES_CAP,
 };
 use tracing::{debug, warn};
 
@@ -50,8 +59,13 @@ use crate::apdu::{
     U_TESTFR_CON,
 };
 use crate::asdu::{
-    common_address, rewrite_cp56time2a_to_now_zoned, Cp56Zone, SessionConfig, DUI_LEN, IOA_LEN,
+    common_address, cot_value, read_ioa, rewrite_cp56time2a_to_now_zoned, Cp56Zone, SessionConfig,
+    DUI_LEN, IOA_LEN,
 };
+use crate::commands::{
+    self, is_command_type, respond_command, CommandBook, CommandContext, CommandsConfig, Part,
+};
+use crate::faults::{Action, FaultInjector, FaultPlan, CORRUPT_NS_OFFSET};
 use crate::inventory::Inventory;
 use crate::responder::{respond_ci, respond_gi, RequestEcho};
 
@@ -142,6 +156,8 @@ pub(crate) enum LinkEnd {
     Protocol(String),
     /// Local socket error.
     Io(String),
+    /// A configured fault ended the session on purpose (`rst`).
+    Injected(String),
 }
 
 impl LinkEnd {
@@ -151,7 +167,7 @@ impl LinkEnd {
             LinkEnd::PeerClosed => "peer closed the connection".into(),
             LinkEnd::Timeout(m) => m.clone(),
             LinkEnd::Protocol(m) => format!("protocol violation: {m}"),
-            LinkEnd::Io(m) => m.clone(),
+            LinkEnd::Io(m) | LinkEnd::Injected(m) => m.clone(),
         }
     }
 }
@@ -161,6 +177,9 @@ impl LinkEnd {
 struct PendingIFrame {
     ns: u16,
     send_ns: u64,
+    /// Dropped by fault injection: its N(S) was consumed but nothing
+    /// went on the wire, so it yields no latency sample.
+    dropped: bool,
 }
 
 /// At most this many interrogations (distinct (type, CA) requests) are
@@ -171,65 +190,197 @@ pub(crate) const MAX_OUTSTANDING_INTERROGATIONS: usize = 8;
 /// floods GI/CI while never acknowledging cannot grow memory.
 pub(crate) const RESPONSE_QUEUE_CAP: usize = 4096;
 
+/// Cap on command exchanges (control-direction commands from the
+/// master) whose response is still queued; further commands get a
+/// negative confirmation.
+pub(crate) const MAX_OUTSTANDING_COMMANDS: usize = 64;
+
+/// Command-exchange metadata carried by every queued ASDU of a GI/CI
+/// or command response, for the per-type round-trip metrics.
+#[derive(Debug, Clone, Copy)]
+struct CmdTag {
+    type_id: u8,
+    /// Receive time of the command.
+    recv_ns: u64,
+    /// First / last ASDU of the response.
+    first: bool,
+    last: bool,
+}
+
 /// One synthesized ASDU waiting to be sent.
 struct Queued {
     asdu: Vec<u8>,
-    /// Receive time of the command this ASDU answers; set on the first
-    /// ASDU of a response so the command-to-response time is measured.
-    cmd_recv_ns: Option<u64>,
+    tag: Option<CmdTag>,
     /// (type, request CA) of the interrogation this frame belongs to,
     /// for a full (positive) response; `None` for a rejection.
     key: Option<(u8, u16)>,
+    /// Last frame of a command (not GI/CI) exchange.
+    ends_command: bool,
+    /// Send verbatim: a command mirror echoes the command's own time
+    /// tag, so the CP56 rewrite does not apply.
+    raw_time: bool,
+    /// When it was queued (the `delay` fault holds it from here).
+    queued_ns: u64,
 }
 
 /// What [`Responder::on_command`] did with an ASDU.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CommandOutcome {
-    /// Not a GI/CI activation.
+    /// Not a GI/CI activation nor (with command echo on) a command.
     NotACommand,
     /// Full response queued (it may itself be a negative ActCon, e.g.
     /// for an unknown CA or an unsupported qualifier).
     Answered,
     /// The same interrogation is still being answered, or too many
-    /// are: a negative ActCon is queued instead of another response.
+    /// interrogations / commands are: a negative confirmation is queued
+    /// instead of a response.
     Rejected,
     /// Response queue full: nothing queued.
     Dropped,
 }
 
-/// Slave-mode GI/CI answering: the point inventory and the queue of
-/// synthesized response ASDUs.
+/// Command echo settings and the command addresses learned from the
+/// capture.
+pub(crate) struct CommandEcho {
+    pub cfg: CommandsConfig,
+    pub book: CommandBook,
+    pub zone: Cp56Zone,
+}
+
+/// Slave-mode answering: the point inventory and the queue of
+/// synthesized response ASDUs for GI/CI ([`crate::responder`]) and
+/// control-direction commands ([`crate::commands`]).
 pub(crate) struct Responder {
     inventory: Inventory,
     queue: VecDeque<Queued>,
     /// Queued-but-unsent frame count per outstanding interrogation.
     outstanding: HashMap<(u8, u16), usize>,
+    /// Answer GI/CI.
+    gi_ci: bool,
+    commands: Option<CommandEcho>,
+    /// Command exchanges with frames still queued.
+    commands_outstanding: usize,
 }
 
 impl Responder {
+    /// GI/CI answering only.
     pub fn new(inventory: Inventory) -> Self {
         Self {
             inventory,
             queue: VecDeque::new(),
             outstanding: HashMap::new(),
+            gi_ci: true,
+            commands: None,
+            commands_outstanding: 0,
         }
     }
 
-    /// If `asdu` is a GI (`C_IC_NA_1`, type 100) or CI (`C_CI_NA_1`,
-    /// type 101) activation, queue the spec-correct response (ActCon →
-    /// data → ActTerm, built by [`crate::responder`]). A request for an
-    /// interrogation that is still being answered, or one beyond
-    /// [`MAX_OUTSTANDING_INTERROGATIONS`], is answered with a negative
-    /// ActCon; with [`RESPONSE_QUEUE_CAP`] frames queued it is dropped.
+    /// Turn GI/CI answering on or off.
+    pub fn gi_ci(mut self, on: bool) -> Self {
+        self.gi_ci = on;
+        self
+    }
+
+    /// Also answer control-direction commands.
+    pub fn with_commands(mut self, echo: CommandEcho) -> Self {
+        self.commands = Some(echo);
+        self
+    }
+
+    fn push(&mut self, q: Queued) {
+        self.queue.push_back(q);
+    }
+
+    /// Queue the answer to `asdu` if it is a GI (`C_IC_NA_1`, 100) or
+    /// CI (`C_CI_NA_1`, 101) activation, or (with command echo on) a
+    /// control-direction command.
+    ///
+    /// GI/CI: the spec-correct response (ActCon → data → ActTerm, built
+    /// by [`crate::responder`]). A request for an interrogation that is
+    /// still being answered, or one beyond
+    /// [`MAX_OUTSTANDING_INTERROGATIONS`], gets a negative ActCon.
+    ///
+    /// Commands: the response built by [`crate::commands`]; beyond
+    /// [`MAX_OUTSTANDING_COMMANDS`] a negative confirmation.
+    ///
+    /// With [`RESPONSE_QUEUE_CAP`] frames queued the request is dropped.
     fn on_command(&mut self, asdu: &[u8], recv_ns: u64) -> CommandOutcome {
-        if asdu.len() < DUI_LEN + IOA_LEN + 1 {
+        if asdu.len() < DUI_LEN {
             return CommandOutcome::NotACommand;
         }
         let type_id = asdu[0];
-        if !matches!(type_id, 100 | 101) {
+        if matches!(type_id, 100 | 101) {
+            if self.gi_ci {
+                return self.on_interrogation(asdu, recv_ns);
+            }
             return CommandOutcome::NotACommand;
         }
-        if asdu[2] & 0x3f != 6 {
+        if self.commands.is_none() || !is_command_type(type_id) {
+            return CommandOutcome::NotACommand;
+        }
+        if self.queue.len() >= RESPONSE_QUEUE_CAP {
+            return CommandOutcome::Dropped;
+        }
+        let tag = |first: bool, last: bool| {
+            Some(CmdTag {
+                type_id,
+                recv_ns,
+                first,
+                last,
+            })
+        };
+        if self.commands_outstanding >= MAX_OUTSTANDING_COMMANDS {
+            let cot = if cot_value(asdu) == commands::COT_DEACT {
+                commands::COT_DEACT_CON
+            } else {
+                commands::COT_ACT_CON
+            };
+            let mut neg = asdu.to_vec();
+            neg[2] = (asdu[2] & 0x80) | 0x40 | cot;
+            self.push(Queued {
+                asdu: neg,
+                tag: tag(true, true),
+                key: None,
+                ends_command: true,
+                raw_time: true,
+                queued_ns: recv_ns,
+            });
+            self.commands_outstanding += 1;
+            return CommandOutcome::Rejected;
+        }
+        let Some(echo) = &self.commands else {
+            return CommandOutcome::NotACommand;
+        };
+        let ctx = CommandContext {
+            cfg: &echo.cfg,
+            book: &echo.book,
+            now_unix_ns: wall_clock_unix_ns(),
+            zone: echo.zone,
+        };
+        let Some(resp) = respond_command(&mut self.inventory, &ctx, asdu) else {
+            return CommandOutcome::NotACommand;
+        };
+        if resp.negative() {
+            debug!(type_id, cot = resp.frames[0].1[2], "command rejected");
+        }
+        let n = resp.frames.len();
+        for (i, (part, a)) in resp.frames.into_iter().enumerate() {
+            self.push(Queued {
+                asdu: a,
+                tag: tag(i == 0, i + 1 == n),
+                key: None,
+                ends_command: i + 1 == n,
+                raw_time: part != Part::ReturnInfo && part != Part::ReadReply,
+                queued_ns: recv_ns,
+            });
+        }
+        self.commands_outstanding += 1;
+        CommandOutcome::Answered
+    }
+
+    fn on_interrogation(&mut self, asdu: &[u8], recv_ns: u64) -> CommandOutcome {
+        let type_id = asdu[0];
+        if asdu.len() < DUI_LEN + IOA_LEN + 1 || asdu[2] & 0x3f != 6 {
             // Activation only; ActCon/ActTerm never come from a master.
             return CommandOutcome::NotACommand;
         }
@@ -242,16 +393,27 @@ impl Responder {
             test: asdu[2] & 0x80 != 0,
         };
         let key = (type_id, echo.ca);
+        let tag = |first: bool, last: bool| {
+            Some(CmdTag {
+                type_id,
+                recv_ns,
+                first,
+                last,
+            })
+        };
         if self.outstanding.contains_key(&key)
             || self.outstanding.len() >= MAX_OUTSTANDING_INTERROGATIONS
         {
             // Mirror of the request: COT 7 with P/N = 1, T echoed.
             let mut neg = asdu.to_vec();
             neg[2] = (asdu[2] & 0x80) | 0x40 | 7;
-            self.queue.push_back(Queued {
+            self.push(Queued {
                 asdu: neg,
-                cmd_recv_ns: Some(recv_ns),
+                tag: tag(true, true),
                 key: None,
+                ends_command: false,
+                raw_time: false,
+                queued_ns: recv_ns,
             });
             return CommandOutcome::Rejected;
         }
@@ -273,14 +435,22 @@ impl Responder {
         if !asdus.is_empty() {
             self.outstanding.insert(key, asdus.len());
         }
+        let n = asdus.len();
         for (i, asdu) in asdus.into_iter().enumerate() {
-            self.queue.push_back(Queued {
+            self.push(Queued {
                 asdu,
-                cmd_recv_ns: (i == 0).then_some(recv_ns),
+                tag: tag(i == 0, i + 1 == n),
                 key: Some(key),
+                ends_command: false,
+                raw_time: false,
+                queued_ns: recv_ns,
             });
         }
         CommandOutcome::Answered
+    }
+
+    fn front_queued_ns(&self) -> Option<u64> {
+        self.queue.front().map(|q| q.queued_ns)
     }
 
     fn pop(&mut self) -> Option<Queued> {
@@ -293,8 +463,34 @@ impl Responder {
                 }
             }
         }
+        if q.ends_command {
+            self.commands_outstanding = self.commands_outstanding.saturating_sub(1);
+        }
         Some(q)
     }
+}
+
+/// Master role: a replayed command awaiting the live slave's answer.
+struct SentCommand {
+    /// DUI + IOA (+ qualifier) of the command.
+    head: Vec<u8>,
+    send_ns: u64,
+    confirmed: bool,
+}
+
+/// Most replayed commands tracked at once (master role); the oldest is
+/// given up (and counted unanswered if it never got a confirmation).
+const MAX_TRACKED_COMMANDS: usize = 1024;
+
+/// Peer behaviour observed after the first injected fault.
+#[derive(Debug, Default)]
+struct Reaction {
+    closed: bool,
+    reset: bool,
+    stopdt: bool,
+    stopdt_con: bool,
+    errors: Vec<String>,
+    first_ns: Option<u64>,
 }
 
 /// CP56Time2a rewrite applied to every outgoing I-frame.
@@ -311,6 +507,8 @@ pub(crate) struct LinkOptions {
     pub cp56: Cp56Rewrite,
     pub responder: Option<Responder>,
     pub reader_name: String,
+    /// Faults to inject on this connection.
+    pub faults: FaultPlan,
 }
 
 pub(crate) struct Link {
@@ -346,6 +544,31 @@ pub(crate) struct Link {
     /// Slave: STOPDT con owed once `pending` drains.
     stop_con_owed: bool,
     responder: Option<Responder>,
+    /// N(R) last sent to the peer (S-frame or I-frame).
+    last_sent_nr: u16,
+    /// Per command type round-trip figures.
+    cmd_stats: BTreeMap<u8, CommandTypeStats>,
+    negative_confirmations: Vec<NegativeConfirmation>,
+    /// Master: replayed commands awaiting the slave's answer.
+    sent_commands: VecDeque<SentCommand>,
+    // --- fault injection ---
+    faults: Option<FaultInjector>,
+    /// I-frames the link attempted to send (sent or dropped).
+    frames_attempted: u64,
+    /// `slow_ack`: deferred S-frame due at this time.
+    ack_due_ns: Option<u64>,
+    /// `rst`: close abortively (RST) when dropped.
+    abort: bool,
+    /// Master `stopdt` fault: send STARTDT act once STOPDT is confirmed.
+    restart_after_stop: bool,
+    /// Slave `stopdt` fault: our unsolicited STOPDT act is out.
+    slave_stopdt_sent: bool,
+    /// A `stopdt` fault that fired outside data transfer, carried out
+    /// once the transfer is started (record index).
+    deferred_stopdt: Option<usize>,
+    /// The connection was reset by the peer (vs. closed).
+    peer_reset_seen: bool,
+    reaction: Reaction,
 }
 
 impl Link {
@@ -404,6 +627,19 @@ impl Link {
             transfer: Transfer::Stopped,
             stop_con_owed: false,
             responder: opts.responder,
+            last_sent_nr: 0,
+            cmd_stats: BTreeMap::new(),
+            negative_confirmations: Vec::new(),
+            sent_commands: VecDeque::new(),
+            faults: FaultInjector::new(&opts.faults, now),
+            frames_attempted: 0,
+            ack_due_ns: None,
+            abort: false,
+            restart_after_stop: false,
+            slave_stopdt_sent: false,
+            deferred_stopdt: None,
+            peer_reset_seen: false,
+            reaction: Reaction::default(),
         })
     }
 
@@ -414,6 +650,23 @@ impl Link {
     /// Can an I-frame go out right now?
     pub fn can_send(&self) -> bool {
         self.transfer == Transfer::Started && self.pending.len() < self.params.k as usize
+    }
+
+    /// Has any configured fault fired on this connection?
+    pub fn faults_fired(&self) -> bool {
+        self.faults.as_ref().is_some_and(|f| f.fired_count() > 0)
+    }
+
+    /// Is `e` the peer's (or our own deliberate) reaction to an
+    /// injected fault rather than a replay failure? Such an end is
+    /// recorded in the fault reaction, not as the session error.
+    pub fn fault_excused(&self, e: &LinkEnd) -> bool {
+        matches!(e, LinkEnd::Injected(_))
+            || (self.faults_fired()
+                && matches!(
+                    e,
+                    LinkEnd::PeerClosed | LinkEnd::Timeout(_) | LinkEnd::Protocol(_)
+                ))
     }
 
     fn cancelled(&self) -> bool {
@@ -434,6 +687,18 @@ impl Link {
         deadline_ns: Option<u64>,
         done: impl Fn(&Link) -> bool,
     ) -> Result<(), LinkEnd> {
+        let r = self.service_loop(deadline_ns, done);
+        if let Err(e) = &r {
+            self.note_end(e);
+        }
+        r
+    }
+
+    fn service_loop(
+        &mut self,
+        deadline_ns: Option<u64>,
+        done: impl Fn(&Link) -> bool,
+    ) -> Result<(), LinkEnd> {
         loop {
             loop {
                 match self.rx.try_recv() {
@@ -443,6 +708,7 @@ impl Link {
                 }
             }
             let now = now_ns();
+            self.poll_faults(now)?;
             self.check_timers(now)?;
             self.drain_responses()?;
             if self.cancelled() {
@@ -488,8 +754,20 @@ impl Link {
         if self.transfer == Transfer::Started && self.pending.len() >= self.params.k as usize {
             self.report.window_stalls += 1;
         }
+        // `delay` fault: hold the frame, servicing the link meanwhile.
+        let now = now_ns();
+        if let Some((d, rec)) = self.faults.as_ref().and_then(|f| f.delay(now)) {
+            if let Some(f) = self.faults.as_mut() {
+                f.note(rec, None);
+            }
+            self.wait_until(now + d)?;
+        }
         self.service(None, |l| l.can_send())?;
-        self.send_i(asdu.to_vec(), false)
+        let r = self.send_i(asdu.to_vec(), false, false);
+        if let Err(e) = &r {
+            self.note_end(e);
+        }
+        r
     }
 
     /// Master: STARTDT act, then wait for con (t1).
@@ -503,6 +781,8 @@ impl Link {
     /// Master: acknowledge everything received, STOPDT act, then wait
     /// for con (t1).
     pub fn master_stop(&mut self) -> Result<(), LinkEnd> {
+        self.restart_after_stop = false;
+        self.deferred_stopdt = None;
         if self.unacked_rx > 0 {
             self.send_s()?;
         }
@@ -523,6 +803,34 @@ impl Link {
     /// The connection is shut down and the reader joined when the link
     /// is dropped right after.
     pub fn into_report(mut self) -> ProtoReport {
+        // Master: replayed commands still waiting for any answer.
+        for c in std::mem::take(&mut self.sent_commands) {
+            if !c.confirmed {
+                self.cmd_entry(c.head[0]).unanswered += 1;
+            }
+        }
+        let stats = &mut self.report.protocol;
+        stats.commands = std::mem::take(&mut self.cmd_stats).into_values().collect();
+        stats.negative_confirmations = std::mem::take(&mut self.negative_confirmations);
+        if let Some(f) = self.faults.take() {
+            if f.fired_count() > 0 {
+                let first = f.first_fire_ns().unwrap_or(0);
+                let n = f.fired_count();
+                let r = std::mem::take(&mut self.reaction);
+                let mut reaction = FaultReaction {
+                    peer_closed: r.closed && !r.reset,
+                    peer_reset: r.reset,
+                    peer_stopdt: r.stopdt,
+                    protocol_errors: r.errors,
+                    first_reaction_ms: r.first_ns.map(|t| t.saturating_sub(first) / 1_000_000),
+                    summary: String::new(),
+                };
+                reaction.summary = reaction_summary(n, &reaction, r.stopdt_con);
+                let stats = &mut self.report.protocol;
+                stats.faults_injected = f.into_records();
+                stats.fault_reaction = Some(reaction);
+            }
+        }
         self.report.unacked_at_end = self.pending.len() as u64;
         self.report.latency_samples_us =
             std::mem::replace(&mut self.latency, LatencyReservoir::new(1)).into_vec();
@@ -537,8 +845,27 @@ impl Link {
     // Timers
     // ------------------------------------------------------------------
 
+    /// Are acknowledgements held back right now (`withhold_acks`)?
+    fn acks_withheld(&self, now: u64) -> bool {
+        self.faults
+            .as_ref()
+            .is_some_and(|f| f.withholding(now).is_some())
+    }
+
+    /// N(R) to put in an outgoing I-frame: V(R), or the last N(R)
+    /// already sent while a fault holds acknowledgements back.
+    fn nr_to_send(&self, now: u64) -> u16 {
+        match &self.faults {
+            Some(f) if f.withholding(now).is_some() || f.slow_ack(now).is_some() => {
+                self.last_sent_nr
+            }
+            _ => self.vr,
+        }
+    }
+
     fn next_timer_ns(&self) -> Option<u64> {
         let p = &self.params;
+        let now = now_ns();
         let mut next: Option<u64> = None;
         let mut consider = |t: u64| next = Some(next.map_or(t, |n| n.min(t)));
         if let Some(f) = self.pending.front() {
@@ -550,11 +877,36 @@ impl Link {
         if let Some((_, t)) = self.u_act {
             consider(t + p.t1_ns);
         }
+        let withheld = self.acks_withheld(now);
         if let Some(t) = self.oldest_unacked_rx_ns {
-            consider(t + p.t2_ns);
+            if !withheld && self.ack_due_ns.is_none() {
+                consider(t + p.t2_ns);
+            }
         }
-        if self.testfr_sent_ns.is_none() && self.u_act.is_none() {
+        if let Some(t) = self.ack_due_ns {
+            consider(t);
+        }
+        let silenced = self
+            .faults
+            .as_ref()
+            .is_some_and(|f| f.testfr_silenced(now).is_some());
+        if self.testfr_sent_ns.is_none() && self.u_act.is_none() && !silenced {
             consider(self.last_rx_ns + p.t3_ns);
+        }
+        if let Some(f) = &self.faults {
+            if let Some(t) = f.next_deadline_ns(now) {
+                consider(t);
+            }
+            if let (Some((d, _)), Some(q)) = (
+                f.delay(now),
+                self.responder.as_ref().and_then(Responder::front_queued_ns),
+            ) {
+                // Only a future release time; a held frame that is
+                // already due waits for the window, not a timer.
+                if q + d > now {
+                    consider(q + d);
+                }
+            }
         }
         next
     }
@@ -594,13 +946,27 @@ impl Link {
                 return Err(LinkEnd::Timeout(msg));
             }
         }
-        if let Some(t) = self.oldest_unacked_rx_ns {
-            if now.saturating_sub(t) >= p.t2_ns {
-                self.send_s()?;
+        if let Some(t) = self.ack_due_ns {
+            if now >= t {
+                // Deferred (`slow_ack`) acknowledgement.
+                self.ack_due_ns = None;
+                if self.unacked_rx > 0 && !self.acks_withheld(now) {
+                    self.send_s()?;
+                }
             }
         }
+        if let Some(t) = self.oldest_unacked_rx_ns {
+            if now.saturating_sub(t) >= p.t2_ns {
+                self.ack_due(now)?;
+            }
+        }
+        let silenced = self
+            .faults
+            .as_ref()
+            .is_some_and(|f| f.testfr_silenced(now).is_some());
         if self.testfr_sent_ns.is_none()
             && self.u_act.is_none()
+            && !silenced
             && now.saturating_sub(self.last_rx_ns) >= p.t3_ns
         {
             self.send_u(U_TESTFR_ACT)?;
@@ -608,6 +974,216 @@ impl Link {
             self.report.protocol.keepalives_sent += 1;
         }
         Ok(())
+    }
+
+    /// An acknowledgement is due (t2 or w): send the S-frame, unless a
+    /// fault withholds it (`withhold_acks`) or defers it (`slow_ack`).
+    fn ack_due(&mut self, now: u64) -> Result<(), LinkEnd> {
+        if self.acks_withheld(now) || self.ack_due_ns.is_some() {
+            return Ok(());
+        }
+        if let Some(f) = self.faults.as_mut() {
+            if let Some((extra, rec)) = f.slow_ack(now) {
+                f.note(rec, None);
+                self.ack_due_ns = Some(now + extra);
+                return Ok(());
+            }
+        }
+        self.send_s()
+    }
+
+    // ------------------------------------------------------------------
+    // Fault injection
+    // ------------------------------------------------------------------
+
+    /// Fire due faults and carry out the one-shot ones.
+    fn poll_faults(&mut self, now: u64) -> Result<(), LinkEnd> {
+        let master = self.role == Role::Master;
+        let Some(f) = self.faults.as_mut() else {
+            return Ok(());
+        };
+        let mut actions = f.poll(now, self.frames_attempted, master);
+        if let Some(rec) = self.deferred_stopdt.take() {
+            actions.push((Action::Stopdt, rec));
+        }
+        for (action, rec) in actions {
+            match action {
+                Action::Rst => {
+                    self.abort = true;
+                    return Err(LinkEnd::Injected(
+                        "fault injection: connection aborted with RST".into(),
+                    ));
+                }
+                Action::Stopdt => {
+                    if self.transfer != Transfer::Started {
+                        // Not in data transfer yet (or already
+                        // stopping): carry it out once started.
+                        self.deferred_stopdt = Some(rec);
+                    } else if master {
+                        if self.unacked_rx > 0 {
+                            self.send_s()?;
+                        }
+                        self.send_u(U_STOPDT_ACT)?;
+                        self.u_act = Some((U_STOPDT_CON, now));
+                        self.transfer = Transfer::PendingStop;
+                        self.restart_after_stop = true;
+                        self.fault_note(rec);
+                    } else {
+                        self.send_u(U_STOPDT_ACT)?;
+                        self.slave_stopdt_sent = true;
+                        self.fault_note(rec);
+                    }
+                }
+                Action::Malformed(count) => {
+                    for _ in 0..count {
+                        // Start octet, then a length octet below the
+                        // minimum of 4: no receiver can frame it.
+                        self.write_raw(&[0x68, 0x02, 0x00, 0x00], "malformed APDU")?;
+                        self.fault_note(rec);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn fault_note(&mut self, rec: usize) {
+        if let Some(f) = self.faults.as_mut() {
+            f.note(rec, None);
+        }
+    }
+
+    /// Record how the session ended, for the fault reaction.
+    fn note_end(&mut self, e: &LinkEnd) {
+        if e == &LinkEnd::PeerClosed {
+            if self.peer_reset_seen {
+                self.reaction.reset = true;
+            } else {
+                self.reaction.closed = true;
+            }
+            self.mark_reaction();
+        }
+    }
+
+    /// Timestamp the first reaction after the first fault.
+    fn mark_reaction(&mut self) {
+        if self.faults_fired() && self.reaction.first_ns.is_none() {
+            self.reaction.first_ns = Some(now_ns());
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Command round trips
+    // ------------------------------------------------------------------
+
+    fn cmd_entry(&mut self, type_id: u8) -> &mut CommandTypeStats {
+        self.cmd_stats
+            .entry(type_id)
+            .or_insert_with(|| CommandTypeStats {
+                type_id,
+                ..Default::default()
+            })
+    }
+
+    /// Count the first answer to a command of `type_id` (`latency_us`
+    /// after it), and the negative ones in detail.
+    fn record_confirmation(&mut self, type_id: u8, part: Part, latency_us: u64, reply: &[u8]) {
+        let st = self.cmd_entry(type_id);
+        match part {
+            Part::Negative => st.negative += 1,
+            Part::DeactCon => st.deact_con += 1,
+            _ => st.act_con += 1,
+        }
+        if st.actcon_us.len() < COMMAND_LATENCY_SAMPLES_CAP {
+            st.actcon_us.push(latency_us);
+        }
+        if part == Part::Negative
+            && self.negative_confirmations.len() < NEGATIVE_CONFIRMATIONS_CAP
+            && reply.len() >= DUI_LEN + IOA_LEN
+        {
+            self.negative_confirmations.push(NegativeConfirmation {
+                at_ms: now_ns().saturating_sub(self.epoch_ns) / 1_000_000,
+                type_id,
+                ca: common_address(reply),
+                ioa: read_ioa(reply, DUI_LEN),
+                cot: cot_value(reply),
+            });
+        }
+    }
+
+    fn record_termination(&mut self, type_id: u8, latency_us: u64) {
+        let st = self.cmd_entry(type_id);
+        st.act_term += 1;
+        if st.actterm_us.len() < COMMAND_LATENCY_SAMPLES_CAP {
+            st.actterm_us.push(latency_us);
+        }
+    }
+
+    /// Master: a replayed command went out.
+    fn track_sent_command(&mut self, asdu: &[u8], send_ns: u64) {
+        if !commands::is_command_request(asdu) || asdu.len() < DUI_LEN + IOA_LEN {
+            return;
+        }
+        self.cmd_entry(asdu[0]).commands += 1;
+        if self.sent_commands.len() >= MAX_TRACKED_COMMANDS {
+            if let Some(old) = self.sent_commands.pop_front() {
+                if !old.confirmed {
+                    self.cmd_entry(old.head[0]).unanswered += 1;
+                }
+            }
+        }
+        let head_len = asdu.len().min(DUI_LEN + IOA_LEN + 5);
+        self.sent_commands.push_back(SentCommand {
+            head: asdu[..head_len].to_vec(),
+            send_ns,
+            confirmed: false,
+        });
+    }
+
+    /// Master: match an I-frame from the slave to a replayed command.
+    fn match_command_reply(&mut self, asdu: &[u8], recv_ns: u64) {
+        let Some(i) = self
+            .sent_commands
+            .iter()
+            .position(|c| commands::answers(&c.head, asdu))
+        else {
+            return;
+        };
+        let part = commands::reply_part(asdu);
+        let (type_id, latency_us, confirmed) = {
+            let c = &self.sent_commands[i];
+            (
+                c.head[0],
+                recv_ns.saturating_sub(c.send_ns) / 1_000,
+                c.confirmed,
+            )
+        };
+        let done = match part {
+            Part::ActTerm => {
+                self.record_termination(type_id, latency_us);
+                true
+            }
+            Part::ActCon => {
+                if !confirmed {
+                    self.record_confirmation(type_id, part, latency_us, asdu);
+                }
+                // Select, system commands and broadcasts get no
+                // ActTerm worth waiting for... except GI/CI.
+                let c = &self.sent_commands[i];
+                commands::is_select(&c.head) || matches!(type_id, 102..=107)
+            }
+            _ => {
+                if !confirmed {
+                    self.record_confirmation(type_id, part, latency_us, asdu);
+                }
+                true
+            }
+        };
+        if done {
+            self.sent_commands.remove(i);
+        } else {
+            self.sent_commands[i].confirmed = true;
+        }
     }
 
     // ------------------------------------------------------------------
@@ -622,6 +1198,9 @@ impl Link {
                 Err(LinkEnd::Protocol(m))
             }
             RxEvent::Failed(kind, m) => {
+                if kind == io::ErrorKind::ConnectionReset {
+                    self.peer_reset_seen = true;
+                }
                 if is_peer_close(kind) {
                     Err(LinkEnd::PeerClosed)
                 } else {
@@ -655,24 +1234,43 @@ impl Link {
                 self.vr = (self.vr + 1) & SEQ_MASK;
                 self.unacked_rx += 1;
                 self.oldest_unacked_rx_ns.get_or_insert(recv_ns);
-                // GI/CI are only answered in the started state: a master
-                // may not send them otherwise, and queueing them would
-                // let it build an unbounded backlog while we cannot send.
+                if let Some(f) = self.faults.as_mut() {
+                    if let Some(rec) = f.withholding(recv_ns) {
+                        f.note(rec, None);
+                    }
+                }
+                // GI/CI and commands are only answered in the started
+                // state: a master may not send them otherwise, and
+                // queueing them would let it build an unbounded backlog
+                // while we cannot send.
                 if self.role == Role::Slave && self.transfer == Transfer::Started {
                     if let Some(r) = &mut self.responder {
-                        if r.on_command(&asdu, recv_ns) == CommandOutcome::Dropped {
+                        let outcome = r.on_command(&asdu, recv_ns);
+                        if outcome != CommandOutcome::NotACommand {
+                            self.cmd_entry(asdu[0]).commands += 1;
+                        }
+                        if outcome == CommandOutcome::Dropped {
+                            let what = if matches!(asdu[0], 100 | 101) {
+                                ("interrogation_flood", "GI/CI activation")
+                            } else {
+                                ("command_flood", "command")
+                            };
                             self.violation(
-                                "interrogation_flood",
+                                what.0,
                                 format!(
-                                    "GI/CI activation dropped: {RESPONSE_QUEUE_CAP} response frames already queued"
+                                    "{} dropped: {RESPONSE_QUEUE_CAP} response frames already queued",
+                                    what.1
                                 ),
                                 false,
                             );
                         }
                     }
                 }
+                if self.role == Role::Master && !self.sent_commands.is_empty() {
+                    self.match_command_reply(&asdu, recv_ns);
+                }
                 if self.unacked_rx >= self.params.w {
-                    self.send_s()?;
+                    self.ack_due(recv_ns.max(now_ns()))?;
                 }
             }
             Apdu::S { nr } => {
@@ -730,14 +1328,25 @@ impl Link {
                 break;
             }
             self.pending.pop_front();
-            self.latency
-                .push(recv_ns.saturating_sub(front.send_ns) / 1_000);
+            if !front.dropped {
+                self.latency
+                    .push(recv_ns.saturating_sub(front.send_ns) / 1_000);
+            }
         }
     }
 
     fn handle_u(&mut self, code: u8) -> Result<(), LinkEnd> {
         match code {
-            U_TESTFR_ACT => self.send_u(U_TESTFR_CON)?,
+            U_TESTFR_ACT => {
+                let silenced = self
+                    .faults
+                    .as_ref()
+                    .and_then(|f| f.testfr_silenced(now_ns()));
+                match silenced {
+                    Some(rec) => self.fault_note(rec),
+                    None => self.send_u(U_TESTFR_CON)?,
+                }
+            }
             U_TESTFR_CON => self.testfr_sent_ns = None,
             U_STARTDT_ACT => {
                 if self.role == Role::Slave {
@@ -755,6 +1364,10 @@ impl Link {
                 }
             }
             U_STOPDT_ACT => {
+                if self.faults_fired() {
+                    self.reaction.stopdt = true;
+                    self.mark_reaction();
+                }
                 if self.role == Role::Slave {
                     // Acknowledge what we received, stop sending, and
                     // confirm once our own I-frames are acknowledged.
@@ -779,6 +1392,18 @@ impl Link {
                     } else {
                         Transfer::Stopped
                     };
+                    if code == U_STOPDT_CON && self.restart_after_stop {
+                        // `stopdt` fault (master): resume the transfer.
+                        self.restart_after_stop = false;
+                        self.send_u(U_STARTDT_ACT)?;
+                        self.u_act = Some((U_STARTDT_CON, now_ns()));
+                        self.transfer = Transfer::PendingStart;
+                    }
+                } else if code == U_STOPDT_CON && self.slave_stopdt_sent {
+                    // The master confirmed our deliberate STOPDT act.
+                    self.slave_stopdt_sent = false;
+                    self.reaction.stopdt_con = true;
+                    self.mark_reaction();
                 } else {
                     self.violation(
                         "unexpected_u_frame",
@@ -794,6 +1419,12 @@ impl Link {
 
     fn violation(&mut self, kind: &str, detail: String, fatal: bool) {
         warn!(kind, %detail, fatal, "IEC 104 protocol violation");
+        if self.faults_fired() {
+            if !self.reaction.errors.iter().any(|k| k == kind) {
+                self.reaction.errors.push(kind.into());
+            }
+            self.mark_reaction();
+        }
         let stats = &mut self.report.protocol;
         stats.protocol_violations += 1;
         if stats.protocol_errors.len() < PROTOCOL_ERRORS_CAP {
@@ -811,12 +1442,18 @@ impl Link {
     // ------------------------------------------------------------------
 
     fn write(&mut self, apdu: &Apdu) -> Result<u64, LinkEnd> {
-        let bytes = apdu.serialize();
-        if let Err(e) = self.writer.write_all(&bytes) {
+        self.write_raw(&apdu.serialize(), apdu_name(apdu))
+    }
+
+    fn write_raw(&mut self, bytes: &[u8], what: &str) -> Result<u64, LinkEnd> {
+        if let Err(e) = self.writer.write_all(bytes) {
+            if e.kind() == io::ErrorKind::ConnectionReset {
+                self.peer_reset_seen = true;
+            }
             return Err(if is_peer_close(e.kind()) {
                 LinkEnd::PeerClosed
             } else {
-                LinkEnd::Io(format!("send {}: {e}", apdu_name(apdu)))
+                LinkEnd::Io(format!("send {what}: {e}"))
             });
         }
         let len = bytes.len() as u64;
@@ -833,6 +1470,8 @@ impl Link {
 
     fn send_s(&mut self) -> Result<(), LinkEnd> {
         self.write(&Apdu::S { nr: self.vr })?;
+        self.last_sent_nr = self.vr;
+        self.ack_due_ns = None;
         self.unacked_rx = 0;
         self.oldest_unacked_rx_ns = None;
         self.report.protocol.acks_sent += 1;
@@ -840,27 +1479,74 @@ impl Link {
     }
 
     /// Send an I-frame with live N(S)/N(R). Caller checked
-    /// [`Link::can_send`].
-    fn send_i(&mut self, mut asdu: Vec<u8>, synthesized: bool) -> Result<(), LinkEnd> {
+    /// [`Link::can_send`]. `raw_time` skips the CP56 rewrite (command
+    /// mirrors echo the command's own time tag).
+    ///
+    /// Fault injection acts here: `drop_iframes` consumes the N(S)
+    /// without sending, `corrupt_ns` puts a wrong N(S) on the wire,
+    /// `duplicate_iframes` writes the frame twice, and while
+    /// `withhold_acks` / `slow_ack` is active the frame repeats the
+    /// last N(R) already sent.
+    fn send_i(
+        &mut self,
+        mut asdu: Vec<u8>,
+        synthesized: bool,
+        raw_time: bool,
+    ) -> Result<(), LinkEnd> {
         debug_assert!(self.can_send());
-        if self.cp56.enabled {
+        let now = now_ns();
+        self.frames_attempted += 1;
+        let ns = self.vs;
+        if self.faults.as_mut().is_some_and(|f| f.roll_drop(now, ns)) {
+            self.pending.push_back(PendingIFrame {
+                ns,
+                send_ns: now,
+                dropped: true,
+            });
+            self.vs = (self.vs + 1) & SEQ_MASK;
+            return Ok(());
+        }
+        if self.cp56.enabled && !raw_time {
             rewrite_cp56time2a_to_now_zoned(&mut asdu, wall_clock_unix_ns(), self.cp56.zone);
         }
+        let wire_ns = if self.faults.as_mut().is_some_and(|f| f.take_corrupt(ns)) {
+            ns.wrapping_add(CORRUPT_NS_OFFSET) & SEQ_MASK
+        } else {
+            ns
+        };
+        let nr = self.nr_to_send(now);
+        let track = self.role == Role::Master && !synthesized;
+        if track {
+            self.track_sent_command(&asdu, now);
+        }
         let apdu = Apdu::I {
-            ns: self.vs,
-            nr: self.vr,
+            ns: wire_ns,
+            nr,
             asdu,
         };
         let send_ns = now_ns();
-        self.write(&apdu)?;
+        let bytes = apdu.serialize();
+        self.write_raw(&bytes, "I-frame")?;
+        if self
+            .faults
+            .as_mut()
+            .is_some_and(|f| f.roll_duplicate(now, ns))
+        {
+            self.write_raw(&bytes, "duplicate I-frame")?;
+        }
         self.pending.push_back(PendingIFrame {
-            ns: self.vs,
+            ns,
             send_ns,
+            dropped: false,
         });
         self.vs = (self.vs + 1) & SEQ_MASK;
-        // The I-frame's N(R) acknowledges everything received so far.
-        self.unacked_rx = 0;
-        self.oldest_unacked_rx_ns = None;
+        self.last_sent_nr = nr;
+        if nr == self.vr {
+            // The I-frame's N(R) acknowledges everything received so far.
+            self.unacked_rx = 0;
+            self.oldest_unacked_rx_ns = None;
+            self.ack_due_ns = None;
+        }
         if synthesized {
             let stats = &mut self.report.protocol;
             stats.synthesized_frames += 1;
@@ -882,28 +1568,98 @@ impl Link {
     /// Send queued synthesized responses while the window allows.
     fn drain_responses(&mut self) -> Result<(), LinkEnd> {
         while self.can_send() {
+            let Some(front) = self.responder.as_ref().and_then(Responder::front_queued_ns) else {
+                break;
+            };
+            let now = now_ns();
+            // Frame triggers may fire between two frames of a burst.
+            self.poll_faults(now)?;
+            if !self.can_send() {
+                break;
+            }
+            let delay = self.faults.as_ref().and_then(|f| f.delay(now));
+            if let Some((d, _)) = delay {
+                if now < front + d {
+                    break;
+                }
+            }
             let Some(q) = self.responder.as_mut().and_then(Responder::pop) else {
                 break;
             };
-            if let Some(t) = q.cmd_recv_ns {
-                let us = now_ns().saturating_sub(t) / 1_000;
-                let v = &mut self.report.protocol.command_response_us;
-                if v.len() < COMMAND_RESPONSE_SAMPLES_CAP {
-                    v.push(us);
+            if let Some((_, rec)) = delay {
+                self.fault_note(rec);
+            }
+            if let Some(tag) = q.tag {
+                let us = now.saturating_sub(tag.recv_ns) / 1_000;
+                if tag.first {
+                    let v = &mut self.report.protocol.command_response_us;
+                    if v.len() < COMMAND_RESPONSE_SAMPLES_CAP {
+                        v.push(us);
+                    }
+                    let part = commands::reply_part(&q.asdu);
+                    self.record_confirmation(tag.type_id, part, us, &q.asdu);
+                }
+                if tag.last
+                    && q.asdu.len() >= DUI_LEN
+                    && q.asdu[0] == tag.type_id
+                    && commands::reply_part(&q.asdu) == Part::ActTerm
+                {
+                    self.record_termination(tag.type_id, us);
                 }
             }
-            self.send_i(q.asdu, true)?;
+            self.send_i(q.asdu, true, q.raw_time)?;
         }
         Ok(())
     }
 }
 
+/// One-line description of the peer's reaction to `n` faults.
+fn reaction_summary(n: usize, r: &FaultReaction, stopdt_con: bool) -> String {
+    let mut parts = Vec::new();
+    if r.peer_reset {
+        parts.push("reset the connection".to_string());
+    } else if r.peer_closed {
+        parts.push("closed the connection".to_string());
+    }
+    if r.peer_stopdt {
+        parts.push("sent STOPDT act".to_string());
+    }
+    if stopdt_con {
+        parts.push("confirmed our STOPDT act".to_string());
+    }
+    if !r.protocol_errors.is_empty() {
+        parts.push(format!("protocol errors: {}", r.protocol_errors.join(", ")));
+    }
+    let what = if parts.is_empty() {
+        "none observed (the session carried on)".to_string()
+    } else {
+        parts.join("; ")
+    };
+    let when = r
+        .first_reaction_ms
+        .map(|ms| format!(", {ms} ms after the first fault"))
+        .unwrap_or_default();
+    format!("{n} fault(s) injected; peer reaction: {what}{when}")
+}
+
 impl Drop for Link {
     fn drop(&mut self) {
+        self.stop.store(true, Ordering::Relaxed);
+        if self.abort {
+            // `rst` fault: SO_LINGER 0 makes the last close send RST.
+            // Shutting down only the read side wakes the reader without
+            // sending anything; once it has dropped its duplicate fd,
+            // the writer (dropped right after this) is the last one.
+            let _ = socket2::SockRef::from(&self.writer).set_linger(Some(Duration::ZERO));
+            let _ = self.writer.shutdown(Shutdown::Read);
+            if let Some(h) = self.reader.take() {
+                let _ = h.join();
+            }
+            return;
+        }
         // shutdown() acts on the socket, not the fd, so the peer sees
         // FIN even though the reader thread holds a dup'd descriptor,
         // and the reader's blocked read returns EOF at once.
-        self.stop.store(true, Ordering::Relaxed);
         let _ = self.writer.shutdown(Shutdown::Both);
         if let Some(h) = self.reader.take() {
             let _ = h.join();
@@ -1039,6 +1795,48 @@ mod tests {
         );
         assert_eq!(
             r.on_command(&[100, 1, 7, 0, 1, 0, 0, 0, 0, 20], 0),
+            CommandOutcome::NotACommand
+        );
+    }
+
+    fn command_responder() -> Responder {
+        let mut inv = Inventory::default();
+        inv.ingest_asdu(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 0]);
+        Responder::new(inv).with_commands(CommandEcho {
+            cfg: CommandsConfig::default(),
+            book: CommandBook::default(),
+            zone: Cp56Zone::Utc,
+        })
+    }
+
+    #[test]
+    fn outstanding_commands_are_capped_and_flood_is_dropped() {
+        let sc = [45, 1, 6, 0, 1, 0, 1, 0, 0, 1];
+        let mut r = command_responder();
+        for _ in 0..MAX_OUTSTANDING_COMMANDS {
+            assert_eq!(r.on_command(&sc, 0), CommandOutcome::Answered);
+        }
+        assert_eq!(r.on_command(&sc, 0), CommandOutcome::Rejected);
+        let out = drain(&mut r);
+        assert_eq!(out.len(), 2 * MAX_OUTSTANDING_COMMANDS + 1);
+        assert_eq!(out.last().unwrap()[2], 0x40 | 7);
+        assert_eq!(r.commands_outstanding, 0);
+        assert_eq!(r.on_command(&sc, 0), CommandOutcome::Answered);
+        // A master that never acknowledges cannot grow the queue.
+        let mut dropped = 0;
+        for _ in 0..RESPONSE_QUEUE_CAP + 10 {
+            if r.on_command(&sc, 0) == CommandOutcome::Dropped {
+                dropped += 1;
+            }
+        }
+        assert_eq!(r.queue.len(), RESPONSE_QUEUE_CAP);
+        assert!(dropped >= 10);
+        // GI/CI off, commands on: a GI is not answered.
+        let mut r = command_responder().gi_ci(false);
+        assert_eq!(r.on_command(&gi(1), 0), CommandOutcome::NotACommand);
+        // Monitor-direction frames are never commands.
+        assert_eq!(
+            r.on_command(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 1], 0),
             CommandOutcome::NotACommand
         );
     }
