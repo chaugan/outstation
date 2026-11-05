@@ -201,19 +201,20 @@ Measured on one 12-thread desktop (Ryzen 5 3600, 64 GB RAM, Linux 7.0) with outs
 
 | | master role, 200 sessions | master, 400 | slave role, 200 RTUs | slave, 400 RTUs |
 |---|---|---|---|---|
-| I-frames/s | 704 k | 641 k | 238 k | 255 k |
-| ack latency p50 / p99 | 2.6 / 5.9 ms | 4.4 / 7.1 ms | 0.4 / 2.7 ms | 0.4 / 2.2 ms |
-| outstation CPU while sending | 4.9 cores | 5.1 cores | 2.3 cores | 2.3 cores |
-| RSS while sending / peak with the analysis | 199 / 566 MB | 382 / 1,127 MB | 135 / 620 MB | 242 / 1,181 MB |
-| threads / open fds | 403 / 414 | 804 / 814 | 277 / 713 | 485 / 1,571 |
-| setup before traffic | 11 s | 27 s | 7 s | 13 s |
+| I-frames/s | 716 k | 657 k | 324 k | 265 k |
+| ack latency p50 / p99 | 2.3 / 6.0 ms | 4.3 / 7.1 ms | 0.4 / 2.3 ms | 0.4 / 2.2 ms |
+| outstation CPU while sending | 4.4 cores | 4.6 cores | 2.0 cores | 2.0 cores |
+| RSS while sending / peak with the analysis | 267 / 571 MB | 451 / 1,138 MB | 172 / 600 MB | 278 / 1,153 MB |
+| setup before traffic / teardown | 0.8 s / 0.9 s | 1.5 s / 1.7 s | 6 s / – | 12 s / – |
+| fidelity verdict, frames lost by the capture | `all_correct` 100, 0 | `all_correct` 100, 0 | `all_correct` 100, 0 | `all_correct` 100, 0 |
 
-- **CPU follows the message rate, not the number of sessions**: about 7-10 µs per I-frame at full speed; 200 RTUs at 10× their captured pace (9,000 I-frames/s) use a third of a core. The 165-RTU production capture of the [April report](reports/2026-04-17-fleet-replay-showcase.md) ran at about 680 I-frames/s.
-- **Memory**: about 0.4-0.65 MB per session while sending, plus the loaded capture (roughly its file size). The automatic analysis needs 2-5 times that for a few seconds after the run.
-- **Setup is serial and costs per session**: in master role 54 ms per session at 200 and 95 ms at 800 (a veth port, per-interface sysctls and an iptables rule each), and teardown takes almost as long again; in slave role 30-45 ms per listener (alias, journal entry, capture filter update), overlapping with traffic.
-- **Fidelity verdicts need paced runs.** At original timing (up to 41 k I-frames/s with 200 RTUs) the analysis scores `all_correct`. At full speed every session completes, but the slave-role capture drops frames (`captured_dropped`, and the analysis says so) and a few master sessions are misjudged because of capture ordering; set `realtime` to give the slave capture RT priority.
+- **Fidelity verdicts hold at full speed.** Every full-speed run of 200 and 400 sessions, in both roles, scores `all_correct`, and the capture lost no frames: it merges its sources by kernel timestamp, reads through a TPACKET_V3 ring and runs at RT priority whenever allowed. If a capture does lose frames, `captured_dropped`, the analysis notes and `run_warning` say so.
+- **CPU follows the message rate, not the number of sessions**: about 6-9 µs per I-frame at full speed; 200 RTUs at 10× their captured pace (9,000 I-frames/s) use a third of a core. The 165-RTU production capture of the [April report](reports/2026-04-17-fleet-replay-showcase.md) ran at about 680 I-frames/s.
+- **Memory**: about 0.5-1 MB per session while sending (including 32 MiB of receive ring per capture socket), plus the loaded capture (roughly its file size). The automatic analysis needs 2-5 times that for a few seconds after the run.
+- **Setup runs in parallel**: in master role about 3 ms per session (veth ports built by up to 8 workers, one iptables transaction, one `tc -batch`), teardown 1-2 s; in slave role 30-45 ms per listener (alias, journal entry, capture filter update), overlapping with traffic.
 - **800 sessions**: slave role runs (800 of 800). In master role the test host's kernel neighbour table overflowed (both ends shared one kernel); outstation's host needs one neighbour entry per master session, so above about 1,000 sessions raise `net.ipv4.neigh.default.gc_thresh3`.
 - Each session holds about 2 (master) to 4 (slave) file descriptors; outstation raises its soft open-file limit to the hard limit at startup.
+- SCADA-gateway mode is for slave role; master-role runs refuse it.
 
 ## Quick start
 
