@@ -1615,7 +1615,9 @@ pub fn run_benchmark(
                     sp.begin_iteration(iter_idx + 1);
                     let run_cfg = ProtoRunCfg {
                         bind_ip: src_ip,
-                        bind_iface: Some(bridge_side.clone()),
+                        // The source IP lives on the inject end; frames
+                        // sent there enter the bridge via its peer.
+                        bind_iface: Some(inject_side.clone()),
                         target_ip: cfg_w.target_ip,
                         target_port: cfg_w.target_port,
                         tcp_nodelay: cfg_w.tcp_nodelay.unwrap_or(false),

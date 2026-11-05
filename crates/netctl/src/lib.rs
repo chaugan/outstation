@@ -136,7 +136,18 @@ impl Topology {
                 ),
             }
         }
-        ip(["link", "add", &self.bridge, "type", "bridge"])?;
+        // ageing_time 0: the bridge never learns MAC locations and
+        // floods every frame to every port (hub), so the capture mirror
+        // port sees unicast traffic too, not only floods.
+        ip([
+            "link",
+            "add",
+            &self.bridge,
+            "type",
+            "bridge",
+            "ageing_time",
+            "0",
+        ])?;
         self.bridge_created = true;
         mark_owned(&self.bridge, self.run_id)?;
         ip(["link", "set", "dev", &self.bridge, "up"])?;
@@ -162,9 +173,12 @@ impl Topology {
         self.add_port_with_ip(id, mac, None, &Protection::default())
     }
 
-    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` to
-    /// the bridge-side end so that the kernel can own TCP sockets bound
-    /// to that IP. Needed for protocol-aware modules.
+    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` (and
+    /// `mac`) to the returned inject-side end, so the kernel can own TCP
+    /// sockets bound to that IP. Needed for protocol-aware modules,
+    /// whose sockets must bind to the inject side: a socket bound to the
+    /// bridge-enslaved end transmits into its veth peer, not into the
+    /// bridge, and never reaches the target.
     ///
     /// `src_ip` is checked with [`protect::validate_port_ip`] before
     /// anything is created: loopback/multicast/broadcast/reserved
@@ -213,14 +227,23 @@ impl Topology {
         mark_owned(&bridge_side, self.run_id)?;
         mark_owned(&inject_side, self.run_id)?;
         if let Some(mac) = mac {
-            set_mac(&bridge_side, mac)?;
+            // With a source IP the kernel builds the frames on the
+            // inject end, so that end carries the source identity.
+            set_mac(
+                if src_ip.is_some() {
+                    &inject_side
+                } else {
+                    &bridge_side
+                },
+                mac,
+            )?;
         }
         ip(["link", "set", "dev", &bridge_side, "master", &self.bridge])?;
         ip(["link", "set", "dev", &bridge_side, "up"])?;
         ip(["link", "set", "dev", &inject_side, "up"])?;
         if let Some(ip_addr) = src_ip {
             let cidr = format!("{ip_addr}/32");
-            ip(["addr", "add", &cidr, "dev", &bridge_side])?;
+            ip(["addr", "add", &cidr, "dev", &inject_side])?;
         }
         Ok(inject_side)
     }
