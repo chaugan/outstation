@@ -71,6 +71,9 @@ pub struct ServeConfig {
     /// Uploads and new captures are refused when free space in the state
     /// dir would drop below this many bytes.
     pub min_free_bytes: u64,
+    /// Free-space source of the disk checks (uploads, health, the run
+    /// guard); statvfs by default.
+    pub free_space: crate::sysinfo::FreeSpace,
     /// Total size cap for `<state>/captures`; oldest captures are evicted
     /// first.
     pub capture_max_total_bytes: u64,
@@ -135,6 +138,7 @@ impl ServeConfig {
             min_free_bytes: env_u64("OUTSTATION_MIN_FREE_MB")
                 .map(|v| v * MIB)
                 .unwrap_or(512 * MIB),
+            free_space: Default::default(),
             capture_max_total_bytes: env_u64("OUTSTATION_CAPTURE_MAX_MB")
                 .map(|v| v * MIB)
                 .unwrap_or(10 * GIB),

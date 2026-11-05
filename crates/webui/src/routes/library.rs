@@ -46,7 +46,7 @@ pub(crate) async fn api_library_list(
 
 /// Refuse an upload when the state filesystem is short on space.
 pub(crate) fn check_free_space(state: &AppState, incoming: u64) -> Result<(), AppError> {
-    if let Some(free) = crate::sysinfo::free_bytes(&state.cfg.state_dir) {
+    if let Some(free) = state.cfg.free_space.free_bytes(&state.cfg.state_dir) {
         if free < state.cfg.min_free_bytes.saturating_add(incoming) {
             return Err(AppError::new(
                 StatusCode::INSUFFICIENT_STORAGE,
@@ -91,6 +91,8 @@ pub(crate) struct UploadLimits {
     /// This upload's share of the library quota, for library uploads.
     quota: Option<QuotaReservation>,
     state_dir: PathBuf,
+    /// Free-space source (statvfs in production).
+    free_space: crate::sysinfo::FreeSpace,
     min_free: u64,
 }
 
@@ -171,10 +173,14 @@ impl UploadLimits {
         let min_free = state.cfg.min_free_bytes;
         Self {
             max: state.cfg.max_upload_bytes,
-            disk_budget: crate::sysinfo::free_bytes(&state.cfg.state_dir)
+            disk_budget: state
+                .cfg
+                .free_space
+                .free_bytes(&state.cfg.state_dir)
                 .map(|f| f.saturating_sub(min_free)),
             quota: None,
             state_dir: state.cfg.state_dir.clone(),
+            free_space: state.cfg.free_space.clone(),
             min_free,
         }
     }
@@ -222,7 +228,10 @@ impl UploadLimits {
         }
         let low = self.disk_budget.is_some_and(|b| written > b)
             || (recheck
-                && crate::sysinfo::free_bytes(&self.state_dir).is_some_and(|f| f < self.min_free));
+                && self
+                    .free_space
+                    .free_bytes(&self.state_dir)
+                    .is_some_and(|f| f < self.min_free));
         if low {
             return Err(AppError::new(
                 StatusCode::INSUFFICIENT_STORAGE,

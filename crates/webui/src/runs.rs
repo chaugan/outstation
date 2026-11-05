@@ -536,7 +536,7 @@ fn spawn_sampler(state: AppState, id: u64, ctx: RunContext) {
                         rs.throughput_history.remove(0);
                     }
                     if tick % 5 == 0 && !ctx.is_cancelled() {
-                        if let Some(free) = crate::sysinfo::free_bytes(&state.cfg.state_dir) {
+                        if let Some(free) = state.cfg.free_space.free_bytes(&state.cfg.state_dir) {
                             if free < state.cfg.min_free_bytes / 2 {
                                 warn!(id, free, "free disk critically low; stopping run");
                                 rs.error = Some(format!(

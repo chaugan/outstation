@@ -221,6 +221,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         allow_hosts: vec!["outstation.lan".into()],
         max_upload_bytes: 64 * 1024,
         min_free_bytes: 0,
+        free_space: Default::default(),
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
         library_max_bytes: 0,
@@ -2280,11 +2281,14 @@ async fn pcap_loads_wait_for_a_heavy_permit() {
 #[tokio::test]
 async fn uploads_respect_disk_reserve_and_library_quota() {
     let dir = tempfile::tempdir().unwrap();
-    let free = crate::sysinfo::free_bytes(dir.path()).unwrap();
-    // Leave ~200 KiB of budget above the reserve.
+    // A fixed free-space figure, so other tests writing to the same
+    // disk cannot change the outcome. Leave 200 KiB of budget above
+    // the reserve.
+    let free = 50 * 1024 * 1024 * 1024u64;
     let h = harness_cfg(dir, Behaviour::BlockUntilCancel, |c| {
         c.max_upload_bytes = 8 * 1024 * 1024;
-        c.min_free_bytes = free.saturating_sub(200 * 1024);
+        c.free_space = crate::sysinfo::FreeSpace::from_fn(move |_| Some(free));
+        c.min_free_bytes = free - 200 * 1024;
     });
     let mut big = tiny_pcap(1);
     big.resize(4 * 1024 * 1024, 0);
