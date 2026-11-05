@@ -822,6 +822,80 @@ pub struct ProtocolStats {
     /// Peer reaction to the injected faults; `None` when no fault
     /// fired.
     pub fault_reaction: Option<FaultReaction>,
+    /// How the peer acknowledged our data messages (F009): on a full
+    /// window, below it (timer-driven), or piggybacked on its own data.
+    pub ack_cadence: AckCadence,
+}
+
+/// The peer's observed acknowledgement cadence (F009). Ack latency
+/// mostly reflects this policy (IEC 104: a receiver acknowledges after
+/// at most w I-frames or when t2 expires), so the report says which of
+/// the two drove the acks. Only acknowledgements that retire at least
+/// one of our data messages count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AckCadence {
+    /// Standalone acknowledgements (IEC 104 S-frames).
+    pub standalone_acks: u64,
+    /// Standalone acknowledgements that covered at least the receive
+    /// window w configured for the session.
+    pub window_acks: u64,
+    /// Standalone acknowledgements that covered fewer than w messages.
+    pub below_window_acks: u64,
+    /// Of `below_window_acks`: the oldest message they acknowledged had
+    /// waited at least 90% of t2, so the peer's t2 timer sent them.
+    pub timer_acks: u64,
+    /// Acknowledgements carried by the peer's own data messages (IEC
+    /// 104: N(R) of a received I-frame).
+    pub piggybacked_acks: u64,
+    /// Data messages retired by all of the above.
+    pub messages_acked: u64,
+    /// Most messages retired by a single acknowledgement.
+    pub max_messages_per_ack: u64,
+}
+
+impl AckCadence {
+    /// Record one acknowledgement that retired `n` (> 0) messages.
+    /// `standalone` is false for an ack carried by a data message;
+    /// `window` is the session's w; `oldest_wait_ns` how long the
+    /// oldest retired message waited; `t2_ns` the session's t2.
+    pub fn record(
+        &mut self,
+        n: u64,
+        standalone: bool,
+        window: u64,
+        oldest_wait_ns: u64,
+        t2_ns: u64,
+    ) {
+        if n == 0 {
+            return;
+        }
+        self.messages_acked = self.messages_acked.saturating_add(n);
+        self.max_messages_per_ack = self.max_messages_per_ack.max(n);
+        if !standalone {
+            self.piggybacked_acks = self.piggybacked_acks.saturating_add(1);
+            return;
+        }
+        self.standalone_acks = self.standalone_acks.saturating_add(1);
+        if n >= window.max(1) {
+            self.window_acks = self.window_acks.saturating_add(1);
+        } else {
+            self.below_window_acks = self.below_window_acks.saturating_add(1);
+            if t2_ns > 0 && oldest_wait_ns >= t2_ns / 10 * 9 {
+                self.timer_acks = self.timer_acks.saturating_add(1);
+            }
+        }
+    }
+
+    /// Fold another connection's or session's figures into `self`.
+    pub fn merge(&mut self, o: &AckCadence) {
+        self.standalone_acks = self.standalone_acks.saturating_add(o.standalone_acks);
+        self.window_acks = self.window_acks.saturating_add(o.window_acks);
+        self.below_window_acks = self.below_window_acks.saturating_add(o.below_window_acks);
+        self.timer_acks = self.timer_acks.saturating_add(o.timer_acks);
+        self.piggybacked_acks = self.piggybacked_acks.saturating_add(o.piggybacked_acks);
+        self.messages_acked = self.messages_acked.saturating_add(o.messages_acked);
+        self.max_messages_per_ack = self.max_messages_per_ack.max(o.max_messages_per_ack);
+    }
 }
 
 impl ProtocolStats {
@@ -890,6 +964,7 @@ impl ProtocolStats {
                 }
             }
         }
+        self.ack_cadence.merge(&other.ack_cadence);
     }
 }
 
@@ -1490,6 +1565,41 @@ pub fn stub_report(name: &str) -> ProtoReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ack_cadence_classifies_and_merges() {
+        let t2 = 10_000_000_000; // 10 s
+        let mut a = AckCadence::default();
+        a.record(0, true, 8, 0, t2); // retired nothing: ignored
+        a.record(8, true, 8, 50_000_000, t2); // full window
+        a.record(12, true, 8, 50_000_000, t2); // more than w
+        a.record(3, true, 8, 9_500_000_000, t2); // t2 timer
+        a.record(3, true, 8, 1_000_000_000, t2); // early, below w
+        a.record(2, false, 8, 9_999_000_000, t2); // piggybacked
+        assert_eq!(a.standalone_acks, 4);
+        assert_eq!(a.window_acks, 2);
+        assert_eq!(a.below_window_acks, 2);
+        assert_eq!(a.timer_acks, 1);
+        assert_eq!(a.piggybacked_acks, 1);
+        assert_eq!(a.messages_acked, 28);
+        assert_eq!(a.max_messages_per_ack, 12);
+        let mut b = AckCadence::default();
+        b.record(20, true, 8, 0, t2);
+        let mut stats = ProtocolStats {
+            ack_cadence: a,
+            ..Default::default()
+        };
+        stats.merge(
+            ProtocolStats {
+                ack_cadence: b,
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(stats.ack_cadence.window_acks, 3);
+        assert_eq!(stats.ack_cadence.messages_acked, 48);
+        assert_eq!(stats.ack_cadence.max_messages_per_ack, 20);
+    }
 
     #[test]
     fn live_hist_edges_match_the_log_formula() {

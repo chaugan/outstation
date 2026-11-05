@@ -247,7 +247,7 @@ sudo virsh net-define isolated.xml && sudo virsh net-start isolated-test && sudo
 
 Kjøringskortet viser status (`completed`, `partial` når noen sesjoner feilet, `stopped`, `failed`), sendte og mottatte meldinger, og nedlasting av opptaket. **Details** viser i tillegg:
 
-- **Ack latency** min/p50/p90/p99/maks: tiden fra en I-ramme sendes til motparten kvitterer, over alle sesjoner, med histogram. I scenario A gjenspeiler dette mest masterens egne `w` og `t2`: den kvitterer etter `w` I-rammer eller `t2` etter den første ukvitterte, så glissen telemetri gir forsinkelser nær masterens `t2`. Det er ikke rundturstid i nettet ([detaljer](iec104-config.md#session-report-fields)).
+- **Ack latency** min/p50/p90/p99/maks: tiden fra en I-ramme sendes til motparten kvitterer, over alle sesjoner, med histogram. I scenario A gjenspeiler dette mest masterens egne `w` og `t2`: den kvitterer etter `w` I-rammer eller `t2` etter den første ukvitterte, så glissen telemetri gir forsinkelser nær masterens `t2`. Det er ikke rundturstid i nettet ([detaljer](iec104-config.md#session-report-fields)). Linjen **Peer ack cadence** under viser hvilken regel som utløste kvitteringene (fullt vindu, t2-timeren eller N(R) i motpartens egne I-rammer), og sier fra når de fleste kom på timeren.
 - **Per sesjon**: sendte og mottatte meldinger, forsinkelsesprosentiler, meldinger per sekund, **window stalls** (hvor ofte sesjonen ventet fordi motparten ikke hadde kvittert for k rammer; et høyt tall betyr at motparten er treg med kvitteringene), **unacked at end**, og eventuell feilmelding.
 - **Gap-histogrammet** sammenligner avstanden mellom rammene i kilden og i avspillingen.
 
