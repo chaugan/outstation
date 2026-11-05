@@ -53,6 +53,8 @@ mod state;
 mod sysinfo;
 
 #[cfg(test)]
+mod helper_tests;
+#[cfg(test)]
 mod tests;
 
 use std::sync::atomic::Ordering;

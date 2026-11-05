@@ -33,19 +33,16 @@ pub(crate) fn find_local_ip_iface(ip: &Ipv4Addr) -> Option<String> {
 }
 
 pub(crate) fn extract_mac(s: &str) -> Option<String> {
-    // find any AA:BB:CC:DD:EE:FF pattern
-    let bytes = s.as_bytes();
-    for i in 0..bytes.len().saturating_sub(16) {
-        let slice = &s[i..i + 17];
-        if slice.chars().enumerate().all(|(j, c)| match j % 3 {
+    // Find the first AA:BB:CC:DD:EE:FF pattern. Byte-wise, so text that
+    // is not ASCII (a localized arping) cannot split a character.
+    s.as_bytes().windows(17).find_map(|w| {
+        let is_mac = w.iter().enumerate().all(|(j, c)| match j % 3 {
             0 | 1 => c.is_ascii_hexdigit(),
-            2 => c == ':',
-            _ => false,
-        }) {
-            return Some(slice.to_lowercase());
-        }
-    }
-    None
+            _ => *c == b':',
+        });
+        // All-ASCII by construction.
+        is_mac.then(|| String::from_utf8_lossy(w).to_lowercase())
+    })
 }
 
 pub(crate) fn default_route_iface() -> std::io::Result<String> {

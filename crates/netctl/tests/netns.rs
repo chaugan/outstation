@@ -529,3 +529,40 @@ fn session_ports_are_isolated_and_mirrored() {
     let j = std::fs::read_to_string(dir.join("state-guards.txt")).unwrap_or_default();
     assert!(j.trim().is_empty(), "journal not empty: {j}");
 }
+
+/// F039: an address another station answers ARP for is refused as a
+/// listen alias (unless forced); a free one passes. The "other station"
+/// is the namespace's own stack behind the far end of a veth pair.
+#[test]
+#[ignore = "privileged: run via scripts/netns-test.sh inside an ostest-* netns"]
+fn duplicate_address_is_detected_before_aliasing() {
+    setup();
+    let live = Ipv4Addr::new(10, 99, 3, 66);
+    let free = Ipv4Addr::new(10, 99, 3, 67);
+    sh(&["ip", "addr", "add", "10.99.3.66/32", "dev", "nsfree1"]);
+    let peer_mac = std::fs::read_to_string("/sys/class/net/nsfree1/address").unwrap();
+    let t = std::time::Instant::now();
+    let got = netctl::probe_address_in_use("nsfree0", live, netctl::DAD_TIMEOUT).unwrap();
+    assert_eq!(
+        got.map(netctl::format_mac).as_deref(),
+        Some(peer_mac.trim()),
+        "no ARP answer for a live address"
+    );
+    assert!(
+        t.elapsed() < netctl::DAD_TIMEOUT,
+        "a live address answers at once"
+    );
+    assert_eq!(
+        netctl::probe_address_in_use("nsfree0", free, netctl::DAD_TIMEOUT).unwrap(),
+        None
+    );
+
+    let strict = Protection::new(Vec::new(), false);
+    let e = netctl::check_address_free("nsfree0", live, &strict).unwrap_err();
+    assert!(format!("{e:#}").contains("already in use"), "{e:#}");
+    assert!(netctl::check_address_free("nsfree0", free, &strict).is_ok());
+    let forced = Protection::new(Vec::new(), true);
+    assert!(netctl::check_address_free("nsfree0", live, &forced).is_ok());
+
+    sh(&["ip", "addr", "del", "10.99.3.66/32", "dev", "nsfree1"]);
+}

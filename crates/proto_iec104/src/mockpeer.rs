@@ -75,6 +75,11 @@ impl Peer {
         }
     }
 
+    /// Wrap an accepted or connected stream.
+    pub fn from_stream(s: TcpStream) -> Self {
+        Self::new(s)
+    }
+
     /// Accept the connection of a master session.
     pub fn accept(listener: &TcpListener) -> Self {
         let (s, _) = listener.accept().expect("accept");
