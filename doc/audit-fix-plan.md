@@ -20,7 +20,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 1: parallel lanes, disjoint files
 
-- [ ] **T01 pcap ingestion** (`crates/pcapload`, `crates/tcp_session`). Refs: P01–P12.
+- [~] **T01 pcap ingestion** (`crates/pcapload`, `crates/tcp_session`). Refs: P01–P12.
   - Sequence-number wraparound (P01).
   - Gap-tolerant reassembly that reports gaps instead of bailing (P02, library part).
   - Strip 802.1Q/ad/QinQ tags; normalise SLL, SLL2 and raw-IP link types; count and report IPv6 and ignored packets (P03).
@@ -33,7 +33,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Anchor at ISN+1 (P11).
   - Reset pcapng sections (P12).
   - Fix the stale header comment. Remove the dead `tcp_session` crate, or fix its timeouts.
-- [ ] **T02 IEC 104 core: framing and ASDU layer** (`proto_iec104/src/{lib,apdu,asdu,inventory,responder}.rs` + new `apci.rs`). Refs: F011, F014, F015, F016, F019, F020, F021, F022, F081, F083, P09.
+- [~] **T02 IEC 104 core: framing and ASDU layer** (`proto_iec104/src/{lib,apdu,asdu,inventory,responder}.rs` + new `apci.rs`). Refs: F011, F014, F015, F016, F019, F020, F021, F022, F081, F083, P09.
   - One `apci::frames()` iterator with resync, used by `count_iframes`, `extract_message_times_ns`, the picker and the inventory.
   - Fix the `element_len` table, with a table test.
   - Monitor-type-only inventory with timed→untimed type mapping.
@@ -42,7 +42,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Surface cp56 config errors, and fix the TZ-vs-SU decode.
   - Single-bit U-frame validation; replace `remove(0)` in the resync with a proper buffer.
   - Sum `per_rtu_bytes` across flows instead of overwriting (P02, consumer part).
-- [ ] **T03 Host safety and scheduler** (`crates/netctl`, `crates/sched`, `crates/raw_replay`). Refs: F026, F028, F030 (sched part), F031, F032, F033, F034, F035, F038, F039, F040, F041, F043, F045, F047, F075, F137 (library part), P02 (`seen` ordering in `sched:1300`), P04 (raw pacing guard).
+- [~] **T03 Host safety and scheduler** (`crates/netctl`, `crates/sched`, `crates/raw_replay`). Refs: F026, F028, F030 (sched part), F031, F032, F033, F034, F035, F038, F039, F040, F041, F043, F045, F047, F075, F137 (library part), P02 (`seen` ordering in `sched:1300`), P04 (raw pacing guard).
   - Derive bridge and tap names from the run id. `reclaim_stale` deletes only interfaces marked as ours.
   - Refuse the default-route NIC, the NIC carrying the request's local address, real bridges (fix `is_bridge`) and existing bridge ports.
   - /32 `noprefixroute` aliases; distinguish Added from AlreadyPresent, with refcounts.
@@ -55,7 +55,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - SCHED_FIFO policy: cap at cores−1, no FIFO with top-speed, no spin for gaps over 1 ms.
   - Join and tear down on spawn failure; no `expect()` in spawn paths.
   - Correct sent and progress counters.
-- [ ] **T04 webui backend: split, then fix** (`crates/webui/src/{lib,db}.rs` → modules, `crates/outstation/src/main.rs`, `systemd/`). Refs: F027, F029, F036, F037, F042, F044, F046, F048, F049, F050, F051, F052, F053, F054, F055, F056, F057, F071, F072, F073, F074, F076, F077, F078, F079, F086, F087, F088 (backend), F089, F090, F091, F092, F094, F101 (backend), F108 (backend), F132, F133, F146, F148, F149, F151.
+- [~] **T04 webui backend: split, then fix** (`crates/webui/src/{lib,db}.rs` → modules, `crates/outstation/src/main.rs`, `systemd/`). Refs: F027, F029, F036, F037, F042, F044, F046, F048, F049, F050, F051, F052, F053, F054, F055, F056, F057, F071, F072, F073, F074, F076, F077, F078, F079, F086, F087, F088 (backend), F089, F090, F091, F092, F094, F101 (backend), F108 (backend), F132, F133, F146, F148, F149, F151.
   - Split `lib.rs` into `routes/`, `dto`, `persist`, `library`, `netprobe` and `runs` modules.
   - Single-active-run lock. A 409 names the active run, client IP and start time. Broadcast an event channel (SSE or WS) for run started/stopped, which the UI shows as a banner.
   - Validate the request, then allocate the run id. `catch_unwind` around workers; stop and delete can finalize a run with no worker; final status derived from session errors.
@@ -94,7 +94,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - `early_break` on send error; idle-serve when the script is empty.
   - `shutdown(Both)` RAII guard and a joined reader.
   - Mock-peer tests for the slave and master paths, TESTFR, STOPDT, wraparound, misbehaving peers and GI timing. Port the scratch probes.
-- [ ] **T06 Fidelity analysis** (`proto_iec104/src/analysis.rs`, `webui/src/analysis.rs`). Refs: F012, F058, F059, F060, F061, F062, F063, F064, F065, F066, F067, F068 (report half), F069, F093 (backend), F136.
+- [~] **T06 Fidelity analysis** (`proto_iec104/src/analysis.rs`, `webui/src/analysis.rs`). Refs: F012, F058, F059, F060, F061, F062, F063, F064, F065, F066, F067, F068 (report half), F069, F093 (backend), F136.
   - Symmetric or synthesized-only GI filter.
   - Content-based score: byte-identical plus CP56-only, with `real_mismatch_count==0` required.
   - Clamp the score; per-iteration and stopped-tail verdicts.
@@ -162,3 +162,5 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - MSRV corrected from 1.75 to 1.85 (verified with `cargo +1.85 check`).
   - Cleared all ~45 clippy warnings.
   - `clippy.toml` pins the clippy MSRV and sets the argument-count threshold.
+- 2026-11-05: Wave 1 started. T01–T04 run in parallel worktrees (`/opt/code/outstation-wt/{pcap,iec104-core,host-sched,webui-backend}`), on branches `audit/<lane>`.
+- 2026-11-05: T06 (analysis) started early in `/opt/code/outstation-wt/analysis`, because it touches only the two analysis.rs files.
