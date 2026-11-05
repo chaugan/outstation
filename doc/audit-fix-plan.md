@@ -92,7 +92,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 2: depends on wave 1
 
-- [~] **T05 IEC 104 session state machine** (`proto_iec104/src/session.rs`). Refs: F000, F001, F002, F003, F004, F005, F006, F008, F009, F010, F013, F017, F018, F023, F024, F025, F140, F141, F142, F143, F144, F145, F147, F150.
+- [x] **T05 IEC 104 session state machine** (`proto_iec104/src/session.rs`). Refs: F000, F001, F002, F003, F004, F005, F006, F008, F009, F010, F013, F017, F018, F023, F024, F025, F140, F141, F142, F143, F144, F145, F147, F150.
   - One `wait_until(deadline)` helper that services rx, t1, t2 (S-frame) and t3 (TESTFR).
   - Configurable k/w/t0–t3 via `proto_config`.
   - Started/Stopped/PendingStop states with STARTDT/STOPDT con replies and gated sends; S-flush before STOPDT.
@@ -215,3 +215,12 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Partly fixed: F060 and F066. They need the run's `loop_within_session`, `paced_speed` and `source_port`, which T08 will persist.
   - Expected interim gap until T05 merges: with synthesis on, the analyzer expects stripped bursts, but the current replayer still sends them.
 - 2026-11-05: Backend halves of T08, T09, T10 and T13 started in `/opt/code/outstation-wt/features`. The UI halves follow after T07 merges.
+- 2026-11-05: T05 merged. Workspace tests: 315 passed.
+  - New `link.rs` engine with t1, t2 and t3, transfer state, sequence validation and reader timestamps.
+  - GI/CI answers sent promptly, within k, with flood caps.
+  - Burst stripping uses the shared rule.
+  - Every exit sends FIN.
+  - Mock-peer tests.
+  - F009 is partly fixed: the metric is documented as ack latency and a command-response metric was added, but the peer's ack cadence is not recorded.
+  - Orchestrator change: slave idle-serve defaults to 30 s, so runs still finish on their own.
+  - New report fields for the UI: `protocol_violations`, `protocol_errors`, `stripped_capture_frames`, `synthesized_frames`, `idle_serve_ms`, `command_response_us`, `acks_sent` and `keepalives_sent`.
