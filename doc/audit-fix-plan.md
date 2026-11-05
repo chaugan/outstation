@@ -193,7 +193,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   5. A slave session whose master closes before STARTDT never listens again.
   6. Master setup and teardown are serial and grow faster than linear (54 → 95 ms per session). Parallelise and batch the iptables calls.
   7. The "master IP renamed" note picks an arbitrary session in master role.
-- [~] **T20 UI polish** (requested by the user 2026-11-05: "no problem with changes to the better"). Starts after the t17 lane lands; README screenshots are then retaken with the t17 screenshot script.
+- [x] **T20 UI polish** (requested by the user 2026-11-05: "no problem with changes to the better"). Starts after the t17 lane lands; README screenshots are then retaken with the t17 screenshot script.
   - Analysis overview first: a verdict hero, a 200-tile RTU heatmap coloured by verdict with click-through, and a dimension summary; detail sections collapsed. The current page is about 12,400 px.
   - Run cards: one primary action plus an overflow menu instead of 8 buttons; a clear status line (no "→ listening" on a stopped run); progress hidden when meaningless.
   - Runs: a live dashboard strip (throughput sparkline, p50/p99 ack latency, session-state bar).
@@ -204,6 +204,9 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Delete with an undo toast instead of a confirm dialog where it is safe.
   - Keyboard shortcuts (g l / g c / g r / g a, `/` to filter) with a `?` help overlay.
   - Typography pass: consistent mono/sans use and number alignment in tables.
+- [ ] **T20b UI follow-ups.**
+  - Live ack-latency p50/p99 while a run is going. This needs a small log-scale latency histogram in the shared progress counters (protoplay, link.rs, sched SourceProgress), summed in the live WebSocket stream. Starts after fx3 merges.
+  - The Compare regression list shows raw metric names and µs ("p99_us rose from 245242 µs"); show friendly labels with ms.
 - [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -387,3 +390,11 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - New scripts: `netns-scale.sh`, `netns-gateway-egress.sh`, `netns-screenshots.sh`, plus fresh README screenshots from real runs.
   - README: Scale and Screenshots sections; fx2's six README edits applied.
   - Remaining engine items are in T17c (fx3). T20 (UI polish) started in parallel.
+- 2026-11-05: T20 merged. Workspace tests: 471 passed, 2 runs green.
+  - Analysis overview with a verdict hero, an RTU heatmap and dimension bars (200-RTU page about 1,190 px, was about 12,400).
+  - Run cards with one primary action and a ⋯ menu.
+  - A live strip, library stat chips, scenario presets, a "What will run" panel and first-run guides.
+  - Dark mode, undo toasts, keyboard shortcuts and a typography pass.
+  - ui-smoke: 522/522 and 542/542 (Chromium 1440/390 and WebKit 1440, light and dark).
+  - README screenshots regenerated from real runs with `netns-screenshots.sh`.
+  - Disk housekeeping: removed 66 GB of finished lanes' build caches from the session scratchpad; the disk is at 81%.
