@@ -247,7 +247,8 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 
 | Fleet verdict | When |
 |---|---|
-| `all_correct` | Every judged endpoint passed |
+| `all_correct` | Every judged endpoint passed, and the run was not stopped |
+| `stopped_clean` | The run was stopped before it finished, and everything it sent before the stop was clean. `run_warning` says it was stopped. A stopped run is never `all_correct` |
 | `partial` | Some passed, some failed |
 | `failed` | Every judged endpoint failed with score 0 |
 | `inconclusive` | Nothing failed, but some endpoints could not be verified |
@@ -263,7 +264,7 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 |---|---|---|
 | `good_delivery` | pass | Everything passes (generic mode) |
 | `identical` | pass | Everything passes, including the target's script (correct mode) |
-| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean |
+| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean. An endpoint whose own session failed is never excused by the stop: its missing frames count as a failure |
 | `no_iframes_expected` | pass | The source carries no I-frames and none were delivered |
 | `degraded` | fail | Content is fine, but time tags, the GI/CI audit or timing failed |
 | `partial_delivery` | fail | Modified, missing, extra or reordered frames, or time tags changed with CP56 rewriting off |

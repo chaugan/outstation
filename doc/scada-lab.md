@@ -253,7 +253,7 @@ Kjøringskortet viser status (`completed`, `partial` når noen sesjoner feilet, 
 
 Alle ferdige tilstandsfulle kjøringer med opptak analyseres automatisk. **Analysis** viser de lagrede analysene for en kjøring; du kan også laste opp et opptak tatt på målsiden med Wireshark eller tcpdump.
 
-- **Dom for hele flåten**: `all_correct`, `partial`, `failed`, `inconclusive`, eller `run_failed` når selve kjøringen feilet eller ikke sendte noe.
+- **Dom for hele flåten**: `all_correct`, `stopped_clean` (kjøringen ble stoppet; det som ble sendt før stoppet var feilfritt), `partial`, `failed`, `inconclusive`, eller `run_failed` når selve kjøringen feilet eller ikke sendte noe.
 - **Per RTU**: poengsum (andelen rammer levert uendret), dom og begrunnelse. `good_delivery` er godkjent; `degraded` betyr at innholdet var riktig, men tidsmerker, GI/CI-revisjonen eller timingen feilet; `partial_delivery` betyr at rammer manglet, kom i tillegg, var endret eller kom i feil rekkefølge; `never_connected` betyr at masteren aldri koblet seg til den RTU-en.
 - **Domsdimensjoner** per RTU: innhold, tidsmerker, GI/CI, timing, handshake, og feil når slike ble injisert.
 - **GI/CI-revisjon**: for hver utspørring masteren sendte, om ActCon kom innen 15 s, om alle datarammer hadde riktig gruppe-COT, om ActTerm fulgte, og om dataene stemte med RTU-ens punktverdier.

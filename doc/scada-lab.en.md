@@ -253,7 +253,7 @@ The run card shows the status (`completed`, `partial` when some sessions failed,
 
 Every finished stateful run with a capture is analysed automatically. **Analysis** lists the stored analyses of a run; you can also upload a capture taken on the target side with Wireshark or tcpdump.
 
-- **Fleet verdict**: `all_correct`, `partial`, `failed`, `inconclusive`, or `run_failed` when the run itself failed or sent nothing.
+- **Fleet verdict**: `all_correct`, `stopped_clean` (the run was stopped; what it sent before the stop was clean), `partial`, `failed`, `inconclusive`, or `run_failed` when the run itself failed or sent nothing.
 - **Per RTU**: score (frames delivered intact, as a percentage), verdict and reason. `good_delivery` passes; `degraded` means the content was right but time tags, the GI/CI audit or timing failed; `partial_delivery` means frames were missing, extra, changed or reordered; `never_connected` means the master never connected to that RTU.
 - **Verdict dimensions** per RTU: content, time tags, GI/CI, timing, handshake, and faults when injected.
 - **GI/CI audit**: for every interrogation the master sent, whether ActCon came within 15 s, every data frame had the right group COT, ActTerm followed, and the data matched the RTU's point values.

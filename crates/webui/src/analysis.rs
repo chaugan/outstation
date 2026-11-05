@@ -863,6 +863,16 @@ fn apply_run_status(
             Some("the run being analysed is still running".to_string()),
             true,
         ),
+        // A stopped run is judged only up to the stop; it is never
+        // certified as a complete replay (N11).
+        (RunStatusHint::Stopped, _) => (
+            Some(
+                "the run being analysed was STOPPED before it finished; only what it sent \
+                 before the stop is judged"
+                    .to_string(),
+            ),
+            false,
+        ),
         // Session errors are judged per endpoint from the capture.
         (RunStatusHint::Partial, _) => (
             Some("some sessions of the run being analysed reported errors".to_string()),
@@ -880,6 +890,18 @@ fn apply_run_status(
     };
     notes.insert(0, format!("WARNING: {w}"));
     if !blocks {
+        // A clean but stopped run says so instead of `all_correct`.
+        let (verdict, reason) = if run.status == RunStatusHint::Stopped && verdict == "all_correct"
+        {
+            (
+                "stopped_clean",
+                format!(
+                    "stopped before the end; everything sent before the stop was clean ({reason})"
+                ),
+            )
+        } else {
+            (verdict, reason)
+        };
         return RunJudgement {
             verdict,
             reason,
@@ -949,14 +971,20 @@ fn analyze_endpoint(
     }
     let (orig_pb, orig_tg) = pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
 
-    let stopped = run.status == RunStatusHint::Stopped || sel.is_some_and(|s| s.cancelled);
+    // A stop excuses a truncated tail, but never on an endpoint whose
+    // own session failed: its missing frames are a failure, whatever
+    // happened to the run afterwards (N11).
+    let failed = sel.is_some_and(|s| s.state == "failed" && !s.cancelled);
+    let stopped =
+        !failed && (run.status == RunStatusHint::Stopped || sel.is_some_and(|s| s.cancelled));
     let (per_session_iters, expected_sessions) = match run.loop_within_session {
         Some(true) => (run.iterations, Some(1u64)),
         Some(false) => (1, (run.iterations > 0).then_some(run.iterations)),
         None => (0, None),
     };
     // An unbounded loop always ends on a stop.
-    let stopped = stopped || (run.loop_within_session.is_some() && run.iterations == 0);
+    let stopped =
+        !failed && (stopped || (run.loop_within_session.is_some() && run.iterations == 0));
 
     // Sessions that carried no payload at all (port probes, refused
     // connects) are listed but not judged.
@@ -2197,5 +2225,94 @@ mod tests {
         let b = t.samples.iter().filter(|p| p[1] == 1.0).count() as f64;
         let frac = b / t.samples.len() as f64;
         assert!((0.4..0.6).contains(&frac), "B share {frac}");
+    }
+
+    // ---------------- N11 regressions (re-audit reaudit_* probes) ----------------
+
+    /// RTU .2 completed; RTU .3's session FAILED after 2 of 8 frames,
+    /// then the operator stopped the run. The stop must not excuse the
+    /// failed endpoint, and the fleet is never certified.
+    #[test]
+    fn reaudit_failed_session_in_stopped_run() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Stopped;
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert_ne!(s.verdict, "stopped_clean");
+        assert!(s.score_pct < 100.0, "{s:?}");
+        assert_eq!(slave(&r, 2).outcome, VerdictOutcome::Pass);
+        assert_eq!(r.verdict, "partial", "{}", r.verdict_reason);
+        assert_ne!(r.fleet.fully_correct, 2);
+        assert!(r.run_warning.as_deref().unwrap().contains("STOPPED"));
+        assert!(r.notes[0].starts_with("WARNING"), "{:?}", r.notes);
+    }
+
+    /// Same failure in an unbounded loop (which always ends on a stop).
+    #[test]
+    fn reaudit_failed_session_in_unbounded_loop() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Partial;
+        run.iterations = 0;
+        run.loop_within_session = Some(true);
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert!(s.score_pct < 100.0, "{s:?}");
+        assert_ne!(r.verdict, "all_correct");
+    }
+
+    /// A finished run whose session failed midway.
+    #[test]
+    fn reaudit_completed_run_session_failed_midway() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Partial;
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert!(s.score_pct < 100.0);
+        assert_eq!(r.verdict, "partial");
+    }
+
+    /// A run stopped after one frame per RTU is clean up to the stop,
+    /// but is reported as stopped with a warning, never `all_correct`.
+    #[test]
+    fn stopped_run_is_never_all_correct() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script()[..1]);
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..1]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Stopped;
+        run.messages_sent = Some(2);
+        for e in &mut run.endpoints {
+            e.state = "cancelled".into();
+            e.cancelled = true;
+            e.sent = 1;
+        }
+        let r = run_analysis(&source, &cap.load(), run);
+        assert_eq!(slave(&r, 2).verdict, "stopped_clean");
+        assert_eq!(r.verdict, "stopped_clean", "{}", r.verdict_reason);
+        assert!(r.verdict_reason.contains("stopped"));
+        assert!(r.run_warning.as_deref().unwrap().contains("STOPPED"));
+        assert!(r.notes[0].contains("STOPPED"), "{:?}", r.notes);
     }
 }
