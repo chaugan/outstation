@@ -28,7 +28,7 @@ use crate::apdu::{
     U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
-    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone,
+    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned,
     Iec104ProtoConfig, RewriteMap, DUI_LEN, IOA_LEN,
 };
 use crate::inventory::Inventory;
@@ -276,8 +276,14 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
+    let cp56_cfg = match Iec104ProtoConfig::parse(cfg.proto_config.as_deref()) {
+        Ok(c) => c.cp56,
+        Err(e) => {
+            report.error = Some(format!("{e}"));
+            return report;
+        }
+    };
+    let cp56_zone = cp56_cfg.zone();
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),
@@ -777,8 +783,14 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
+    let cp56_cfg = match Iec104ProtoConfig::parse(cfg.proto_config.as_deref()) {
+        Ok(c) => c.cp56,
+        Err(e) => {
+            report.error = Some(format!("{e}"));
+            return report;
+        }
+    };
+    let cp56_zone = cp56_cfg.zone();
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),

@@ -122,35 +122,51 @@ pub fn write_ioa(asdu: &mut [u8], offset: usize, ioa: u32) {
 }
 
 /// Information element size (bytes) for a Type ID, **excluding** the
-/// 3-byte IOA. Returns `None` for types we don't know how to step
-/// through.
+/// 3-byte IOA, per IEC 60870-5-101 §7.3 and IEC 60870-5-104 §8.
+/// Returns `None` for type IDs that are undefined, reserved, private
+/// or variable-length (F_SG_NA_1, 125).
+///
+/// Information-element sizes used below: SIQ/DIQ/QDS/QOS/QPM/QPA/QOI/
+/// QCC/QRP/COI/SCO/DCO/RCO/SEP/SPE/OCI/QDP = 1, NVA/SVA/FBP/TSC/
+/// CP16Time2a/NOF = 2, VTI = 1, CP24Time2a/LOF = 3, BSI/BCR-value/
+/// IEEE STD 754 float/SCD = 4 (BCR = 4 + 1 sequence octet = 5),
+/// CP56Time2a = 7.
 pub fn element_len(type_id: u8) -> Option<usize> {
-    // Only the types we can walk safely. Names are from IEC 60870-5-101.
     Some(match type_id {
-        1 => 1,          // M_SP_NA_1 — SIQ
-        2 => 1 + 3,      // M_SP_TA_1 — SIQ + CP24Time2a
-        3 => 1,          // M_DP_NA_1 — DIQ
-        4 => 1 + 3,      // M_DP_TA_1 — DIQ + CP24
-        5 => 1 + 1,      // M_ST_NA_1 — VTI + QDS
-        6 => 1 + 1 + 3,  // M_ST_TA_1 — VTI + QDS + CP24
-        7 => 4 + 1,      // M_BO_NA_1 — BSI + QDS
-        8 => 4 + 1 + 3,  // M_BO_TA_1 — BSI + QDS + CP24
-        9 => 2 + 1,      // M_ME_NA_1 — NVA + QDS
-        10 => 2 + 1 + 3, // M_ME_TA_1 — NVA + QDS + CP24
-        11 => 2 + 1,     // M_ME_NB_1 — SVA + QDS
-        12 => 2 + 1 + 3, // M_ME_TB_1 — SVA + QDS + CP24
-        13 => 4 + 1,     // M_ME_NC_1 — float + QDS
-        14 => 4 + 1 + 3, // M_ME_TC_1 — float + QDS + CP24
-        15 => 4 + 1,     // M_IT_NA_1 — BCR
-        16 => 4 + 1 + 3, // M_IT_TA_1 — BCR + CP24
-        30 => 1 + 7,     // M_SP_TB_1 — SIQ + CP56Time2a
-        31 => 1 + 7,     // M_DP_TB_1 — DIQ + CP56
-        32 => 1 + 1 + 7, // M_ST_TB_1 — VTI + QDS + CP56
-        33 => 4 + 1 + 7, // M_BO_TB_1 — BSI + QDS + CP56
-        34 => 2 + 1 + 7, // M_ME_TD_1 — NVA + QDS + CP56
-        35 => 2 + 1 + 7, // M_ME_TE_1 — SVA + QDS + CP56
-        36 => 4 + 1 + 7, // M_ME_TF_1 — float + QDS + CP56
-        37 => 4 + 1 + 7, // M_IT_TB_1 — BCR + CP56
+        // --- Process information in monitor direction ---
+        1 => 1,              // M_SP_NA_1 — SIQ
+        2 => 1 + 3,          // M_SP_TA_1 — SIQ + CP24Time2a
+        3 => 1,              // M_DP_NA_1 — DIQ
+        4 => 1 + 3,          // M_DP_TA_1 — DIQ + CP24
+        5 => 1 + 1,          // M_ST_NA_1 — VTI + QDS
+        6 => 1 + 1 + 3,      // M_ST_TA_1 — VTI + QDS + CP24
+        7 => 4 + 1,          // M_BO_NA_1 — BSI + QDS
+        8 => 4 + 1 + 3,      // M_BO_TA_1 — BSI + QDS + CP24
+        9 => 2 + 1,          // M_ME_NA_1 — NVA + QDS
+        10 => 2 + 1 + 3,     // M_ME_TA_1 — NVA + QDS + CP24
+        11 => 2 + 1,         // M_ME_NB_1 — SVA + QDS
+        12 => 2 + 1 + 3,     // M_ME_TB_1 — SVA + QDS + CP24
+        13 => 4 + 1,         // M_ME_NC_1 — float + QDS
+        14 => 4 + 1 + 3,     // M_ME_TC_1 — float + QDS + CP24
+        15 => 5,             // M_IT_NA_1 — BCR
+        16 => 5 + 3,         // M_IT_TA_1 — BCR + CP24
+        17 => 1 + 2 + 3,     // M_EP_TA_1 — SEP + CP16 + CP24
+        18 => 1 + 1 + 2 + 3, // M_EP_TB_1 — SPE + QDP + CP16 + CP24
+        19 => 1 + 1 + 2 + 3, // M_EP_TC_1 — OCI + QDP + CP16 + CP24
+        20 => 4 + 1,         // M_PS_NA_1 — SCD + QDS
+        21 => 2,             // M_ME_ND_1 — NVA
+        30 => 1 + 7,         // M_SP_TB_1 — SIQ + CP56Time2a
+        31 => 1 + 7,         // M_DP_TB_1 — DIQ + CP56
+        32 => 1 + 1 + 7,     // M_ST_TB_1 — VTI + QDS + CP56
+        33 => 4 + 1 + 7,     // M_BO_TB_1 — BSI + QDS + CP56
+        34 => 2 + 1 + 7,     // M_ME_TD_1 — NVA + QDS + CP56
+        35 => 2 + 1 + 7,     // M_ME_TE_1 — SVA + QDS + CP56
+        36 => 4 + 1 + 7,     // M_ME_TF_1 — float + QDS + CP56
+        37 => 5 + 7,         // M_IT_TB_1 — BCR + CP56
+        38 => 1 + 2 + 7,     // M_EP_TD_1 — SEP + CP16 + CP56
+        39 => 1 + 1 + 2 + 7, // M_EP_TE_1 — SPE + QDP + CP16 + CP56
+        40 => 1 + 1 + 2 + 7, // M_EP_TF_1 — OCI + QDP + CP16 + CP56
+        // --- Process information in control direction ---
         45 => 1,         // C_SC_NA_1 — SCO
         46 => 1,         // C_DC_NA_1 — DCO
         47 => 1,         // C_RC_NA_1 — RCO
@@ -165,15 +181,30 @@ pub fn element_len(type_id: u8) -> Option<usize> {
         62 => 2 + 1 + 7, // C_SE_TB_1 — SVA + QOS + CP56
         63 => 4 + 1 + 7, // C_SE_TC_1 — float + QOS + CP56
         64 => 4 + 7,     // C_BO_TA_1 — BSI + CP56
-        70 => 1,         // M_EI_NA_1 — COI
-        100 => 1,        // C_IC_NA_1 — QOI
-        101 => 1,        // C_CI_NA_1 — QCC
-        102 => 0,        // C_RD_NA_1 — no element
-        103 => 7,        // C_CS_NA_1 — CP56Time2a
-        104 => 1,        // C_TS_NA_1 — FBP (obsolete)
-        105 => 1,        // C_RP_NA_1 — QRP
-        106 => 3,        // C_CD_NA_1 — CP16Time2a
-        107 => 1 + 7,    // C_TS_TA_1 — TSC + CP56
+        // --- System information ---
+        70 => 1,      // M_EI_NA_1 — COI
+        100 => 1,     // C_IC_NA_1 — QOI
+        101 => 1,     // C_CI_NA_1 — QCC
+        102 => 0,     // C_RD_NA_1 — no element
+        103 => 7,     // C_CS_NA_1 — CP56Time2a
+        104 => 2,     // C_TS_NA_1 — FBP (fixed test pattern 0x55AA)
+        105 => 1,     // C_RP_NA_1 — QRP
+        106 => 2,     // C_CD_NA_1 — CP16Time2a
+        107 => 2 + 7, // C_TS_TA_1 — TSC + CP56
+        // --- Parameter in control direction ---
+        110 => 2 + 1, // P_ME_NA_1 — NVA + QPM
+        111 => 2 + 1, // P_ME_NB_1 — SVA + QPM
+        112 => 4 + 1, // P_ME_NC_1 — float + QPM
+        113 => 1,     // P_AC_NA_1 — QPA
+        // --- File transfer (fixed-length ones only) ---
+        120 => 2 + 3 + 1,     // F_FR_NA_1 — NOF + LOF + FRQ
+        121 => 2 + 1 + 3 + 1, // F_SR_NA_1 — NOF + NOS + LOF + SRQ
+        122 => 2 + 1 + 1,     // F_SC_NA_1 — NOF + NOS + SCQ
+        123 => 2 + 1 + 1 + 1, // F_LS_NA_1 — NOF + NOS + LSQ + CHS
+        124 => 2 + 1 + 1,     // F_AF_NA_1 — NOF + NOS + AFQ
+        // 125 F_SG_NA_1 carries a variable-length segment: no fixed size.
+        126 => 2 + 3 + 1 + 7, // F_DR_TA_1 — NOF + LOF + SOF + CP56
+        127 => 2 + 7 + 7,     // F_SC_NB_1 — NOF + range start + range stop
         _ => return None,
     })
 }
@@ -261,15 +292,46 @@ pub fn rewrite_asdu(asdu: &mut [u8], map: &RewriteMap) -> usize {
 /// element, for ASDU types whose elements end with a CP56Time2a field.
 /// Returns `None` for types without CP56Time2a (or that use the older
 /// CP24Time2a — those are intentionally skipped, see `rewrite_cp56time2a_to_now`).
+///
+/// File-transfer types (126, 127) carry file-system times, not event
+/// times, and are deliberately excluded so a rewrite never touches them.
 pub fn cp56_offset_in_element(type_id: u8) -> Option<usize> {
-    // Every CP56-bearing type in the table above ends its element with
-    // 7 bytes of CP56Time2a, so the offset is element_len - 7.
+    // Every CP56-bearing type listed here ends its element with 7 bytes
+    // of CP56Time2a, so the offset is element_len - 7.
     match type_id {
-        30 | 31 | 32 | 33 | 34 | 35 | 36 | 37 | 58 | 59 | 60 | 61 | 62 | 63 | 64 | 103 | 107 => {
-            element_len(type_id).map(|e| e - 7)
-        }
+        30..=40 | 58..=64 | 103 | 107 => element_len(type_id).map(|e| e - 7),
         _ => None,
     }
+}
+
+/// Byte offset (within `asdu`) of every CP56Time2a field the ASDU
+/// carries, walking SQ=0 and SQ=1 layouts. Fields that would run past
+/// the end of the buffer are not returned. This is the single shared
+/// CP56 walk used by the rewriters and the analyzer.
+pub fn cp56_field_offsets(asdu: &[u8]) -> Vec<usize> {
+    let mut out = Vec::new();
+    if asdu.len() < DUI_LEN {
+        return out;
+    }
+    let type_id = asdu[0];
+    let (Some(cp56_off_in_elem), Some(elem)) =
+        (cp56_offset_in_element(type_id), element_len(type_id))
+    else {
+        return out;
+    };
+    let (sq, n) = vsq(asdu);
+    // SQ=1: one IOA, then n consecutive elements. SQ=0: n (IOA, element)
+    // pairs. Either way the first element starts right after an IOA.
+    let first = DUI_LEN + IOA_LEN + cp56_off_in_elem;
+    let stride = if sq { elem } else { IOA_LEN + elem };
+    for k in 0..n as usize {
+        let cp_start = first + k * stride;
+        if cp_start + 7 > asdu.len() {
+            break;
+        }
+        out.push(cp_start);
+    }
+    out
 }
 
 /// Timezone convention for encoding / decoding a CP56Time2a field.
@@ -325,19 +387,15 @@ fn break_local(unix_secs: i64) -> (u32, u32, u32, u32, u32, u32, bool) {
     )
 }
 
-/// Inverse of `break_local`: take local calendar components plus the
-/// SU (DST) flag and return the Unix epoch seconds they represent.
-/// Uses `libc::mktime`, which respects the server's local timezone
-/// and `tm_isdst` when resolving ambiguous times at DST boundaries.
-fn assemble_local(
-    year: u32,
-    month: u32,
-    day: u32,
-    hour: u32,
-    minute: u32,
-    second: u32,
-    su: bool,
-) -> i64 {
+/// Local calendar components `(year, month, day, hour, minute, second)`
+/// with a 4-digit year and 1-based month.
+type Ymdhms = (u32, u32, u32, u32, u32, u32);
+
+/// Run `mktime` on local calendar components with the given
+/// `tm_isdst` hint. Returns the epoch seconds plus the normalised
+/// components mktime wrote back, or `None` if mktime failed.
+fn mktime_local(ymdhms: Ymdhms, isdst: i32) -> Option<(i64, Ymdhms)> {
+    let (year, month, day, hour, minute, second) = ymdhms;
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = year as i32 - 1900;
     tm.tm_mon = month as i32 - 1;
@@ -345,8 +403,49 @@ fn assemble_local(
     tm.tm_hour = hour as i32;
     tm.tm_min = minute as i32;
     tm.tm_sec = second as i32;
-    tm.tm_isdst = if su { 1 } else { 0 };
-    unsafe { libc::mktime(&mut tm) as i64 }
+    tm.tm_isdst = isdst;
+    let t = unsafe { libc::mktime(&mut tm) };
+    // CP56 years are 2000..=2127, so -1 is never a legitimate result:
+    // it is mktime's error value.
+    if t == -1 {
+        return None;
+    }
+    Some((
+        t as i64,
+        (
+            (tm.tm_year + 1900) as u32,
+            (tm.tm_mon + 1) as u32,
+            tm.tm_mday as u32,
+            tm.tm_hour as u32,
+            tm.tm_min as u32,
+            tm.tm_sec as u32,
+        ),
+    ))
+}
+
+/// Inverse of `break_local`: local calendar components to Unix epoch
+/// seconds, using the host's timezone rules.
+///
+/// The TZ rules decide; the SU flag is only a hint. Each of the two
+/// `tm_isdst` interpretations is tried and kept only if mktime did not
+/// have to normalise the wall-clock time (i.e. it really exists with
+/// that DST state). If both exist (the repeated hour when DST ends),
+/// SU picks between them. If neither does (the skipped hour when DST
+/// starts, which a correct encoder never produces), mktime's own
+/// `tm_isdst = -1` resolution is used. Returns `None` when mktime
+/// fails.
+fn assemble_local(ymdhms: Ymdhms, su: bool) -> Option<i64> {
+    let exact = |isdst: i32| -> Option<i64> {
+        let (t, norm) = mktime_local(ymdhms, isdst)?;
+        (norm == ymdhms).then_some(t)
+    };
+    let dst = exact(1);
+    let std = exact(0);
+    match (dst, std) {
+        (Some(d), Some(s)) if d != s => Some(if su { d } else { s }),
+        (Some(t), _) | (None, Some(t)) => Some(t),
+        (None, None) => mktime_local(ymdhms, -1).map(|(t, _)| t),
+    }
 }
 
 /// Encode a wall-clock instant as a CP56Time2a 7-byte field per
@@ -479,10 +578,15 @@ pub fn decode_cp56time2a(b: &[u8; 7]) -> (u64, bool, bool) {
 }
 
 /// Decode a CP56Time2a that was encoded in the server's local
-/// timezone (SU bit indicates the DST state at encode time). Returns
-/// (unix_ns, iv) — SU is consumed to resolve the ambiguity at DST
-/// transitions and not returned separately.
-pub fn decode_cp56time2a_local(b: &[u8; 7]) -> (u64, bool) {
+/// timezone. Returns `Some((unix_ns, iv))`.
+///
+/// The host's TZ rules are authoritative; the SU bit only breaks the
+/// tie for the repeated hour at the end of DST (see `assemble_local`).
+/// Returns `None` when the field is not a valid calendar time (month
+/// 0 or > 12, day 0, hour > 23, minute > 59, ms >= 60000) or mktime
+/// cannot convert it. Callers should count such stamps as undecodable
+/// rather than treat them as the epoch.
+pub fn decode_cp56time2a_local(b: &[u8; 7]) -> Option<(u64, bool)> {
     let ms_in_min = (b[0] as u32) | ((b[1] as u32) << 8);
     let iv = b[2] & 0x80 != 0;
     let minute = (b[2] & 0x3f) as u32;
@@ -491,14 +595,15 @@ pub fn decode_cp56time2a_local(b: &[u8; 7]) -> (u64, bool) {
     let day = (b[4] & 0x1f) as u32;
     let month = (b[5] & 0x0f) as u32;
     let year = 2000u32 + (b[6] & 0x7f) as u32;
+    if ms_in_min >= 60_000 || minute > 59 || hour > 23 || day == 0 || !(1..=12).contains(&month) {
+        return None;
+    }
 
     let second = ms_in_min / 1000;
     let ms = ms_in_min % 1000;
-    let secs = assemble_local(year, month, day, hour, minute, second, su);
-    // `mktime` can return -1 on failure (out-of-range, missing TZ).
-    // Clamp negative into 0 so the drift delta remains computable.
-    let base_secs = if secs < 0 { 0 } else { secs as u64 };
-    (base_secs * 1_000_000_000 + (ms as u64) * 1_000_000, iv)
+    let secs = assemble_local((year, month, day, hour, minute, second), su)?;
+    let secs = u64::try_from(secs).ok()?;
+    Some((secs * 1_000_000_000 + (ms as u64) * 1_000_000, iv))
 }
 
 /// Rewrite every CP56Time2a field inside the ASDU to `now_unix_ns`,
@@ -510,58 +615,14 @@ pub fn decode_cp56time2a_local(b: &[u8; 7]) -> (u64, bool) {
 /// field, returns 0 with no mutation. CP24Time2a (3-byte, in M_*_TA_1
 /// types) is intentionally NOT touched — see plan notes.
 pub fn rewrite_cp56time2a_to_now(asdu: &mut [u8], now_unix_ns: u64) -> usize {
-    if asdu.len() < DUI_LEN {
-        return 0;
+    let offsets = cp56_field_offsets(asdu);
+    for &cp_start in &offsets {
+        let field = &mut asdu[cp_start..cp_start + 7];
+        let iv = field[2] & 0x80 != 0;
+        let su = field[3] & 0x80 != 0;
+        field.copy_from_slice(&encode_cp56time2a(now_unix_ns, iv, su));
     }
-    let type_id = asdu[0];
-    let Some(cp56_off_in_elem) = cp56_offset_in_element(type_id) else {
-        return 0;
-    };
-    let Some(elem) = element_len(type_id) else {
-        return 0;
-    };
-    let (sq, n) = vsq(asdu);
-    let n = n as usize;
-    if n == 0 {
-        return 0;
-    }
-
-    let mut rewrites = 0usize;
-    if sq {
-        // Single base IOA, then n consecutive elements of size `elem`.
-        let mut off = DUI_LEN + IOA_LEN;
-        for _ in 0..n {
-            let cp_start = off + cp56_off_in_elem;
-            if cp_start + 7 > asdu.len() {
-                break;
-            }
-            let src: [u8; 7] = asdu[cp_start..cp_start + 7].try_into().unwrap();
-            let iv = src[2] & 0x80 != 0;
-            let su = src[3] & 0x80 != 0;
-            let new = encode_cp56time2a(now_unix_ns, iv, su);
-            asdu[cp_start..cp_start + 7].copy_from_slice(&new);
-            rewrites += 1;
-            off += elem;
-        }
-    } else {
-        // n full objects, each `IOA_LEN + elem` bytes.
-        let stride = IOA_LEN + elem;
-        let mut off = DUI_LEN;
-        for _ in 0..n {
-            let cp_start = off + IOA_LEN + cp56_off_in_elem;
-            if cp_start + 7 > asdu.len() {
-                break;
-            }
-            let src: [u8; 7] = asdu[cp_start..cp_start + 7].try_into().unwrap();
-            let iv = src[2] & 0x80 != 0;
-            let su = src[3] & 0x80 != 0;
-            let new = encode_cp56time2a(now_unix_ns, iv, su);
-            asdu[cp_start..cp_start + 7].copy_from_slice(&new);
-            rewrites += 1;
-            off += stride;
-        }
-    }
-    rewrites
+    offsets.len()
 }
 
 /// Zone-aware variant of [`rewrite_cp56time2a_to_now`]. Encodes each
@@ -574,58 +635,17 @@ pub fn rewrite_cp56time2a_to_now(asdu: &mut [u8], now_unix_ns: u64) -> usize {
 /// IV (invalid) is always preserved from the source ASDU so
 /// data-quality semantics survive the rewrite regardless of zone.
 pub fn rewrite_cp56time2a_to_now_zoned(asdu: &mut [u8], now_unix_ns: u64, zone: Cp56Zone) -> usize {
-    if asdu.len() < DUI_LEN {
-        return 0;
-    }
-    let type_id = asdu[0];
-    let Some(cp56_off_in_elem) = cp56_offset_in_element(type_id) else {
-        return 0;
-    };
-    let Some(elem) = element_len(type_id) else {
-        return 0;
-    };
-    let (sq, n) = vsq(asdu);
-    let n = n as usize;
-    if n == 0 {
-        return 0;
-    }
-
-    let mut rewrites = 0usize;
-    let patch = |asdu: &mut [u8], cp_start: usize| -> bool {
-        if cp_start + 7 > asdu.len() {
-            return false;
-        }
-        let src: [u8; 7] = asdu[cp_start..cp_start + 7].try_into().unwrap();
-        let iv = src[2] & 0x80 != 0;
+    let offsets = cp56_field_offsets(asdu);
+    for &cp_start in &offsets {
+        let field = &mut asdu[cp_start..cp_start + 7];
+        let iv = field[2] & 0x80 != 0;
         let new = match zone {
             Cp56Zone::Utc => encode_cp56time2a(now_unix_ns, iv, false),
             Cp56Zone::Local => encode_cp56time2a_local(now_unix_ns, iv),
         };
-        asdu[cp_start..cp_start + 7].copy_from_slice(&new);
-        true
-    };
-
-    if sq {
-        let mut off = DUI_LEN + IOA_LEN;
-        for _ in 0..n {
-            if !patch(asdu, off + cp56_off_in_elem) {
-                break;
-            }
-            rewrites += 1;
-            off += elem;
-        }
-    } else {
-        let stride = IOA_LEN + elem;
-        let mut off = DUI_LEN;
-        for _ in 0..n {
-            if !patch(asdu, off + IOA_LEN + cp56_off_in_elem) {
-                break;
-            }
-            rewrites += 1;
-            off += stride;
-        }
+        field.copy_from_slice(&new);
     }
-    rewrites
+    offsets.len()
 }
 
 /// Parse the JSON proto_config into a [`RewriteMap`]. Returns an empty
@@ -668,12 +688,15 @@ pub struct Iec104ProtoConfig {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Cp56Config {
     /// Whether to rewrite every CP56Time2a in outgoing ASDUs to the
     /// wall-clock moment the carrying frame hits the wire.
     #[serde(default, alias = "rewrite_cp56_to_now")]
     pub rewrite_to_now: bool,
     /// Timezone convention used by the rewrite. `"utc"` or `"local"`.
+    /// Validated by [`Iec104ProtoConfig::parse`]; use
+    /// [`Cp56Config::zone`] for the typed value.
     #[serde(default = "default_cp56_zone", alias = "cp56_zone")]
     pub zone: String,
 }
@@ -687,24 +710,56 @@ impl Default for Cp56Config {
     }
 }
 
+impl Cp56Config {
+    /// Typed zone. A config that came through
+    /// [`Iec104ProtoConfig::parse`] always has a valid zone string;
+    /// for a hand-built config an unknown string maps to `Local`.
+    pub fn zone(&self) -> Cp56Zone {
+        Cp56Zone::parse(&self.zone).unwrap_or(Cp56Zone::Local)
+    }
+}
+
 fn default_cp56_zone() -> String {
     "local".into()
 }
 
 impl Iec104ProtoConfig {
-    /// Parse `proto_config` JSON. Tolerates `None`, empty string,
-    /// `"null"`, `"{}"`, missing `cp56` sub-object — all default to
-    /// a no-rewrite local-zone config.
-    pub fn parse(proto_config: Option<&str>) -> Self {
+    /// Parse `proto_config` JSON. `None`, an empty string, `"null"`,
+    /// `"{}"` and a missing `cp56` sub-object all give the default
+    /// (no rewrite, local zone).
+    ///
+    /// Malformed input is an error, never a silent default: invalid
+    /// JSON, a wrongly typed field (`"rewrite_to_now": "true"`), an
+    /// unknown key inside `cp56` (a typo), or a zone other than
+    /// `"utc"` / `"local"`.
+    pub fn parse(proto_config: Option<&str>) -> Result<Self> {
         let Some(s) = proto_config else {
-            return Self::default();
+            return Ok(Self::default());
         };
         let trimmed = s.trim();
         if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
-            return Self::default();
+            return Ok(Self::default());
         }
-        serde_json::from_str(trimmed).unwrap_or_default()
+        let cfg: Self = serde_json::from_str(trimmed)
+            .map_err(|e| anyhow::anyhow!("proto_config (cp56): {e}"))?;
+        if Cp56Zone::parse(&cfg.cp56.zone).is_none() {
+            bail!(
+                "proto_config (cp56): unknown zone {:?} (expected \"utc\" or \"local\")",
+                cfg.cp56.zone
+            );
+        }
+        Ok(cfg)
     }
+}
+
+/// Validate a full IEC 104 `proto_config` (rewrite map and `cp56`
+/// section) without starting a run. Intended for submit-time
+/// validation so a malformed config is rejected before any run id is
+/// allocated.
+pub fn validate_proto_config(proto_config: Option<&str>) -> Result<()> {
+    load_rewrite_map(proto_config)?;
+    Iec104ProtoConfig::parse(proto_config)?;
+    Ok(())
 }
 
 /// Convenience for tests and callers that already hold a map in memory.
@@ -888,7 +943,7 @@ mod tests {
         // must round-trip to the same unix_ns within millisecond
         // precision, regardless of the server's current timezone.
         let b = encode_cp56time2a_local(PI_DAY_2024_NS, false);
-        let (ns, iv) = decode_cp56time2a_local(&b);
+        let (ns, iv) = decode_cp56time2a_local(&b).expect("decodable");
         let diff_ms = (ns as i128 - PI_DAY_2024_NS as i128).abs() / 1_000_000;
         assert!(
             diff_ms < 2,
@@ -906,7 +961,7 @@ mod tests {
     fn cp56_local_iv_preserved() {
         let b = encode_cp56time2a_local(PI_DAY_2024_NS, true);
         assert_eq!(b[2] & 0x80, 0x80, "IV bit must be set");
-        let (_, iv) = decode_cp56time2a_local(&b);
+        let (_, iv) = decode_cp56time2a_local(&b).expect("decodable");
         assert!(iv);
     }
 
@@ -940,7 +995,7 @@ mod tests {
         // DST state for Pi-Day 2024 — we don't assert a specific value,
         // only that the decoded unix_ns is close to the input.
         let stamp: [u8; 7] = asdu[9..16].try_into().unwrap();
-        let (ns, _) = decode_cp56time2a_local(&stamp);
+        let (ns, _) = decode_cp56time2a_local(&stamp).expect("decodable");
         let diff_ms = (ns as i128 - PI_DAY_2024_NS as i128).abs() / 1_000_000;
         assert!(diff_ms < 2, "{} ms off", diff_ms);
     }
@@ -970,7 +1025,12 @@ mod tests {
         assert_eq!(cp56_offset_in_element(58), Some(1)); // SCO + CP56
         assert_eq!(cp56_offset_in_element(64), Some(4)); // BSI + CP56
         assert_eq!(cp56_offset_in_element(103), Some(0)); // bare CP56
-                                                          // CP24 types intentionally not touched.
+        assert_eq!(cp56_offset_in_element(107), Some(2)); // TSC + CP56
+        assert_eq!(cp56_offset_in_element(38), Some(3)); // SEP + CP16 + CP56
+        assert_eq!(cp56_offset_in_element(40), Some(4)); // OCI + QDP + CP16 + CP56
+                                                         // File-transfer times are left alone.
+        assert_eq!(cp56_offset_in_element(126), None);
+        // CP24 types intentionally not touched.
         assert_eq!(cp56_offset_in_element(2), None);
         assert_eq!(cp56_offset_in_element(14), None);
         // Untimed types
@@ -1152,5 +1212,227 @@ mod tests {
         // Should rewrite only the first IOA (conservative fallback).
         assert_eq!(rewrite_asdu(&mut asdu, &map), 1);
         assert_eq!(read_ioa(&asdu, DUI_LEN), 999);
+    }
+
+    /// Table test against the information-element sizes in
+    /// IEC 60870-5-101 §7.3 / IEC 60870-5-104 §8 (sizes exclude the IOA).
+    #[test]
+    fn element_len_matches_standard_table() {
+        #[rustfmt::skip]
+        let table: &[(u8, &str, usize)] = &[
+            (1, "M_SP_NA_1", 1), (2, "M_SP_TA_1", 4), (3, "M_DP_NA_1", 1),
+            (4, "M_DP_TA_1", 4), (5, "M_ST_NA_1", 2), (6, "M_ST_TA_1", 5),
+            (7, "M_BO_NA_1", 5), (8, "M_BO_TA_1", 8), (9, "M_ME_NA_1", 3),
+            (10, "M_ME_TA_1", 6), (11, "M_ME_NB_1", 3), (12, "M_ME_TB_1", 6),
+            (13, "M_ME_NC_1", 5), (14, "M_ME_TC_1", 8), (15, "M_IT_NA_1", 5),
+            (16, "M_IT_TA_1", 8), (17, "M_EP_TA_1", 6), (18, "M_EP_TB_1", 7),
+            (19, "M_EP_TC_1", 7), (20, "M_PS_NA_1", 5), (21, "M_ME_ND_1", 2),
+            (30, "M_SP_TB_1", 8), (31, "M_DP_TB_1", 8), (32, "M_ST_TB_1", 9),
+            (33, "M_BO_TB_1", 12), (34, "M_ME_TD_1", 10), (35, "M_ME_TE_1", 10),
+            (36, "M_ME_TF_1", 12), (37, "M_IT_TB_1", 12), (38, "M_EP_TD_1", 10),
+            (39, "M_EP_TE_1", 11), (40, "M_EP_TF_1", 11),
+            (45, "C_SC_NA_1", 1), (46, "C_DC_NA_1", 1), (47, "C_RC_NA_1", 1),
+            (48, "C_SE_NA_1", 3), (49, "C_SE_NB_1", 3), (50, "C_SE_NC_1", 5),
+            (51, "C_BO_NA_1", 4), (58, "C_SC_TA_1", 8), (59, "C_DC_TA_1", 8),
+            (60, "C_RC_TA_1", 8), (61, "C_SE_TA_1", 10), (62, "C_SE_TB_1", 10),
+            (63, "C_SE_TC_1", 12), (64, "C_BO_TA_1", 11),
+            (70, "M_EI_NA_1", 1),
+            (100, "C_IC_NA_1", 1), (101, "C_CI_NA_1", 1), (102, "C_RD_NA_1", 0),
+            (103, "C_CS_NA_1", 7), (104, "C_TS_NA_1", 2), (105, "C_RP_NA_1", 1),
+            (106, "C_CD_NA_1", 2), (107, "C_TS_TA_1", 9),
+            (110, "P_ME_NA_1", 3), (111, "P_ME_NB_1", 3), (112, "P_ME_NC_1", 5),
+            (113, "P_AC_NA_1", 1),
+            (120, "F_FR_NA_1", 6), (121, "F_SR_NA_1", 7), (122, "F_SC_NA_1", 4),
+            (123, "F_LS_NA_1", 5), (124, "F_AF_NA_1", 4), (126, "F_DR_TA_1", 13),
+            (127, "F_SC_NB_1", 16),
+        ];
+        for &(t, name, len) in table {
+            assert_eq!(element_len(t), Some(len), "{name} (type {t})");
+        }
+        // Everything not in the table is unknown (undefined, reserved,
+        // private, or variable-length F_SG_NA_1).
+        for t in 0..=255u8 {
+            if !table.iter().any(|&(tt, _, _)| tt == t) {
+                assert_eq!(element_len(t), None, "type {t} should be unknown");
+            }
+        }
+    }
+
+    #[test]
+    fn rewrite_cp56_type107_keeps_tsc() {
+        // C_TS_TA_1: TSC (2 octets, 0xBEEF) + CP56. The TSC must survive.
+        let mut asdu = vec![
+            107, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0xef, 0xbe,
+        ];
+        asdu.extend_from_slice(&[0u8; 7]);
+        let n = rewrite_cp56time2a_to_now(&mut asdu, PI_DAY_2024_NS);
+        assert_eq!(n, 1);
+        assert_eq!(&asdu[9..11], &[0xef, 0xbe]);
+        assert_eq!(
+            &asdu[11..18],
+            &encode_cp56time2a(PI_DAY_2024_NS, false, false)
+        );
+    }
+
+    #[test]
+    fn cp56_field_offsets_sq0_and_sq1() {
+        // Type 31 (DIQ + CP56 = 8 octets).
+        let mut sq0 = vec![31, 0x02, 3, 0, 1, 0];
+        sq0.extend_from_slice(&[0u8; 2 * (IOA_LEN + 8)]);
+        assert_eq!(cp56_field_offsets(&sq0), vec![10, 21]);
+        let mut sq1 = vec![31, 0x82, 3, 0, 1, 0, 0, 0, 0];
+        sq1.extend_from_slice(&[0u8; 2 * 8]);
+        assert_eq!(cp56_field_offsets(&sq1), vec![10, 18]);
+        // Truncated second element is not returned.
+        sq1.truncate(sq1.len() - 1);
+        assert_eq!(cp56_field_offsets(&sq1), vec![10]);
+        // Untimed type.
+        assert!(cp56_field_offsets(&[1, 1, 3, 0, 1, 0, 0, 0, 0, 1]).is_empty());
+    }
+
+    #[test]
+    fn proto_config_parse_defaults_and_errors() {
+        for ok in [
+            None,
+            Some(""),
+            Some("null"),
+            Some("{}"),
+            Some(r#"{"ioa":{}}"#),
+        ] {
+            let c = Iec104ProtoConfig::parse(ok).unwrap();
+            assert!(!c.cp56.rewrite_to_now);
+            assert_eq!(c.cp56.zone(), Cp56Zone::Local);
+        }
+        let c = Iec104ProtoConfig::parse(Some(r#"{"cp56":{"rewrite_to_now":true,"zone":"UTC"}}"#))
+            .unwrap();
+        assert!(c.cp56.rewrite_to_now);
+        assert_eq!(c.cp56.zone(), Cp56Zone::Utc);
+        // Legacy aliases still accepted.
+        let c = Iec104ProtoConfig::parse(Some(
+            r#"{"cp56":{"rewrite_cp56_to_now":true,"cp56_zone":"local"}}"#,
+        ))
+        .unwrap();
+        assert!(c.cp56.rewrite_to_now);
+        for bad in [
+            r#"{"cp56":{"rewrite_to_now":"true"}}"#,
+            r#"{"cp56":{"rewrite_to_nwo":true}}"#,
+            r#"{"cp56":{"zone":"cet"}}"#,
+            r#"{"cp56":"#,
+            r#"{"cp56":5}"#,
+        ] {
+            assert!(Iec104ProtoConfig::parse(Some(bad)).is_err(), "{bad}");
+            assert!(validate_proto_config(Some(bad)).is_err(), "{bad}");
+        }
+        assert!(validate_proto_config(Some(r#"{"ioa":{"x":1}}"#)).is_err());
+        assert!(validate_proto_config(Some(r#"{"ioa":{"1":2},"cp56":{"zone":"utc"}}"#)).is_ok());
+    }
+
+    #[test]
+    fn cp56_local_rejects_invalid_fields() {
+        let good = encode_cp56time2a_local(PI_DAY_2024_NS, false);
+        assert!(decode_cp56time2a_local(&good).is_some());
+        let mut b = good;
+        b[5] = 0; // month 0
+        assert!(decode_cp56time2a_local(&b).is_none());
+        let mut b = good;
+        b[5] = 13;
+        assert!(decode_cp56time2a_local(&b).is_none());
+        let mut b = good;
+        b[4] &= 0xe0; // day 0
+        assert!(decode_cp56time2a_local(&b).is_none());
+        let mut b = good;
+        b[3] = (b[3] & 0x80) | 24; // hour 24
+        assert!(decode_cp56time2a_local(&b).is_none());
+        let mut b = good;
+        b[0] = 0x60;
+        b[1] = 0xea; // 60000 ms
+        assert!(decode_cp56time2a_local(&b).is_none());
+    }
+
+    /// Local-zone CP56 decoding across the Europe/Oslo DST transitions.
+    /// glibc reads `TZ` process-wide, so the checks run in a child
+    /// process of this test binary with `TZ=Europe/Oslo` (see
+    /// `oslo_dst_child`). Skipped when the tz database is not installed.
+    #[test]
+    fn cp56_local_dst_transitions_europe_oslo() {
+        if !std::path::Path::new("/usr/share/zoneinfo/Europe/Oslo").exists() {
+            eprintln!("skipping: /usr/share/zoneinfo/Europe/Oslo not installed");
+            return;
+        }
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .args([
+                "--ignored",
+                "--exact",
+                "asdu::tests::oslo_dst_child",
+                "--nocapture",
+            ])
+            .env("TZ", "Europe/Oslo")
+            .env("OUTSTATION_OSLO_DST_CHILD", "1")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success(),
+            "child failed:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(stdout.contains("1 passed"), "child did not run: {stdout}");
+    }
+
+    /// Child half of `cp56_local_dst_transitions_europe_oslo`. Only does
+    /// anything when launched by the parent with `TZ=Europe/Oslo`.
+    #[test]
+    #[ignore = "run by cp56_local_dst_transitions_europe_oslo with TZ=Europe/Oslo"]
+    fn oslo_dst_child() {
+        if std::env::var_os("OUTSTATION_OSLO_DST_CHILD").is_none() {
+            return;
+        }
+        const S: u64 = 1_000_000_000;
+        // Build a local-time CP56 stamp by hand: 2024-mm-dd hh:mm:00.
+        let stamp = |month: u8, day: u8, hour: u8, minute: u8, su: bool| -> [u8; 7] {
+            [
+                0,
+                0,
+                minute,
+                hour | if su { 0x80 } else { 0 },
+                day,
+                month,
+                24,
+            ]
+        };
+        let dec = |b: [u8; 7]| decode_cp56time2a_local(&b).map(|(ns, _)| ns / S);
+
+        // DST ends 2024-10-27 03:00 CEST -> 02:00 CET. 02:30 occurs twice.
+        // 02:30 CEST = 00:30 UTC = 1729989000; 02:30 CET = 01:30 UTC.
+        assert_eq!(dec(stamp(10, 27, 2, 30, true)), Some(1_729_989_000));
+        assert_eq!(dec(stamp(10, 27, 2, 30, false)), Some(1_729_992_600));
+        // Outside the ambiguous hour the TZ rules win over a wrong SU:
+        // 2024-11-05 12:00 is CET (11:00 UTC) whatever SU says.
+        assert_eq!(dec(stamp(11, 5, 12, 0, false)), Some(1_730_804_400));
+        assert_eq!(dec(stamp(11, 5, 12, 0, true)), Some(1_730_804_400));
+        // 2024-07-01 12:00 is CEST (10:00 UTC), even with SU=0.
+        assert_eq!(dec(stamp(7, 1, 12, 0, true)), Some(1_719_828_000));
+        assert_eq!(dec(stamp(7, 1, 12, 0, false)), Some(1_719_828_000));
+        // DST starts 2024-03-31 02:00 CET -> 03:00 CEST. 01:59 CET and
+        // 03:00 CEST are one minute apart in real time.
+        let before = dec(stamp(3, 31, 1, 59, false)).unwrap();
+        let after = dec(stamp(3, 31, 3, 0, true)).unwrap();
+        assert_eq!(before, 1_711_846_740);
+        assert_eq!(after - before, 60);
+        // 02:30 on that day does not exist; it still decodes (to a time
+        // inside the transition window) rather than to the epoch.
+        let gap = dec(stamp(3, 31, 2, 30, false)).unwrap();
+        assert!((before - 3600..=after + 3600).contains(&gap), "gap={gap}");
+
+        // Encoder/decoder round trip every 10 minutes across both
+        // transition days.
+        for start in [1_711_839_600u64, 1_729_980_000] {
+            for k in 0..(6 * 6) {
+                let t = start + k * 600;
+                let b = encode_cp56time2a_local(t * S, false);
+                assert_eq!(dec(b), Some(t), "round trip at {t} bytes={b:x?}");
+            }
+        }
     }
 }
