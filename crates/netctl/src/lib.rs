@@ -27,6 +27,7 @@ use tracing::{debug, warn};
 
 pub mod alias;
 pub mod cleanup;
+pub mod dad;
 pub mod guard;
 pub mod harden;
 pub mod journal;
@@ -39,6 +40,7 @@ pub use alias::{
     AliasLease, AliasOutcome,
 };
 pub use cleanup::{cleanup_all, iface_owner, reclaim_run_ifaces, reclaim_stale, CleanupReport};
+pub use dad::{check_address_free, probe_address_in_use, DAD_TIMEOUT};
 pub use guard::{EgressGuard, GatewayGuard};
 pub use journal::{aliases_path, guards_path, DEFAULT_STATE_DIR};
 pub use local::{local_iface_of, session_ifaces};

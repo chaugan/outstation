@@ -107,7 +107,9 @@ impl SlaveCapture {
 /// Make `listen_ip` bindable: nothing to do if it is unspecified or
 /// already local; otherwise add a `/32 noprefixroute` alias on the
 /// configured alias NIC (or the default-route NIC, which is protected
-/// and needs `force`). Returns the lease that keeps the alias alive.
+/// and needs `force`), unless another station on that LAN answers ARP
+/// for the address (refused unless `force`). Returns the lease that
+/// keeps the alias alive.
 pub(crate) fn ensure_listen_alias(
     listen_ip: Ipv4Addr,
     alias_iface: Option<&str>,
@@ -132,6 +134,8 @@ pub(crate) fn ensure_listen_alias(
     };
     netctl::check_nic_allowed(&iface, "add listen aliases to", prot).with_context(ctx)?;
     netctl::validate_alias_ip(listen_ip, prot).with_context(ctx)?;
+    // Refuse an address another station already answers for (F039).
+    netctl::check_address_free(&iface, listen_ip, prot)?;
     let lease = netctl::AliasLease::acquire(&iface, listen_ip, state_dir).with_context(ctx)?;
     Ok(Some(lease))
 }
