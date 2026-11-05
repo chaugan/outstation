@@ -134,6 +134,26 @@ impl Capture {
         Ok(true)
     }
 
+    /// Also capture on `iface`, through its own kernel `filter`, on a
+    /// capture started unfiltered (an unfiltered capture has no
+    /// capture-wide filter that could replace it). The run capture uses
+    /// this for the enslaved NIC: incoming frames to the run's MACs
+    /// only ([`bpf::incoming_to_macs_filter`]). Returns `false` if
+    /// `iface` is already captured.
+    pub fn add_iface_with_filter(&self, iface: &str, filter: &[bpf::Insn]) -> Result<bool> {
+        let mut inner = self.lock();
+        if inner.filter.is_some() {
+            bail!("add_iface_with_filter on a filtered capture; use add_iface");
+        }
+        if inner.socks.iter().any(|s| s.iface == iface) {
+            return Ok(false);
+        }
+        let sock = open_socket(iface, Some(filter))?;
+        info!(iface, path = %self.path.display(), "capture: added filtered interface");
+        inner.socks.push(sock);
+        Ok(true)
+    }
+
     /// Replace the kernel filter on every socket of a filtered capture
     /// (atomically per socket). A socket that rejects the new filter
     /// keeps its old one and is reported as an error.
@@ -237,8 +257,8 @@ impl Capture {
 
 /// Frames read from one socket per wakeup before the next is served.
 const BURST: usize = 256;
-/// Frames drained from one socket when the capture stops (bounded, so
-/// a socket that keeps receiving cannot hold the stop up).
+/// Frames drained in total when the capture stops (bounded, so a
+/// socket that keeps receiving cannot hold the stop up).
 const DRAIN_MAX: usize = 1 << 16;
 
 /// Counters shared with the handle.
@@ -273,9 +293,118 @@ fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
     }
 }
 
+/// One frame read in a wakeup, waiting to be written in time order.
+struct Pending {
+    ts_sec: u32,
+    ts_us: u32,
+    /// Range of the frame in the batch arena.
+    start: usize,
+    len: usize,
+}
+
+/// Outcome of reading one socket.
+enum SockRead {
+    /// Read `n` frames; the socket may hold more (the burst ran out).
+    More(usize),
+    /// Read `n` frames and the socket is empty.
+    Empty(usize),
+    /// The socket failed; drop it.
+    Dead,
+}
+
+/// Read up to `burst` frames from `fd` into `arena`/`batch`, stamping
+/// each with its kernel receive time (`SO_TIMESTAMP`; the read time if
+/// the kernel gave none).
+fn read_socket(
+    fd: RawFd,
+    loopback: bool,
+    iface: &str,
+    burst: usize,
+    buf: &mut [u8],
+    arena: &mut Vec<u8>,
+    batch: &mut Vec<Pending>,
+) -> SockRead {
+    // u64 storage keeps the control buffer aligned for cmsghdr.
+    let mut cbuf = [0u64; 16];
+    let mut n_read = 0usize;
+    for _ in 0..burst {
+        let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+        let mut msg: libc::msghdr = unsafe { mem::zeroed() };
+        msg.msg_name = &mut from as *mut libc::sockaddr_ll as *mut libc::c_void;
+        msg.msg_namelen = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cbuf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = mem::size_of_val(&cbuf) as _;
+        // SAFETY: `msg` points at live, correctly sized buffers.
+        let n = unsafe { libc::recvmsg(fd, &mut msg, libc::MSG_DONTWAIT) };
+        if n < 0 {
+            let err = io::Error::last_os_error();
+            return match err.raw_os_error() {
+                Some(libc::EAGAIN) | Some(libc::EINTR) => SockRead::Empty(n_read),
+                _ => {
+                    warn!(iface, error = %err, "capture recv failed; dropping interface");
+                    SockRead::Dead
+                }
+            };
+        }
+        if n == 0 {
+            return SockRead::Empty(n_read);
+        }
+        n_read += 1;
+        // The kernel filter already drops these on lo; this also
+        // covers an unfiltered or older socket.
+        if loopback && from.sll_pkttype == libc::PACKET_OUTGOING {
+            continue;
+        }
+        let tv = cmsg_timestamp(&msg).unwrap_or_else(|| {
+            let mut tv: libc::timeval = unsafe { mem::zeroed() };
+            // SAFETY: plain gettimeofday into a local.
+            unsafe {
+                libc::gettimeofday(&mut tv, std::ptr::null_mut());
+            }
+            tv
+        });
+        let frame = &buf[..n as usize];
+        batch.push(Pending {
+            ts_sec: tv.tv_sec as u32,
+            ts_us: tv.tv_usec as u32,
+            start: arena.len(),
+            len: frame.len(),
+        });
+        arena.extend_from_slice(frame);
+    }
+    SockRead::More(n_read)
+}
+
+/// The `SCM_TIMESTAMP` of a received message, if present.
+fn cmsg_timestamp(msg: &libc::msghdr) -> Option<libc::timeval> {
+    // SAFETY: `msg` was filled by recvmsg; the CMSG_* walk stays
+    // within `msg_control`/`msg_controllen`.
+    unsafe {
+        let mut c = libc::CMSG_FIRSTHDR(msg);
+        while !c.is_null() {
+            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_TIMESTAMP {
+                return Some(std::ptr::read_unaligned(
+                    libc::CMSG_DATA(c) as *const libc::timeval
+                ));
+            }
+            c = libc::CMSG_NXTHDR(msg, c);
+        }
+    }
+    None
+}
+
 fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c: &Counters) {
     let mut buf = vec![0u8; 65536];
+    let mut arena: Vec<u8> = Vec::with_capacity(1 << 20);
+    let mut batch: Vec<Pending> = Vec::with_capacity(BURST * 2);
     let mut last_stats = Instant::now();
+    let mut drained = 0usize;
     loop {
         // Once stopping, drain what is queued, collect the drop counts
         // and exit.
@@ -308,57 +437,36 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
             return;
         }
         let mut dead: Vec<RawFd> = Vec::new();
+        let mut more = false;
+        arena.clear();
+        batch.clear();
         for (p, (fd, loopback, iface)) in pfds.iter().zip(&socks) {
             if p.revents == 0 {
                 continue;
             }
-            let burst = if stopping { DRAIN_MAX } else { BURST };
-            for _ in 0..burst {
-                let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
-                let mut from_len = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
-                // SAFETY: `buf` and `from` are valid for the given sizes.
-                let n = unsafe {
-                    libc::recvfrom(
-                        *fd,
-                        buf.as_mut_ptr() as *mut libc::c_void,
-                        buf.len(),
-                        libc::MSG_DONTWAIT,
-                        &mut from as *mut libc::sockaddr_ll as *mut libc::sockaddr,
-                        &mut from_len,
-                    )
-                };
-                if n < 0 {
-                    let err = io::Error::last_os_error();
-                    match err.raw_os_error() {
-                        Some(libc::EAGAIN) | Some(libc::EINTR) => {}
-                        _ => {
-                            warn!(iface, error = %err, "capture recv failed; dropping interface");
-                            dead.push(*fd);
-                        }
-                    }
-                    break;
+            match read_socket(
+                *fd, *loopback, iface, BURST, &mut buf, &mut arena, &mut batch,
+            ) {
+                SockRead::More(n) => {
+                    more = true;
+                    drained += n;
                 }
-                if n == 0 {
-                    break;
-                }
-                // The kernel filter already drops these on lo; this
-                // also covers an unfiltered or older socket.
-                if *loopback && from.sll_pkttype == libc::PACKET_OUTGOING {
-                    continue;
-                }
-                let frame = &buf[..n as usize];
-                let mut tv: libc::timeval = unsafe { mem::zeroed() };
-                // SAFETY: plain gettimeofday into a local.
-                unsafe {
-                    libc::gettimeofday(&mut tv, std::ptr::null_mut());
-                }
-                if let Err(e) = write_record(writer, tv.tv_sec as u32, tv.tv_usec as u32, frame) {
-                    warn!(error = %e, "capture write failed");
-                    return;
-                }
-                c.packets.fetch_add(1, Ordering::Relaxed);
-                c.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                SockRead::Empty(n) => drained += n,
+                SockRead::Dead => dead.push(*fd),
             }
+        }
+        // Several sockets (the port mirror and the enslaved NIC) are
+        // read in turns: write this wakeup's frames in kernel time
+        // order, so a reply never lands before its request.
+        batch.sort_by_key(|p| (p.ts_sec, p.ts_us));
+        for p in &batch {
+            let frame = &arena[p.start..p.start + p.len];
+            if let Err(e) = write_record(writer, p.ts_sec, p.ts_us, frame) {
+                warn!(error = %e, "capture write failed");
+                return;
+            }
+            c.packets.fetch_add(1, Ordering::Relaxed);
+            c.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
         }
         if stopping || last_stats.elapsed() >= STATS_EVERY {
             collect_drops(&socks, &c.dropped);
@@ -372,8 +480,14 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
                 .retain(|s| !dead.contains(&s.fd.as_raw_fd()));
         }
         if stopping {
+            // Keep draining while a socket still holds frames, bounded
+            // so a socket that keeps receiving cannot hold the stop up.
+            if more && drained < DRAIN_MAX {
+                continue;
+            }
             return;
         }
+        drained = 0;
     }
 }
 
@@ -408,6 +522,27 @@ fn grow_rcvbuf(fd: RawFd, iface: &str) {
         }
     }
     debug!(iface, "capture: could not grow the receive buffer");
+}
+
+/// Ask for each frame's kernel receive time (`SO_TIMESTAMP`), so
+/// frames read from several sockets can be written in the order they
+/// were seen and the pcap's gaps reflect the wire, not the reader's
+/// wakeups. Best effort: without it the read time is used.
+fn enable_timestamps(fd: RawFd, iface: &str) {
+    let on: libc::c_int = 1;
+    // SAFETY: `on` is a valid c_int.
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_TIMESTAMP,
+            &on as *const libc::c_int as *const libc::c_void,
+            mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        debug!(iface, "capture: no kernel timestamps");
+    }
 }
 
 /// Link types a capture can record as LINKTYPE_ETHERNET.
@@ -478,6 +613,7 @@ fn open_socket(iface: &str, filter: Option<&[bpf::Insn]>) -> Result<CapSock> {
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
     let loopback = ltype == ARPHRD_LOOPBACK;
     grow_rcvbuf(fd.as_raw_fd(), iface);
+    enable_timestamps(fd.as_raw_fd(), iface);
     match (filter, loopback) {
         (Some(f), _) => attach_filter(fd.as_raw_fd(), &effective_filter(loopback, f))?,
         (None, true) => attach_filter(fd.as_raw_fd(), &bpf::skip_outgoing(&bpf::accept_all()))?,
@@ -549,5 +685,149 @@ impl Drop for Capture {
 pub fn delete_capture(path: &Path) {
     if path.exists() {
         let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A datagram socketpair stands in for an AF_PACKET socket: the
+    /// reader only polls and receives, and SO_TIMESTAMP works on it.
+    fn pair() -> (OwnedFd, OwnedFd) {
+        let mut fds = [0 as RawFd; 2];
+        // SAFETY: `fds` has room for the two descriptors.
+        let rc = unsafe {
+            libc::socketpair(
+                libc::AF_UNIX,
+                libc::SOCK_DGRAM | libc::SOCK_CLOEXEC,
+                0,
+                fds.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "{}", io::Error::last_os_error());
+        // SAFETY: both are fresh descriptors we own.
+        let (a, b) = unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        grow_rcvbuf(a.as_raw_fd(), "test");
+        enable_timestamps(a.as_raw_fd(), "test");
+        (a, b)
+    }
+
+    fn send(fd: &OwnedFd, frame: &[u8]) {
+        // SAFETY: `frame` is valid for its length.
+        let n = unsafe {
+            libc::send(
+                fd.as_raw_fd(),
+                frame.as_ptr() as *const libc::c_void,
+                frame.len(),
+                0,
+            )
+        };
+        assert_eq!(n, frame.len() as isize, "{}", io::Error::last_os_error());
+    }
+
+    fn capture_on(path: &Path, socks: Vec<OwnedFd>) -> Capture {
+        let socks = socks
+            .into_iter()
+            .enumerate()
+            .map(|(i, fd)| CapSock {
+                fd,
+                iface: format!("test{i}"),
+                loopback: false,
+            })
+            .collect();
+        Capture::spawn(
+            path.to_path_buf(),
+            Inner {
+                socks,
+                filter: None,
+            },
+            None,
+        )
+        .unwrap()
+    }
+
+    /// The records of a classic pcap: (sec, usec, frame).
+    fn records(path: &Path) -> Vec<(u32, u32, Vec<u8>)> {
+        let b = std::fs::read(path).unwrap();
+        let mut out = Vec::new();
+        let mut off = 24;
+        while off + 16 <= b.len() {
+            let u = |o: usize| u32::from_le_bytes(b[o..o + 4].try_into().unwrap());
+            let incl = u(off + 8) as usize;
+            out.push((u(off), u(off + 4), b[off + 16..off + 16 + incl].to_vec()));
+            off += 16 + incl;
+        }
+        assert_eq!(off, b.len(), "trailing bytes in {}", path.display());
+        out
+    }
+
+    fn frame(tag: u16) -> Vec<u8> {
+        let mut f = vec![0u8; 60];
+        f[..2].copy_from_slice(&tag.to_be_bytes());
+        f
+    }
+
+    /// B2: the counters `finish` returns are read after the reader has
+    /// stopped and drained, so they match the file exactly, even for
+    /// frames that were still queued when the stop was requested.
+    #[test]
+    fn finish_counts_every_frame_in_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        for round in 0..20u16 {
+            let path = dir.path().join(format!("c{round}.pcap"));
+            let (rx, tx) = pair();
+            let cap = capture_on(&path, vec![rx]);
+            let n = 300 + round * 37;
+            for i in 0..n {
+                send(&tx, &frame(i));
+            }
+            // Stop right away: most frames are still in the queue.
+            let st = cap.finish();
+            let recs = records(&path);
+            assert_eq!(st.packets, recs.len() as u64, "round {round}");
+            assert_eq!(st.packets, u64::from(n), "round {round}: drained on stop");
+            assert_eq!(
+                st.bytes,
+                recs.iter().map(|r| r.2.len() as u64).sum::<u64>(),
+                "round {round}"
+            );
+            assert_eq!(st.dropped, 0);
+        }
+    }
+
+    /// Frames read from several sockets in one wakeup are written in
+    /// kernel-timestamp order, not in socket order.
+    #[test]
+    fn frames_from_several_sockets_are_written_in_time_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("order.pcap");
+        let (rx_a, tx_a) = pair();
+        let (rx_b, tx_b) = pair();
+        // Queue before the reader starts, so one wakeup sees both
+        // sockets: b's frames are older than a's, a is read first.
+        for i in 0..5 {
+            send(&tx_b, &frame(100 + i));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        for i in 0..5 {
+            send(&tx_a, &frame(i));
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let cap = capture_on(&path, vec![rx_a, rx_b]);
+        std::thread::sleep(Duration::from_millis(300));
+        let st = cap.finish();
+        assert_eq!(st.packets, 10);
+        let recs = records(&path);
+        let tags: Vec<u16> = recs
+            .iter()
+            .map(|r| u16::from_be_bytes([r.2[0], r.2[1]]))
+            .collect();
+        assert_eq!(tags, [100, 101, 102, 103, 104, 0, 1, 2, 3, 4]);
+        let ts: Vec<(u32, u32)> = recs.iter().map(|r| (r.0, r.1)).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+        // Kernel receive times: the 2 ms spacing survives.
+        let us = |t: (u32, u32)| u64::from(t.0) * 1_000_000 + u64::from(t.1);
+        assert!(us(ts[9]) - us(ts[0]) >= 15_000, "{ts:?}");
     }
 }

@@ -19,6 +19,12 @@
 # reach $NS_A's host-only address nor route into $NS_M through a
 # session port (also with ip_forward=1).
 #
+# Then the Rust tests in crates/sched/tests/capture_netns.rs run raw
+# and master runs against the same LAN while watching it from $NS_T
+# (os-b): the run's capture holds every wire frame exactly once (sent
+# and received), nothing but replayed or session frames reaches the
+# LAN, and an unbounded master run spaces its connections.
+#
 # Usage: scripts/netns-bench-test.sh [extra test-binary args]
 # Env:   NS_A / NS_T / NS_X / NS_M (defaults ostest-bench-{a,t,x,m}; must
 #        start with "ostest-"), CARGO_TARGET_DIR (honoured by cargo).
@@ -43,8 +49,10 @@ done
 
 cd "$(dirname "$0")/.."
 
-bin="$(cargo test -p outstation --test bench_netns --no-run --message-format=json 2>/dev/null \
-  | python3 -c '
+# test_bin PACKAGE TEST: build an integration-test binary, print its path.
+test_bin() {
+  cargo test -p "$1" --test "$2" --no-run --message-format=json 2>/dev/null \
+    | python3 -c '
 import json, sys
 for line in sys.stdin:
     try:
@@ -52,11 +60,14 @@ for line in sys.stdin:
     except ValueError:
         continue
     if m.get("reason") == "compiler-artifact" and m.get("executable") \
-            and m["target"]["name"] == "bench_netns":
+            and m["target"]["name"] == sys.argv[1]:
         print(m["executable"])
-')"
-if [ -z "$bin" ]; then
-  echo "could not build the bench_netns test binary" >&2
+' "$2"
+}
+bin="$(test_bin outstation bench_netns)"
+cap_bin="$(test_bin sched capture_netns)"
+if [ -z "$bin" ] || [ -z "$cap_bin" ]; then
+  echo "could not build the bench_netns / capture_netns test binaries" >&2
   exit 1
 fi
 
@@ -107,3 +118,8 @@ sudo ip netns exec "$NS_A" env OUTSTATION_NETNS_TEST=1 \
   OUTSTATION_BENCH_TARGET=10.77.0.1 OUTSTATION_BENCH_NIC=os-a \
   OUTSTATION_NS_LAN="$NS_X" OUTSTATION_NS_MGMT="$NS_M" \
   "$bin" --ignored --test-threads=1 "$@"
+
+sudo ip netns exec "$NS_A" env OUTSTATION_NETNS_TEST=1 \
+  OUTSTATION_BENCH_TARGET=10.77.0.1 OUTSTATION_BENCH_NIC=os-a \
+  OUTSTATION_NS_TARGET="$NS_T" OUTSTATION_LAN_PORT=os-b \
+  "$cap_bin" --ignored --test-threads=1 "$@"

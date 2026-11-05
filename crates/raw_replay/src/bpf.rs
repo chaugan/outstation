@@ -76,6 +76,37 @@ pub fn skip_outgoing(prog: &[Insn]) -> Vec<Insn> {
     v
 }
 
+/// Accept frames that are *not* outgoing and whose destination MAC is
+/// a group address (broadcast or multicast) or one of `macs`: what a
+/// run bridge delivers from its enslaved NIC to the run's own ports.
+/// Used on the enslaved NIC, whose outgoing frames the port mirror
+/// already holds, so a capture of both sees every wire frame of the run
+/// exactly once (B1). Frames for other LAN hosts are dropped in the
+/// kernel. With more MACs than fit in one program, the MAC test is
+/// left out (every incoming frame is kept).
+pub fn incoming_to_macs_filter(macs: &[[u8; 6]]) -> Vec<Insn> {
+    // 5 instructions per MAC (all jumps short and forward), 7 fixed.
+    if macs.len() * 5 + 7 > MAX_INSNS {
+        return skip_outgoing(&accept_all());
+    }
+    let mut prog: Vec<Insn> = Vec::with_capacity(macs.len() * 5 + 4);
+    // Group bit of the destination MAC.
+    prog.push(stmt(LD | B | ABS, 0));
+    prog.push(jump(JMP | JSET | K, 0x01, 0, 1));
+    prog.push(stmt(RET | K, SNAPLEN));
+    for m in macs {
+        let hi = u32::from(u16::from_be_bytes([m[0], m[1]]));
+        let lo = u32::from_be_bytes([m[2], m[3], m[4], m[5]]);
+        prog.push(stmt(LD | W | ABS, 2));
+        prog.push(jump(JMP | JEQ | K, lo, 0, 3));
+        prog.push(stmt(LD | H | ABS, 0));
+        prog.push(jump(JMP | JEQ | K, hi, 0, 1));
+        prog.push(stmt(RET | K, SNAPLEN));
+    }
+    prog.push(stmt(RET | K, 0));
+    skip_outgoing(&prog)
+}
+
 /// Labels of [`tcp_endpoints_filter`].
 #[derive(Clone, Copy)]
 enum Label {
@@ -373,6 +404,66 @@ mod tests {
         let all = skip_outgoing(&accept_all());
         assert_eq!(run_typed(&all, &other, 0), SNAPLEN);
         assert_eq!(run_typed(&all, &other, libc::PACKET_OUTGOING), 0);
+    }
+
+    #[test]
+    fn incoming_frames_to_our_macs_and_groups_only() {
+        let a = [0x02, 0x00, 0x5e, 0x00, 0x64, 0x6c];
+        let b = [0x02, 0x13, 0x2c, 0xde, 0xd6, 0x23];
+        let p = incoming_to_macs_filter(&[a, b]);
+        let to = |dst: [u8; 6]| {
+            let mut f = tcp("10.77.0.1", 2404, "192.168.10.3", 50000);
+            f[..6].copy_from_slice(&dst);
+            f
+        };
+        let keep = |f: &[u8], t: u8| run_typed(&p, f, t) == SNAPLEN;
+        // Incoming (host, broadcast, multicast, other host).
+        for t in [0u8, 1, 2, 3] {
+            assert!(keep(&to(a), t));
+            assert!(keep(&to(b), t));
+            assert!(keep(&to([0xff; 6]), t), "broadcast");
+            assert!(keep(&to([0x01, 0x00, 0x5e, 0, 0, 0x16]), t), "multicast");
+            assert!(!keep(&to([0x02, 0x00, 0x5e, 0x00, 0x64, 0x6d]), t));
+            assert!(
+                !keep(&to([0x02, 0x01, 0x5e, 0x00, 0x64, 0x6c]), t),
+                "same low 4 bytes"
+            );
+            assert!(
+                !keep(&to([0x02, 0x00, 0x2c, 0xde, 0xd6, 0x23]), t),
+                "mixed halves"
+            );
+        }
+        // Outgoing copies are always dropped.
+        assert!(!keep(&to(a), libc::PACKET_OUTGOING));
+        assert!(!keep(&to([0xff; 6]), libc::PACKET_OUTGOING));
+        // Truncated frames are dropped.
+        assert_eq!(run(&p, &to(a)[..4]), 0);
+        // No MACs: groups only.
+        let g = incoming_to_macs_filter(&[]);
+        assert_eq!(run(&g, &to([0xff; 6])), SNAPLEN);
+        assert_eq!(run(&g, &to(a)), 0);
+        // Too many MACs: everything incoming.
+        let many: Vec<[u8; 6]> = (0..800u32)
+            .map(|n| {
+                let x = n.to_be_bytes();
+                [2, 0, x[0], x[1], x[2], x[3]]
+            })
+            .collect();
+        let m = incoming_to_macs_filter(&many);
+        assert!(m.len() <= MAX_INSNS);
+        assert_eq!(run(&m, &to(many[799])), SNAPLEN);
+        assert_eq!(run(&m, &to(many[0])), SNAPLEN);
+        assert_eq!(run(&m, &to([2, 9, 9, 9, 9, 9])), 0);
+        let huge: Vec<[u8; 6]> = (0..1000u32)
+            .map(|n| {
+                let x = n.to_be_bytes();
+                [2, 1, x[0], x[1], x[2], x[3]]
+            })
+            .chain(many.iter().copied())
+            .collect();
+        let h = incoming_to_macs_filter(&huge);
+        assert_eq!(run(&h, &to([2, 9, 9, 9, 9, 9])), SNAPLEN);
+        assert_eq!(run_typed(&h, &to(a), libc::PACKET_OUTGOING), 0);
     }
 
     #[test]

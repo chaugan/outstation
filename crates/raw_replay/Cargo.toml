@@ -19,3 +19,6 @@ tracing-subscriber = { workspace = true }
 libc = { workspace = true }
 pcapload = { path = "../pcapload" }
 rewrite = { path = "../rewrite" }
+
+[dev-dependencies]
+tempfile = "3"

@@ -23,6 +23,11 @@
 //!   deleting them (teardown, or [`crate::cleanup_all`] after a crash)
 //!   removes their per-interface settings with them, so there is no
 //!   prior value to restore;
+//! * on every interface a topology creates (hardened or not), before it
+//!   comes up ([`quiet_iface`]): multicast off and IPv6 off, and the
+//!   bridge is created without multicast snooping, so the run's
+//!   interfaces never originate IGMP, DAD, router solicitations or
+//!   MLD of their own: only replayed and session frames reach the LAN;
 //! * journaled, comment-tagged iptables rules (see [`crate::guard`]),
 //!   installed with an `iptables -C` check and failing closed:
 //!   - `raw PREROUTING -i <prefix>+ -j DROP`: nothing that arrives on
@@ -141,6 +146,30 @@ pub fn harden_iface(iface: &str, rp: RpFilter) -> Result<()> {
             write_sysctl(&key, "1").with_context(|| format!("harden {iface}: {key}=1"))?;
             if read_sysctl(&key)?.as_deref() != Some("1") {
                 bail!("harden {iface}: {key} did not stick at 1");
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Keep `iface` from originating frames of its own: multicast off (no
+/// IGMP reports, no multicast joins) and, when the kernel has IPv6,
+/// `disable_ipv6=1` (no DAD, router solicitations or MLD). Call before
+/// the interface comes up. Applied to every interface a topology
+/// creates, hardened or not, so that only replayed and session frames
+/// ever reach the LAN (O2). Like [`harden_iface`] this is not journaled:
+/// the setting dies with the interface.
+pub fn quiet_iface(iface: &str) -> Result<()> {
+    validate_owned_ifname(iface)?;
+    crate::ip(["link", "set", "dev", iface, "multicast", "off"])
+        .with_context(|| format!("quiet {iface}: multicast off"))?;
+    let key = format!("net.ipv6.conf.{iface}.disable_ipv6");
+    match read_sysctl(&key)? {
+        None => debug!(iface, "no IPv6 on this host"),
+        Some(_) => {
+            write_sysctl(&key, "1").with_context(|| format!("quiet {iface}: {key}=1"))?;
+            if read_sysctl(&key)?.as_deref() != Some("1") {
+                bail!("quiet {iface}: {key} did not stick at 1");
             }
         }
     }
@@ -285,6 +314,7 @@ mod tests {
     #[test]
     fn foreign_names_are_refused() {
         assert!(harden_iface("eth0", RpFilter::Strict).is_err());
+        assert!(quiet_iface("eth0").is_err());
         assert!(Hardening::install("eth", None, None, 1, Path::new("/nonexistent")).is_err());
     }
 }

@@ -499,10 +499,17 @@ fn start_capture(
     rt_priority: Option<i32>,
     warnings: &mut Vec<String>,
 ) {
-    // Capture on a dedicated dummy device that every run port mirrors
-    // its ingress and egress to (tc mirred), not on the bridge device
-    // (which only sees a fraction of forwarded traffic) nor on an
-    // extra bridge port (which only sees floods once MACs are learned).
+    // Two vantage points, so that every wire frame of the run is
+    // recorded exactly once (B1):
+    // * a dedicated dummy device every run port mirrors its *ingress*
+    //   to (tc mirred): each replayed or session frame, once, as it
+    //   enters the bridge, however often the bridge floods it;
+    // * the enslaved NIC, incoming only and only frames addressed to
+    //   the run's MACs (or broadcast/multicast): the target's replies.
+    //   Its outgoing frames are the ports' frames, already recorded.
+    // Not the bridge device (it sees only a fraction of forwarded
+    // traffic), nor an extra bridge port (only floods once MACs are
+    // learned), nor port egress (a flood is seen once per port).
     let port = match names.capture_port() {
         Ok(p) => p,
         Err(e) => {
@@ -513,22 +520,30 @@ fn start_capture(
     let Some(topo) = res.topo.as_mut() else {
         return;
     };
-    match topo.add_capture_mirror(&port) {
-        Ok(()) => match Capture::start_with_priority(&port, path, rt_priority) {
-            Ok(c) => {
-                info!(path = %path.display(), iface = %port, "capture started");
-                res.capture = Some(c);
-            }
-            Err(e) => {
-                warn!(error = %e, path = %path.display(), "capture failed to start");
-                warnings.push(format!("capture failed to start: {e:#}"));
-            }
-        },
+    if let Err(e) = topo.add_capture_mirror(&port) {
+        warn!(error = %format!("{e:#}"), "could not create capture mirror");
+        warnings.push(format!("could not create capture mirror: {e:#}"));
+        return;
+    }
+    let cap = match Capture::start_with_priority(&port, path, rt_priority) {
+        Ok(c) => c,
         Err(e) => {
-            warn!(error = %format!("{e:#}"), "could not create capture mirror");
-            warnings.push(format!("could not create capture mirror: {e:#}"));
+            warn!(error = %e, path = %path.display(), "capture failed to start");
+            warnings.push(format!("capture failed to start: {e:#}"));
+            return;
+        }
+    };
+    let filter = raw_replay::bpf::incoming_to_macs_filter(topo.port_macs());
+    for nic in topo.enslaved() {
+        if let Err(e) = cap.add_iface_with_filter(nic, &filter) {
+            warn!(nic, error = %format!("{e:#}"), "capture: cannot record replies on the NIC");
+            warnings.push(format!(
+                "capture records no replies from the target: capture on {nic} failed: {e:#}"
+            ));
         }
     }
+    info!(path = %path.display(), ifaces = ?cap.ifaces(), "capture started");
+    res.capture = Some(cap);
 }
 
 /// Stop the capture (after a short delay for frames still in flight)
