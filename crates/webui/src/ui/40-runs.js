@@ -1215,7 +1215,7 @@ function finishedStatsHtml(r) {
     `<div><dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd></div>` +
     `<div><dt>Ack p50</dt><dd>${lat(b.aggregate_latency_p50_us)}</dd></div>` +
     `<div><dt>Ack p99</dt><dd>${lat(b.aggregate_latency_p99_us)}</dd></div>` +
-    `<div><dt>Sessions</dt><dd>${fmtInt(b.sessions)}${b.sessions_failed ? ` <span class="bad">(${fmtInt(b.sessions_failed)} failed)</span>` : ''}</dd></div>` +
+    (b.sessions_failed ? `<div><dt>Failed sessions</dt><dd class="bad">${fmtInt(b.sessions_failed)} of ${fmtInt(b.sessions)}</dd></div>` : '') +
     `<div><dt>Messages</dt><dd>${fmtInt(b.total_messages_sent)} sent · ${fmtInt(b.total_messages_received)} received</dd></div></dl>`;
 }
 

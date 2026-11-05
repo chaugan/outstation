@@ -581,7 +581,8 @@ function renderCfgSummary() {
   const p = S.library.find(x => x.id === S.selectedPcapId);
   const rows = [];
   const row = (k, v, cls) => rows.push(`<dt>${esc(k)}</dt><dd${cls ? ` class="${cls}"` : ''}>${v}</dd>`);
-  row('Capture', p ? `<code class="wrap">${esc(p.name)}</code>` : 'none selected', p ? '' : 'warn');
+  // <wbr> after separators, so a long file name breaks at a sensible place.
+  row('Capture', p ? `<code class="wrap">${esc(p.name).replace(/([._-])/g, '$1<wbr>')}</code>` : 'none selected', p ? '' : 'warn');
   if (bench) {
     row('Role', c.role === 'slave' ? 'We simulate the RTUs (slave); the SCADA master connects to us' : 'We act as the master and connect to the target');
     const ip = val('cfg-target-ip');
