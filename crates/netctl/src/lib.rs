@@ -128,6 +128,7 @@ impl Topology {
         &mut self,
         prefix: &str,
         peer: Option<std::net::Ipv4Addr>,
+        peer_port: Option<u16>,
         state_dir: &std::path::Path,
     ) -> Result<()> {
         if self.hardening.is_some() {
@@ -136,6 +137,7 @@ impl Topology {
         self.hardening = Some(harden::Hardening::install(
             prefix,
             peer,
+            peer_port,
             self.run_id,
             state_dir,
         )?);
@@ -385,9 +387,21 @@ impl Topology {
             }
         }
         self.bridge_created = false;
-        // Interfaces are gone; only now drop the isolation rules.
+        // Only drop the isolation rules once every run interface is
+        // really gone. If any deletion failed, an interface may still
+        // carry a session address: keep the rules installed and
+        // journaled (fail closed) so `cleanup_all` removes them together
+        // with the leftover interfaces (security review).
         if let Some(mut h) = self.hardening.take() {
-            errors += h.release();
+            if errors == 0 {
+                errors += h.release();
+            } else {
+                warn!(
+                    prefix = %h.prefix,
+                    "interface teardown incomplete; keeping isolation rules for cleanup_all"
+                );
+                std::mem::forget(h);
+            }
         }
         self.done = true;
         errors

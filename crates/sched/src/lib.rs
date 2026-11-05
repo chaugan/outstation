@@ -436,6 +436,7 @@ fn bring_up_topology(
     names: &IfaceNames,
     egress_nic: Option<&str>,
     peer: Ipv4Addr,
+    peer_port: Option<u16>,
     state_dir: &Path,
     prot: &Protection,
     warnings: &mut Vec<String>,
@@ -452,7 +453,7 @@ fn bring_up_topology(
     let mut topo = Topology::new(&names.bridge, names.run_id)?;
     // Isolate the run's interfaces from the host stack before any
     // exists (fail closed): only `peer` may reach session addresses.
-    topo.harden(&names.tap_prefix, Some(peer), state_dir)
+    topo.harden(&names.tap_prefix, Some(peer), peer_port, state_dir)
         .context("isolate run interfaces from the host")?;
     topo.create_bridge().context("create bridge")?;
     res.topo = Some(topo);
@@ -645,6 +646,7 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         &names,
         cfg.egress_nic.as_deref(),
         cfg.target_ip,
+        None,
         &state_dir,
         &prot,
         &mut warnings,
@@ -1399,6 +1401,7 @@ pub fn run_benchmark(
         &names,
         cfg.egress_nic.as_deref(),
         cfg.target_ip,
+        Some(cfg.target_port),
         &state_dir,
         &prot,
         &mut warnings,

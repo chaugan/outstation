@@ -99,17 +99,25 @@ pub fn prefix_rules(prefix: &str, run_id: u64) -> [TaggedRule; 3] {
 }
 
 /// The per-session ACCEPT: `peer` may reach `src` on the run's
-/// interfaces.
-pub fn session_accept_rule(prefix: &str, peer: Ipv4Addr, src: Ipv4Addr, run_id: u64) -> TaggedRule {
+/// interfaces. With `peer_port` the rule is narrowed to TCP segments
+/// *from* that port (the replies of the target service the session
+/// talks to), so a spoofed `peer` source cannot reach any other
+/// protocol or port on the session address (security review).
+pub fn session_accept_rule(
+    prefix: &str,
+    peer: Ipv4Addr,
+    peer_port: Option<u16>,
+    src: Ipv4Addr,
+    run_id: u64,
+) -> TaggedRule {
     let wild = format!("{prefix}+");
     let (p, s) = (format!("{peer}/32"), format!("{src}/32"));
-    rule(
-        "raw",
-        "PREROUTING",
-        &["-i", &wild, "-s", &p, "-d", &s],
-        run_id,
-        "ACCEPT",
-    )
+    let port = peer_port.map(|x| x.to_string());
+    let mut spec: Vec<&str> = vec!["-i", &wild, "-s", &p, "-d", &s];
+    if let Some(port) = port.as_deref() {
+        spec.extend(["-p", "tcp", "--sport", port]);
+    }
+    rule("raw", "PREROUTING", &spec, run_id, "ACCEPT")
 }
 
 /// Apply the per-interface settings to `iface` and verify them.
@@ -146,6 +154,8 @@ pub fn harden_iface(iface: &str, rp: RpFilter) -> Result<()> {
 pub struct Hardening {
     pub prefix: String,
     pub peer: Option<Ipv4Addr>,
+    /// TCP source port of the peer's replies; narrows every ACCEPT.
+    pub peer_port: Option<u16>,
     run_id: u64,
     state_dir: PathBuf,
     // Dropped before `base`: ACCEPTs go first.
@@ -158,6 +168,7 @@ impl Hardening {
     pub fn install(
         prefix: &str,
         peer: Option<Ipv4Addr>,
+        peer_port: Option<u16>,
         run_id: u64,
         state_dir: &Path,
     ) -> Result<Self> {
@@ -168,10 +179,16 @@ impl Hardening {
                 .with_context(|| format!("isolate {prefix}+ from the host stack"))?;
             base.push(l);
         }
-        info!(prefix, ?peer, "run interfaces isolated from the host stack");
+        info!(
+            prefix,
+            ?peer,
+            ?peer_port,
+            "run interfaces isolated from the host stack"
+        );
         Ok(Self {
             prefix: prefix.to_string(),
             peer,
+            peer_port,
             run_id,
             state_dir: state_dir.to_path_buf(),
             accepts: HashMap::new(),
@@ -188,7 +205,7 @@ impl Hardening {
         if self.accepts.contains_key(&src) {
             return Ok(());
         }
-        let r = session_accept_rule(&self.prefix, peer, src, self.run_id);
+        let r = session_accept_rule(&self.prefix, peer, self.peer_port, src, self.run_id);
         let l = RuleLease::install(r, true, &self.state_dir)
             .with_context(|| format!("allow {peer} -> {src}"))?;
         self.accepts.insert(src, l);
@@ -234,12 +251,24 @@ mod tests {
         let a = session_accept_rule(
             "pcrab_",
             Ipv4Addr::new(10, 0, 0, 1),
+            Some(2404),
             Ipv4Addr::new(192, 168, 1, 2),
             7,
         );
         assert_eq!(
-            a.spec[..6],
-            ["-i", "pcrab_+", "-s", "10.0.0.1/32", "-d", "192.168.1.2/32"]
+            a.spec[..10],
+            [
+                "-i",
+                "pcrab_+",
+                "-s",
+                "10.0.0.1/32",
+                "-d",
+                "192.168.1.2/32",
+                "-p",
+                "tcp",
+                "--sport",
+                "2404"
+            ]
         );
         assert_eq!(a.spec.last().unwrap(), "ACCEPT");
         // Journal lines round-trip.
@@ -256,6 +285,6 @@ mod tests {
     #[test]
     fn foreign_names_are_refused() {
         assert!(harden_iface("eth0", RpFilter::Strict).is_err());
-        assert!(Hardening::install("eth", None, 1, Path::new("/nonexistent")).is_err());
+        assert!(Hardening::install("eth", None, None, 1, Path::new("/nonexistent")).is_err());
     }
 }

@@ -333,7 +333,7 @@ fn port_source_ip_is_validated() {
         .add_port_with_ip("pcr4_b0", None, Some(Ipv4Addr::new(10, 77, 0, 1)), &none)
         .unwrap_err();
     assert!(format!("{e:#}").contains("isolation"), "{e:#}");
-    topo.harden("pcr4_", Some(Ipv4Addr::new(10, 99, 0, 9)), &dir)
+    topo.harden("pcr4_", Some(Ipv4Addr::new(10, 99, 0, 9)), None, &dir)
         .unwrap();
     topo.create_bridge().unwrap();
     // 10.99.3.1 is nsfree0's address: stealing it is refused.
@@ -431,7 +431,7 @@ fn session_ports_are_isolated_and_mirrored() {
     let dir = state_dir("harden");
     let none = Protection::default();
     let mut topo = Topology::new("pcr5_br", 5).unwrap();
-    topo.harden("pcr5_", Some(Ipv4Addr::new(10, 55, 0, 1)), &dir)
+    topo.harden("pcr5_", Some(Ipv4Addr::new(10, 55, 0, 1)), None, &dir)
         .unwrap();
     topo.create_bridge().unwrap();
     let inj = topo
