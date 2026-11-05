@@ -10,7 +10,7 @@
 //!   sessions or runs sharing an IP do not delete it under each other.
 
 use std::collections::HashMap;
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Mutex, MutexGuard, OnceLock};
@@ -35,12 +35,7 @@ fn alias_line(iface: &str, ip: Ipv4Addr, prefix: u8) -> String {
     format!("{iface} {ip} {prefix}")
 }
 
-/// True if `ip` is assigned to any local interface.
-pub fn ip_is_local(ip: Ipv4Addr) -> Result<bool> {
-    Ok(crate::protect::all_local_addrs()?
-        .iter()
-        .any(|(_, a)| *a == IpAddr::V4(ip)))
-}
+pub use crate::local::ip_is_local;
 
 fn is_already_assigned_err(stderr: &str) -> bool {
     stderr.contains("File exists") || stderr.contains("already assigned")

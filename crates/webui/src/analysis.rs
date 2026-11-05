@@ -751,8 +751,12 @@ fn analyze_loaded(
     });
 
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
-    let (verdict, verdict_reason, run_warning) =
-        apply_run_status(run, verdict, verdict_reason, &mut fleet_notes);
+    let RunJudgement {
+        verdict,
+        reason: verdict_reason,
+        warning: run_warning,
+        score_pct,
+    } = apply_run_status(run, verdict, verdict_reason, score_pct, &mut fleet_notes);
 
     let iteration_starts_ms = detect_iteration_starts(captured, req.target_port, fleet.slave_count);
 
@@ -791,13 +795,38 @@ fn analyze_loaded(
     })
 }
 
-/// F093: a run that failed or sent nothing can never be certified.
+/// The fleet verdict after the run's own status was applied.
+#[derive(Debug, Clone, PartialEq)]
+struct RunJudgement {
+    verdict: &'static str,
+    reason: String,
+    warning: Option<String>,
+    score_pct: f64,
+}
+
+/// True when the run delivered nothing at all: it reported 0 messages
+/// sent, or every endpoint failed before sending one.
+fn delivered_nothing(run: &RunInfo) -> bool {
+    run.messages_sent == Some(0)
+        || (!run.endpoints.is_empty()
+            && run
+                .endpoints
+                .iter()
+                .all(|e| e.sent == 0 && e.state == "failed"))
+}
+
+/// F093/T07b: a run that failed, is still running or delivered nothing
+/// can never be certified, and never gets a `partial` (or any other
+/// capture-derived) verdict: it is `run_failed`. A run that delivered
+/// nothing also scores 0, whatever the capture holds.
 fn apply_run_status(
     run: &RunInfo,
     verdict: &'static str,
     reason: String,
+    score_pct: f64,
     notes: &mut Vec<String>,
-) -> (&'static str, String, Option<String>) {
+) -> RunJudgement {
+    let silent = delivered_nothing(run);
     // (warning, whether it blocks certification)
     let (warning, blocks) = match (run.status, run.messages_sent) {
         (RunStatusHint::Failed, _) => (
@@ -814,6 +843,10 @@ fn apply_run_status(
             Some("the run being analysed sent 0 messages".to_string()),
             true,
         ),
+        _ if silent => (
+            Some("every session of the run being analysed failed before sending".to_string()),
+            true,
+        ),
         (RunStatusHint::Running, _) => (
             Some("the run being analysed is still running".to_string()),
             true,
@@ -826,20 +859,34 @@ fn apply_run_status(
         _ => (None, false),
     };
     let Some(w) = warning else {
-        return (verdict, reason, None);
+        return RunJudgement {
+            verdict,
+            reason,
+            warning: None,
+            score_pct,
+        };
     };
     notes.insert(0, format!("WARNING: {w}"));
     if !blocks {
-        return (verdict, reason, Some(w));
+        return RunJudgement {
+            verdict,
+            reason,
+            warning: Some(w),
+            score_pct,
+        };
     }
-    if verdict == "all_correct" || verdict == "inconclusive" {
-        (
-            "run_failed",
-            format!("{w}; the capture matched ({reason}), but this run cannot be certified"),
-            Some(w),
-        )
+    let reason = if silent {
+        format!("{w}: the run delivered nothing, so there is nothing to score (capture: {verdict}, {reason})")
+    } else if verdict == "all_correct" || verdict == "inconclusive" {
+        format!("{w}; the capture matched ({reason}), but this run cannot be certified")
     } else {
-        (verdict, format!("{reason} ({w})"), Some(w))
+        format!("{w}; capture verdict {verdict}: {reason}")
+    };
+    RunJudgement {
+        verdict: "run_failed",
+        reason,
+        warning: Some(w),
+        score_pct: if silent { 0.0 } else { score_pct },
     }
 }
 
@@ -1934,44 +1981,157 @@ mod tests {
 
     #[test]
     fn apply_run_status_table() {
-        let mut notes = Vec::new();
-        let ok = RunInfo {
-            status: RunStatusHint::Completed,
-            messages_sent: Some(10),
+        let ep = |state: &str, sent: u64| SelectedEndpoint {
+            source_ip: rtu(2),
+            listen_ip: None,
+            listen_port: None,
+            state: state.into(),
+            cancelled: false,
+            sent,
+        };
+        let info = |status, sent: Option<u64>, eps: Vec<SelectedEndpoint>| RunInfo {
+            status,
+            messages_sent: sent,
+            endpoints: eps,
             ..Default::default()
         };
-        assert_eq!(
-            apply_run_status(&ok, "all_correct", "x".into(), &mut notes).0,
-            "all_correct"
-        );
-        let failed = RunInfo {
-            status: RunStatusHint::Failed,
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_run_status(&failed, "all_correct", "x".into(), &mut notes).0,
-            "run_failed"
-        );
-        assert_eq!(
-            apply_run_status(&failed, "partial", "x".into(), &mut notes).0,
-            "partial"
-        );
-        let running = RunInfo {
-            status: RunStatusHint::Running,
-            ..Default::default()
-        };
-        assert_eq!(
-            apply_run_status(&running, "all_correct", "x".into(), &mut notes).0,
-            "run_failed"
-        );
-        let partial = RunInfo {
-            status: RunStatusHint::Partial,
-            messages_sent: Some(10),
-            ..Default::default()
-        };
-        let (v, _, w) = apply_run_status(&partial, "all_correct", "x".into(), &mut notes);
-        assert_eq!(v, "all_correct");
-        assert!(w.is_some());
+        use RunStatusHint as H;
+        // (name, run, capture verdict, capture score, verdict, score, warned)
+        let cases: Vec<(&str, RunInfo, &str, f64, &str, f64, bool)> = vec![
+            (
+                "clean run",
+                info(H::Completed, Some(10), vec![]),
+                "all_correct",
+                100.0,
+                "all_correct",
+                100.0,
+                false,
+            ),
+            (
+                "clean partial",
+                info(H::Completed, Some(10), vec![]),
+                "partial",
+                81.4,
+                "partial",
+                81.4,
+                false,
+            ),
+            (
+                "session errors",
+                info(H::Partial, Some(10), vec![]),
+                "all_correct",
+                100.0,
+                "all_correct",
+                100.0,
+                true,
+            ),
+            (
+                "failed, matched",
+                info(H::Failed, Some(10), vec![]),
+                "all_correct",
+                100.0,
+                "run_failed",
+                100.0,
+                true,
+            ),
+            (
+                "failed, partial",
+                info(H::Failed, Some(10), vec![]),
+                "partial",
+                81.4,
+                "run_failed",
+                81.4,
+                true,
+            ),
+            (
+                "failed, failed",
+                info(H::Failed, Some(10), vec![]),
+                "failed",
+                10.0,
+                "run_failed",
+                10.0,
+                true,
+            ),
+            (
+                "running",
+                info(H::Running, Some(10), vec![]),
+                "all_correct",
+                100.0,
+                "run_failed",
+                100.0,
+                true,
+            ),
+            // The T07b report: 0 messages sent, capture judged partial.
+            (
+                "sent 0, partial",
+                info(H::Completed, Some(0), vec![]),
+                "partial",
+                81.4,
+                "run_failed",
+                0.0,
+                true,
+            ),
+            (
+                "stopped, sent 0",
+                info(H::Stopped, Some(0), vec![]),
+                "partial",
+                81.4,
+                "run_failed",
+                0.0,
+                true,
+            ),
+            (
+                "failed, sent 0",
+                info(H::Failed, Some(0), vec![]),
+                "all_correct",
+                100.0,
+                "run_failed",
+                0.0,
+                true,
+            ),
+            (
+                "every session failed before sending",
+                info(H::Failed, None, vec![ep("failed", 0), ep("failed", 0)]),
+                "partial",
+                81.4,
+                "run_failed",
+                0.0,
+                true,
+            ),
+            (
+                "every session failed before sending, status unknown",
+                info(H::Unknown, None, vec![ep("failed", 0), ep("failed", 0)]),
+                "partial",
+                81.4,
+                "run_failed",
+                0.0,
+                true,
+            ),
+            (
+                "one endpoint delivered",
+                info(H::Unknown, None, vec![ep("failed", 0), ep("completed", 5)]),
+                "partial",
+                81.4,
+                "partial",
+                81.4,
+                false,
+            ),
+        ];
+        for (name, run, v0, s0, want_v, want_s, warned) in cases {
+            let mut notes = Vec::new();
+            let j = apply_run_status(&run, v0, "x".into(), s0, &mut notes);
+            assert_eq!(j.verdict, want_v, "{name}");
+            assert_eq!(j.score_pct, want_s, "{name}");
+            assert_eq!(j.warning.is_some(), warned, "{name}");
+            assert_eq!(notes.len(), usize::from(warned), "{name}");
+            if want_s == 0.0 {
+                assert!(
+                    j.reason.contains("delivered nothing"),
+                    "{name}: {}",
+                    j.reason
+                );
+            }
+        }
     }
 
     #[test]

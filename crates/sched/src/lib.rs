@@ -174,6 +174,9 @@ pub struct SourceProgress {
     pub iter_current: Arc<AtomicU64>,
     /// Total iterations planned (`0` = unlimited / loop until cancel).
     pub iter_total: Arc<AtomicU64>,
+    /// Why the session failed; set together with the `FAILED` state.
+    /// `None` while running and for completed or cancelled sessions.
+    pub error: Arc<Mutex<Option<String>>>,
 }
 
 impl SourceProgress {
@@ -202,6 +205,7 @@ impl SourceProgress {
             listen_ip: Arc::new(Mutex::new(Ipv4Addr::UNSPECIFIED)),
             iter_current: Default::default(),
             iter_total: Default::default(),
+            error: Default::default(),
         }
     }
 
@@ -239,6 +243,21 @@ impl SourceProgress {
     }
     pub fn snapshot_listen_ip(&self) -> Ipv4Addr {
         *self.listen_ip.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    /// The session's failure reason, if it failed.
+    pub fn snapshot_error(&self) -> Option<String> {
+        self.error.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Record the terminal state; a `FAILED` state also records `error`.
+    fn set_final(&self, state: u8, error: Option<&str>) {
+        *self.error.lock().unwrap_or_else(|e| e.into_inner()) =
+            if state == protoplay::session_state::FAILED {
+                Some(error.unwrap_or("session failed").to_string())
+            } else {
+                None
+            };
+        self.state.store(state, Ordering::Relaxed);
     }
 
     /// Start iteration `iter` (1-based): fold the previous iteration's
@@ -1193,6 +1212,10 @@ pub struct SessionReport {
     pub flow_idx: usize,
     pub started_at_ns: u64,
     pub proto_report: protoplay::ProtoReport,
+    /// The session was stopped (run stop or per-session cancel) before
+    /// it finished. Its `proto_report.error`, if any, says where it was
+    /// stopped; it is not a failure.
+    pub cancelled: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1228,8 +1251,7 @@ struct SessionIdent {
 impl SessionIdent {
     fn failed_report(&self, msg: &str) -> SessionReport {
         self.progress
-            .state
-            .store(protoplay::session_state::FAILED, Ordering::Relaxed);
+            .set_final(protoplay::session_state::FAILED, Some(msg));
         SessionReport {
             src_ip: self.src_ip,
             src_mac: self.src_mac,
@@ -1240,6 +1262,7 @@ impl SessionIdent {
                 error: Some(msg.into()),
                 ..Default::default()
             },
+            cancelled: false,
         }
     }
 }
@@ -1346,26 +1369,43 @@ fn install_gateway(
     }
 }
 
+/// Terminal state of a session. A session that ends with an error
+/// while its (or the run's) cancel flag is up was stopped, not failed:
+/// a listener torn down by STOP before any master connected, or a
+/// script cut short by it, is `CANCELLED`. A session that finished
+/// cleanly stays `COMPLETED` even if the stop arrived during its
+/// idle-serve tail.
+fn final_state(cancelled_mid_run: bool, cancel_flag: bool, has_error: bool) -> u8 {
+    use protoplay::session_state as ss;
+    if cancelled_mid_run || (cancel_flag && has_error) {
+        ss::CANCELLED
+    } else if has_error {
+        ss::FAILED
+    } else {
+        ss::COMPLETED
+    }
+}
+
 /// Final per-session bookkeeping shared by master and slave workers.
+/// Returns whether the session counts as cancelled.
 fn finish_session(
     ctx: &RunContext,
     sp: &SourceProgress,
     pr: &protoplay::ProtoReport,
     cancelled_mid_run: bool,
-) {
+) -> bool {
     // Leave sent/received/bytes at the LAST iteration's live counts so
     // the per-iteration progress bar lands at ~100%; cumulative totals
     // are in `sent_done_iters + sent` and in the final report.
     sp.unacked.store(pr.unacked_at_end, Ordering::Relaxed);
-    let final_state = if cancelled_mid_run {
-        protoplay::session_state::CANCELLED
-    } else if pr.error.is_some() {
-        protoplay::session_state::FAILED
-    } else {
-        protoplay::session_state::COMPLETED
-    };
-    sp.state.store(final_state, Ordering::Relaxed);
+    let state = final_state(
+        cancelled_mid_run,
+        ctx.is_cancelled() || sp.is_cancelled(),
+        pr.error.is_some(),
+    );
+    sp.set_final(state, pr.error.as_deref());
     ctx.sessions_done.fetch_add(1, Ordering::Relaxed);
+    state == protoplay::session_state::CANCELLED
 }
 
 /// Walk the pcap's TCP flows, pick every flow whose server-side port
@@ -1601,8 +1641,7 @@ pub fn run_benchmark(
                     sleep_interruptible(Duration::from_nanos(first_pkt_rel_ns), cancelled);
                 }
                 if cancelled() {
-                    sp.state
-                        .store(protoplay::session_state::CANCELLED, Ordering::Relaxed);
+                    sp.set_final(protoplay::session_state::CANCELLED, None);
                     ctx_w.sessions_done.fetch_add(1, Ordering::Relaxed);
                     return SessionReport {
                         src_ip,
@@ -1614,6 +1653,7 @@ pub fn run_benchmark(
                             error: Some("cancelled before start".into()),
                             ..Default::default()
                         },
+                        cancelled: true,
                     };
                 }
 
@@ -1665,14 +1705,14 @@ pub fn run_benchmark(
                     }
                 }
                 let pr = acc.into_report();
-                finish_session(&ctx_w, &sp, &pr, cancelled_mid_run);
+                let cancelled = finish_session(&ctx_w, &sp, &pr, cancelled_mid_run);
                 info!(
                     %src_ip,
                     messages_sent = pr.messages_sent,
                     messages_received = pr.messages_received,
                     p50_us = pr.latency_p50_us,
                     p99_us = pr.latency_p99_us,
-                    cancelled = cancelled_mid_run,
+                    cancelled,
                     error = ?pr.error,
                     "benchmark session complete"
                 );
@@ -1683,6 +1723,7 @@ pub fn run_benchmark(
                     flow_idx,
                     started_at_ns,
                     proto_report: pr,
+                    cancelled,
                 }
             });
         match spawned {
@@ -1708,6 +1749,99 @@ pub fn run_benchmark(
     report.warnings.extend(warnings);
     res.finish(&mut report.warnings);
     Ok(report)
+}
+
+/// Capture of a slave run (T18): one AF_PACKET socket per interface
+/// that carries a listener's sessions, each with a kernel filter that
+/// admits only TCP to or from `(listen ip, listen port)` of this run's
+/// listeners. Listen IPs are only final once a slave is started (the
+/// user may edit them), so each slave registers its address with
+/// [`SlaveCapture::watch`] right before it binds.
+struct SlaveCapture {
+    cap: Capture,
+    port: u16,
+    /// The SCADA master, when known: the route to it names the
+    /// interface the sessions use.
+    peer: Option<Ipv4Addr>,
+    ips: Mutex<Vec<Ipv4Addr>>,
+    warnings: Mutex<Vec<String>>,
+}
+
+impl SlaveCapture {
+    fn start(path: &Path, port: u16, peer: Ipv4Addr) -> Result<Self> {
+        let cap = Capture::start_filtered(path, raw_replay::bpf::reject_all())?;
+        info!(path = %path.display(), port, "slave capture started");
+        Ok(Self {
+            cap,
+            port,
+            peer: (!peer.is_unspecified()).then_some(peer),
+            ips: Mutex::new(Vec::new()),
+            warnings: Mutex::new(Vec::new()),
+        })
+    }
+
+    fn warn(&self, msg: String) {
+        warn!("{msg}");
+        let mut w = self.warnings.lock().unwrap_or_else(|e| e.into_inner());
+        if w.len() < 16 && !w.contains(&msg) {
+            w.push(msg);
+        }
+    }
+
+    /// Record the sessions of a listener on `listen_ip`. Never fails
+    /// the session: problems become run warnings.
+    fn watch(&self, listen_ip: Ipv4Addr) {
+        if listen_ip.is_unspecified() {
+            self.warn(format!(
+                "capture: a listener on {listen_ip} (any address) is not recorded;                  give each RTU its own listen IP"
+            ));
+            return;
+        }
+        let ifaces = netctl::session_ifaces(listen_ip, self.peer);
+        let mut ips = self.ips.lock().unwrap_or_else(|e| e.into_inner());
+        if !ips.contains(&listen_ip) {
+            ips.push(listen_ip);
+            let filter = match raw_replay::bpf::tcp_endpoints_filter(&ips, self.port) {
+                Ok(f) => f,
+                Err(e) => {
+                    ips.pop();
+                    drop(ips);
+                    self.warn(format!("capture: {listen_ip} not recorded: {e:#}"));
+                    return;
+                }
+            };
+            if let Err(e) = self.cap.set_filter(filter) {
+                self.warn(format!("capture filter update for {listen_ip}: {e:#}"));
+            }
+        }
+        drop(ips);
+        if ifaces.is_empty() {
+            self.warn(format!(
+                "capture: no interface found that carries {listen_ip}; its sessions are not recorded"
+            ));
+        }
+        for i in ifaces {
+            if let Err(e) = self.cap.add_iface(&i) {
+                self.warn(format!("capture on {i} for {listen_ip}: {e:#}"));
+            }
+        }
+    }
+
+    /// Stop after a short flush delay; `(path, packets, bytes, warnings)`.
+    fn finish(self) -> (PathBuf, u64, u64, Vec<String>) {
+        std::thread::sleep(Duration::from_millis(200));
+        let packets = self.cap.packets.load(Ordering::Relaxed);
+        let bytes = self.cap.bytes.load(Ordering::Relaxed);
+        let path = self.cap.path.clone();
+        let ifaces = self.cap.ifaces();
+        self.cap.stop();
+        info!(packets, bytes, ?ifaces, "slave capture stopped");
+        let w = self
+            .warnings
+            .into_inner()
+            .unwrap_or_else(|e| e.into_inner());
+        (path, packets, bytes, w)
+    }
 }
 
 /// Make `listen_ip` bindable: nothing to do if it is unspecified or
@@ -1867,6 +2001,20 @@ fn run_benchmark_slave(
         ..Default::default()
     };
 
+    // Capture of the listeners' sessions (T18). A capture that cannot
+    // start costs the run its analysis, not the run itself.
+    let mut start_warnings: Vec<String> = Vec::new();
+    let capture: Option<Arc<SlaveCapture>> = cfg.capture_path.as_deref().and_then(|path| {
+        match SlaveCapture::start(path, cfg.listen_port_base, cfg.target_ip) {
+            Ok(c) => Some(Arc::new(c)),
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), "slave capture failed to start");
+                start_warnings.push(format!("capture failed to start: {e:#}"));
+                None
+            }
+        }
+    });
+
     // 3. Warmup.
     if cfg.startup_delay_secs > 0 {
         info!(
@@ -1908,6 +2056,7 @@ fn run_benchmark_slave(
         let session_progress = sp.message_progress(&ctx.cancel);
         let state_dir_w = state_dir.clone();
         let prot_w = prot.clone();
+        let capture_w = capture.clone();
         let ident = SessionIdent {
             src_ip,
             src_mac,
@@ -1921,7 +2070,7 @@ fn run_benchmark_slave(
             .spawn(move || {
                 let cancelled = || ctx_w.is_cancelled() || sp.is_cancelled();
                 let early_report = |msg: &str, state: u8| {
-                    sp.state.store(state, Ordering::Relaxed);
+                    sp.set_final(state, Some(msg));
                     ctx_w.sessions_done.fetch_add(1, Ordering::Relaxed);
                     SessionReport {
                         src_ip,
@@ -1933,19 +2082,29 @@ fn run_benchmark_slave(
                             error: Some(msg.into()),
                             ..Default::default()
                         },
+                        cancelled: state == protoplay::session_state::CANCELLED,
                     }
                 };
-                // Wait for the user to flip `ready` for this slave.
+                let cancelled_before_start = || {
+                    let msg = if ctx_w.is_cancelled() {
+                        "cancelled before start"
+                    } else {
+                        "slave cancelled before start"
+                    };
+                    early_report(msg, protoplay::session_state::CANCELLED)
+                };
+                // Wait for the user to flip `ready` for this slave. A
+                // stop also flips `ready` (to wake this loop), so check
+                // the cancel flags once more after the gate: a slave
+                // that never started is cancelled, not failed.
                 while !sp.is_ready() {
                     if cancelled() {
-                        let msg = if ctx_w.is_cancelled() {
-                            "cancelled before start"
-                        } else {
-                            "slave cancelled before start"
-                        };
-                        return early_report(msg, protoplay::session_state::CANCELLED);
+                        return cancelled_before_start();
                     }
                     std::thread::sleep(Duration::from_millis(150));
+                }
+                if cancelled() {
+                    return cancelled_before_start();
                 }
 
                 // Snapshot the user-edited listen IP after the gate.
@@ -1962,6 +2121,12 @@ fn run_benchmark_slave(
                         return early_report(&format!("{e:#}"), protoplay::session_state::FAILED);
                     }
                 };
+
+                // Record this listener's sessions from its first SYN.
+                if let Some(c) = &capture_w {
+                    c.watch(listen_ip);
+                }
+                drop(capture_w);
 
                 let started_at_ns = now_ns();
                 info!(%src_ip, %listen_ip, listen_port, bytes = payload.len(),
@@ -2023,7 +2188,7 @@ fn run_benchmark_slave(
                 }
 
                 let pr = acc.into_report();
-                finish_session(&ctx_w, &sp, &pr, cancelled_mid_run);
+                let cancelled = finish_session(&ctx_w, &sp, &pr, cancelled_mid_run);
                 info!(
                     %src_ip,
                     listen_port,
@@ -2031,7 +2196,7 @@ fn run_benchmark_slave(
                     messages_received = pr.messages_received,
                     p50_us = pr.latency_p50_us,
                     p99_us = pr.latency_p99_us,
-                    cancelled = cancelled_mid_run,
+                    cancelled,
                     error = ?pr.error,
                     "slave session complete"
                 );
@@ -2042,6 +2207,7 @@ fn run_benchmark_slave(
                     flow_idx,
                     started_at_ns,
                     proto_report: pr,
+                    cancelled,
                 }
             });
         match spawned {
@@ -2058,6 +2224,23 @@ fn run_benchmark_slave(
 
     // 5. Join all and aggregate.
     let mut report = join_sessions(handles, run_start_ns);
+    report.warnings.extend(start_warnings);
+    if let Some(c) = capture {
+        match Arc::try_unwrap(c) {
+            Ok(c) => {
+                let (path, packets, bytes, w) = c.finish();
+                report.capture_path = Some(path);
+                report.captured_packets = packets;
+                report.captured_bytes = bytes;
+                report.warnings.extend(w);
+            }
+            // Only a session thread that never returned still holds it;
+            // dropping the last reference stops the capture.
+            Err(_) => report
+                .warnings
+                .push("capture still referenced by a session; not reported".into()),
+        }
+    }
     res.finish(&mut report.warnings);
     Ok(report)
 }
@@ -2304,6 +2487,162 @@ mod tests {
         };
         let r = run_iteration(&PanicReplayer, cfg);
         assert!(r.error.unwrap().contains("spawn iec104-reader"));
+    }
+
+    #[test]
+    fn final_state_table() {
+        use protoplay::session_state as ss;
+        // (cancelled at a loop boundary, cancel flag up, error) -> state
+        let cases = [
+            (false, false, false, ss::COMPLETED),
+            (false, false, true, ss::FAILED),
+            (true, false, false, ss::CANCELLED),
+            (true, true, true, ss::CANCELLED),
+            // Stopped while listening / mid-script: the error is the stop.
+            (false, true, true, ss::CANCELLED),
+            // Finished cleanly while the stop arrived (idle-serve tail).
+            (false, true, false, ss::COMPLETED),
+        ];
+        for (mid, flag, err, want) in cases {
+            assert_eq!(final_state(mid, flag, err), want, "{mid} {flag} {err}");
+        }
+    }
+
+    /// Slave replayer that "listens" until cancelled, like the IEC 104
+    /// slave with no master connecting.
+    struct ListenUntilCancelled;
+    impl protoplay::ProtoReplayer for ListenUntilCancelled {
+        fn name(&self) -> &'static str {
+            "listen"
+        }
+        fn well_known_ports(&self) -> &'static [u16] {
+            &[2404]
+        }
+        fn readiness(&self) -> protoplay::Readiness {
+            protoplay::Readiness::Ready
+        }
+        fn run(&self, cfg: protoplay::ProtoRunCfg) -> protoplay::ProtoReport {
+            let p = cfg.progress.expect("progress");
+            p.state
+                .store(protoplay::session_state::LISTENING, Ordering::Relaxed);
+            while !p.is_cancelled() {
+                thread::sleep(Duration::from_millis(10));
+            }
+            p.state
+                .store(protoplay::session_state::FAILED, Ordering::Relaxed);
+            protoplay::ProtoReport {
+                error: Some("cancelled while listening".into()),
+                ..Default::default()
+            }
+        }
+    }
+
+    #[test]
+    fn stopping_a_slave_run_cancels_pending_and_listening_sessions() {
+        // T07b: STOP used to count never-started slaves as failed.
+        let pcap = Arc::new(
+            pcapload::load(
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("../../examples/synth_iec104_rtus200_ts.pcap"),
+            )
+            .unwrap(),
+        );
+        let rtus: std::collections::HashSet<Ipv4Addr> = [49, 67, 16]
+            .iter()
+            .map(|&n| Ipv4Addr::new(192, 168, 10, n))
+            .collect();
+        let state = tempfile_dir();
+        let cfg = BenchmarkConfig {
+            role: protoplay::Role::Slave,
+            selected_endpoints: Some(rtus),
+            state_dir: Some(state.clone()),
+            ..Default::default()
+        };
+        let ctx = RunContext::new();
+        let c = ctx.clone();
+        let h = thread::spawn(move || {
+            run_benchmark_slave(pcap, cfg, Arc::new(ListenUntilCancelled), c)
+        });
+        // One slave starts listening (on a loopback address: no alias),
+        // the other two never get their "start".
+        let first = loop {
+            let sp = ctx.sources().clone();
+            if sp.len() == 3 {
+                break sp[0].clone();
+            }
+            thread::sleep(Duration::from_millis(10));
+        };
+        *first.listen_ip.lock().unwrap() = Ipv4Addr::new(127, 0, 10, 49);
+        first.ready.store(true, Ordering::Relaxed);
+        while first.snapshot_state() != protoplay::session_state::LISTENING {
+            thread::sleep(Duration::from_millis(10));
+        }
+        // What the webui's STOP does: cancel everything and wake the
+        // pending slaves.
+        ctx.cancel_all();
+        for p in ctx.sources().iter() {
+            p.ready.store(true, Ordering::Relaxed);
+        }
+        let report = h.join().unwrap().unwrap();
+        assert_eq!(report.per_session.len(), 3);
+        for s in &report.per_session {
+            assert!(
+                s.cancelled,
+                "{} not cancelled: {:?}",
+                s.src_ip, s.proto_report.error
+            );
+        }
+        for p in ctx.sources().iter() {
+            assert_eq!(p.snapshot_state(), protoplay::session_state::CANCELLED);
+            assert_eq!(p.snapshot_error(), None);
+        }
+        assert_eq!(ctx.sessions_done.load(Ordering::Relaxed), 3);
+        let _ = std::fs::remove_dir_all(state);
+    }
+
+    fn tempfile_dir() -> PathBuf {
+        let d =
+            std::env::temp_dir().join(format!("sched-test-{}-{}", std::process::id(), now_ns()));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn a_failed_session_records_its_reason() {
+        let p = SourceProgress::new(None, [0; 6], "x".into(), 0, true);
+        let ctx = RunContext::new();
+        let pr = protoplay::ProtoReport {
+            error: Some("no master connected within 600s".into()),
+            ..Default::default()
+        };
+        assert!(!finish_session(&ctx, &p, &pr, false));
+        assert_eq!(p.snapshot_state(), protoplay::session_state::FAILED);
+        assert_eq!(
+            p.snapshot_error().as_deref(),
+            Some("no master connected within 600s")
+        );
+        // A clean session has no reason.
+        let q = SourceProgress::new(None, [0; 6], "y".into(), 0, true);
+        finish_session(&ctx, &q, &protoplay::ProtoReport::default(), false);
+        assert_eq!(q.snapshot_state(), protoplay::session_state::COMPLETED);
+        assert_eq!(q.snapshot_error(), None);
+    }
+
+    #[test]
+    fn loopback_listen_ips_need_no_alias() {
+        // T07b: all of 127/8 is local via `lo`; a slave listening there
+        // must never be aliased onto a NIC (or refused for lack of one).
+        let prot = Protection::new(Vec::new(), false);
+        for ip in ["127.0.0.1", "127.0.10.49", "127.254.0.9"] {
+            let lease = ensure_listen_alias(
+                ip.parse().unwrap(),
+                None,
+                Path::new("/nonexistent-state-dir"),
+                &prot,
+            )
+            .unwrap();
+            assert!(lease.is_none(), "{ip} was aliased");
+        }
     }
 
     #[test]

@@ -258,6 +258,28 @@ fn slave(payload: Vec<u8>, proto_config: &str) -> (Running, u16) {
     (Running::spawn(c), port)
 }
 
+/// T07b: a slave stopped while still listening (no master ever
+/// connected) is cancelled, not failed.
+#[test]
+fn slave_stopped_while_listening_is_cancelled() {
+    let (run, _port) = slave(blob(&[sp_asdu(1, 1)]), "{}");
+    let deadline = Instant::now() + ms(3000);
+    while run.progress.state.load(Ordering::Relaxed) != session_state::LISTENING {
+        assert!(Instant::now() < deadline, "never listened");
+        std::thread::sleep(ms(5));
+    }
+    let state = run.progress.state.clone();
+    run.progress.cancel.store(true, Ordering::Relaxed);
+    let (rep, _, _) = run.join_within(ms(2000));
+    assert_eq!(rep.error.as_deref(), Some("cancelled while listening"));
+    assert!(!rep.connected);
+    assert_eq!(
+        state.load(Ordering::Relaxed),
+        session_state::CANCELLED,
+        "a never-connected listener must not count as failed"
+    );
+}
+
 /// F150: end-to-end slave session: handshake, replay, acks, live GI,
 /// idle-serve for `idle_serve_secs`, then close with FIN.
 #[test]

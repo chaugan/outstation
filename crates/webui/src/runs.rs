@@ -121,6 +121,7 @@ pub(crate) fn refresh_progress(rs: &mut RunState) {
                 cancelled: p.is_cancelled(),
                 iter_current: p.iter_current.load(Ordering::Relaxed),
                 iter_total: p.iter_total.load(Ordering::Relaxed),
+                error: p.snapshot_error(),
             }
         })
         .collect();
@@ -171,9 +172,12 @@ pub(crate) fn derive_status(cancelled: bool, outcome: &RunOutcome) -> (RunStatus
         }
         RunOutcome::Benchmark(Ok(r)) => {
             let n = r.per_session.len();
+            // Stopped sessions (a per-slave cancel) are not failures.
+            let cancelled = r.per_session.iter().filter(|s| s.cancelled).count();
             let errs: Vec<&str> = r
                 .per_session
                 .iter()
+                .filter(|s| !s.cancelled)
                 .filter_map(|s| s.proto_report.error.as_deref())
                 .collect();
             if n == 0 {
@@ -181,10 +185,24 @@ pub(crate) fn derive_status(cancelled: bool, outcome: &RunOutcome) -> (RunStatus
                     RunStatus::Failed,
                     Some("no sessions ran (no matching flows or RTUs selected)".into()),
                 )
-            } else if errs.len() == n {
+            } else if cancelled == n {
+                (
+                    RunStatus::Stopped,
+                    Some(format!("all {n} sessions were stopped")),
+                )
+            } else if errs.len() == n - cancelled {
+                let stopped = if cancelled > 0 {
+                    format!(" ({cancelled} more stopped)")
+                } else {
+                    String::new()
+                };
                 (
                     RunStatus::Failed,
-                    Some(format!("all {n} sessions failed; first error: {}", errs[0])),
+                    Some(format!(
+                        "all {} sessions failed{stopped}; first error: {}",
+                        errs.len(),
+                        errs[0]
+                    )),
                 )
             } else if !errs.is_empty() {
                 (
@@ -511,6 +529,7 @@ mod tests {
             iter_total: Arc::new(AtomicU64::new(0)),
             sent_done_iters: Arc::new(AtomicU64::new(0)),
             bytes_done_iters: Arc::new(AtomicU64::new(0)),
+            error: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -539,6 +558,103 @@ mod tests {
             (0, 144),
             "a failed session is not a sent frame"
         );
+    }
+
+    fn bench_session(error: Option<&str>, cancelled: bool) -> sched::SessionReport {
+        sched::SessionReport {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_mac: [0; 6],
+            tap: String::new(),
+            flow_idx: 0,
+            started_at_ns: 0,
+            proto_report: protoplay::ProtoReport {
+                error: error.map(str::to_string),
+                ..Default::default()
+            },
+            cancelled,
+        }
+    }
+
+    #[test]
+    fn cancelled_sessions_are_not_failures() {
+        // T07b: a STOP of a 200-slave run used to report 200 failures.
+        let stopped = |n: usize| BenchmarkReport {
+            per_session: (0..n)
+                .map(|_| bench_session(Some("cancelled before start"), true))
+                .collect(),
+            ..Default::default()
+        };
+        let r = stopped(200);
+        let (st, _) = derive_status(true, &RunOutcome::Benchmark(Ok(r.clone())));
+        assert_eq!(st, RunStatus::Stopped);
+        let j = BenchmarkReportJson::from(&r);
+        assert_eq!(j.sessions_failed(), 0);
+        assert_eq!(j.sessions_cancelled(), 200);
+        // Every slave cancelled one by one (no run-level stop).
+        let (st, _) = derive_status(false, &RunOutcome::Benchmark(Ok(stopped(3))));
+        assert_eq!(st, RunStatus::Stopped);
+
+        // One stopped, one completed: completed.
+        let r = BenchmarkReport {
+            per_session: vec![
+                bench_session(Some("slave cancelled before start"), true),
+                bench_session(None, false),
+            ],
+            ..Default::default()
+        };
+        assert_eq!(
+            derive_status(false, &RunOutcome::Benchmark(Ok(r))).0,
+            RunStatus::Completed
+        );
+        // One stopped, one failed: the failure still counts.
+        let r = BenchmarkReport {
+            per_session: vec![
+                bench_session(Some("slave cancelled before start"), true),
+                bench_session(Some("bind: in use"), false),
+            ],
+            ..Default::default()
+        };
+        let (st, e) = derive_status(false, &RunOutcome::Benchmark(Ok(r.clone())));
+        assert_eq!(st, RunStatus::Failed);
+        assert!(e.unwrap().contains("1 more stopped"));
+        assert_eq!(BenchmarkReportJson::from(&r).sessions_failed(), 1);
+    }
+
+    #[test]
+    fn per_source_rows_carry_the_failure_reason() {
+        let ctx = RunContext::new();
+        let s = source(0, 10);
+        s.state
+            .store(protoplay::session_state::FAILED, Ordering::Relaxed);
+        *s.error.lock().unwrap() = Some("no master connected within 600s".into());
+        ctx.per_source.lock_safe().push(s);
+        let mut rs = crate::persist::stored_to_runstate(
+            &crate::db::StoredRun {
+                id: 1,
+                status: "running".into(),
+                target_ip: "10.0.0.1".into(),
+                mode: "benchmark".into(),
+                ..Default::default()
+            },
+            std::path::Path::new("/nonexistent"),
+            std::path::Path::new("/nonexistent"),
+        )
+        .unwrap();
+        rs.ctx = ctx;
+        refresh_progress(&mut rs);
+        let row = &rs.per_source_progress[0];
+        assert_eq!(row.state, "failed");
+        assert_eq!(
+            row.error.as_deref(),
+            Some("no master connected within 600s")
+        );
+        let v = serde_json::to_value(rs.summary()).unwrap();
+        assert_eq!(
+            v["per_source_progress"][0]["error"],
+            "no master connected within 600s"
+        );
+        assert_eq!(v["sources_failed"], 1);
+        assert_eq!(v["sources_cancelled"], 0);
     }
 
     #[test]
