@@ -360,6 +360,41 @@ fn n17_reconnect_with_the_same_isn_and_no_fin_is_split() {
     assert_eq!(streams(&p, 1), (s4.client, s4.server));
 }
 
+/// T17c: a capture merged from two vantage points can hold a flow's
+/// SYN-ACK and the server's first data before the client's SYN. The SYN
+/// whose ISN the SYN-ACK acknowledges is that flow's own: one flow,
+/// both streams intact (it used to split off with the client's half).
+#[test]
+fn late_own_syn_after_its_syn_ack_does_not_split() {
+    let b = base();
+    // SYN, SYN-ACK, ACK, STARTDT act, STARTDT con, ... ->
+    // SYN-ACK, STARTDT con, SYN, ACK, STARTDT act, ...
+    let p0 = &b.pkts;
+    let mut pk = vec![
+        p0[1].clone(),
+        p0[4].clone(),
+        p0[0].clone(),
+        p0[2].clone(),
+        p0[3].clone(),
+    ];
+    pk.extend(p0[5..].iter().cloned());
+    let p = load(&pcap(&pk));
+    assert_eq!(p.flows.len(), 1, "flows: {:?}", p.flows);
+    assert_eq!(p.ingest.flows_split, 0);
+    assert!(p.flows[0].saw_syn && p.flows[0].saw_syn_ack);
+    assert_eq!(p.flows[0].client_isn, Some(1000));
+    assert_eq!(p.flows[0].client, Some((Ipv4Addr::from(CIP), CPORT)));
+    assert_eq!(streams(&p, 0), (b.client.clone(), b.server.clone()));
+
+    // A SYN with another ISN in the same place is still a new flow.
+    let other = session(77_000, 5000, 6, 1_700_000_000_000_000_000, true);
+    let mut pk = vec![p0[1].clone(), p0[4].clone(), other.pkts[0].clone()];
+    pk.extend(p0[5..].iter().cloned());
+    let p = load(&pcap(&pk));
+    assert_eq!(p.flows.len(), 2, "flows: {:?}", p.flows);
+    assert_eq!(p.ingest.flows_split, 1);
+}
+
 #[test]
 fn p05_retransmitted_syn_does_not_split() {
     let b = base();

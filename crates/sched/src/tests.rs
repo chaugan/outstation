@@ -800,10 +800,11 @@ fn capture_ok_and_truncation_reach_the_reports() {
     assert!(!b.capture_ok);
 }
 
-/// N8: a benchmark's capture reader runs at RT priority only with
-/// realtime on; the byte cap is passed through.
+/// T17c (reverting N8): a benchmark's capture reader asks for RT
+/// priority whether or not `realtime` is set; the byte cap is passed
+/// through.
 #[test]
-fn benchmark_capture_is_realtime_only_on_request() {
+fn benchmark_capture_is_realtime_whenever_allowed() {
     let cfg = BenchmarkConfig {
         capture_max_bytes: Some(1 << 20),
         ..Default::default()
@@ -811,7 +812,7 @@ fn benchmark_capture_is_realtime_only_on_request() {
     assert_eq!(
         bench_capture_opts(&cfg),
         CaptureOpts {
-            rt_priority: None,
+            rt_priority: Some(CAPTURE_RT_PRIORITY),
             max_bytes: Some(1 << 20),
         }
     );
@@ -884,5 +885,45 @@ fn replayed_flows_match_the_selection() {
     assert_eq!(slave.len(), picks.len());
     for p in &picks {
         assert_eq!(slave[&p.server_ip], p.flow_idx, "{}", p.server_ip);
+    }
+}
+
+/// T17c: a master-role benchmark with gateway mode is refused before it
+/// touches the host (no privileges needed to reach the refusal).
+#[test]
+fn master_role_refuses_gateway_mode() {
+    let pcap = Arc::new(
+        pcapload::load(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../examples/synth_iec104_rtus200_ts.pcap"),
+        )
+        .unwrap(),
+    );
+    for (ip, iface, nat) in [
+        (Some(Ipv4Addr::new(10, 0, 0, 254)), Some("eth0"), None),
+        (None, None, Some("eth1")),
+    ] {
+        let state = tempfile_dir();
+        let cfg = BenchmarkConfig {
+            role: protoplay::Role::Master,
+            scada_gateway_ip: ip,
+            scada_gateway_iface: iface.map(String::from),
+            upstream_nat_iface: nat.map(String::from),
+            state_dir: Some(state.clone()),
+            ..Default::default()
+        };
+        let e = run_benchmark(
+            Arc::clone(&pcap),
+            cfg,
+            Arc::new(proto_iec104::Iec104Replayer::new()),
+            RunContext::new(),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains("slave role only"), "{e:#}");
+        assert!(
+            std::fs::read_dir(&state).map_or(true, |mut d| d.next().is_none()),
+            "nothing journaled"
+        );
+        let _ = std::fs::remove_dir_all(state);
     }
 }

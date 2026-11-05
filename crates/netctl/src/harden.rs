@@ -241,20 +241,37 @@ impl Hardening {
         Ok(())
     }
 
-    /// Remove every rule now. Returns the number of failures (which
-    /// stay journaled).
+    /// [`Hardening::allow_session`] for many addresses at once: one
+    /// journal update and one iptables transaction
+    /// ([`RuleLease::install_batch`]). Addresses already allowed (or
+    /// repeated) are skipped.
+    pub fn allow_sessions(&mut self, srcs: &[Ipv4Addr]) -> Result<()> {
+        let Some(peer) = self.peer else {
+            bail!("a port with a source IP needs the run's peer (target) address");
+        };
+        let mut new: Vec<Ipv4Addr> = Vec::new();
+        for s in srcs {
+            if !self.accepts.contains_key(s) && !new.contains(s) {
+                new.push(*s);
+            }
+        }
+        let rules = new
+            .iter()
+            .map(|s| session_accept_rule(&self.prefix, peer, self.peer_port, *s, self.run_id))
+            .collect();
+        let leases = RuleLease::install_batch(rules, true, &self.state_dir)
+            .with_context(|| format!("allow {peer} -> {} session addresses", new.len()))?;
+        self.accepts.extend(new.into_iter().zip(leases));
+        Ok(())
+    }
+
+    /// Remove every rule now, the session ACCEPTs first, each group in
+    /// one batch ([`RuleLease::release_batch`]). Returns the number of
+    /// failures (which stay journaled).
     pub fn release(&mut self) -> usize {
-        let mut errors = 0;
-        for (_, l) in self.accepts.drain() {
-            if l.release().is_err() {
-                errors += 1;
-            }
-        }
-        for l in self.base.drain(..) {
-            if l.release().is_err() {
-                errors += 1;
-            }
-        }
+        let accepts: Vec<RuleLease> = self.accepts.drain().map(|(_, l)| l).collect();
+        let mut errors = RuleLease::release_batch(accepts);
+        errors += RuleLease::release_batch(std::mem::take(&mut self.base));
         errors
     }
 }

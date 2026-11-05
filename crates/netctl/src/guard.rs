@@ -295,6 +295,112 @@ fn iptables(args: &[&str]) -> Result<std::process::Output> {
         .with_context(|| format!("spawn `iptables {}`", args.join(" ")))
 }
 
+/// Words iptables-restore can take unquoted.
+fn restore_safe(word: &str) -> bool {
+    !word.is_empty()
+        && word
+            .bytes()
+            .all(|b| b.is_ascii_graphic() && !matches!(b, b'"' | b'\'' | b'\\' | b'#'))
+}
+
+/// The `iptables-restore --noflush` input applying `op(rule)` followed
+/// by the rule's spec for every rule, grouped by table in first-seen
+/// order (rule order is kept within a table). `None` if a word would
+/// need quoting.
+fn restore_script<'a>(
+    rules: &'a [TaggedRule],
+    op: impl Fn(&'a TaggedRule) -> Vec<&'a str>,
+) -> Option<String> {
+    let mut tables: Vec<&str> = Vec::new();
+    for r in rules {
+        if !tables.contains(&r.table.as_str()) {
+            tables.push(&r.table);
+        }
+    }
+    let mut out = String::new();
+    for t in tables {
+        if !restore_safe(t) {
+            return None;
+        }
+        out.push_str(&format!("*{t}\n"));
+        for r in rules.iter().filter(|r| r.table == t) {
+            let words: Vec<&str> = op(r)
+                .into_iter()
+                .chain(r.spec.iter().map(String::as_str))
+                .collect();
+            if !words.iter().all(|w| restore_safe(w)) {
+                return None;
+            }
+            out.push_str(&words.join(" "));
+            out.push('\n');
+        }
+        out.push_str("COMMIT\n");
+    }
+    Some(out)
+}
+
+/// Apply `op` to every rule in one atomic `iptables-restore --noflush`.
+fn restore_batch<'a>(
+    rules: &'a [TaggedRule],
+    op: impl Fn(&'a TaggedRule) -> Vec<&'a str>,
+) -> Result<()> {
+    use std::io::Write;
+    let script = restore_script(rules, op).context("rule needs quoting")?;
+    let mut child = Command::new("iptables-restore")
+        .args(["-w", "--noflush"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn `iptables-restore`")?;
+    let wrote = child
+        .stdin
+        .take()
+        .context("iptables-restore stdin")?
+        .write_all(script.as_bytes());
+    let out = child
+        .wait_with_output()
+        .context("wait for iptables-restore")?;
+    wrote.context("write to iptables-restore")?;
+    if !out.status.success() {
+        bail!(
+            "iptables-restore failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// For every rule, whether a rule with all of its words is still in its
+/// chain (`iptables -S`; a match may be a near-miss, which only costs
+/// an exact recheck). One listing per (table, chain).
+fn remaining_rules(rules: &[TaggedRule]) -> Result<Vec<bool>> {
+    let mut listings: HashMap<(String, String), Vec<Vec<String>>> = HashMap::new();
+    let mut out = Vec::with_capacity(rules.len());
+    for r in rules {
+        let key = (r.table.clone(), r.chain.clone());
+        if !listings.contains_key(&key) {
+            let o = iptables(&["-t", &r.table, "-S", &r.chain])?;
+            if !o.status.success() {
+                bail!(
+                    "iptables -S failed: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+            }
+            let lines = String::from_utf8_lossy(&o.stdout)
+                .lines()
+                .map(|l| l.split_whitespace().map(str::to_string).collect())
+                .collect();
+            listings.insert(key.clone(), lines);
+        }
+        let present = listings[&key]
+            .iter()
+            .any(|line: &Vec<String>| r.spec.iter().all(|w| line.contains(w)));
+        out.push(present);
+    }
+    Ok(out)
+}
+
 /// One comment-tagged iptables rule.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaggedRule {
@@ -408,6 +514,108 @@ impl RuleLease {
             line,
             released: false,
         })
+    }
+
+    /// Install many rules with one journal update and one
+    /// `iptables-restore --noflush` transaction (T17c: per-rule
+    /// `iptables` calls made master setup grow faster than linear).
+    /// Every rule is journaled before anything is applied, exactly as
+    /// [`RuleLease::install`] does, so a crash leaves nothing
+    /// unjournaled. The transaction is atomic: if it fails, its journal
+    /// lines are removed again and every rule goes through
+    /// [`RuleLease::install`] one by one. An identical rule that
+    /// already exists is not adopted here but inserted again; release
+    /// removes every copy.
+    pub fn install_batch(rules: Vec<TaggedRule>, top: bool, state_dir: &Path) -> Result<Vec<Self>> {
+        if rules.is_empty() {
+            return Ok(Vec::new());
+        }
+        let journal_path = guards_path(state_dir);
+        let lines = rules
+            .iter()
+            .map(|r| r.entry().to_line())
+            .collect::<Result<Vec<_>>>()?;
+        journal::add_lines(&journal_path, &lines).context("journal iptables rules")?;
+        let op: Vec<&str> = if top { vec!["-I"] } else { vec!["-A"] };
+        let applied = restore_batch(&rules, |r| {
+            let mut v = op.clone();
+            v.push(r.chain.as_str());
+            if top {
+                v.push("1");
+            }
+            v
+        });
+        let mut leases = Vec::with_capacity(rules.len());
+        match applied {
+            Ok(()) => {
+                for (rule, line) in rules.into_iter().zip(lines) {
+                    leases.push(Self {
+                        rule,
+                        journal_path: journal_path.clone(),
+                        line,
+                        released: false,
+                    });
+                }
+            }
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), rules = rules.len(),
+                    "batched iptables insert failed; inserting rule by rule");
+                journal::remove_lines(&journal_path, &lines)?;
+                for rule in rules {
+                    // On error the leases so far are dropped, which
+                    // removes their rules again (fail closed).
+                    leases.push(Self::install(rule, top, state_dir)?);
+                }
+            }
+        }
+        Ok(leases)
+    }
+
+    /// Remove many rules: one `iptables-restore --noflush` deleting one
+    /// copy of each, one listing per chain to catch copies left over,
+    /// which are then deleted rule by rule ([`TaggedRule::delete_all`]),
+    /// and one journal update. A rule that could not be removed stays
+    /// journaled. Returns the number of failures.
+    pub fn release_batch(leases: Vec<Self>) -> usize {
+        let mut leases: Vec<Self> = leases.into_iter().filter(|l| !l.released).collect();
+        if leases.is_empty() {
+            return 0;
+        }
+        let rules: Vec<TaggedRule> = leases.iter().map(|l| l.rule.clone()).collect();
+        let mut recheck = vec![true; leases.len()];
+        match restore_batch(&rules, |r| vec!["-D", r.chain.as_str()]) {
+            Ok(()) => match remaining_rules(&rules) {
+                Ok(left) => recheck = left,
+                Err(e) => {
+                    warn!(error = %format!("{e:#}"), "listing iptables rules failed");
+                }
+            },
+            Err(e) => {
+                warn!(error = %format!("{e:#}"), rules = rules.len(),
+                    "batched iptables delete failed; deleting rule by rule");
+            }
+        }
+        let mut errors = 0;
+        let mut gone: Vec<String> = Vec::with_capacity(leases.len());
+        for (l, again) in leases.iter_mut().zip(recheck) {
+            l.released = true;
+            if again {
+                if let Err(e) = l.rule.delete_all() {
+                    warn!(rule = ?l.rule, error = %format!("{e:#}"),
+                        "iptables rule removal failed; journal keeps it for cleanup");
+                    errors += 1;
+                    continue;
+                }
+            }
+            gone.push(l.line.clone());
+        }
+        if let Some(path) = leases.first().map(|l| l.journal_path.clone()) {
+            if let Err(e) = journal::remove_lines(&path, &gone) {
+                warn!(error = %format!("{e:#}"), "journal update after rule removal failed");
+                errors += 1;
+            }
+        }
+        errors
     }
 
     pub fn rule(&self) -> &TaggedRule {

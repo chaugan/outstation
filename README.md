@@ -244,7 +244,7 @@ The unit binds `0.0.0.0:8080` for LAN access, **without authentication**: read [
 4. **Start run**. In slave role, press **Start all pending** on the run card (or start listeners one by one), then let the master connect to the RTU IPs on port 2404.
 5. **Runs** shows live progress per session and, under **Details**, latency per session. **Analysis** lists the run's stored analyses, including the automatic one, and shows the per-RTU drill-down.
 
-The [SCADA lab guide](doc/scada-lab.en.md) walks through both scenarios, including SCADA-gateway mode for a master on another subnet.
+The [SCADA lab guide](doc/scada-lab.en.md) walks through both scenarios, including SCADA-gateway mode (slave role only) for a master on another subnet.
 
 ## Headless benchmarks for CI
 

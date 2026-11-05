@@ -495,7 +495,7 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // Validated by `load_config`: a boolean or absent (= on).
     let synthesize = pc.gi_ci_synthesis.unwrap_or(true);
     let echo_commands = pc.commands.enabled;
-    let responder = (synthesize || echo_commands).then(|| {
+    let live = (synthesize || echo_commands).then(|| {
         let mut inventory = Inventory::default();
         let mut book = CommandBook::default();
         for f in &script.frames {
@@ -509,17 +509,24 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             commands = echo_commands,
             "slave: built point inventory for live responses"
         );
-        let r = Responder::new(inventory).gi_ci(synthesize);
-        if echo_commands {
-            r.with_commands(CommandEcho {
-                cfg: pc.commands.clone(),
-                book,
-                zone: pc.cp56.zone(),
-            })
-        } else {
-            r
-        }
+        (inventory, book)
     });
+    // A fresh responder per connection: a master that closed before
+    // STARTDT leaves nothing behind for the next one (T17c).
+    let make_responder = || {
+        live.as_ref().map(|(inventory, book)| {
+            let r = Responder::new(inventory.clone()).gi_ci(synthesize);
+            if echo_commands {
+                r.with_commands(CommandEcho {
+                    cfg: pc.commands.clone(),
+                    book: book.clone(),
+                    zone: pc.cp56.zone(),
+                })
+            } else {
+                r
+            }
+        })
+    };
     // The live master gets synthesized answers to its own GI/CI and
     // commands; replaying the captured exchanges too would hand it
     // unsolicited confirmations and duplicate data (and, with return
@@ -568,62 +575,80 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     set_state(&progress, session_state::LISTENING);
     info!(%listen_addr, "slave: listening for master connect");
 
-    // 2. Accept, honouring cancel and LISTEN_ACCEPT_TIMEOUT.
-    let accept_deadline = Instant::now() + LISTEN_ACCEPT_TIMEOUT;
+    // 2. Accept, honouring cancel and LISTEN_ACCEPT_TIMEOUT, until a
+    //    master completes STARTDT. A master that closes (or resets) its
+    //    connection before that, e.g. a port probe or a master that
+    //    gives up and redials, leaves the session listening again
+    //    (T17c): the listener stays open until STARTDT.
     listener.set_nonblocking(true).ok();
-    let (stream, peer_addr) = loop {
-        if progress_cancelled(&progress) {
-            report.error = Some("cancelled while listening".into());
-            report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-            // Stopped before any master connected: not a failure.
-            set_state(&progress, session_state::CANCELLED);
-            return report;
-        }
-        match listener.accept() {
-            Ok((s, addr)) => break (s, addr),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= accept_deadline {
-                    report.error = Some(format!(
-                        "no master connected within {}s",
-                        LISTEN_ACCEPT_TIMEOUT.as_secs()
-                    ));
-                    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-                    set_state(&progress, session_state::FAILED);
-                    return report;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+    let base_report = report;
+    let mut dropped_before_startdt = 0u64;
+    let mut link = loop {
+        let (stream, peer_addr) = match accept_master(&listener, &progress, t_start) {
+            Ok(x) => x,
+            Err(mut r) => {
+                let mut report = base_report;
+                report.error = r.error.take();
+                report.elapsed_ms = r.elapsed_ms;
+                report.protocol.connections_before_startdt = dropped_before_startdt;
+                return report;
             }
-            Err(e) => {
-                report.error = Some(format!("accept: {e}"));
-                report.elapsed_ms = t_start.elapsed().as_millis() as u64;
+        };
+        stream.set_nonblocking(false).ok();
+        info!(%peer_addr, "slave: master connected");
+        set_state(&progress, session_state::CONNECTED);
+        stream.set_nodelay(cfg.tcp_nodelay).ok();
+        let opts = link_options(
+            Role::Slave,
+            &pc.session,
+            &pc,
+            &progress,
+            make_responder(),
+            format!("iec104-slave-reader-{}", cfg.listen_port),
+        );
+        let mut fresh = base_report.clone();
+        fresh.connected = true;
+        let mut link = match Link::start(stream, opts, fresh) {
+            Ok(l) => l,
+            Err(r) => {
                 set_state(&progress, session_state::FAILED);
+                return finish(*r, t_start);
+            }
+        };
+        match wait_startdt(&mut link) {
+            Startdt::Started => break link,
+            Startdt::Closed(why) => {
+                dropped_before_startdt += 1;
+                info!(%peer_addr, reason = %why, dropped_before_startdt,
+                    "slave: master left before STARTDT; listening again");
+                drop(link);
+                set_state(&progress, session_state::LISTENING);
+            }
+            Startdt::Failed(error) => {
+                let mut report = link.into_report();
+                report.protocol.connections_before_startdt = dropped_before_startdt;
+                if report.error.is_none() {
+                    report.error = error;
+                }
+                let report = finish(report, t_start);
+                set_state(
+                    &progress,
+                    if report.error.is_some() {
+                        session_state::FAILED
+                    } else {
+                        session_state::COMPLETED
+                    },
+                );
                 return report;
             }
         }
     };
     // One connection per session: stop accepting.
     drop(listener);
-    stream.set_nonblocking(false).ok();
-    info!(%peer_addr, "slave: master connected");
-    set_state(&progress, session_state::CONNECTED);
-    report.connected = true;
-    stream.set_nodelay(cfg.tcp_nodelay).ok();
+    link.report.protocol.connections_before_startdt = dropped_before_startdt;
+    set_state(&progress, session_state::ACTIVE);
+    info!("slave: STARTDT handshake complete, now active");
 
-    let opts = link_options(
-        Role::Slave,
-        &pc.session,
-        &pc,
-        &progress,
-        responder,
-        format!("iec104-slave-reader-{}", cfg.listen_port),
-    );
-    let mut link = match Link::start(stream, opts, report) {
-        Ok(l) => l,
-        Err(r) => {
-            set_state(&progress, session_state::FAILED);
-            return finish(*r, t_start);
-        }
-    };
     let error = drive_slave(&mut link, &cfg, &script, &pc.session);
     let mut report = link.into_report();
     if report.error.is_none() {
@@ -641,7 +666,77 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     report
 }
 
-/// STARTDT, script loops, idle-serve. Returns the session error.
+/// Wait for the next master connection on the (non-blocking)
+/// `listener`, honouring cancel and [`LISTEN_ACCEPT_TIMEOUT`] (counted
+/// from now). On cancel, timeout or an accept error the returned
+/// report carries the error and elapsed time, and the session state is
+/// set.
+fn accept_master(
+    listener: &TcpListener,
+    progress: &Option<MessageProgress>,
+    t_start: Instant,
+) -> Result<(std::net::TcpStream, SocketAddr), Box<ProtoReport>> {
+    let accept_deadline = Instant::now() + LISTEN_ACCEPT_TIMEOUT;
+    let end = |msg: String, state: u8| {
+        set_state(progress, state);
+        Err(Box::new(ProtoReport {
+            error: Some(msg),
+            elapsed_ms: t_start.elapsed().as_millis() as u64,
+            ..Default::default()
+        }))
+    };
+    loop {
+        if progress_cancelled(progress) {
+            // Stopped before any master connected: not a failure.
+            return end("cancelled while listening".into(), session_state::CANCELLED);
+        }
+        match listener.accept() {
+            Ok(x) => return Ok(x),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= accept_deadline {
+                    return end(
+                        format!(
+                            "no master connected within {}s",
+                            LISTEN_ACCEPT_TIMEOUT.as_secs()
+                        ),
+                        session_state::FAILED,
+                    );
+                }
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return end(format!("accept: {e}"), session_state::FAILED),
+        }
+    }
+}
+
+/// How the wait for the master's STARTDT act ended.
+enum Startdt {
+    Started,
+    /// The master closed or reset its connection first: the session
+    /// listens again.
+    Closed(String),
+    /// Timeout, protocol violation, cancel: the session ends with this
+    /// error (`None` = excused by fault injection).
+    Failed(Option<String>),
+}
+
+/// Wait for STARTDT act (the link replies con).
+fn wait_startdt(link: &mut Link) -> Startdt {
+    let deadline = now_ns() + HANDSHAKE_TIMEOUT.as_nanos() as u64;
+    match link.service(Some(deadline), |l| l.transfer() == Transfer::Started) {
+        Ok(()) if link.transfer() == Transfer::Started => Startdt::Started,
+        Ok(()) => Startdt::Failed(Some("timeout waiting for STARTDT act from master".into())),
+        Err(e @ (LinkEnd::PeerClosed | LinkEnd::Io(_))) if !link.fault_excused(&e) => {
+            Startdt::Closed(e.describe())
+        }
+        Err(e) => {
+            let msg = format!("{} waiting for STARTDT act", e.describe());
+            Startdt::Failed(fail(link, &e, msg))
+        }
+    }
+}
+
+/// Script loops and idle-serve after STARTDT. Returns the session error.
 fn drive_slave(
     link: &mut Link,
     cfg: &ProtoRunCfg,
@@ -650,19 +745,7 @@ fn drive_slave(
 ) -> Option<String> {
     let progress = &cfg.progress;
 
-    // 3. Wait for STARTDT act (the link replies con).
-    let deadline = now_ns() + HANDSHAKE_TIMEOUT.as_nanos() as u64;
-    match link.service(Some(deadline), |l| l.transfer() == Transfer::Started) {
-        Ok(()) if link.transfer() == Transfer::Started => {}
-        Ok(()) => return Some("timeout waiting for STARTDT act from master".into()),
-        Err(e) => {
-            let msg = format!("{} waiting for STARTDT act", e.describe());
-            return fail(link, &e, msg);
-        }
-    }
-    set_state(progress, session_state::ACTIVE);
-    info!("slave: STARTDT handshake complete, now active");
-
+    // 3. STARTDT is done (see `run_slave_session`).
     // 4. Replay the captured script `loop_iterations` times within this
     //    connection (0 = until cancel or disconnect). Sequence numbers
     //    and the window persist across loops. An empty script goes

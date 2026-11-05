@@ -37,7 +37,7 @@
 //! the per-endpoint [`SlaveDetail`] map, so the caller can persist the
 //! summary with the run and store or serve each detail lazily.
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet};
 use std::net::Ipv4Addr;
 use std::path::Path;
 
@@ -165,6 +165,56 @@ pub struct RunInfo {
     /// The capture stopped at its per-run size cap: frames after that
     /// point are missing from it, not from the wire.
     pub capture_truncated: bool,
+    /// The run's warnings about its capture (filter fallback, a
+    /// listener or NIC not recorded, …), see [`is_capture_warning`].
+    /// Copied into the notes and `run_warning` so that a reader of the
+    /// analysis alone sees them (T17c).
+    pub capture_warnings: Vec<String>,
+    /// The scheduler's `capture_ok`; `Some(false)` = the run knows its
+    /// capture is incomplete. `None` = unknown.
+    pub capture_ok: Option<bool>,
+}
+
+/// Whether a run warning is about the run's capture.
+pub fn is_capture_warning(w: &str) -> bool {
+    w.to_ascii_lowercase().contains("capture")
+}
+
+/// Capture warnings already reported by their own note (lost frames,
+/// the byte cap).
+fn capture_warning_has_own_note(w: &str) -> bool {
+    let l = w.to_ascii_lowercase();
+    l.starts_with("capture lost ")
+        || l.contains("byte cap")
+        || l.contains("size cap")
+        || l.contains("truncat")
+}
+
+/// The capture's problems in one line for `run_warning`, if any.
+fn capture_problems(run: &RunInfo) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if run.capture_ok == Some(false) {
+        parts.push("the run reported its capture as incomplete (capture_ok false)".into());
+    }
+    if run.capture_dropped > 0 {
+        parts.push(format!("it lost {} frames", run.capture_dropped));
+    }
+    if run.capture_truncated {
+        parts.push("it is truncated at its size cap".into());
+    }
+    parts.extend(
+        run.capture_warnings
+            .iter()
+            .filter(|w| !capture_warning_has_own_note(w))
+            .cloned(),
+    );
+    (!parts.is_empty()).then(|| {
+        format!(
+            "the run's capture is not a complete record ({}); frames reported missing may have \
+             been delivered",
+            parts.join("; ")
+        )
+    })
 }
 
 /// Everything [`analyze`] needs.
@@ -423,11 +473,124 @@ pub struct SlaveDetail {
     pub pacing_weight: f64,
 }
 
-#[derive(Serialize, Debug, Clone)]
+/// The controlling station(s) of the source pcap and of the run's
+/// capture. `captured`/`live` name one representative each (the
+/// renamed one when there is a rename, else the busiest, ties by
+/// address); the complete difference is in `captured_only` and
+/// `live_only` (T17c).
+#[derive(Serialize, Debug, Clone, PartialEq)]
 pub struct MasterIpMapping {
     pub captured: Option<String>,
     pub live: Option<String>,
     pub renamed: bool,
+    /// Masters of the source pcap that do not appear in the capture.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub captured_only: Vec<String>,
+    /// Masters of the capture that are not in the source pcap.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub live_only: Vec<String>,
+}
+
+/// Client IPs of the flows on `port`, with their flow counts.
+fn master_ip_counts(p: &LoadedPcap, port: u16) -> BTreeMap<Ipv4Addr, usize> {
+    let mut counts = BTreeMap::new();
+    for flow in &p.flows {
+        let Some((_, sp)) = flow.server else { continue };
+        if sp != port {
+            continue;
+        }
+        if let Some((cip, _)) = flow.client {
+            *counts.entry(cip).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// The busiest IP of `counts` (ties: the lowest address).
+fn busiest(counts: &BTreeMap<Ipv4Addr, usize>) -> Option<Ipv4Addr> {
+    counts
+        .iter()
+        .max_by_key(|(ip, c)| (**c, std::cmp::Reverse(**ip)))
+        .map(|(ip, _)| *ip)
+}
+
+/// At most `MAX` addresses, then how many more.
+fn ip_list(ips: &[Ipv4Addr]) -> String {
+    const MAX: usize = 8;
+    let mut s = ips
+        .iter()
+        .take(MAX)
+        .map(Ipv4Addr::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    if ips.len() > MAX {
+        s.push_str(&format!(", … (+{} more)", ips.len() - MAX));
+    }
+    s
+}
+
+/// Compare the masters of the source pcap (`captured`) with those of
+/// the run's capture (`live`): the mapping for the report and, when
+/// masters were renamed, one note naming every rename or summarising
+/// them. Deterministic whatever the flow order. A master of the source
+/// pcap that is missing from the capture without a new address taking
+/// its place is not a rename (its sessions never connected; the
+/// endpoint verdicts say so). In master role every session is its own
+/// master, so without a rename there is no single master to show.
+fn compare_master_ips(
+    captured: &BTreeMap<Ipv4Addr, usize>,
+    live: &BTreeMap<Ipv4Addr, usize>,
+    role: RoleHint,
+) -> (Option<MasterIpMapping>, Option<String>) {
+    let captured_only: Vec<Ipv4Addr> = captured
+        .keys()
+        .filter(|ip| !live.contains_key(ip))
+        .copied()
+        .collect();
+    let live_only: Vec<Ipv4Addr> = live
+        .keys()
+        .filter(|ip| !captured.contains_key(ip))
+        .copied()
+        .collect();
+    let renamed = !captured_only.is_empty() && !live_only.is_empty();
+    let note = match (renamed, captured_only.as_slice(), live_only.as_slice()) {
+        (false, _, _) => None,
+        (true, [a], [b]) => Some(format!("master IP renamed: captured={a} live={b}")),
+        (true, many, [b]) => Some(format!(
+            "master IP renamed: {} captured masters ({}) all appear as live={b}",
+            many.len(),
+            ip_list(many)
+        )),
+        (true, c, l) => Some(format!(
+            "master IPs renamed: {} captured master(s) not seen live ({}); {} live master(s) \
+             not in the source pcap ({})",
+            c.len(),
+            ip_list(c),
+            l.len(),
+            ip_list(l)
+        )),
+    };
+    if captured.is_empty() && live.is_empty() {
+        return (None, note);
+    }
+    if role == RoleHint::Master && !renamed && captured.len().max(live.len()) > 1 {
+        return (None, note);
+    }
+    let pick = |only: &[Ipv4Addr], all: &BTreeMap<Ipv4Addr, usize>| {
+        if renamed {
+            only.first().copied()
+        } else {
+            busiest(all)
+        }
+    };
+    let mapping = MasterIpMapping {
+        captured: pick(&captured_only, captured).map(|ip| ip.to_string()),
+        live: pick(&live_only, live).map(|ip| ip.to_string()),
+        renamed,
+        captured_only: captured_only.iter().map(Ipv4Addr::to_string).collect(),
+        live_only: live_only.iter().map(Ipv4Addr::to_string).collect(),
+    };
+    (Some(mapping), note)
 }
 
 /// Fleet-wide pacing-drift timeline. Protocol-agnostic XY series.
@@ -481,23 +644,6 @@ fn flow_info(flow: &pcapload::Flow) -> FlowInfo {
 
 /// Auto-detect the master IP: the client IP with the most flows whose
 /// server port matches `target_port`.
-fn detect_master_ip(p: &LoadedPcap, target_port: u16) -> Option<Ipv4Addr> {
-    let mut counts: HashMap<Ipv4Addr, usize> = HashMap::new();
-    for flow in &p.flows {
-        let Some((_, sp)) = flow.server else { continue };
-        if sp != target_port {
-            continue;
-        }
-        if let Some((cip, _)) = flow.client {
-            *counts.entry(cip).or_insert(0) += 1;
-        }
-    }
-    counts
-        .into_iter()
-        .max_by_key(|(ip, c)| (*c, std::cmp::Reverse(*ip)))
-        .map(|(ip, _)| ip)
-}
-
 /// The endpoint key of a flow: RTU (server) IP in slave role, master
 /// (client) IP in master role.
 fn endpoint_of(flow: &pcapload::Flow, role: RoleHint) -> Option<Ipv4Addr> {
@@ -606,24 +752,15 @@ fn analyze_loaded(
     let mut fleet_notes: Vec<String> = Vec::new();
     let source_port = detect_source_port(original, req.target_port, run, role);
 
-    let captured_master_ip = detect_master_ip(original, source_port);
-    let live_master_ip = detect_master_ip(captured, req.target_port);
-    let renamed = match (captured_master_ip, live_master_ip) {
-        (Some(a), Some(b)) => a != b,
-        _ => false,
-    };
-    let master_ip_mapping = if captured_master_ip.is_some() || live_master_ip.is_some() {
-        Some(MasterIpMapping {
-            captured: captured_master_ip.map(|ip| ip.to_string()),
-            live: live_master_ip.map(|ip| ip.to_string()),
-            renamed,
-        })
-    } else {
-        None
-    };
-    if let (true, Some(a), Some(b)) = (renamed, captured_master_ip, live_master_ip) {
-        fleet_notes.push(format!("master IP renamed: captured={a} live={b}"));
+    let mut captured_masters = master_ip_counts(original, source_port);
+    if role == RoleHint::Master && !run.endpoints.is_empty() {
+        // Masters the run did not select are not expected live.
+        captured_masters.retain(|ip, _| run.endpoints.iter().any(|e| e.source_ip == *ip));
     }
+    let live_masters = master_ip_counts(captured, req.target_port);
+    let (master_ip_mapping, rename_note) =
+        compare_master_ips(&captured_masters, &live_masters, role);
+    fleet_notes.extend(rename_note);
 
     // Source endpoints and the reference flow the replayer used for
     // each: the one sched picks (its best flow per endpoint, N18).
@@ -827,6 +964,24 @@ fn analyze_loaded(
             ),
         );
     }
+    // The run's other capture warnings (filter fallback, listeners or
+    // NICs not recorded), so the analysis alone shows them (T17c).
+    for w in run
+        .capture_warnings
+        .iter()
+        .rev()
+        .filter(|w| !capture_warning_has_own_note(w))
+    {
+        fleet_notes.insert(0, format!("WARNING: {w}"));
+    }
+    if run.capture_ok == Some(false) {
+        fleet_notes.insert(
+            0,
+            "WARNING: the run reported its capture as incomplete (capture_ok false); frames \
+             reported missing may have been delivered"
+                .to_string(),
+        );
+    }
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
     let RunJudgement {
         verdict,
@@ -834,6 +989,10 @@ fn analyze_loaded(
         warning: run_warning,
         score_pct,
     } = apply_run_status(run, verdict, verdict_reason, score_pct, &mut fleet_notes);
+    let run_warning = match (run_warning, capture_problems(run)) {
+        (Some(w), Some(c)) => Some(format!("{w}; {c}")),
+        (w, c) => w.or(c),
+    };
 
     let iteration_starts_ms = detect_iteration_starts(captured, req.target_port, fleet.slave_count);
 
@@ -1911,6 +2070,150 @@ mod tests {
             "{:?}",
             r.notes
         );
+        assert!(
+            r.run_warning.as_deref().unwrap().contains("lost 17 frames"),
+            "{:?}",
+            r.run_warning
+        );
+    }
+
+    /// T17c: the master-IP note is deterministic and complete: one
+    /// rename is named, many-to-one is summarised with every address
+    /// (capped), many-to-many lists both sides; masters that merely
+    /// never connected are no rename, and master role without a rename
+    /// shows no single master.
+    #[test]
+    fn master_ip_renames_are_listed_deterministically() {
+        let ip = |n: u8| Ipv4Addr::new(10, 20, 100, n);
+        let set = |ips: &[u8], flows: usize| -> BTreeMap<Ipv4Addr, usize> {
+            ips.iter().map(|n| (ip(*n), flows)).collect()
+        };
+        // Slave role, one master renamed.
+        let (m, note) = compare_master_ips(&set(&[10], 5), &set(&[99], 5), RoleHint::Slave);
+        let m = m.unwrap();
+        assert!(m.renamed);
+        assert_eq!(
+            (m.captured.as_deref(), m.live.as_deref()),
+            (Some("10.20.100.10"), Some("10.20.100.99"))
+        );
+        assert_eq!(
+            note.as_deref(),
+            Some("master IP renamed: captured=10.20.100.10 live=10.20.100.99")
+        );
+        // Same master: no note, the busiest is shown.
+        let (m, note) = compare_master_ips(&set(&[10], 5), &set(&[10], 9), RoleHint::Slave);
+        assert!(!m.unwrap().renamed && note.is_none());
+
+        // Master role, 200 masters keeping their addresses, a few of
+        // them flow-split (more flows): no note and no single master.
+        let all: Vec<u8> = (1..=200).collect();
+        let mut live = set(&all, 30);
+        *live.get_mut(&ip(173)).unwrap() = 31;
+        let (m, note) = compare_master_ips(&set(&all, 1), &live, RoleHint::Master);
+        assert!(m.is_none() && note.is_none());
+        // Some never connected: still no rename.
+        let (m, note) = compare_master_ips(&set(&all, 1), &set(&all[..150], 30), RoleHint::Master);
+        assert!(m.is_none() && note.is_none());
+
+        // Master role with one bind IP for every session: summarised.
+        let (m, note) = compare_master_ips(&set(&all, 1), &set(&[250], 6000), RoleHint::Master);
+        let m = m.unwrap();
+        assert_eq!(m.captured_only.len(), 200);
+        assert_eq!(m.live.as_deref(), Some("10.20.100.250"));
+        let note = note.unwrap();
+        assert!(
+            note.starts_with("master IP renamed: 200 captured masters (10.20.100.1, 10.20.100.2,"),
+            "{note}"
+        );
+        assert!(
+            note.ends_with("(+192 more)) all appear as live=10.20.100.250"),
+            "{note}"
+        );
+
+        // Many to many: both sides listed, independent of map order.
+        let (_, note) = compare_master_ips(&set(&[3, 1, 2], 1), &set(&[7, 5], 1), RoleHint::Slave);
+        assert_eq!(
+            note.as_deref(),
+            Some(
+                "master IPs renamed: 3 captured master(s) not seen live (10.20.100.1, \
+                 10.20.100.2, 10.20.100.3); 2 live master(s) not in the source pcap \
+                 (10.20.100.5, 10.20.100.7)"
+            )
+        );
+    }
+
+    /// T17c: the run's capture warnings (filter fallback, a reader that
+    /// failed, truncation, drops, `capture_ok == false`) reach the
+    /// analysis notes and `run_warning`; warnings that have their own
+    /// note are not repeated, and other run warnings are not copied.
+    #[test]
+    fn capture_warnings_reach_notes_and_run_warning() {
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let captured = cap.load();
+        let fallback = "capture on eth1: the per-MAC reply filter for 600 sessions did not fit \
+                        (ENOMEM); every incoming frame on eth1 is recorded, including other LAN \
+                        traffic";
+        let warnings: Vec<String> = [
+            fallback,
+            "capture lost 17 frames (kernel receive queue full); its analysis may report frames \
+             as missing that were delivered",
+            "capture stopped at its byte cap after 10 frames (760 bytes); it holds only the \
+             start of the run",
+            "topology teardown: teardown had 1 errors",
+        ]
+        .iter()
+        .map(|w| w.to_string())
+        .filter(|w| is_capture_warning(w))
+        .collect();
+        assert_eq!(warnings.len(), 3, "teardown is not a capture warning");
+        let run = RunInfo {
+            capture_dropped: 17,
+            capture_truncated: true,
+            capture_warnings: warnings,
+            capture_ok: Some(false),
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &captured, run);
+        let warned: Vec<&String> = r
+            .notes
+            .iter()
+            .filter(|n| n.starts_with("WARNING"))
+            .collect();
+        assert!(
+            warned.iter().any(|n| n.contains("per-MAC reply filter")),
+            "{warned:?}"
+        );
+        assert!(warned.iter().any(|n| n.contains("capture_ok false")));
+        assert_eq!(
+            warned.iter().filter(|n| n.contains("lost 17")).count(),
+            1,
+            "no duplicate drop note: {warned:?}"
+        );
+        assert_eq!(
+            warned
+                .iter()
+                .filter(|n| n.contains("cap") && n.contains("truncat"))
+                .count(),
+            1,
+            "{warned:?}"
+        );
+        let rw = r.run_warning.as_deref().unwrap();
+        for want in [
+            "per-MAC reply filter",
+            "capture_ok false",
+            "lost 17 frames",
+            "truncated",
+        ] {
+            assert!(rw.contains(want), "{want}: {rw}");
+        }
+        assert!(!rw.contains("teardown"), "{rw}");
+
+        // A clean capture adds nothing.
+        let r = run_analysis(&source, &captured, completed_run(&[2]));
+        assert!(r.run_warning.is_none());
+        assert!(!r.notes.iter().any(|n| n.starts_with("WARNING")));
     }
 
     #[test]

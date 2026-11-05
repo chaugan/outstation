@@ -162,6 +162,36 @@ pub fn remove_line(path: &Path, line: &str) -> Result<bool> {
     })
 }
 
+/// Append every line of `new` that is not already present, in one
+/// locked update (one fsync for a whole batch).
+pub fn add_lines(path: &Path, new: &[String]) -> Result<()> {
+    for l in new {
+        check_line(l)?;
+    }
+    update_lines(path, |lines| {
+        for l in new {
+            if !lines.iter().any(|x| x == l) {
+                lines.push(l.clone());
+            }
+        }
+    })
+}
+
+/// Remove the first copy of every line of `gone`, in one locked update.
+/// Returns how many were found.
+pub fn remove_lines(path: &Path, gone: &[String]) -> Result<usize> {
+    update_lines(path, |lines| {
+        let mut n = 0;
+        for l in gone {
+            if let Some(i) = lines.iter().position(|x| x == l) {
+                lines.remove(i);
+                n += 1;
+            }
+        }
+        n
+    })
+}
+
 fn check_line(line: &str) -> Result<()> {
     if line.contains('\n') || line.contains('\r') || line.trim().is_empty() {
         bail!("invalid journal line {line:?}");

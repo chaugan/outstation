@@ -462,6 +462,9 @@ pub struct ProtocolStatsJson {
     pub idle_serve_ms: u64,
     pub acks_sent: u64,
     pub keepalives_sent: u64,
+    /// Slave role: master connections that ended before STARTDT; the
+    /// listener accepted again after each (T17c).
+    pub connections_before_startdt: u64,
     /// Per command type round-trip figures (T11), sorted by type ID.
     /// The sample arrays are capped by the session; the UI computes
     /// percentiles from them.
@@ -549,6 +552,7 @@ impl From<&protoplay::ProtocolStats> for ProtocolStatsJson {
             idle_serve_ms: p.idle_serve_ms,
             acks_sent: p.acks_sent,
             keepalives_sent: p.keepalives_sent,
+            connections_before_startdt: p.connections_before_startdt,
             commands: p
                 .commands
                 .iter()

@@ -112,6 +112,8 @@ Valgfri **NAT oppstrøms**: oppgi det ytre nettverkskortet (`eth1`), så slår o
 
 Alt gateway-modus gjør, blir journalført og tilbakestilt når kjøringen slutter. Gateway-modus nekter å bruke outstation-vertens egen standard gateway som gateway-IP.
 
+**Gateway-modus gjelder bare slave-rollen** (scenario A, *Target is a master*). En kjøring i master-rolle (scenario B) som setter noen av gateway-feltene, blir avvist med `gateway_requires_slave`. I master-rollen har hver sesjon sin egen broport, og svarene må komme tilbake gjennom den porten. Et gateway-alias på det slavebundne nettverkskortet svarer ikke på ARP (kortet er en broport), og et alias på et annet kort trekker svarene bort fra sesjonens port, så sesjonene ville bare gått ut på tid. Skal du teste en enhet som når outstations sesjonsadresser via en ruter i master-rollen, legger du en rute på enheten under test eller på labruteren mot outstations nettverkskort, eller bruker opptatte mastere i enhetens eget subnett.
+
 ---
 
 ## 5. Scenario A: test av en SCADA-master

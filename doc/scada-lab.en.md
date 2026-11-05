@@ -112,6 +112,8 @@ Optional **upstream NAT**: name the outer NIC (`eth1`) and outstation also enabl
 
 Everything gateway mode does is journaled and undone when the run ends. Gateway mode refuses the outstation host's own default gateway as the gateway IP.
 
+**Gateway mode is for slave role only** (scenario A, *Target is a master*). A master-role run (scenario B) that sets any of the gateway fields is refused with `gateway_requires_slave`. In master role every session has its own bridge port and its replies must come back through that port; a gateway alias on the enslaved NIC answers no ARP (the NIC is a bridge port), and one on another NIC pulls the replies away from the session's port, so the sessions could only time out. To test a device that reaches outstation's session addresses through a router in master role, add a route on the device under test or on the lab router towards outstation's NIC, or use captured masters on the device's own subnet.
+
 ---
 
 ## 5. Scenario A: testing a SCADA master

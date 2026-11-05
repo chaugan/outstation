@@ -679,6 +679,10 @@ pub struct ProtocolStats {
     pub acks_sent: u64,
     /// Keep-alive probes sent (IEC 104 TESTFR act after t3 idle).
     pub keepalives_sent: u64,
+    /// Slave role: master connections that ended before the master's
+    /// STARTDT act (a port probe, a master that redialled); the
+    /// listener kept accepting after each.
+    pub connections_before_startdt: u64,
     /// Per command type round-trip figures, sorted by type ID.
     pub commands: Vec<CommandTypeStats>,
     /// Negative command confirmations, capped at
@@ -724,6 +728,7 @@ impl ProtocolStats {
         self.idle_serve_ms += other.idle_serve_ms;
         self.acks_sent += other.acks_sent;
         self.keepalives_sent += other.keepalives_sent;
+        self.connections_before_startdt += other.connections_before_startdt;
         for c in other.commands {
             match self.commands.iter_mut().find(|x| x.type_id == c.type_id) {
                 Some(x) => x.merge(c),

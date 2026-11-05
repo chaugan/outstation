@@ -47,7 +47,7 @@ pub use local::{local_iface_of, session_ifaces};
 pub use names::{IfaceNames, PortKind};
 pub use protect::{
     check_nic_allowed, is_bridge, is_bridge_port, nic_assessment, validate_alias_ip,
-    validate_port_ip, NicAssessment, Protection,
+    validate_port_ip, validate_port_ips, NicAssessment, Protection,
 };
 
 pub type MacAddr = [u8; 6];
@@ -70,6 +70,57 @@ pub fn parse_mac(s: &str) -> Result<MacAddr> {
             .with_context(|| format!("bad hex byte {p:?} in MAC {s:?}"))?;
     }
     Ok(out)
+}
+
+/// One port of a batch, see [`Topology::add_ports`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSpec {
+    /// Bridge-side interface name; the inject side is `{id}i`.
+    pub id: String,
+    pub mac: Option<MacAddr>,
+    pub src_ip: Option<std::net::Ipv4Addr>,
+}
+
+/// Largest number of worker threads that set up or tear down ports at
+/// once. Each port is a dozen `ip`/`tc`/`ethtool` processes and sysctl
+/// writes: process start-up dominates and runs in parallel, while the
+/// kernel serialises the netlink changes themselves (rtnl).
+pub const PORT_WORKERS: usize = 8;
+
+fn port_workers(jobs: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, PORT_WORKERS)
+        .min(jobs.max(1))
+}
+
+/// Run `f` over `items` on at most [`PORT_WORKERS`] threads and return
+/// the results in item order. After the first error no new item is
+/// started (items not started return `None`).
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> (R, bool) + Sync) -> Vec<Option<R>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|sc| {
+        for _ in 0..port_workers(items.len()) {
+            sc.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { return };
+                let (r, ok) = f(item);
+                if !ok {
+                    failed.store(true, Ordering::Relaxed);
+                }
+                out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+            });
+        }
+    });
+    out.into_inner().unwrap_or_else(|e| e.into_inner())
 }
 
 /// Set the `outstation:<run_id>` ownership marker on `iface`.
@@ -271,77 +322,109 @@ impl Topology {
                 bail!("interface {n} already exists");
             }
         }
-        ip([
-            "link",
-            "add",
-            &bridge_side,
-            "type",
-            "veth",
-            "peer",
-            "name",
-            &inject_side,
-        ])?;
-        // Track it right away so teardown/drop removes it whatever fails next.
-        self.taps.push(bridge_side.clone());
-        mark_owned(&bridge_side, self.run_id)?;
-        mark_owned(&inject_side, self.run_id)?;
-        if let Some(mac) = mac {
-            // With a source IP the kernel builds the frames on the
-            // inject end, so that end carries the source identity.
-            set_mac(
-                if src_ip.is_some() {
-                    &inject_side
-                } else {
-                    &bridge_side
-                },
-                mac,
-            )?;
+        if let (Some(h), Some(ip_addr)) = (self.hardening.as_mut(), src_ip) {
+            h.allow_session(ip_addr)?;
+        }
+        let ctx = self.port_ctx();
+        let (created, mac) = build_port(&ctx, &bridge_side, mac, src_ip);
+        if created {
+            // Tracked once created, so teardown/drop removes it
+            // whatever failed next (and never an interface we did not
+            // create).
+            self.taps.push(bridge_side.clone());
+        }
+        self.port_macs.push(mac?);
+        Ok(inject_side)
+    }
+
+    /// What [`build_port`] needs from the topology.
+    fn port_ctx(&self) -> PortCtx {
+        PortCtx {
+            bridge: self.bridge.clone(),
+            run_id: self.run_id,
+            hardened: self.hardening.is_some(),
+            mirror: self.mirror.clone(),
+        }
+    }
+
+    /// [`Topology::add_port_with_ip`] for many ports at once (T17c):
+    /// the source addresses are checked against one snapshot of the
+    /// host ([`validate_port_ips`]) and the names against one interface
+    /// listing, every session ACCEPT is installed in one journaled
+    /// iptables transaction ([`harden::Hardening::allow_sessions`]), and
+    /// the ports are built by a bounded pool of [`PORT_WORKERS`]
+    /// threads. Fail closed: the first error stops the batch (no new
+    /// port is started) and is returned; every port created so far is
+    /// tracked, so teardown removes it. Returns the inject-side names in
+    /// `specs` order.
+    pub fn add_ports(&mut self, specs: &[PortSpec], prot: &Protection) -> Result<Vec<String>> {
+        let ips: Vec<std::net::Ipv4Addr> = specs.iter().filter_map(|p| p.src_ip).collect();
+        let mut seen = std::collections::HashSet::new();
+        for p in specs {
+            let inject = format!("{}i", p.id);
+            names::validate_owned_ifname(&p.id)?;
+            names::validate_owned_ifname(&inject)
+                .with_context(|| format!("port id {:?} leaves no room for the 'i' suffix", p.id))?;
+            if !seen.insert(p.id.clone()) {
+                bail!("port {} given twice", p.id);
+            }
+        }
+        if !ips.is_empty() {
+            let own_inject: Vec<String> = self.taps.iter().map(|t| format!("{t}i")).collect();
+            let own: Vec<&str> = std::iter::once(self.bridge.as_str())
+                .chain(self.taps.iter().map(String::as_str))
+                .chain(own_inject.iter().map(String::as_str))
+                .collect();
+            protect::validate_port_ips(&ips, prot, &own)?;
+            match &self.hardening {
+                None => bail!(
+                    "refusing ports with source IPs on a topology without host-stack isolation \
+                     (Topology::harden)"
+                ),
+                Some(h) if h.peer.is_none() => {
+                    bail!("ports with source IPs need the run's peer address")
+                }
+                Some(_) => {}
+            }
+        }
+        let existing = list_with_prefix(names::IFNAME_PREFIX)?;
+        for p in specs {
+            for n in [p.id.clone(), format!("{}i", p.id)] {
+                if existing.contains(&n) {
+                    bail!("interface {n} already exists");
+                }
+            }
         }
         if let Some(h) = self.hardening.as_mut() {
-            // Loose reverse-path check on session ends: the host's own
-            // route to the target normally uses another interface, and
-            // the raw ACCEPT rule already pins the source to the peer.
-            harden::harden_iface(&inject_side, harden::RpFilter::Loose)?;
-            if let Some(ip_addr) = src_ip {
-                h.allow_session(ip_addr)?;
-            }
+            h.allow_sessions(&ips)?;
         }
-        // Neither end originates anything of its own (IGMP, IPv6
-        // DAD/RS/MLD): only replayed or session frames reach the LAN.
-        harden::quiet_iface(&inject_side)?;
-        harden::quiet_iface(&bridge_side)?;
-        if src_ip.is_some() {
-            // The kernel builds session frames on the inject end. With
-            // checksum offload (and so TSO/GSO) left on, they enter the
-            // bridge with partial checksums or as one oversized
-            // segment, and the port mirror would record them so;
-            // computed in software they are recorded as they leave on
-            // the wire. Our own interface: nothing to restore.
-            if let Err(e) = guard::set_tx_checksum(&inject_side, false) {
-                warn!(iface = %inject_side, error = %format!("{e:#}"),
-                    "could not turn checksum offload off; the capture may show partial checksums");
-            }
-        }
-        ip(["link", "set", "dev", &bridge_side, "master", &self.bridge])?;
-        ip(["link", "set", "dev", &bridge_side, "up"])?;
-        ip(["link", "set", "dev", &inject_side, "up"])?;
-        if let Some(ip_addr) = src_ip {
-            let cidr = format!("{ip_addr}/32");
-            ip(["addr", "add", &cidr, "dev", &inject_side])?;
-        }
-        let identity = if src_ip.is_some() {
-            &inject_side
-        } else {
-            &bridge_side
-        };
-        self.port_macs.push(match mac {
-            Some(m) => m,
-            None => read_mac(identity)?,
+        let ctx = self.port_ctx();
+        let results = par_map(specs, |p| {
+            let (created, mac) = build_port(&ctx, &p.id, p.mac, p.src_ip);
+            let ok = mac.is_ok();
+            ((created, mac), ok)
         });
-        if let Some(cap) = self.mirror.clone() {
-            mirror_port(&bridge_side, &cap)?;
+        let mut first_err = None;
+        let mut out = Vec::with_capacity(specs.len());
+        for (p, r) in specs.iter().zip(results) {
+            let Some((created, mac)) = r else { continue };
+            if created {
+                self.taps.push(p.id.clone());
+            }
+            match mac {
+                Ok(m) => {
+                    self.port_macs.push(m);
+                    out.push(format!("{}i", p.id));
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e.context(format!("add port {}", p.id)));
+                }
+            }
         }
-        Ok(inject_side)
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
     }
 
     /// The source MAC of every port added with [`Topology::add_port`] /
@@ -391,9 +474,7 @@ impl Topology {
         harden::quiet_iface(name)?;
         ip(["link", "set", "dev", name, "up"])?;
         let ports: Vec<String> = self.taps.iter().filter(|t| *t != name).cloned().collect();
-        for p in &ports {
-            mirror_port(p, name)?;
-        }
+        mirror_ports(&ports, name)?;
         self.mirror = Some(name.to_string());
         Ok(())
     }
@@ -439,15 +520,22 @@ impl Topology {
                 errors += 1;
             }
         }
-        for tap in std::mem::take(&mut self.taps) {
-            if !iface_exists(&tap).unwrap_or(true) {
-                continue;
-            }
-            if let Err(e) = delete_iface(&tap) {
-                warn!(iface = %tap, error = %e, "port teardown failed");
-                errors += 1;
-            }
-        }
+        // In parallel (T17c); every port is tried whatever the others
+        // do, and each failure is counted.
+        let taps = std::mem::take(&mut self.taps);
+        let failed = par_map(&taps, |tap| {
+            let bad = iface_exists(tap).unwrap_or(true) && {
+                match delete_iface(tap) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        warn!(iface = %tap, error = %e, "port teardown failed");
+                        true
+                    }
+                }
+            };
+            (bad, true)
+        });
+        errors += failed.into_iter().filter(|b| *b == Some(true)).count();
         if self.bridge_created && iface_exists(&self.bridge).unwrap_or(false) {
             if let Err(e) = delete_iface(&self.bridge) {
                 warn!(iface = %self.bridge, error = %e, "bridge teardown failed");
@@ -506,6 +594,141 @@ impl Drop for Topology {
             self.do_teardown();
         }
     }
+}
+
+/// Topology facts a port build needs; shared by the worker threads.
+struct PortCtx {
+    bridge: String,
+    run_id: u64,
+    hardened: bool,
+    mirror: Option<String>,
+}
+
+/// Create one veth port `bridge_side` / `{bridge_side}i` and wire it up
+/// (see [`Topology::add_port_with_ip`]); names and the source address
+/// are already validated and the session ACCEPT installed. Returns
+/// whether the veth pair was created (so the caller tracks it for
+/// teardown even when a later step failed) and the port's source MAC.
+fn build_port(
+    ctx: &PortCtx,
+    bridge_side: &str,
+    mac: Option<MacAddr>,
+    src_ip: Option<std::net::Ipv4Addr>,
+) -> (bool, Result<MacAddr>) {
+    let inject_side = format!("{bridge_side}i");
+    if let Err(e) = ip([
+        "link",
+        "add",
+        bridge_side,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &inject_side,
+    ]) {
+        return (false, Err(e));
+    }
+    let rest = || -> Result<MacAddr> {
+        mark_owned(bridge_side, ctx.run_id)?;
+        mark_owned(&inject_side, ctx.run_id)?;
+        if let Some(mac) = mac {
+            // With a source IP the kernel builds the frames on the
+            // inject end, so that end carries the source identity.
+            set_mac(
+                if src_ip.is_some() {
+                    &inject_side
+                } else {
+                    bridge_side
+                },
+                mac,
+            )?;
+        }
+        if ctx.hardened {
+            // Loose reverse-path check on session ends: the host's own
+            // route to the target normally uses another interface, and
+            // the raw ACCEPT rule already pins the source to the peer.
+            harden::harden_iface(&inject_side, harden::RpFilter::Loose)?;
+        }
+        // Neither end originates anything of its own (IGMP, IPv6
+        // DAD/RS/MLD): only replayed or session frames reach the LAN.
+        harden::quiet_iface(&inject_side)?;
+        harden::quiet_iface(bridge_side)?;
+        if src_ip.is_some() {
+            // The kernel builds session frames on the inject end. With
+            // checksum offload (and so TSO/GSO) left on, they enter the
+            // bridge with partial checksums or as one oversized
+            // segment, and the port mirror would record them so;
+            // computed in software they are recorded as they leave on
+            // the wire. Our own interface: nothing to restore.
+            if let Err(e) = guard::set_tx_checksum(&inject_side, false) {
+                warn!(iface = %inject_side, error = %format!("{e:#}"),
+                    "could not turn checksum offload off; the capture may show partial checksums");
+            }
+        }
+        ip(["link", "set", "dev", bridge_side, "master", &ctx.bridge])?;
+        ip(["link", "set", "dev", bridge_side, "up"])?;
+        ip(["link", "set", "dev", &inject_side, "up"])?;
+        if let Some(ip_addr) = src_ip {
+            let cidr = format!("{ip_addr}/32");
+            ip(["addr", "add", &cidr, "dev", &inject_side])?;
+        }
+        let identity = if src_ip.is_some() {
+            inject_side.as_str()
+        } else {
+            bridge_side
+        };
+        let m = match mac {
+            Some(m) => m,
+            None => read_mac(identity)?,
+        };
+        if let Some(cap) = &ctx.mirror {
+            mirror_port(bridge_side, cap)?;
+        }
+        Ok(m)
+    };
+    (true, rest())
+}
+
+/// [`mirror_port`] for many ports in one `tc -batch` process (T17c):
+/// every `tc` start dumps all host links, which made one process per
+/// port quadratic in the session count (5 s for 400 ports). Stops at
+/// the first failing command and reports it.
+fn mirror_ports(ports: &[String], cap: &str) -> Result<()> {
+    use std::io::Write;
+    if ports.is_empty() {
+        return Ok(());
+    }
+    names::validate_owned_ifname(cap)?;
+    let mut script = String::new();
+    for p in ports {
+        names::validate_owned_ifname(p)?;
+        script.push_str(&format!(
+            "qdisc add dev {p} clsact\nfilter add dev {p} ingress matchall action mirred egress mirror dev {cap}\n"
+        ));
+    }
+    debug!(ports = ports.len(), cap, "tc -batch");
+    let mut child = Command::new("tc")
+        .args(["-batch", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn `tc -batch`")?;
+    let wrote = child
+        .stdin
+        .take()
+        .context("tc stdin")?
+        .write_all(script.as_bytes());
+    let out = child.wait_with_output().context("wait for tc")?;
+    wrote.context("write to tc")?;
+    if !out.status.success() {
+        bail!(
+            "`tc -batch` (mirror {} ports to {cap}) failed: {}",
+            ports.len(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 /// Mirror the ingress of `port` to `cap` with tc. Only ingress: a

@@ -147,9 +147,8 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         ..Default::default()
     };
     if let Some(path) = &cfg.capture_path {
-        let rt_active = rt_plan.iter().any(|b| *b);
         let opts = CaptureOpts {
-            rt_priority: rt_active.then_some(CAPTURE_RT_PRIORITY),
+            rt_priority: capture_rt_priority(),
             max_bytes: cfg.capture_max_bytes,
         };
         capture.open_failed = !start_capture(&mut res, &names, path, opts, &mut warnings);
@@ -223,38 +222,48 @@ fn add_raw_ports(
         .map(|v| v.iter().copied().collect());
     let topo = res.topo.as_mut().context("topology missing")?;
     let mut workers: Vec<RawWorker> = Vec::new();
+    let mut specs: Vec<netctl::PortSpec> = Vec::new();
     for (idx, (ip, src)) in pcap
         .sources
         .iter()
         .filter(|(ip, _)| wanted.as_ref().is_none_or(|s| s.contains(ip)))
         .enumerate()
     {
-        let bridge_side = names.port(PortKind::RawIp, idx)?;
-        let inject_side = topo
-            .add_port(&bridge_side, Some(src.src_mac))
-            .with_context(|| format!("add port {bridge_side}"))?;
+        specs.push(netctl::PortSpec {
+            id: names.port(PortKind::RawIp, idx)?,
+            mac: Some(src.src_mac),
+            src_ip: None,
+        });
         workers.push(RawWorker {
             ip: Some(*ip),
             mac: src.src_mac,
             kind: SourceKind::Ipv4,
-            inject_side,
+            inject_side: String::new(),
             packet_indices: src.packet_indices.clone(),
         });
     }
     if cfg.include_non_ip {
         for (idx, (mac, info)) in pcap.non_ip_sources.iter().enumerate() {
-            let bridge_side = names.port(PortKind::RawL2, idx)?;
-            let inject_side = topo
-                .add_port(&bridge_side, Some(*mac))
-                .with_context(|| format!("add port {bridge_side}"))?;
+            specs.push(netctl::PortSpec {
+                id: names.port(PortKind::RawL2, idx)?,
+                mac: Some(*mac),
+                src_ip: None,
+            });
             workers.push(RawWorker {
                 ip: None,
                 mac: *mac,
                 kind: SourceKind::NonIp,
-                inject_side,
+                inject_side: String::new(),
                 packet_indices: info.packet_indices.clone(),
             });
         }
+    }
+    // One batch, built in parallel (T17c).
+    let injects = topo
+        .add_ports(&specs, &netctl::Protection::default())
+        .context("add replay ports")?;
+    for (w, inject) in workers.iter_mut().zip(injects) {
+        w.inject_side = inject;
     }
     if workers.is_empty() {
         bail!("nothing to replay (no IPv4 sources and include_non_ip disabled)");

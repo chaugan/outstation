@@ -177,10 +177,11 @@ pub(crate) fn finish_session(
 }
 
 /// Capture settings of a benchmark run, either role: the reader runs
-/// at RT priority only with `realtime` on (N8).
+/// at RT priority whenever the process may use it, `realtime` or not
+/// (T17c; see [`capture_rt_priority`]).
 pub(crate) fn bench_capture_opts(cfg: &BenchmarkConfig) -> CaptureOpts {
     CaptureOpts {
-        rt_priority: cfg.realtime.then_some(CAPTURE_RT_PRIORITY),
+        rt_priority: capture_rt_priority(),
         max_bytes: cfg.capture_max_bytes,
     }
 }
@@ -252,6 +253,17 @@ pub fn run_benchmark(
     if matches!(cfg.role, protoplay::Role::Slave) {
         return run_benchmark_slave(pcap, cfg, replayer, ctx);
     }
+    // Gateway mode cannot work in master role (T17c, see the scale
+    // report §7): the gateway alias lands either on the enslaved NIC (a
+    // bridge port, which answers no ARP) or on another NIC (the replies
+    // then miss the session's port). Refused before any host change;
+    // the web/CLI layer refuses it first with `gateway_requires_slave`.
+    if cfg.scada_gateway_ip.is_some()
+        || cfg.scada_gateway_iface.is_some()
+        || cfg.upstream_nat_iface.is_some()
+    {
+        bail!("SCADA-gateway mode works in slave role only; refusing it in master role");
+    }
 
     let names = IfaceNames::custom(
         cfg.run_id,
@@ -274,7 +286,6 @@ pub fn run_benchmark(
         &prot,
         &mut warnings,
     )?;
-    res.gateway = install_gateway(&cfg, &state_dir, &prot)?;
 
     // 2. Select flows: one per client IP whose server port matches.
     let picks = select_master_flows(&pcap, &cfg, &*replayer)?;
@@ -442,26 +453,36 @@ fn add_session_ports(
         info!(%ip, "master_bind_ip override active — sessions will originate from this address");
     }
     let topo = res.topo.as_mut().context("topology missing")?;
-    let mut bindings: Vec<SessionBinding> = Vec::with_capacity(picks.len());
-    for (i, p) in picks.iter().enumerate() {
-        let effective_src_ip = master_override.unwrap_or(p.client_ip);
-        let bridge_side = names.port(PortKind::Session, i)?;
-        let inject_side = topo
-            .add_port_with_ip(
-                &bridge_side,
-                Some(p.client_mac),
-                Some(effective_src_ip),
-                prot,
-            )
-            .with_context(|| format!("add session port {bridge_side}"))?;
-        bindings.push(SessionBinding {
-            src_ip: effective_src_ip,
+    let specs = picks
+        .iter()
+        .enumerate()
+        .map(|(i, p)| {
+            Ok(netctl::PortSpec {
+                id: names.port(PortKind::Session, i)?,
+                mac: Some(p.client_mac),
+                src_ip: Some(master_override.unwrap_or(p.client_ip)),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    // One batch: parallel port setup, one iptables transaction (T17c).
+    let t0 = std::time::Instant::now();
+    let injects = topo.add_ports(&specs, prot).context("add session ports")?;
+    info!(
+        ports = specs.len(),
+        ms = t0.elapsed().as_millis() as u64,
+        "session ports up"
+    );
+    Ok(specs
+        .into_iter()
+        .zip(injects)
+        .zip(picks)
+        .map(|((spec, inject_side), p)| SessionBinding {
+            src_ip: spec.src_ip.unwrap_or(p.client_ip),
             src_mac: p.client_mac,
-            bridge_side,
+            bridge_side: spec.id,
             inject_side,
-        });
-    }
-    Ok(bindings)
+        })
+        .collect())
 }
 
 /// Pre-populate per-session progress. `planned` stays 0 until the

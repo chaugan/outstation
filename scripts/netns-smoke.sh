@@ -33,15 +33,19 @@
 #      client_ip; stop mid-run -> stopped, host restored
 #   6  default-route NIC refused without force (run fails, host
 #      untouched), accepted with force
-#   7  SIGTERM mid-run (unbounded run with SCADA gateway + upstream NAT,
-#      so sysctls, aliases, NAT rules and NIC offloads are all leased):
-#      exits within TimeoutStopSec (30 s), no pcr* interfaces, no
-#      outstation-run-* rules, sysctls/offloads/addresses restored; the
-#      run is "stopped" with finished_at after a restart, and the
-#      restart auto-analyses it
-#   8  SIGKILL mid-run: leftovers exist, `outstation cleanup` restores
-#      everything (twice: idempotent), restart is a no-op cleanup, run
-#      is failed/orphaned with finished_at
+#   7  a master run with SCADA-gateway mode is refused (400
+#      gateway_requires_slave: gateway mode is slave-role only). SIGTERM
+#      mid-run, twice: an unbounded slave run with SCADA gateway +
+#      upstream NAT (gateway alias, ip_forward, NAT rule, RTU aliases)
+#      and an unbounded master run (bridge, veths, rules, NIC
+#      offloads): host restored each time; the master run exits within
+#      TimeoutStopSec (30 s), no pcr* interfaces, no outstation-run-*
+#      rules, sysctls/offloads/addresses restored; it is "stopped" with
+#      finished_at after a restart, and the restart auto-analyses it
+#   8  SIGKILL mid-run, the same two runs: leftovers exist, `outstation
+#      cleanup` restores everything (twice for the master run:
+#      idempotent), restart is a no-op cleanup, run is failed/orphaned
+#      with finished_at
 #   9  re-run (force not inherited), profiles CRUD, compare with the
 #      409 analysis_missing -> POST analyze -> 200 path, /metrics
 #      consistent with /api/runs and stored analyses
@@ -482,6 +486,57 @@ master_body() { # [extra JSON members]
 }
 LONG_EXTRA=',"force":true,"iterations":0,"pacing":"original","speed":1.0'
 GW_EXTRA=',"scada_gateway_ip":"'"$GW_IP"'","scada_gateway_iface":"gwin","upstream_nat_iface":"uplink"'
+# Gateway mode is slave-role only (T17c): an unbounded slave run with
+# the SCADA gateway and upstream NAT, its RTUs aliased on os-s.
+slave_gw_body() {
+  printf '{"pcap_id":"%s","mode":"benchmark","role":"slave","target_ip":"%s","alias_iface":"os-s","selected_rtus":%s,"warmup_secs":0,"iterations":0,"loop_within_session":true%s}' \
+    "$PCAP_ID" "$MASTER_IP" "$RTUS_JSON" "$GW_EXTRA"
+}
+
+# slave_gw_phase SIGNAL: start an unbounded slave run with gateway mode,
+# start its listeners, wait for its leases (gateway alias,
+# ip_forward=1, the tagged NAT rule, an RTU alias on os-s), then stop
+# the server with SIGNAL. TERM: the server must restore the host. KILL:
+# the leases stay until `outstation cleanup` undoes them from the
+# journal. Leaves the server stopped.
+slave_gw_phase() {
+  local sig=$1 i lo first ok=""
+  start_run "$(slave_gw_body)" || { bad "start slave gateway run"; return 1; }
+  local gw_run=$RID
+  api POST "/api/runs/$RID/slaves/start_all"
+  check "slave gateway run: start_all -> 200" eq "$HTTP" 200 || echo "      $RESP"
+  first=$(jvs "$RTUS_JSON" 'd[0]')
+  for ((i = 0; i < 80; i++)); do
+    lo=$(leftovers)
+    if [ "$(lo_field "$lo" gw_alias)" = 1 ] && [ "$(lo_field "$lo" ip_forward)" = 1 ] \
+      && [ "$(lo_field "$lo" tagged_rules)" -gt 0 ] \
+      && nsx "$NS_A" ip -o addr show dev os-s | grep -q " $first/32"; then
+      ok=yes
+      break
+    fi
+    sleep 0.25
+  done
+  echo "      slave gateway run $gw_run mid-run: $lo"
+  check "slave gateway run: gateway alias, ip_forward=1, tagged NAT rule, RTU alias" eq "$ok" yes
+  stop_server "$sig"
+  if [ "$sig" = TERM ]; then
+    check "slave gateway run: graceful shutdown logged" contains "$(cat "$SERVE_LOG")" "shutdown complete"
+    snapshot "$WORK/snap-gw-term.txt"
+    check "slave gateway run: SIGTERM restored the host" same_as_baseline "$WORK/snap-gw-term.txt"
+  else
+    lo=$(leftovers)
+    echo "      slave gateway run after SIGKILL: $lo"
+    check "slave gateway run: leases left by SIGKILL" eq \
+      "$(lo_field "$lo" ip_forward)$(lo_field "$lo" gw_alias)" 11
+    nsx "$NS_A" env RUST_LOG=info NO_COLOR=1 "$BIN" cleanup --state-dir "$STATE" >"$WORK/cleanup-gw.log" 2>&1
+    check "slave gateway run: outstation cleanup -> exit 0" eq "$?" 0
+    snapshot "$WORK/snap-gw-kill.txt"
+    check "slave gateway run: cleanup restored everything" same_as_baseline "$WORK/snap-gw-kill.txt"
+    local j
+    j=$(sudo cat "$STATE/state-guards.txt" "$STATE/state-aliases.txt" 2>/dev/null | grep -c .)
+    check "slave gateway run: guard and alias journals empty" eq "$j" 0
+  fi
+}
 
 # =========================================================================
 # Cases
@@ -703,16 +758,24 @@ case_protected() {
 }
 
 case_sigterm() {
-  need PCAP_ID SERVER_PID || return 1
-  start_run "$(master_body "$LONG_EXTRA$GW_EXTRA")" || { bad "start long run"; return 1; }
+  need PCAP_ID RTUS_JSON SERVER_PID || return 1
+  # Gateway mode is refused in master role (T17c).
+  post_json /api/run "$(master_body "$LONG_EXTRA$GW_EXTRA")"
+  check "master run with gateway mode -> 400 gateway_requires_slave" eq \
+    "$HTTP/$(jv 'd.get("code")')" 400/gateway_requires_slave
+  # The gateway leases first: an unbounded slave run with gateway mode,
+  # stopped with SIGTERM.
+  slave_gw_phase TERM || return 1
+  start_server || { bad "restart"; return 1; }
+  start_run "$(master_body "$LONG_EXTRA")" || { bad "start long run"; return 1; }
   TERM_RUN=$RID
   check "long run active" wait_active "$RID" || return 1
   local lo
   lo=$(leftovers)
   echo "      mid-run: $lo"
-  check "mid-run: pcr interfaces, tagged rules, ip_forward=1, gateway alias, tx-checksum off" eq \
-    "$( [ "$(lo_field "$lo" pcr_links)" -gt 0 ] && [ "$(lo_field "$lo" tagged_rules)" -gt 0 ] && echo yes)$(lo_field "$lo" ip_forward)$(lo_field "$lo" gw_alias)$(lo_field "$lo" os_a_tx_checksum)" \
-    "yes11off"
+  check "mid-run: pcr interfaces, tagged rules, tx-checksum off" eq \
+    "$( [ "$(lo_field "$lo" pcr_links)" -gt 0 ] && [ "$(lo_field "$lo" tagged_rules)" -gt 0 ] && echo yes)$(lo_field "$lo" os_a_tx_checksum)" \
+    "yesoff"
   stop_server TERM
   local rc=$?
   echo "      exited ${STOP_SECS}s after SIGTERM"
@@ -734,17 +797,22 @@ case_sigterm() {
 }
 
 case_sigkill() {
-  need PCAP_ID SERVER_PID || return 1
-  start_run "$(master_body "$LONG_EXTRA$GW_EXTRA")" || { bad "start long run"; return 1; }
+  need PCAP_ID RTUS_JSON SERVER_PID || return 1
+  # The gateway leases first: an unbounded slave run with gateway mode,
+  # killed, then `outstation cleanup`. The restart skips auto-analysis
+  # (case 9 needs a run without a stored analysis).
+  slave_gw_phase KILL || return 1
+  start_server --no-auto-analyze || { bad "restart"; return 1; }
+  start_run "$(master_body "$LONG_EXTRA")" || { bad "start long run"; return 1; }
   KILL_RUN=$RID
   check "long run active" wait_active "$RID" || return 1
   stop_server KILL
   local lo
   lo=$(leftovers)
   echo "      after SIGKILL: $lo"
-  check "leftovers exist: pcr interfaces, tagged rules, ip_forward=1, gateway alias, tx-checksum off" eq \
-    "$( [ "$(lo_field "$lo" pcr_links)" -gt 0 ] && [ "$(lo_field "$lo" tagged_rules)" -gt 0 ] && echo yes)$(lo_field "$lo" ip_forward)$(lo_field "$lo" gw_alias)$(lo_field "$lo" os_a_tx_checksum)" \
-    "yes11off"
+  check "leftovers exist: pcr interfaces, tagged rules, tx-checksum off" eq \
+    "$( [ "$(lo_field "$lo" pcr_links)" -gt 0 ] && [ "$(lo_field "$lo" tagged_rules)" -gt 0 ] && echo yes)$(lo_field "$lo" os_a_tx_checksum)" \
+    "yesoff"
   local jn
   jn=$(sudo cat "$STATE/state-guards.txt" 2>/dev/null | grep -c .)
   echo "      guard journal: $jn entries"

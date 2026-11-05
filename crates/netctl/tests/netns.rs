@@ -566,3 +566,155 @@ fn duplicate_address_is_detected_before_aliasing() {
 
     sh(&["ip", "addr", "del", "10.99.3.66/32", "dev", "nsfree1"]);
 }
+
+/// T17c: a batch of session ports is built by the worker pool with the
+/// same result as one by one: every port isolated, addressed, mirrored
+/// and quiet, one journaled ACCEPT per address (each rule journaled),
+/// and teardown removes all of it in parallel and in one iptables
+/// transaction. A batch that fails half way is fail-closed: the error
+/// comes back, every port that was created is tracked, and teardown
+/// leaves no interface, rule or journal line behind.
+#[test]
+#[ignore = "privileged: run via scripts/netns-test.sh inside an ostest-* netns"]
+fn batched_session_ports_match_serial_ones_and_fail_closed() {
+    setup();
+    let dir = state_dir("batch");
+    let none = Protection::default();
+    let mut topo = Topology::new("pcr6_br", 6).unwrap();
+    topo.harden("pcr6_", Some(Ipv4Addr::new(10, 56, 0, 1)), Some(2404), &dir)
+        .unwrap();
+    topo.create_bridge().unwrap();
+    topo.add_capture_mirror("pcr6_cap").unwrap();
+    let n = 40u8;
+    let specs: Vec<netctl::PortSpec> = (0..n)
+        .map(|i| netctl::PortSpec {
+            id: format!("pcr6_b{i}"),
+            mac: Some([0x02, 0, 0, 0, 0x56, i]),
+            src_ip: Some(Ipv4Addr::new(10, 56, 1, i + 1)),
+        })
+        .collect();
+    let t = std::time::Instant::now();
+    let inj = topo.add_ports(&specs, &none).unwrap();
+    eprintln!("{n} ports in {:?}", t.elapsed());
+    assert_eq!(inj.len(), usize::from(n));
+    for (i, name) in inj.iter().enumerate() {
+        assert_eq!(*name, format!("pcr6_b{i}i"));
+        assert!(has_addr(name, &format!("10.56.1.{}", i + 1)), "{name}");
+        let filters = sh(&[
+            "tc",
+            "filter",
+            "show",
+            "dev",
+            &format!("pcr6_b{i}"),
+            "ingress",
+        ]);
+        assert!(filters.contains("pcr6_cap"), "{filters}");
+        let l = sh(&["ip", "-o", "link", "show", "dev", name]);
+        assert!(!l.contains("MULTICAST") && l.contains("UP"), "{l}");
+        assert_eq!(
+            read_sysctl(&format!("net.ipv4.conf.{name}.rp_filter"))
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+    }
+    assert_eq!(topo.port_macs().len(), usize::from(n));
+    assert_eq!(topo.port_macs()[7], [0x02, 0, 0, 0, 0x56, 7]);
+    assert_eq!(
+        rule_count("raw", "outstation-run-6"),
+        usize::from(n) + 1,
+        "DROP + one ACCEPT per session"
+    );
+    let raw = sh(&["iptables", "-t", "raw", "-S", "PREROUTING"]);
+    let last_accept = raw.rfind("-j ACCEPT").unwrap();
+    let drop = raw.find("--comment outstation-run-6 -j DROP").unwrap();
+    assert!(last_accept < drop, "every ACCEPT precedes the DROP:\n{raw}");
+    let journal = std::fs::read_to_string(dir.join("state-guards.txt")).unwrap();
+    assert_eq!(
+        journal.lines().filter(|l| l.contains("ACCEPT")).count(),
+        usize::from(n),
+        "each rule journaled: {journal}"
+    );
+    // Same addresses again: nothing new is installed.
+    let again: Vec<netctl::PortSpec> = specs
+        .iter()
+        .take(2)
+        .enumerate()
+        .map(|(i, s)| netctl::PortSpec {
+            id: format!("pcr6_c{i}"),
+            ..s.clone()
+        })
+        .collect();
+    topo.add_ports(&again, &none).unwrap();
+    assert_eq!(rule_count("raw", "outstation-run-6"), usize::from(n) + 1);
+    let t = std::time::Instant::now();
+    topo.teardown().unwrap();
+    eprintln!("teardown in {:?}", t.elapsed());
+    assert!(sh(&["ip", "-o", "link", "show"])
+        .lines()
+        .all(|l| !l.contains("pcr6_")));
+    assert_eq!(rule_count("raw", "outstation-run-6"), 0);
+    assert_eq!(rule_count("filter", "outstation-run-6"), 0);
+    let j = std::fs::read_to_string(dir.join("state-guards.txt")).unwrap_or_default();
+    assert!(j.trim().is_empty(), "journal not empty: {j}");
+
+    // Fail closed: a multicast MAC is refused by the kernel half way
+    // through the batch.
+    let mut topo = Topology::new("pcr7_br", 7).unwrap();
+    topo.harden("pcr7_", Some(Ipv4Addr::new(10, 57, 0, 1)), None, &dir)
+        .unwrap();
+    topo.create_bridge().unwrap();
+    let specs: Vec<netctl::PortSpec> = (0..20u8)
+        .map(|i| netctl::PortSpec {
+            id: format!("pcr7_b{i}"),
+            mac: Some(if i == 10 {
+                [0x01, 0, 0x5e, 0, 0, 1]
+            } else {
+                [0x02, 0, 0, 0, 0x57, i]
+            }),
+            src_ip: Some(Ipv4Addr::new(10, 57, 1, i + 1)),
+        })
+        .collect();
+    let e = topo.add_ports(&specs, &none).unwrap_err();
+    assert!(format!("{e:#}").contains("pcr7_b10"), "{e:#}");
+    assert!(
+        exists("pcr7_b10"),
+        "the failed port was created and is tracked"
+    );
+    topo.teardown().unwrap();
+    assert!(sh(&["ip", "-o", "link", "show"])
+        .lines()
+        .all(|l| !l.contains("pcr7_")));
+    assert_eq!(rule_count("raw", "outstation-run-7"), 0);
+    let j = std::fs::read_to_string(dir.join("state-guards.txt")).unwrap_or_default();
+    assert!(j.trim().is_empty(), "journal not empty: {j}");
+
+    // A refused address stops the batch before anything is created.
+    let mut topo = Topology::new("pcr8_br", 8).unwrap();
+    topo.harden("pcr8_", Some(Ipv4Addr::new(10, 58, 0, 1)), None, &dir)
+        .unwrap();
+    topo.create_bridge().unwrap();
+    let specs = vec![
+        netctl::PortSpec {
+            id: "pcr8_b0".into(),
+            mac: None,
+            src_ip: Some(Ipv4Addr::new(10, 58, 1, 1)),
+        },
+        netctl::PortSpec {
+            id: "pcr8_b1".into(),
+            mac: None,
+            // Held by nsfree0 (setup).
+            src_ip: Some(Ipv4Addr::new(10, 99, 3, 1)),
+        },
+    ];
+    let e = topo.add_ports(&specs, &none).unwrap_err();
+    assert!(format!("{e:#}").contains("10.99.3.1"), "{e:#}");
+    assert!(!exists("pcr8_b0"));
+    assert_eq!(
+        rule_count("raw", "outstation-run-8"),
+        1,
+        "only the run's DROP, no ACCEPT"
+    );
+    topo.teardown().unwrap();
+    assert_eq!(rule_count("raw", "outstation-run-8"), 0);
+}

@@ -280,6 +280,80 @@ fn slave_stopped_while_listening_is_cancelled() {
     );
 }
 
+/// T17c: a master that closes (FIN), or resets (RST), its connection
+/// before STARTDT leaves the slave listening again; the next master gets
+/// the whole script and the session completes. A probe that sends
+/// TESTFR first is no different. The dropped connections are counted.
+#[test]
+fn slave_listens_again_after_master_leaves_before_startdt() {
+    let (run, port) = slave(
+        blob(&[sp_asdu(1, 1), sp_asdu(2, 0), sp_asdu(3, 1)]),
+        r#"{"session":{"t1":3,"t2":1,"idle_serve_secs":0.2}}"#,
+    );
+    let wait_state = |want: u8| {
+        let deadline = Instant::now() + ms(3000);
+        while run.progress.state.load(Ordering::Relaxed) != want {
+            assert!(Instant::now() < deadline, "state never became {want}");
+            std::thread::sleep(ms(5));
+        }
+    };
+    // 1. Connect and close without a word.
+    let p = Peer::connect(port);
+    wait_state(session_state::CONNECTED);
+    drop(p);
+    wait_state(session_state::LISTENING);
+    // 2. Probe with TESTFR, then reset.
+    let mut p = Peer::connect(port);
+    p.send_u(U_TESTFR_ACT);
+    let a = p.recv(ms(2000)).expect("TESTFR con");
+    assert!(is_u(&a, U_TESTFR_CON), "{a:?}");
+    p.reset();
+    wait_state(session_state::LISTENING);
+    // 3. A real master: the full script.
+    let mut p = Peer::connect(port);
+    master_handshake(&mut p);
+    for _ in 0..3 {
+        assert!(is_i(&p.recv(ms(2000)).expect("I-frame")));
+    }
+    p.ack();
+    assert!(p.sees_fin(ms(3000)), "no FIN after idle-serve");
+    let (rep, _, _) = run.join_within(ms(3000));
+    assert!(rep.error.is_none(), "{:?}", rep.error);
+    assert!(rep.connected);
+    assert_eq!(rep.messages_sent, 3);
+    assert_eq!(
+        rep.messages_received, 0,
+        "the probe's TESTFR is not counted"
+    );
+    assert_eq!(rep.protocol.connections_before_startdt, 2);
+    assert_eq!(rep.protocol.protocol_violations, 0, "{:?}", kinds(&rep));
+}
+
+/// T17c: a master that connects and stays silent still ends the
+/// session at the STARTDT timeout (only a closed connection re-arms
+/// the listener), and a stop while listening again is a cancel.
+#[test]
+fn slave_stopped_after_an_early_close_is_cancelled() {
+    let (run, port) = slave(blob(&[sp_asdu(1, 1)]), "{}");
+    let p = Peer::connect(port);
+    let deadline = Instant::now() + ms(3000);
+    while run.progress.state.load(Ordering::Relaxed) != session_state::CONNECTED {
+        assert!(Instant::now() < deadline, "never connected");
+        std::thread::sleep(ms(5));
+    }
+    drop(p);
+    while run.progress.state.load(Ordering::Relaxed) != session_state::LISTENING {
+        assert!(Instant::now() < deadline, "never listened again");
+        std::thread::sleep(ms(5));
+    }
+    let state = run.progress.state.clone();
+    run.cancel();
+    let (rep, _, _) = run.join_within(ms(2000));
+    assert_eq!(rep.error.as_deref(), Some("cancelled while listening"));
+    assert_eq!(rep.protocol.connections_before_startdt, 1);
+    assert_eq!(state.load(Ordering::Relaxed), session_state::CANCELLED);
+}
+
 /// F150: end-to-end slave session: handshake, replay, acks, live GI,
 /// idle-serve for `idle_serve_secs`, then close with FIN.
 #[test]

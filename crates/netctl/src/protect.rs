@@ -413,6 +413,25 @@ pub fn assess_port_ip(
     Ok(())
 }
 
+/// [`validate_port_ip`] for many addresses against one snapshot of the
+/// host's addresses and gateways (one `ip addr` listing for a whole
+/// batch of ports instead of one per port, whose output grows with
+/// every session address added).
+pub fn validate_port_ips(ips: &[Ipv4Addr], prot: &Protection, own_ifaces: &[&str]) -> Result<()> {
+    if ips.is_empty() {
+        return Ok(());
+    }
+    let facts = AliasIpFacts {
+        gateways: default_gateways_v4().unwrap_or_default(),
+    };
+    let local = all_local_addrs()?;
+    for ip in ips {
+        assess_port_ip(*ip, &local, &facts, prot, own_ifaces)
+            .map_err(|e| anyhow::anyhow!("refusing source address {ip}: {e:#}"))?;
+    }
+    Ok(())
+}
+
 /// Live version of [`assess_port_ip`].
 pub fn validate_port_ip(ip: Ipv4Addr, prot: &Protection, own_ifaces: &[&str]) -> Result<()> {
     let facts = AliasIpFacts {

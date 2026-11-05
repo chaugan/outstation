@@ -49,7 +49,7 @@ Host tools the service calls: `ip` and `tc` (iproute2), `iptables` (with the `co
 | `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `LockPersonality`, `RestrictSUIDSGID`, `RestrictNamespaces`, `SystemCallArchitectures=native`, `UMask=0027` | Hardening |
 | `ProtectKernelTunables=no` | The run guards write sysctls (`bridge-nf-call-iptables`, `ip_forward`, per-interface settings) |
 | `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET AF_UNIX` | Sessions, netlink, raw replay and capture, journald |
-| `RestrictRealtime=no` | SCHED_FIFO for raw replay with `realtime` |
+| `RestrictRealtime=no` | SCHED_FIFO for raw replay with `realtime`, and for every run's capture reader (it only blocks and drains the run's own frames; at default priority it lost frames under load) |
 | `StateDirectory=outstation`, `ReadWritePaths=/var/lib/outstation` | Everything the service writes lives here. Nothing lives in its private `/tmp` |
 | `ReadWritePaths=-/run/xtables.lock` | `ProtectSystem=strict` makes `/run` read-only, and iptables-legacy takes its lock at `/run/xtables.lock`. iptables-nft does not use that file. The leading `-` makes systemd ignore the path when it does not exist |
 | `MemoryDenyWriteExecute=yes` | Hardening: no memory mapping that is both writable and executable |
