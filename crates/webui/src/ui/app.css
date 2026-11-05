@@ -535,6 +535,16 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
 .an-tbl th { text-align: left; color: var(--ink-2); padding: 4px 8px; font-weight: 600; }
 .an-tbl td { padding: 3px 8px; }
 
+/* ---------- health ---------- */
+.health-chip {
+  font: inherit; font-family: var(--mono); font-size: var(--fs-xs); font-weight: 600; cursor: pointer;
+  background: #fbf6ea; color: var(--warn); border: 1px solid currentColor; border-radius: 2px; padding: 1px 8px; line-height: 18px;
+}
+.health-chip[data-level="bad"] { background: #fdf5f5; color: var(--err); }
+.health-list { margin: 4px 0 0; padding-left: 18px; }
+.health-list li + li { margin-top: 4px; }
+.health-list:focus { outline: none; }
+
 /* ---------- footer ---------- */
 .footer {
   max-width: 1200px; margin: 0 auto; padding: 16px 24px 32px; border-top: 1px solid var(--rule);
@@ -575,6 +585,7 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
   .an-slave-head > :nth-child(3), .an-slave-head > :nth-child(5) { display: none; }
   .an-slave-sum > :nth-child(4), .an-slave-head > :nth-child(4) { display: none; }
   .an-slave-detail { padding: 8px 6px 12px; }
+  .statusbar { flex-wrap: wrap; }
   .an-tid-hist { grid-template-columns: minmax(0, 1fr); }
   .an-anomaly-list .row { grid-template-columns: 60px minmax(0, 1fr) 70px; }
   .an-anomaly-list .row .ctx { display: none; }

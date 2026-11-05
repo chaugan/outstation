@@ -23,6 +23,7 @@
     </nav>
     <div class="statusbar">
       <a class="active-run" id="active-run" href="#/runs" hidden></a>
+      <button type="button" class="health-chip" id="health-chip" data-act="show-health" hidden></button>
       <span class="conn" id="conn" data-state="connecting" role="status" aria-live="polite">
         <span class="conn-dot" aria-hidden="true"></span><span id="conn-text">connecting…</span>
       </span>
@@ -32,7 +33,7 @@
 
 <div class="banners">
   <div class="banner warn" id="degraded-banner" role="status" hidden>
-    <div class="banner-body"><strong>Server health:</strong> <span id="degraded-text"></span></div>
+    <div class="banner-body"><strong>Server health</strong><div id="degraded-text"></div></div>
     <button type="button" class="btn btn-text" data-act="dismiss-banner" data-target="degraded-banner">Dismiss</button>
   </div>
   <div class="banner info" id="run-banner" role="status" aria-live="polite" hidden>
@@ -445,6 +446,8 @@
   <span><span class="k">Topology</span> <span class="v">veth per source</span></span>
   <span><span class="k">Protocols</span> <span class="v" id="foot-protocols">—</span></span>
   <span><span class="k">UI</span> <span class="v" id="foot-version">—</span></span>
+  <span><span class="k">Auto-analysis</span> <span class="v" id="foot-auto">—</span></span>
+  <span><span class="k">Metrics</span> <a class="v" href="/metrics">/metrics</a> <span class="muted">(Prometheus)</span></span>
 </footer>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
