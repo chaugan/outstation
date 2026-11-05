@@ -150,16 +150,16 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 
 ## Wave 3: product features
 
-- [~] **T08 (backend done; UI is in T19) Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
+- [x] **T08 Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
 - [x] **T09 Headless bench CLI.** `outstation bench --profile run.json --assert score>=99 --assert p99_ms<=500 --report out.json`. It runs, captures, analyses its own mirror and exits non-zero on failure. Refs: F131; product item #2.
-- [~] **T10 (backend done; UI is in T19) Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
+- [x] **T10 Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
 - [x] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
 - [x] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [x] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
 - [x] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
 - [x] **T18 Slave-mode capture.** Slave runs (the main "test a SCADA master" scenario) have no mirror capture, so auto-analysis and `bench` score assertions cannot cover them. Capture the RTU listen-IP traffic on the alias NIC with a BPF filter limited to the run's listen IPs and port, store it like the other captures, and enable auto-analysis and bench scoring for slave runs.
-- [~] **T19 UI for the wave-3 features.**
+- [x] **T19 UI for the wave-3 features.**
   - Re-run and "Load config" from a run, plus named profiles (save, load, delete).
   - Compare view with a run picker, regression highlighting and thresholds; when an analysis is missing, POST `/api/runs/:id/analyze` and retry.
   - Auto-analysis state on run cards; SSE `analysis_finished` and `analysis_failed` trigger a refresh.
@@ -286,3 +286,13 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Slave runs now capture through a kernel-BPF-filtered AF_PACKET socket on the RTU-IP and master-route interfaces, so auto-analysis and bench scoring work in slave role.
   - Privileged suites rerun by the orchestrator: netns-test 7/7, netns-bench-test 3/3, netns-slave-test 2/2 on 10 of 11 runs. The one flaky failure, right after the bench suite, went back to the lane for a root cause (T18b). Host interface and iptables counts unchanged.
 - 2026-11-05: T15 (docs) and T16 (privileged HTTP smoke suite) started in parallel with T19 (UI) and T18b (flake).
+- 2026-11-05: T19 merged. Workspace tests: 405 passed.
+  - Re-run and "Load into Configure", with force always re-confirmed.
+  - Profiles CRUD.
+  - Compare view with an analysis_missing → analyze → retry flow.
+  - Auto-analysis state, plus SSE-driven refresh.
+  - Command and fault-plan editors, and reports.
+  - `degraded_detail` health banner and a /metrics link.
+  - ui-smoke: 203 checks pass in Chromium 1440/390 and WebKit 1440.
+  - With this, T08 and T10 are complete.
+- 2026-11-05: Orchestrator: IEC 104 `proto_config` is validated at submit through `ProtoReplayer::validate_config`, returning 400 `invalid_proto_config`.
