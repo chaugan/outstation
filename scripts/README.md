@@ -66,18 +66,22 @@ Cases, in order (later cases reuse the server and runs of earlier ones):
    409 `run_active` with `client_ip`; stopping mid-run gives `stopped`.
 6. The default-route NIC is refused without `force` (the run fails and
    nothing is touched) and accepted with it.
-7. SIGTERM mid-run (an unbounded run with SCADA gateway and upstream
-   NAT, so a sysctl, an alias, NAT and filter rules and a NIC offload
-   are all leased): the server exits within `TimeoutStopSec` (30 s) and
-   the namespace is back to its baseline: no `pcr*` interfaces, no
-   `outstation-run-*` rules, sysctls, offloads, addresses and routes
-   restored. After a restart the run is `stopped` with `finished_at`,
-   and the restart auto-analyses it (it finished too late during the
-   shutdown).
-8. SIGKILL mid-run: the leftovers are there, `outstation cleanup
-   --state-dir` restores the baseline (and is a no-op the second time),
-   the restarted server's startup cleanup undoes nothing, and the run is
-   `failed` ("interrupted by server restart") with `finished_at`.
+7. A master run with SCADA-gateway mode is refused (400
+   `gateway_requires_slave`; gateway mode is slave-role only). Then
+   SIGTERM mid-run, twice: an unbounded slave run with SCADA gateway
+   and upstream NAT (gateway alias, `ip_forward`, NAT rule, RTU
+   aliases), and an unbounded master run (bridge, veths, filter rules,
+   a NIC offload). Each time the namespace is back to its baseline: no
+   `pcr*` interfaces, no `outstation-run-*` rules, sysctls, offloads,
+   addresses and routes restored. The master run's server exits within
+   `TimeoutStopSec` (30 s); after a restart that run is `stopped` with
+   `finished_at`, and the restart auto-analyses it (it finished too
+   late during the shutdown).
+8. SIGKILL mid-run, the same two runs: the leftovers are there,
+   `outstation cleanup --state-dir` restores the baseline (and is a
+   no-op the second time), the restarted server's startup cleanup
+   undoes nothing, and the run is `failed` ("interrupted by server
+   restart") with `finished_at`.
 9. Re-run (a stored `force` is not inherited), profiles CRUD, compare
    (409 `analysis_missing` → `POST /api/runs/:id/analyze` → 200), and
    `/metrics` agrees with `/api/runs` and the stored analyses.

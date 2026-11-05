@@ -34,6 +34,7 @@ Medians of 3 runs each, as fast as possible (`pacing: fast`), event-driven peers
 - **800 sessions** run in slave role (all 800 complete, 174 k I-frames/s). In master role 508 of 800 connected: the rest failed because this test host's kernel neighbour table overflowed (§5), a limit of putting both ends on one kernel. Setup then takes 77 s and teardown 47 s.
 - **Fixed in this lane**: the master capture lost every reply above 527 sessions (§6.1), and slave runs above ~250 RTUs ran out of file descriptors under the systemd default limit (§6.2).
 - **Gateway mode does not work in master role with an egress NIC** (§7).
+- **After T17c** (§10): every full-speed run of 200 and 400 sessions, both roles, scores `all_correct` with no frame lost by the capture; master-role setup takes 3.2-3.4 ms per session (0.8 s for 200, 1.5 s for 400) and teardown 0.9-1.7 s; gateway mode is refused in master role.
 
 ---
 
@@ -191,7 +192,7 @@ When the attach failed, the run logged `capture: cannot record replies on the NI
 
 Fix (`dfe8df1`): when the per-MAC filter is rejected, the NIC is captured with the accept-all-incoming filter instead, with a run warning ("the per-MAC reply filter for N sessions did not fit ...; every incoming frame on NIC is recorded, including other LAN traffic"). Regression test `master_capture_keeps_replies_when_the_mac_filter_does_not_fit` in `crates/sched/tests/capture_netns.rs` (privileged, run by `scripts/netns-bench-test.sh`) sets `optmem_max=512` in its namespace so that even a one-session filter does not fit; it fails without the fix.
 
-Still open: the analysis does not carry the run's capture warnings into its notes, so a capture without replies reads as "never connected" rather than "inconclusive".
+Still open at the time: the analysis did not carry the run's capture warnings into its notes, so a capture without replies read as "never connected" rather than "inconclusive". Since T17c the notes and `run_warning` carry them (§10.2).
 
 ### 6.2 Slave runs above ~250 RTUs ran out of file descriptors under the systemd default (fixed in this lane)
 
@@ -201,7 +202,7 @@ Repro (binary before `ccd5e08`): `NOFILE=1024 scripts/netns-scale.sh slave-400`.
 
 Fix (`ccd5e08`): at startup outstation raises the soft limit to the hard limit (at most 2^20) and warns when it stays below 4,096. Unit test `nofile_limit_is_raised_to_the_hard_limit` (it lowers the soft limit to 1,024 first). With the fix the same run completes 400 of 400 (§4.6).
 
-### 6.3 Master runs: a few sessions flagged although they ran correctly (not fixed)
+### 6.3 Master runs: a few sessions flagged although they ran correctly (fixed in T17c, §10)
 
 In every full-speed master run 0.5-9 % of the sessions get `handshake_incomplete` ("session k/30: content matched but the STARTDT handshake was not seen"), with `captured_dropped` 0 and every I-frame delivered; at original timing (merged code) 1-2 of 200 sessions are sometimes reported as "never connected" although they sent all their I-frames.
 
@@ -209,22 +210,22 @@ Cause, from a kept capture (`KEEP_CAPTURES=1`): every frame is there, with corre
 
 Repro: `REPEAT=1 KEEP_CAPTURES=1 scripts/netns-scale.sh master-200`, then list a flagged session's connections in `runs/master-200-fast-r1/capture.pcap` in file order. Possible fixes: let the capture writer merge its readers by timestamp (a short reorder window), or sort packets by timestamp in `pcapload` before building flows.
 
-### 6.4 Slave runs at full speed: the capture cannot keep up (a limit, reported honestly)
+### 6.4 Slave runs at full speed: the capture cannot keep up (fixed in T17c, §10.3)
 
 At 240-320 k I-frames/s the slave capture (one AF_PACKET socket on the alias NIC, 32 MiB receive buffer) loses 4-16 % of the frames. The run reports them in `captured_dropped`, the analysis says "the capture lost N frames (kernel receive queue full); frames reported missing may have been delivered", and the verdict is `partial`. Every session completed. At 10× and 100× original timing (up to 41 k I-frames/s) nothing is dropped and 200 RTUs score `all_correct`. Use original timing for fidelity verdicts and full speed for throughput.
 
-### 6.5 Re-audit change N8: the slave capture no longer runs at RT priority by default
+### 6.5 Re-audit change N8: the slave capture no longer runs at RT priority by default (reverted in T17c, §10)
 
 Since the re-audit merge the slave capture thread gets RT priority only when the run sets `realtime` (`crates/sched/src/slave.rs`, "RT priority only when the run asks for realtime (N8)"); T18b had made it RT by default because the capture overflowed under CPU load. At full speed the drops went from 46.5 k (median, slave-200, before the merge) to 237 k after it; with `"realtime": true` they are 60 k (and 0 in one of three runs). Suggest saying in the docs that heavy slave runs whose capture is to be analysed should set `realtime`.
 
 ### 6.6 Smaller observations
 
-- **Setup and teardown are serial and grow faster than the session count in master role**: 54 ms per session at 200, 67 ms at 400, 95 ms at 800 (one `ip`/`sysctl`/`iptables` call at a time, and each iptables check scans a longer chain), and teardown takes almost as long again (9.6 s, 20.2 s, 46.7 s). Slave role: 30-34 ms per listener at 200-400, 43 ms at 800, overlapping with traffic.
-- **A slave session whose first master connection closes before STARTDT ends for good** ("peer closed the connection waiting for STARTDT act") and does not listen again. Seen with an early version of the fast master peer that dropped half-open connections; a real master that probes the port before connecting for real would hit it too.
-- **Cosmetic**: in master role with many captured masters the analysis note "master IP renamed: captured=10.20.100.10 live=10.20.100.173" names one session's address, although every session has its own master.
+- **Setup and teardown are serial and grow faster than the session count in master role**: 54 ms per session at 200, 67 ms at 400, 95 ms at 800 (one `ip`/`sysctl`/`iptables` call at a time, and each iptables check scans a longer chain), and teardown takes almost as long again (9.6 s, 20.2 s, 46.7 s). Slave role: 30-34 ms per listener at 200-400, 43 ms at 800, overlapping with traffic. *Fixed for master role in T17c (§10.2, item 6).*
+- **A slave session whose first master connection closes before STARTDT ends for good** ("peer closed the connection waiting for STARTDT act") and does not listen again. Seen with an early version of the fast master peer that dropped half-open connections; a real master that probes the port before connecting for real would hit it too. *Fixed in T17c (§10.2, item 5).*
+- **Cosmetic**: in master role with many captured masters the analysis note "master IP renamed: captured=10.20.100.10 live=10.20.100.173" names one session's address, although every session has its own master. *Fixed in T17c (§10.2, item 7).*
 - **Capture filter sizes in slave role**: the per-RTU filter (4 instructions per RTU) fits 1,019 RTUs before the 4,096-instruction limit; its option-memory limit was not reached at 800 RTUs. Above the limit an RTU is not recorded, with a warning (from the code, not measured).
 
-## 7. SCADA-gateway mode with an egress NIC in master role
+## 7. SCADA-gateway mode with an egress NIC in master role (refused since T17c, §10.2)
 
 Question left by T15: does gateway mode work in master role when the run enslaves an egress NIC? It does not. Repro: [`scripts/netns-gateway-egress.sh`](../scripts/netns-gateway-egress.sh). One session, master `10.20.100.10` (off the RTU's subnet), RTU `10.77.0.1/24` whose default gateway `10.77.0.254` does not exist on the isolated LAN, egress NIC `os-a` (not the default-route NIC, so no `force` is needed for it):
 
@@ -289,3 +290,65 @@ The script prints one JSON line per run and a Markdown table of every run and th
 | slave-200 GI fixed | 1 | 0.4 | 1,501,671 | 175,020 | 289,639 | 309,349 | 0.48 | 2.41 | 229 | 24.6 | 134 | 614 | 285 | 503 | 6.0 | 29.5 | 7.3 | 0.0 | 0 | 173,874 | partial | 85.82 |
 | slave-200 GI fixed | 2 | 0.9 | 1,501,671 | 174,390 | 290,931 | 336,977 | 0.45 | 2.26 | 229 | 24.5 | 136 | 632 | 288 | 583 | 5.9 | 29.4 | 7.4 | 0.0 | 0 | 177,420 | partial | 87.99 |
 | slave-200 GI fixed | 3 | 1.2 | 1,501,671 | 175,613 | 286,414 | 293,840 | 0.45 | 2.42 | 231 | 24.7 | 136 | 622 | 285 | 787 | 6.0 | 29.7 | 7.3 | 0.0 | 0 | 176,038 | partial | 87.04 |
+
+## 10. After T17c
+
+T17c (lane fx3, branch `audit/fx3`) fixed the engine problems of §6 and §7. Same host, same script and scenarios, release build of `18015b8`; medians of 3 runs each. The "before" column is a fresh run of the binary at `475292a` (the T17 merge) on the same afternoon, so that both sides saw the same host load (1-minute load average 2.5-9 before the runs; the host was busy with other lanes' builds).
+
+### 10.1 Headline
+
+| | master-200 before | master-200 after | master-400 before | master-400 after | slave-200 before | slave-200 after | slave-400 after |
+|---|---|---|---|---|---|---|---|
+| verdict | partial ×3, 99.6 | **all_correct ×3, 100** | partial ×3, 100.0 (rounded) | **all_correct ×3, 100** | partial ×3, 85.5 | **all_correct ×3, 100** | **all_correct ×3, 100** |
+| `captured_dropped` | 0 | 0 | 0 | 0 | 175,885 | **0** | **0** |
+| setup before traffic | 11.1 s | **0.8 s** | 27.4 s | **1.5 s** | 6.0 s | 6.2 s | 12.1 s |
+| per session | 54.6 ms | **3.4 ms** | 67.9 ms | **3.2 ms** | 29.4 ms | 30.7 ms | 30.0 ms |
+| teardown | 9.5 s | **0.9 s** | 20.2 s | **1.7 s** | none | none | none |
+| I-frames/s on the wire | 681,434 | 716,169 | 621,487 | 657,404 | 278,578 | 324,388 | 264,852 |
+| ack latency p50 / p99 | 2.7 / 6.5 ms | 2.3 / 6.0 ms | 4.5 / 7.9 ms | 4.3 / 7.1 ms | 0.5 / 2.2 ms | 0.4 / 2.3 ms | 0.4 / 2.2 ms |
+| outstation CPU while sending | n/a (1) | 4.4 cores | n/a (1) | 4.6 cores | n/a (1) | 2.0 cores | 2.0 cores |
+| outstation CPU s, whole bench | 30.6 | **23.7** | 72.5 | **51.1** | 24.6 | 22.1 | 45.9 |
+| RSS while sending / peak | n/a (1) / 563 MB | 267 / 571 MB | n/a (1) / 1,127 MB | 451 / 1,138 MB | n/a (1) / 616 MB | 172 / 600 MB | 278 / 1,153 MB |
+
+(1) The /proc sampler matches the process by name and missed the renamed "before" binary; §3 has those figures for the same code (master-200: 4.9 cores, 199 MB; master-400: 5.1 cores, 382 MB; slave-200: 2.3 cores, 135 MB).
+
+Every one of the 12 runs completed with every session, and every one scored `all_correct` at full speed. The extra ~70 MB of RSS while sending is the capture's receive rings (§10.3), 32 MiB per capture socket, mapped up front.
+
+### 10.2 What changed, item by item
+
+1. **Gateway mode in master role is refused** (§7): `scada_gateway_ip`, `scada_gateway_iface` or `upstream_nat_iface` in a master-role benchmark is a 400 `gateway_requires_slave` (POST /api/run, re-run, profiles, `outstation bench`), with a message naming the alternatives; sched refuses it too. `scripts/netns-gateway-egress.sh` now expects it: cases 1 (completes) and 2 (fails) as before, cases 3 to 6 refused before any host change, exit 1 otherwise. Lab guide (en/no), api.md and README updated.
+2. **Capture ordering** (§6.3): the capture writer merges its sockets by kernel timestamp (a bounded reorder buffer, k-way by `SO_TIMESTAMP`/ring time, flushed by a watermark: the poll time less 20 ms, lowered to the last timestamp read from any socket that still has frames queued; at most 128 Ki frames, 64 MiB or 500 ms). pcapload additionally keeps a SYN that its flow's SYN-ACK already acknowledged (exact ISN match) in the flow instead of splitting it. Result: 0 "out-of-order timestamps" warnings in the kept master captures (each "before" master run had one) and `all_correct` in 9 of 9 full-speed master runs, against `partial` in 6 of 6 before. Check: `KEEP_CAPTURES=1 scripts/netns-scale.sh master-200`, 3 runs, `all_correct` ×3 (twice: after the ordering fix alone, §10.4, and with everything).
+3. **Capture at RT priority again, and through a ring** (§6.4, §6.5): every run's capture reader asks for SCHED_FIFO whatever `realtime` says (it only blocks and drains the run's own frames; losing frames corrupts verdicts). That alone cut the slave-200 drops from 175,885 to 48,357. The reader then got a TPACKET_V3 receive ring per socket (§10.3), and the drops went to 0 in 12 of 12 runs, slave-400 included.
+4. **The analysis shows the capture's warnings**: filter fallback, listeners or NICs not recorded, `capture_ok == false`, drops and truncation are copied into the analysis notes and summarised in `run_warning`.
+5. **Slave reconnect** (§6.6): a master that closes or resets its connection before STARTDT no longer ends the slave session; the listener stays open until STARTDT and accepts the next master (counted in `protocol.connections_before_startdt`).
+6. **Setup and teardown** (§6.6): ports are built by a pool of 8 threads, the session addresses are validated against one snapshot of the host, every session ACCEPT goes in with one journaled `iptables-restore --noflush`, and the capture mirror's tc filters go through one `tc -batch` (every `tc` start dumps all host links: that alone was 5 of the 6.5 s of a 400-session setup with the pool). Teardown deletes ports in parallel and removes the rules in one transaction. Per-session cost is now flat (3.4 ms at 200, 3.2 ms at 400) instead of growing (54.6, 67.9). Fail-closed behaviour and the journal are unchanged: every rule is journaled before it is applied, a failed batch is undone, and only created ports are tracked for teardown.
+7. **The master-IP note** compares the full sets of captured and live masters: one rename is named, many-to-one is summarised with every address, and master role without a rename shows no single master.
+
+### 10.3 The capture ring
+
+A `recvmsg` per frame and a 32 MiB socket buffer charged at about 1 KiB per small frame (skb truesize) let the reader fall behind at 300 k frames/s. Each capture socket now maps a TPACKET_V3 ring of 32 blocks of 1 MiB: frames are packed back to back (about 100 bytes for a small IEC 104 frame), the reader takes a whole block per wakeup, and the kernel timestamp comes with every frame. The block timeout is 2 ms, which the reorder hold covers. Without a ring (the kernel refuses one), the socket is read frame by frame as before. Every frame header is bounds-checked against its block before it is read (security review).
+
+Measured in steps on slave-200 (medians of 3, `captured_dropped` / score): before 175,885 / 85.5; RT priority 48,357 / 97.2; RT priority and ring 0 / 100. The ring also lowered the CPU used while sending (master-200: 495 % to 439 %; slave-200: 227 % to 203 %).
+
+One master-400 run of an intermediate build (4 port workers, ring, 2 runs) lost 318 frames on both capture sockets in the same second, which points at a reader stall (the shared disk was 97 % full and busy) rather than at the ring's size; none of the 12 final runs lost a frame.
+
+### 10.4 Intermediate runs
+
+| build | scenario | setup s (ms/session) | teardown s | CPU s | dropped | verdict, score |
+|---|---|---|---|---|---|---|
+| ordering + RT priority (`10cf14e`) | master-200 | 11.3 (55.8) | 9.6 | 32.3 | 0 | all_correct ×3, 100 |
+| ordering + RT priority | slave-200 | 6.5 (32.4) | none | 24.8 | 48,357 | partial ×3, 97.2 |
+| + parallel setup, tc per port (`9e64f35`) | master-200 | 2.1 (9.8) | 0.9 | 35.3 | 0 | all_correct ×3, 100 |
+| + parallel setup, tc per port | master-400 | 6.5 (15.8) | 1.7 | 94.5 | 0 | all_correct ×3, 100 |
+| + ring (`f845c56`) | slave-200 | 6.2 (30.5) | none | 22.6 | 0 | all_correct ×3, 100 |
+| + ring | master-200 | 2.1 (9.9) | 0.8 | 32.7 | 0 | all_correct ×3, 100 |
+
+The parallel setup with one `tc` pair per port used more CPU than the serial one (master-400: 94.5 against 72.5 s): eight `tc` processes at a time each dumping 800+ links. The `tc -batch` mirror removed that (51.1 s, and 1.5 s of setup).
+
+### 10.5 Still open
+
+- **Slave-role setup** is unchanged at about 30 ms per listener (alias, journal entry, capture filter update), overlapping with traffic: T17c parallelised master role only.
+- **Neighbour table** (§5) and **one CPU for both ends** (§4.5) are limits of this test host, not of outstation.
+- **The capture writer runs on the reader thread**: a long write stall (a full or slow disk) still makes the kernel drop frames, and the run then says so (`captured_dropped`, notes, `run_warning`).
+
+Raw numbers: `results.jsonl` of each run in the lane's work directories (`scale-before`, `scale-a`, `scale-b`, `scale-c`, `scale-final`, `scale-final2`); the command lines are those of §8 with `NS_PREFIX=ostest-fx3-scale`.
