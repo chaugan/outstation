@@ -213,6 +213,9 @@ pub struct PlaybackReport {
     pub iterations_truncated: bool,
     pub iterations_configured: u64,
     pub iterations_observed: usize,
+    /// Passes delivered beyond `iterations_configured` (when that is
+    /// known): every frame in them counts as extra (N12).
+    pub extra_passes: usize,
     pub iterations_complete: usize,
     pub iterations_clean: usize,
     pub stopped_tail: Option<TailReport>,
@@ -251,7 +254,8 @@ pub struct IterationReport {
     /// 1-based.
     pub iteration: usize,
     /// `clean`, `deviations`, `stopped_tail_clean`,
-    /// `stopped_tail_deviations` or `not_started`.
+    /// `stopped_tail_deviations`, `not_started` or `extra_pass` (a pass
+    /// beyond the configured iteration count; all of it is extra).
     pub status: &'static str,
     pub expected: usize,
     pub identical: usize,
@@ -657,6 +661,12 @@ pub fn analyze_iec104_flow(
             "captured session contains {} passes of the {}-frame source script; each pass is judged separately",
             cmp.iterations_observed,
             expected_frames.len()
+        ));
+    }
+    if cmp.report.extra_passes > 0 {
+        notes.push(format!(
+            "{} pass(es) beyond the {} configured iteration(s) were delivered; their frames count as extra",
+            cmp.report.extra_passes, cmp_cfg.iterations_configured
         ));
     }
 
@@ -1585,6 +1595,21 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     let observed = last_touched.map(|e| e / e_len + 1).unwrap_or(0);
     let last_e = last_touched.unwrap_or(0);
     let tail_excused = cfg.stopped_early || (cfg.iterations_configured == 0 && observed > 1);
+    // Passes past a known iteration count were never owed: everything
+    // delivered in them is extra, nothing in them is missing (N12).
+    let configured = cfg.iterations_configured as usize;
+    let beyond = |it: usize| configured > 0 && it >= configured;
+    let extra_diff = |d: usize, it: usize| IFrameDiff {
+        kind: "extra",
+        index: d,
+        iteration: it + 1,
+        expected_index: None,
+        delivered_index: Some(d),
+        expected_type_id: None,
+        actual_type_id: Some(del_tids[d]),
+        expected_asdu_hex: String::new(),
+        actual_asdu_hex: to_hex(del[d].asdu),
+    };
 
     let mut iters: Vec<IterationReport> = (0..observed.max(1))
         .map(|i| IterationReport {
@@ -1610,6 +1635,11 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
         let it = e / e_len;
         let class = classify_pair(src[pos].asdu, &del[d], cfg);
         pair_classes.push((e, d, class));
+        if beyond(it) {
+            iters[it].extra += 1;
+            push_mm(extra_diff(d, it));
+            continue;
+        }
         if src_tids[pos] == del_tids[d] {
             report.matched_type_ids += 1;
         }
@@ -1653,6 +1683,11 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     for &(e, d) in &es.reordered {
         let pos = e % e_len;
         let it = (e / e_len).min(iters.len() - 1);
+        if beyond(it) {
+            iters[it].extra += 1;
+            push_mm(extra_diff(d, it));
+            continue;
+        }
         iters[it].reordered += 1;
         push_mm(IFrameDiff {
             kind: "reordered",
@@ -1671,8 +1706,10 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     let mut missing_indices: Vec<usize> = Vec::new();
     for &e in &es.missing {
         let it = e / e_len;
-        if it >= iters.len() {
-            continue; // repeated copy never started (insert-inflated)
+        if it >= iters.len() || beyond(it) {
+            // Repeated copy never started (insert-inflated), or a pass
+            // that was not owed.
+            continue;
         }
         if e > last_e && tail_excused {
             iters[it].not_sent += 1;
@@ -1716,12 +1753,19 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
         });
     }
     // Iterations the run was configured for but never started.
-    let configured = cfg.iterations_configured as usize;
     let never_started = configured.saturating_sub(observed.max(1));
     let never_started_frames = never_started.saturating_mul(e_len);
 
     // --- Per-iteration status, totals ---
     for (i, ir) in iters.iter_mut().enumerate() {
+        if beyond(i) {
+            ir.expected = 0;
+            ir.score_pct = 0.0;
+            ir.status = "extra_pass";
+            report.extra_count += ir.extra;
+            report.extra_passes += 1;
+            continue;
+        }
         let is_last = i + 1 == observed.max(1);
         let in_scope = ir.expected - ir.not_sent;
         let good = ir.identical + ir.cp56_ok;
@@ -4074,6 +4118,51 @@ mod tests {
         assert_eq!(o.r.verdict, "partial_delivery");
         assert_eq!(o.n("missing_count"), 5);
         assert!((o.r.score_pct - 75.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn passes_beyond_the_configured_count_are_extra() {
+        // N12 (probe C3): 3 clean passes delivered, 2 configured.
+        let exp = script10();
+        let mut got = exp.clone();
+        got.extend(exp.clone());
+        got.extend(exp.clone());
+        let c = ctx_with(
+            RunFacts {
+                iterations_per_session: 2,
+                ..Default::default()
+            },
+            None,
+        );
+        let o = run_with(&exp, &got, &c);
+        assert_ne!(o.r.verdict, "good_delivery", "{}", o.r.verdict_reason);
+        assert_ne!(o.r.outcome, VerdictOutcome::Pass);
+        assert_eq!(o.n("extra_count"), 10);
+        assert_eq!(o.n("extra_passes"), 1);
+        assert_eq!(o.n("missing_count"), 0);
+        assert_eq!(o.n("expected_iframes"), 20);
+        assert_eq!(o.n("iterations_clean"), 2);
+        let iters = o.pb("iterations").as_array().unwrap();
+        assert_eq!(iters.len(), 3);
+        assert_eq!(iters[2]["status"], "extra_pass");
+        assert_eq!(iters[2]["extra"], 10);
+        assert!(o
+            .r
+            .notes
+            .iter()
+            .any(|n| n.contains("beyond the 2 configured")));
+        // A partial extra pass is flagged too, and owes nothing.
+        let mut got = exp.clone();
+        got.extend(exp.clone());
+        got.extend(exp[..4].to_vec());
+        let o = run_with(&exp, &got, &c);
+        assert_eq!(o.n("extra_count"), 4);
+        assert_eq!(o.n("missing_count"), 0);
+        assert_eq!(o.n("not_sent_count"), 0);
+        // Unknown count (0): repeated passes are judged, not extra.
+        let o = run(&exp, &[exp.clone(), exp.clone(), exp.clone()].concat());
+        assert_eq!(o.n("extra_passes"), 0);
+        assert_eq!(o.r.verdict, "good_delivery");
     }
 
     #[test]
