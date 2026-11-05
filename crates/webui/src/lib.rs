@@ -211,7 +211,7 @@ pub(crate) fn restore(state: &AppState) -> Result<()> {
         &captures_dir,
         state.cfg.capture_max_total_bytes,
         state.cfg.capture_max_count,
-        None,
+        &[],
     );
     Ok(())
 }

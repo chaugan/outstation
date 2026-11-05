@@ -1943,3 +1943,72 @@ async fn next_run_starts_as_soon_as_previous_is_terminal() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// N6: a run is never visible without a registered worker.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_launch_never_abandons_a_live_worker() {
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    for want in 1..=30u64 {
+        // A watcher that stops the run the instant it becomes visible,
+        // the way a racing STOP click would.
+        let st = h.state.clone();
+        let watcher = std::thread::spawn(move || loop {
+            if let Some(e) = st.get_run(want) {
+                let alive = st.worker_alive(want);
+                crate::runs::cancel_run(&e.lock_safe());
+                return alive;
+            }
+            std::hint::spin_loop();
+        });
+        let (s, v) = h
+            .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(
+            watcher.join().unwrap(),
+            "run {want} was visible before its worker was registered"
+        );
+        let (s, v) = h
+            .call(Method::POST, &format!("/api/runs/{want}/stop"), None)
+            .await;
+        assert!(s.is_success(), "{v}");
+        let r = h.wait_status(want, "stopped").await;
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("no live worker"),
+            "run {want} was abandoned while its worker ran: {r}"
+        );
+        // The worker itself finalised it and is gone.
+        for _ in 0..200 {
+            if !h.state.worker_alive(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!h.state.worker_alive(want));
+    }
+}
+
+/// N13: retention never evicts a run's own capture before its
+/// auto-analysis ran, even when that one capture exceeds the cap.
+#[tokio::test]
+async fn retention_spares_the_capture_awaiting_analysis() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.capture_max_total_bytes = 1,
+    );
+    add_fixture(&h, "pcr_1");
+    let first = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(first).await;
+    assert_eq!(v["auto_analysis"]["state"], "done", "{v}");
+    // The next finished run evicts the older, analysed capture but
+    // keeps its own until it is analysed.
+    let second = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(second).await;
+    assert_eq!(v["auto_analysis"]["state"], "done", "{v}");
+    let files = h.files_in("state/captures");
+    assert!(!files.contains(&format!("run_{first}.pcap")), "{files:?}");
+}

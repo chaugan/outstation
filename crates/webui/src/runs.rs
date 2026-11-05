@@ -286,11 +286,6 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
         client_ip: l.client_ip.clone(),
         started_at,
     });
-    state
-        .runs
-        .lock_safe()
-        .insert(id, Arc::new(std::sync::Mutex::new(rs)));
-    drop(active);
 
     let job = match l.job {
         RunJob::Raw(mut cfg) => {
@@ -304,12 +299,22 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
             RunJob::Benchmark(cfg, rep)
         }
     };
+    // The worker is spawned and registered in `workers` *before* the
+    // run becomes visible in `runs` and before `active` is released, so
+    // a stop or delete can never see a running run without a live
+    // worker and finalise it as abandoned while the worker still runs
+    // (N6). The worker waits for `go` so it cannot finalise a run that
+    // is not registered yet.
+    let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
     let st = state.clone();
     let pcap = l.pcap;
     let worker_ctx = ctx.clone();
     let spawned = std::thread::Builder::new()
         .name(format!("webui-run-{id}"))
         .spawn(move || {
+            // Err means launch gave up on the run; finalize still runs
+            // and is idempotent.
+            let _ = go_rx.recv();
             let span = info_span!("run", id);
             let _enter = span.enter();
             info!("run worker started");
@@ -323,19 +328,27 @@ pub(crate) fn launch(state: &AppState, l: Launch) -> Result<u64, AppError> {
             .unwrap_or_else(|p| RunOutcome::Panicked(panic_message(&*p)));
             finalize(&st, id, outcome);
         });
-    match spawned {
+    let spawn_err = match spawned {
         Ok(h) => {
             state.workers.lock_safe().insert(id, h);
+            None
         }
-        Err(e) => {
-            finalize(
-                state,
-                id,
-                RunOutcome::Panicked(format!("could not spawn run thread: {e}")),
-            );
-            return Err(AppError::Internal(format!("spawn run thread: {e}")));
-        }
+        Err(e) => Some(e),
+    };
+    state
+        .runs
+        .lock_safe()
+        .insert(id, Arc::new(std::sync::Mutex::new(rs)));
+    drop(active);
+    if let Some(e) = spawn_err {
+        finalize(
+            state,
+            id,
+            RunOutcome::Panicked(format!("could not spawn run thread: {e}")),
+        );
+        return Err(AppError::Internal(format!("spawn run thread: {e}")));
     }
+    let _ = go_tx.send(());
     spawn_sampler(state.clone(), id, ctx);
     state.emit("run_started", id, &l.client_ip, l.client_id, "running");
     info!(id, client = %l.client_ip, "run started");
@@ -386,18 +399,43 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
         }
         (status, rs.started_by.clone().unwrap_or_default())
     };
-    let keep = state
-        .active_run()
-        .map(|a| captures::capture_path(&state.cfg.captures_dir(), a.run_id));
+    state.emit("run_finished", id, &started_by, None, status.as_str());
+    info!(id, status = status.as_str(), "run finished");
+    // Queue the analysis first, then enforce retention with this run's
+    // capture and every capture still waiting for its analysis
+    // protected, so a run's own capture is never evicted before it is
+    // analysed (N13).
+    crate::analysis_run::spawn_auto_analysis(state, id);
+    let keep = retention_keep(state, id);
     captures::enforce_retention(
         &state.cfg.captures_dir(),
         state.cfg.capture_max_total_bytes,
         state.cfg.capture_max_count,
-        keep.as_deref(),
+        &keep,
     );
-    state.emit("run_finished", id, &started_by, None, status.as_str());
-    info!(id, status = status.as_str(), "run finished");
-    crate::analysis_run::spawn_auto_analysis(state, id);
+}
+
+/// Captures retention must not evict: the active run's, run `just_finished`'s
+/// and those of runs whose auto-analysis is queued or running.
+pub(crate) fn retention_keep(state: &AppState, just_finished: u64) -> Vec<PathBuf> {
+    let dir = state.cfg.captures_dir();
+    let mut keep = vec![captures::capture_path(&dir, just_finished)];
+    if let Some(a) = state.active_run() {
+        keep.push(captures::capture_path(&dir, a.run_id));
+    }
+    for e in state.all_runs() {
+        let rs = e.lock_safe();
+        let pending = rs
+            .auto_analysis
+            .as_ref()
+            .is_some_and(|a| matches!(a.state, "queued" | "running"));
+        if pending {
+            if let Some(p) = &rs.capture_file {
+                keep.push(p.clone());
+            }
+        }
+    }
+    keep
 }
 
 fn release_active(state: &AppState, id: u64) {
