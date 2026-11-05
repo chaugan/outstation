@@ -2,7 +2,9 @@
 // /api/runs/:id only for expanded runs), the runs list with keyed
 // updates, run cards that scale to 200 sessions (state summary,
 // filter, sort, pages), slave controls, the detail panel and its
-// charts (throughput sparkline, ack-latency and gap histograms).
+// charts (throughput sparkline, ack-latency and gap histograms), the
+// auto-analysis state, re-run / load-into-Configure / compare actions,
+// and the per-session command and fault-injection sections.
 'use strict';
 
 // ---------------------------------------------------------------------------
@@ -55,6 +57,7 @@ document.addEventListener('visibilitychange', () => { if (!document.hidden) poll
 
 const runUi = {
   expanded: new Set(),
+  msg: new Map(),     // id -> {cls, html}: result of the card's last action
   filter: '',
   status: '',
   page: 0,
@@ -131,6 +134,7 @@ function runTitle(r) {
 
 function runSubmeta(r) {
   const parts = [];
+  if (r.rerun_of != null) parts.push(`re-run of <a href="#/runs/${esc(r.rerun_of)}">${runNum(r.rerun_of)}</a>`);
   if (r.mode === 'benchmark') {
     parts.push(`${esc(r.proto)} ${esc(r.role)}`);
     if (r.target_port) parts.push(r.role === 'slave' ? `listening on port ${r.target_port}` : `port ${r.target_port}`);
@@ -180,7 +184,30 @@ function pagerHtml(act, page, pages, total, what, extra = '') {
     `<button type="button" class="btn btn-secondary" data-act="${act}" data-page="${page + 1}" ${extra}${page >= pages - 1 ? ' disabled' : ''} data-fk="${act}-next${extra ? '-' + extra.replace(/\D/g, '') : ''}">Next</button></nav>`;
 }
 
-const RUN_PARTS = ['head', 'err', 'progress', 'states', 'spark', 'actions', 'sessions', 'detail'];
+const RUN_PARTS = ['head', 'err', 'progress', 'states', 'spark', 'analysis', 'actions', 'msg', 'sessions', 'detail'];
+
+// Latest stored analysis and the auto-analysis state of a run.
+const AUTO_TEXT = { queued: 'Auto-analysis queued', running: 'Auto-analysis running…', done: 'Auto-analysis done', failed: 'Auto-analysis failed', skipped: 'Auto-analysis skipped' };
+function analysisLink(runId, a) {
+  const v = String(a.verdict || 'unknown');
+  const score = a.score != null ? Number(a.score) : (a.score_pct != null ? Number(a.score_pct) : null);
+  return `<a class="an-link" href="#/analysis/${esc(runId)}/${esc(a.id)}">${verdictHtml(v)}` +
+    `${score != null && isFinite(score) ? ` <b class="${scoreCls(score)}">${score.toFixed(1)}%</b>` : ''}` +
+    ` <span class="an-link-id">analysis #${esc(a.id)}${a.source ? ', ' + esc(String(a.source).replace(/_/g, '-')) : ''}</span></a>`;
+}
+function analysisStateHtml(r) {
+  if (r.mode !== 'benchmark') return '';
+  const la = r.latest_analysis;
+  const aa = r.auto_analysis;
+  const bits = [];
+  if (aa && aa.state && aa.state !== 'done') {
+    const cls = aa.state === 'failed' ? 'bad' : (aa.state === 'skipped' ? 'muted' : 'busy');
+    bits.push(`<span class="auto-st auto-${esc(aa.state)} ${cls}">${esc(AUTO_TEXT[aa.state] || aa.state)}${aa.error ? `: <span class="auto-err">${esc(aa.error)}</span>` : ''}</span>`);
+  }
+  if (la) bits.push(`<span class="an-latest">${aa && aa.state === 'done' && aa.analysis_id === la.id ? 'Auto-analysis' : 'Latest analysis'}: ${analysisLink(r.id, la)}</span>`);
+  else if (!aa && r.status !== 'running') bits.push('<span class="muted">Not analysed yet</span>');
+  return bits.length ? `<p class="an-state">${bits.join(' ')}</p>` : '';
+}
 
 function renderRunCard(li, r, isNew) {
   if (isNew) {
@@ -192,8 +219,10 @@ function renderRunCard(li, r, isNew) {
     `<h3 class="run-title">${runTitle(r)}</h3><span class="status s-${esc(r.status)}">${esc(r.status)}</span>` +
     `<p class="submeta">${runSubmeta(r)}</p>`);
   const expanded = runUi.expanded.has(r.id);
+  const hint = r.error ? explainRunError(r.error) : '';
   setHTML(part('err'), r.error && !expanded
-    ? `<p class="err-line"><span class="err-label">Error:</span> ${esc(r.error.length > 220 ? r.error.slice(0, 220) + '…' : r.error)}</p>` : '');
+    ? `<p class="err-line"><span class="err-label">Error:</span> ${esc(r.error.length > 220 ? r.error.slice(0, 220) + '…' : r.error)}</p>` +
+      (hint ? `<p class="hint-strong err-hint">${esc(hint)}</p>` : '') : '');
 
   const total = r.planned || (r.report ? r.report.total_packets : 0) || (r.benchmark ? r.benchmark.total_messages_sent : 0);
   const cur = r.status === 'running' ? r.sent : (r.report ? r.report.total_packets : (r.benchmark ? r.benchmark.total_messages_sent : r.sent));
@@ -208,6 +237,7 @@ function renderRunCard(li, r, isNew) {
   const th = r.throughput_history || [];
   setHTML(part('spark'), r.status === 'running' && th.length > 1
     ? `<div class="sparkrow"><span class="lbl">Throughput</span>${sparklineSvg(th)}<span class="val">${fmtInt(th[th.length - 1])} pkt/s</span></div>` : '');
+  setHTML(part('analysis'), analysisStateHtml(r));
 
   const acts = [];
   if (r.status === 'running') {
@@ -221,11 +251,128 @@ function renderRunCard(li, r, isNew) {
   acts.push(`<button type="button" class="btn btn-secondary" data-act="run-toggle" data-id="${r.id}" data-fk="run-${r.id}-toggle" aria-expanded="${expanded}" aria-controls="run-detail-${r.id}">${expanded ? 'Hide details' : 'Details'}</button>`);
   if (r.has_capture) acts.push(`<a class="btn btn-secondary" href="/api/runs/${r.id}/download" download>Download capture</a>`);
   if (r.mode === 'benchmark' && r.status !== 'running') acts.push(`<a class="btn btn-secondary" href="#/analysis/${r.id}">Analyze</a>`);
+  acts.push(...runReuseButtons(r, 'card'));
   if (r.status !== 'running') acts.push(`<button type="button" class="btn btn-text danger" data-act="run-delete" data-id="${r.id}" data-fk="run-${r.id}-delete" aria-label="Delete run ${r.id}">Delete</button>`);
   setHTML(part('actions'), `<div class="btn-row">${acts.join('')}</div>`);
+  const m = runUi.msg.get(r.id);
+  setHTML(part('msg'), m ? `<p class="run-msg ${esc(m.cls)}" role="status">${m.html}</p>` : '');
 
   renderSessions(part('sessions'), r);
   renderDetail(part('detail'), r, expanded);
+}
+
+// Re-run, load into Configure, compare: on the card and in the detail.
+function runReuseButtons(r, where) {
+  const b = [];
+  const fk = `run-${r.id}-${where}`;
+  if (r.status !== 'running') b.push(`<button type="button" class="btn btn-secondary" data-act="run-rerun" data-id="${r.id}" data-fk="${fk}-rerun" aria-label="Re-run run ${r.id}">Re-run</button>`);
+  b.push(`<button type="button" class="btn btn-secondary" data-act="run-load" data-id="${r.id}" data-fk="${fk}-load" aria-label="Load the settings of run ${r.id} into Configure">Load into Configure</button>`);
+  if (r.mode === 'benchmark' && r.status !== 'running') b.push(`<button type="button" class="btn btn-secondary" data-act="run-compare" data-id="${r.id}" data-fk="${fk}-compare" aria-label="Compare run ${r.id} with another run">Compare with…</button>`);
+  return b;
+}
+
+function setRunMsg(id, cls, html) {
+  if (html) runUi.msg.set(id, { cls, html }); else runUi.msg.delete(id);
+  renderRuns();
+}
+
+// Re-runs started here: their failure is reported on the original card.
+const rerunWatch = new Map();   // new id -> original id
+
+async function rerunRun(id) {
+  setRunMsg(id, 'muted', 'Loading the run\'s settings…');
+  const got = await fetchRunRequest(id);
+  if (got.error) { setRunMsg(id, 'bad', `Cannot re-run: ${esc(got.error)}`); return; }
+  const req = got.request;
+  const what = [
+    req.mode === 'raw' ? 'Raw L2 replay' : `Stateful ${req.proto_name || 'iec104'}, we act as ${req.role === 'slave' ? 'slaves' : 'master'}`,
+    `Pcap: ${libraryName(req.pcap_id)}`,
+    req.mode === 'benchmark' && req.role === 'slave' ? `Listening from port ${req.listen_port_base}` : `Target: ${req.target_ip}${req.mode === 'benchmark' ? ':' + req.target_port : ''}`,
+  ];
+  if (req.proto_config) what.push(`Protocol config: ${req.proto_config.length > 120 ? req.proto_config.slice(0, 120) + '…' : req.proto_config}`);
+  let ok;
+  if (req.force) {
+    ok = await askDialog({
+      title: `Re-run #${id} with protection overridden?`,
+      body: [
+        `Run #${id} overrode NIC and address protection. The override is never carried over, so confirm it again: the run may use the default-route NIC, the address this page is served on, bridge ports, and addresses held by other interfaces.`,
+        'To re-run without the override, use “Load into Configure” instead.',
+      ],
+      list: what,
+      confirm: 'Re-run with override',
+      danger: true,
+    });
+  } else {
+    ok = await askDialog({ title: `Re-run #${id}?`, body: 'Starts a new run with the same settings:', list: what, confirm: 'Start re-run' });
+  }
+  if (!ok) { setRunMsg(id, '', ''); return; }
+  setRunMsg(id, 'muted', 'Starting the re-run…');
+  const res = await api(`/api/runs/${id}/rerun${req.force ? '?force=true' : ''}`, 'POST', null, { timeout: 120000 });
+  if (!res.ok) {
+    let msg;
+    if (res.code === 'run_active') {
+      const d = res.data || {};
+      msg = `Run #${esc(d.active_run_id)} is already active${d.client_ip ? ' (started by ' + esc(d.client_ip) + ')' : ''}. Only one run can be active at a time: <a href="#/runs/${esc(d.active_run_id)}">open it</a>, stop it or wait for it to finish.`;
+    } else if (res.code === 'request_missing') {
+      msg = `Run #${id} was recorded before run settings were stored, so it cannot be re-run.`;
+    } else {
+      const hint = explainRunError(res.error);
+      msg = `The server refused the re-run: ${esc(res.error)}${hint ? ` <span class="hint-strong">${esc(hint)}</span>` : ''}`;
+    }
+    setRunMsg(id, 'bad', msg);
+    notify(`Re-run of #${id} failed: ${res.error}`, 'error');
+    return;
+  }
+  const nid = res.data.id;
+  rerunWatch.set(nid, id);
+  setRunMsg(id, 'ok', `Re-run started as <a href="#/runs/${esc(nid)}">${runNum(nid)}</a>.`);
+  announce(`Re-run ${nid} of run ${id} started`);
+  pollRunsSoon();
+}
+
+function updateRerunWatch() {
+  for (const [nid, oid] of rerunWatch) {
+    const r = S.runs.find(x => x.id === nid);
+    if (!r || r.status === 'running') continue;
+    rerunWatch.delete(nid);
+    const link = `<a href="#/runs/${esc(nid)}">${runNum(nid)}</a>`;
+    if (r.status === 'failed' || r.error) {
+      const hint = explainRunError(r.error);
+      runUi.msg.set(oid, { cls: 'bad', html: `Re-run ${link} ${esc(r.status)}: ${esc(r.error || 'no error text recorded')}${hint ? ` <span class="hint-strong">${esc(hint)}</span>` : ''}` });
+      notify(`Re-run #${nid} ${r.status}: ${r.error || 'no error text'}${hint ? ' ' + hint : ''}`, 'error');
+    } else {
+      runUi.msg.set(oid, { cls: 'ok', html: `Re-run ${link} ${esc(r.status)}.` });
+    }
+    announce(`Re-run ${nid} ${r.status}`);
+  }
+}
+
+// Baseline for "Compare with…": the run this one re-ran, else the newest
+// earlier finished benchmark run of the same pcap and role, else any.
+function suggestBaseline(id) {
+  const r = S.runs.find(x => x.id === id);
+  const ok = x => x && x.id !== id && x.mode === 'benchmark' && x.status !== 'running';
+  if (r && r.rerun_of != null && ok(S.runs.find(x => x.id === r.rerun_of))) return r.rerun_of;
+  const older = S.runs.filter(x => ok(x) && x.id < id);
+  const same = older.find(x => r && x.pcap_id === r.pcap_id && x.role === r.role);
+  const pick = same || older[0] || S.runs.find(ok);
+  return pick ? pick.id : null;
+}
+
+// Refetch one run after an analysis event: its detail and its
+// latest_analysis / auto_analysis in the list.
+async function refetchRun(id) {
+  const res = await api(`/api/runs/${id}`, 'GET', null, { timeout: 15000 });
+  if (res.ok && res.data && typeof res.data === 'object') {
+    if (runUi.expanded.has(id) || S.runDetail.has(id)) S.runDetail.set(id, res.data);
+    const row = S.runs.find(x => x.id === id);
+    if (row) {
+      row.latest_analysis = res.data.latest_analysis ?? row.latest_analysis;
+      row.auto_analysis = res.data.auto_analysis ?? row.auto_analysis;
+    }
+    emit('runs', S.runs);
+  }
+  pollRunsSoon();
 }
 
 // ---------------------------------------------------------------------------
@@ -309,8 +456,11 @@ function progressCell(p, s) {
     `${fmtInt(p.sent || 0)} / ${fmtInt(p.planned || 0)} ${iterChip(p)}`;
 }
 
+// Per-session error (failed sessions), shown under the state.
+const sessErr = p => (p.error ? `<span class="sess-err">${esc(p.error)}</span>` : '');
+
 function sourceRowHtml(p, s) {
-  return `<tr><td><span class="st st-${s}">${s}</span></td><td><code>${esc(p.src_ip || 'L2 ' + p.src_mac)}</code></td>` +
+  return `<tr${p.error ? ' class="row-problem"' : ''}><td><span class="st st-${s}">${s}</span>${sessErr(p)}</td><td><code>${esc(p.src_ip || 'L2 ' + p.src_mac)}</code></td>` +
     `<td class="num">${progressCell(p, s)}</td><td class="num">${fmtInt(p.received || 0)}</td></tr>`;
 }
 
@@ -340,7 +490,7 @@ function slaveRowHtml(r, p, idx, s) {
       act = `<button type="button" class="btn btn-text danger" data-act="slave-stop" data-run="${r.id}" data-idx="${idx}" data-fk="${fk}-stop">Stop</button>`;
     }
   }
-  return `<tr><td><span class="st st-${s}">${s}</span></td><td><code>${esc(p.src_ip || p.src_mac)}</code></td><td>${listen}</td>` +
+  return `<tr${p.error ? ' class="row-problem"' : ''}><td><span class="st st-${s}">${s}</span>${sessErr(p)}</td><td><code>${esc(p.src_ip || p.src_mac)}</code></td><td>${listen}</td>` +
     `<td class="num">${progressCell(p, s)}</td><td class="actions-cell">${act}</td></tr>`;
 }
 
@@ -413,6 +563,8 @@ function renderDetail(box, r, expanded) {
   h += `<dt>Target</dt><dd>${esc(d.target_ip)}${d.target_port ? ':' + esc(d.target_port) : ''}${d.target_mac ? ' · ' + esc(d.target_mac) : ''}</dd>`;
   h += `<dt>Mode</dt><dd>${d.mode === 'benchmark' ? `stateful ${esc(d.proto)}, ${esc(d.role)}` : 'raw L2'} · speed ${esc(d.speed)}×${d.top_speed ? ' (top)' : ''}${d.realtime ? ' · SCHED_FIFO' : ''}</dd>`;
   h += `<dt>Time</dt><dd>started ${fmtClock(d.started_at)}${d.finished_at ? ', finished ' + fmtClock(d.finished_at) : ''}${d.started_by ? ' · by ' + esc(d.started_by) : ''}</dd>`;
+  if (d.rerun_of != null) h += `<dt>Re-run of</dt><dd><a href="#/runs/${esc(d.rerun_of)}">${runNum(d.rerun_of)}</a></dd>`;
+  if (d.request && d.request.force) h += '<dt>Protection</dt><dd class="warn">overridden for this run (never carried over to a re-run)</dd>';
   if (d.proto_config) h += `<dt>Protocol config</dt><dd><code class="wrap">${esc(d.proto_config)}</code></dd>`;
   if (d.report) {
     h += `<dt>Sent</dt><dd>${fmtInt(d.report.total_packets)} packets · ${fmtBytes(d.report.total_bytes)}</dd>`;
@@ -428,6 +580,7 @@ function renderDetail(box, r, expanded) {
     h += `<dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd>`;
     h += `<dt>Ack latency</dt><dd>min ${fmtInt(b.aggregate_latency_min_us)} µs · p50 ${fmtInt(b.aggregate_latency_p50_us)} µs · p90 ${fmtInt(b.aggregate_latency_p90_us)} µs · p99 ${fmtInt(b.aggregate_latency_p99_us)} µs · max ${fmtInt(b.aggregate_latency_max_us)} µs</dd>`;
     h += `<dt>Protocol violations</dt><dd class="${violations ? 'bad' : 'ok'}">${fmtInt(violations)}</dd>`;
+    h += commandFaultTotals(b.per_session || []);
     if (b.capture_path) h += `<dt>Capture</dt><dd>${fmtInt(b.captured_packets)} frames · ${fmtBytes(b.captured_bytes)}</dd>`;
   }
   h += '</dl>';
@@ -443,7 +596,7 @@ function renderDetail(box, r, expanded) {
   }
 
   if (b && b.per_session && b.per_session.length) {
-    h += benchSessionsHtml(r.id, b.per_session);
+    h += benchSessionsHtml(r.id, b.per_session, d.proto);
     h += '<h4>Ack latency distribution</h4>';
     h += latencyChart(`lat-agg-${r.id}`, b.aggregate_latency_histogram, b.aggregate_latency_p50_us, b.aggregate_latency_p99_us);
   }
@@ -460,7 +613,7 @@ function renderDetail(box, r, expanded) {
   setHTML(box, h);
 }
 
-function benchSessionsHtml(runId, sessions) {
+function benchSessionsHtml(runId, sessions, proto) {
   const u = ui(runId);
   const rows = sessions.map((s, i) => ({ s, i, v: (s.protocol && s.protocol.protocol_violations) || 0 }));
   rows.sort((a, b) => ((b.s.error ? 1 : 0) - (a.s.error ? 1 : 0)) || (b.v - a.v) || (ipToInt(a.s.src_ip) - ipToInt(b.s.src_ip)));
@@ -472,7 +625,11 @@ function benchSessionsHtml(runId, sessions) {
     '<th scope="col" class="num">Ack p50 (µs)</th><th scope="col" class="num">Ack p99 (µs)</th><th scope="col" class="num">Ack max (µs)</th><th scope="col" class="num">msg/s</th>' +
     '<th scope="col" class="num">Window stalls</th><th scope="col" class="num">Violations</th><th scope="col">Status</th><th scope="col"><span class="sr-only">More</span></th></tr></thead><tbody>';
   for (const { s, i, v } of page) {
-    const status = s.error ? '<span class="bad">error</span>' : (s.connected ? '<span class="ok">ok</span>' : 'not connected');
+    const pf = s.protocol || {};
+    const flags = [];
+    if ((pf.faults_injected || []).length) flags.push(`<span class="badge fault-badge" title="faults were injected on purpose">${plural(pf.faults_injected.length, 'fault')}</span>`);
+    if ((pf.negative_confirmations || []).length) flags.push(`<span class="badge neg-badge">${fmtInt(pf.negative_confirmations.length)} negative</span>`);
+    const status = (s.error ? '<span class="bad">error</span>' : (s.connected ? '<span class="ok">ok</span>' : 'not connected')) + (flags.length ? ' ' + flags.join(' ') : '');
     const open = u.open.has(i);
     h += `<tr${s.error || v ? ' class="row-problem"' : ''}><td><code>${esc(s.src_ip)}</code></td><td class="num">${fmtInt(s.messages_sent)}</td><td class="num">${fmtInt(s.messages_received)}</td>` +
       `<td class="num">${fmtInt(s.latency_p50_us)}</td><td class="num">${fmtInt(s.latency_p99_us)}</td><td class="num">${fmtInt(s.latency_max_us)}</td>` +
@@ -480,14 +637,110 @@ function benchSessionsHtml(runId, sessions) {
       `<td class="num ${v ? 'bad' : ''}">${fmtInt(v)}</td><td>${status}</td>` +
       `<td><button type="button" class="btn btn-text" data-act="bench-row" data-id="${runId}" data-idx="${i}" data-fk="bench-${runId}-${i}" aria-expanded="${open}">${open ? 'Less' : 'More'}</button></td></tr>`;
     if (s.error) h += `<tr class="sub"><td colspan="11"><div class="err-box">${esc(s.error)}</div></td></tr>`;
-    if (open) h += `<tr class="sub"><td colspan="11">${protoStatsHtml(s)}</td></tr>`;
+    if (open) h += `<tr class="sub"><td colspan="11">${protoStatsHtml(s, proto)}</td></tr>`;
   }
   h += '</tbody></table></div>';
   h += pagerHtml('bench-page', u.benchPage, pages, rows.length, 'sessions', `data-id="${runId}"`);
   return h;
 }
 
-function protoStatsHtml(s) {
+// Sum of the command and fault figures over every session, for the
+// detail's key-value list.
+function commandFaultTotals(sessions) {
+  let cmds = 0, neg = 0, unans = 0, faults = 0, reacted = 0, withFaults = 0;
+  for (const s of sessions) {
+    const p = s.protocol || {};
+    for (const c of p.commands || []) { cmds += c.commands || 0; neg += c.negative || 0; unans += c.unanswered || 0; }
+    const f = (p.faults_injected || []).length;
+    faults += f;
+    if (f) withFaults++;
+    const fr = p.fault_reaction;
+    if (fr && (fr.peer_closed || fr.peer_reset || fr.peer_stopdt)) reacted++;
+  }
+  let h = '';
+  if (cmds) h += `<dt>Commands</dt><dd>${fmtInt(cmds)} · ${neg ? `<span class="warn">${fmtInt(neg)} negative</span>` : '0 negative'}${unans ? ` · <span class="bad">${fmtInt(unans)} unanswered</span>` : ''}</dd>`;
+  if (faults) h += `<dt>Injected faults</dt><dd class="warn">${fmtInt(faults)} on ${plural(withFaults, 'session')} · peer reacted (closed, reset or STOPDT) on ${fmtInt(reacted)}</dd>`;
+  return h;
+}
+
+// Median and maximum of a sample array, the way the session reports
+// them (upper median of the sorted samples).
+function p50max(samples) {
+  if (!samples || !samples.length) return null;
+  const a = samples.slice().sort((x, y) => x - y);
+  return { p50: a[Math.floor(a.length / 2)], max: a[a.length - 1], n: a.length };
+}
+
+const COT_TEXT = { 7: 'ActCon (negative)', 9: 'DeactCon (negative)', 44: 'unknown type', 45: 'unknown COT', 46: 'unknown common address', 47: 'unknown IOA' };
+
+function typeName(proto, t) {
+  const pr = (window.PROTOCOL_RENDERERS || {})[proto];
+  return pr && typeof pr.tidName === 'function' ? `${pr.tidName(t)} [${t}]` : `type ${t}`;
+}
+
+function commandsHtml(p, proto) {
+  const rows = p.commands || [];
+  if (!rows.length) return '';
+  const lat = x => (x ? `${usFmt(x.p50)} / ${usFmt(x.max)}` : '—');
+  let h = '<h5>Commands</h5><div class="table-scroll"><table class="t cmd-table"><thead><tr><th scope="col">Type</th>' +
+    '<th scope="col" class="num">Commands</th><th scope="col" class="num">ActCon</th><th scope="col" class="num">Negative</th>' +
+    '<th scope="col" class="num">ActTerm</th><th scope="col" class="num">DeactCon</th><th scope="col" class="num">Unanswered</th>' +
+    '<th scope="col" class="num">ActCon p50 / max</th><th scope="col" class="num">ActTerm p50 / max</th></tr></thead><tbody>';
+  for (const c of rows) {
+    const ac = p50max(c.actcon_us);
+    const at = p50max(c.actterm_us);
+    h += `<tr${c.negative || c.unanswered ? ' class="row-problem"' : ''}><td><code>${esc(typeName(proto, c.type_id))}</code></td>` +
+      `<td class="num">${fmtInt(c.commands)}</td><td class="num">${fmtInt(c.act_con)}</td><td class="num${c.negative ? ' warn' : ''}">${fmtInt(c.negative)}</td>` +
+      `<td class="num">${fmtInt(c.act_term)}</td><td class="num">${fmtInt(c.deact_con)}</td><td class="num${c.unanswered ? ' bad' : ''}">${fmtInt(c.unanswered)}</td>` +
+      `<td class="num" title="${ac ? ac.n + ' samples' : ''}">${lat(ac)}</td><td class="num" title="${at ? at.n + ' samples' : ''}">${lat(at)}</td></tr>`;
+  }
+  h += '</tbody></table></div><p class="hint">Latencies run from the command to its first confirmation (ActCon, negative or DeactCon) and to its ActTerm, from the recorded samples.</p>';
+  return h;
+}
+
+function negativesHtml(p, proto) {
+  const n = p.negative_confirmations || [];
+  if (!n.length) return '';
+  const shown = n.slice(0, 50);
+  let h = `<h5>Negative confirmations (${fmtInt(n.length)}${n.length > shown.length ? ', first ' + shown.length + ' listed' : ''})</h5>` +
+    '<div class="table-scroll"><table class="t"><thead><tr><th scope="col" class="num">At (ms)</th><th scope="col">Type</th>' +
+    '<th scope="col" class="num">CA</th><th scope="col" class="num">IOA</th><th scope="col">COT</th></tr></thead><tbody>';
+  for (const x of shown) {
+    h += `<tr><td class="num">+${fmtInt(x.at_ms)}</td><td><code>${esc(typeName(proto, x.type_id))}</code></td><td class="num">${fmtInt(x.ca)}</td>` +
+      `<td class="num">${fmtInt(x.ioa)}</td><td>${esc(x.cot)}${COT_TEXT[x.cot] ? ' · ' + esc(COT_TEXT[x.cot]) : ''}</td></tr>`;
+  }
+  return h + '</tbody></table></div>';
+}
+
+function faultsInjectedHtml(p) {
+  const f = p.faults_injected || [];
+  const fr = p.fault_reaction;
+  if (!f.length && !fr) return '';
+  let h = `<h5>Injected faults (${fmtInt(f.length)})</h5>`;
+  if (f.length) {
+    h += '<div class="table-scroll"><table class="t"><thead><tr><th scope="col" class="num">At (ms)</th><th scope="col">Kind</th>' +
+      '<th scope="col">What was done</th><th scope="col" class="num">Frames affected</th></tr></thead><tbody>';
+    for (const x of f) {
+      h += `<tr><td class="num">+${fmtInt(x.at_ms)}</td><td><code>${esc(x.kind)}</code></td><td>${esc(x.detail)}</td><td class="num">${fmtInt(x.frames_affected)}</td></tr>`;
+    }
+    h += '</tbody></table></div>';
+  }
+  if (fr) {
+    const chips = [];
+    if (fr.peer_closed) chips.push('closed the connection');
+    if (fr.peer_reset) chips.push('reset the connection');
+    if (fr.peer_stopdt) chips.push('sent STOPDT');
+    h += '<div class="fault-reaction"><p><b>Peer reaction:</b> ' +
+      (chips.length ? esc(chips.join(', ')) : 'no close, reset or STOPDT') +
+      (fr.first_reaction_ms != null ? ` · first reaction ${fmtInt(fr.first_reaction_ms)} ms after the first fault` : '') + '</p>';
+    if ((fr.protocol_errors || []).length) h += `<p>Protocol errors after the first fault: ${fr.protocol_errors.map(e => `<code>${esc(e)}</code>`).join(', ')}</p>`;
+    if (fr.summary) h += `<p class="hint">${esc(fr.summary)}</p>`;
+    h += '</div>';
+  }
+  return h;
+}
+
+function protoStatsHtml(s, proto) {
   const p = s.protocol;
   let h = '<dl class="kv compact">';
   h += `<dt>Bytes</dt><dd>${fmtBytes(s.bytes_written)} written · ${fmtBytes(s.bytes_read)} read</dd>`;
@@ -513,6 +766,7 @@ function protoStatsHtml(s) {
   } else if (!p) {
     h += '<p class="hint">No protocol counters were recorded for this session.</p>';
   }
+  if (p) h += commandsHtml(p, proto) + negativesHtml(p, proto) + faultsInjectedHtml(p);
   return h;
 }
 
@@ -581,6 +835,13 @@ actions({
   },
   'runs-page': b => { runUi.page = Number(b.dataset.page); renderRuns(); },
   'gap-retry': b => { gapCache.delete(Number(b.dataset.id)); renderRuns(); },
+  'run-rerun': b => rerunRun(Number(b.dataset.id)),
+  'run-load': b => loadRunIntoConfigure(Number(b.dataset.id)),
+  'run-compare': b => {
+    const id = Number(b.dataset.id);
+    const a = suggestBaseline(id);
+    location.hash = `#/compare/${a != null ? a : ''}/${id}`;
+  },
 });
 
 // ---------------------------------------------------------------------------
@@ -733,6 +994,7 @@ document.addEventListener('mouseout', e => { if (e.target.classList && e.target.
 function initRuns() {
   el('runs-filter').addEventListener('input', e => { runUi.filter = e.target.value.trim(); runUi.page = 0; renderRuns(); });
   el('runs-status').addEventListener('change', e => { runUi.status = e.target.value; runUi.page = 0; renderRuns(); });
+  on('runs', updateRerunWatch);
   on('runs', renderRuns);
   on('library', renderRuns);
   on('route', ({ view, arg }) => {
