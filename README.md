@@ -110,13 +110,14 @@ Every host change a run makes is journaled before it is made and undone when the
 - **Auto-analysis** of every finished benchmark run's capture (slave and master role), stored with the run. Upload your own target-side capture for a second opinion.
 - **Compare** two runs: fleet and per-RTU deltas in score, delivered frames, latency and throughput, with regression flags and thresholds.
 - **Re-run** a run with its stored request, and save named **profiles**.
-- Download the capture; inter-frame gap histograms (source vs replay); per-session latency histograms.
+- Download the capture, or a self-contained printable HTML report of any analysis; inter-frame gap histograms (source vs replay); per-session latency histograms.
 
 **Operations**
 
 - Single-run lock: a second start gets 409 naming who started the active run, and every open UI shows a banner while someone else's run is active.
 - `GET /api/status` health with degraded reasons, and Prometheus `GET /metrics`.
-- SQLite history with schema migrations; captures under the state directory with size and count caps.
+- SQLite history with schema migrations; captures under the state directory with a per-run size cap and total size and count caps.
+- State-directory lock: a second `serve`, an `outstation bench` or a plain `outstation cleanup` on the same state directory refuses while a server runs (`cleanup --force` overrides).
 - Graceful SIGTERM: runs are stopped and host changes undone before exit.
 
 The UI covers the whole lifecycle: library, configure (with saved profiles), runs (re-run, load settings back into the form, live auto-analysis state), analysis and run-to-run compare. Everything is also available through the [HTTP API](doc/api.md) and the `bench` CLI.
@@ -253,13 +254,13 @@ The [SCADA lab guide](doc/scada-lab.en.md) walks through both scenarios, includi
 sudo outstation bench --pcap fleet.pcap --profile run.json \
     --assert 'score>=99' --assert 'p99_ms<=500' --assert 'sessions_failed==0' \
     --report out.json
-echo $?   # 0 = all assertions passed, 1 = an assertion failed, 2 = the run failed or was interrupted
+echo $?   # 0 = all assertions passed, 1 = an assertion failed, 2 = the run failed, was interrupted or its capture failed
 ```
 
 - `--profile` is a run request (`POST /api/run` body) or a profile from `GET /api/profiles/:id`; `mode` defaults to `benchmark`.
 - Metrics for `--assert`: `score`, `p50_ms`, `p90_ms`, `p99_ms`, `max_ms`, `throughput`, `sessions_failed`, `delivered_pct`, `verdict_failures`. Operators: `>=`, `<=`, `==`, `>`, `<`. A metric that is not available counts as a failure.
-- `--report -` writes the report to stdout; `--correct` analyses in correct mode; `--capture` and `--state-dir` move the capture and journals.
-- SIGINT/SIGTERM stop the run and clean up. The cleanup reclaims every outstation-owned interface on the host, so do not run `bench` while the server has an active run on the same host.
+- `--report -` writes the report to stdout; `--correct` analyses in correct mode; `--capture` and `--state-dir` move the capture and journals; `--cp56-tolerance-ms` sets the analysis' time-tag tolerance.
+- SIGINT/SIGTERM stop the run and clean up. `bench` refuses to start while a server holds the same state directory; with a different state directory, do not run it while a server has an active run on the same host, because the cleanup reclaims every outstation-owned interface on the host.
 
 ## Generating synthetic IEC 104 pcaps
 
