@@ -326,7 +326,15 @@ fn drop_rule_is_not_duplicated() {
 fn port_source_ip_is_validated() {
     setup();
     let none = Protection::default();
+    let dir = state_dir("portip");
     let mut topo = Topology::new("pcr4_br", 4).unwrap();
+    // Without host-stack isolation an IP-bearing port is refused.
+    let e = topo
+        .add_port_with_ip("pcr4_b0", None, Some(Ipv4Addr::new(10, 77, 0, 1)), &none)
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("isolation"), "{e:#}");
+    topo.harden("pcr4_", Some(Ipv4Addr::new(10, 99, 0, 9)), &dir)
+        .unwrap();
     topo.create_bridge().unwrap();
     // 10.99.3.1 is nsfree0's address: stealing it is refused.
     let e = topo
@@ -410,4 +418,83 @@ fn protected_nics_are_refused() {
     assert!(!sh(&["ip", "-o", "link", "show", "dev", "nsfree1"]).contains("master"));
     sh(&["ip", "link", "del", "hostbr0"]);
     std::fs::remove_dir_all(&dir).unwrap();
+}
+
+/// Run interfaces are isolated from the host stack: per-interface
+/// sysctls on the inject end and the bridge, tagged raw/FORWARD rules
+/// with one ACCEPT per session address, all gone after teardown, and
+/// the capture mirror sees unicast both ways.
+#[test]
+#[ignore = "privileged: run via scripts/netns-test.sh inside an ostest-* netns"]
+fn session_ports_are_isolated_and_mirrored() {
+    setup();
+    let dir = state_dir("harden");
+    let none = Protection::default();
+    let mut topo = Topology::new("pcr5_br", 5).unwrap();
+    topo.harden("pcr5_", Some(Ipv4Addr::new(10, 55, 0, 1)), &dir)
+        .unwrap();
+    topo.create_bridge().unwrap();
+    let inj = topo
+        .add_port_with_ip("pcr5_b0", None, Some(Ipv4Addr::new(10, 55, 0, 2)), &none)
+        .unwrap();
+    assert_eq!(inj, "pcr5_b0i");
+    assert!(has_addr("pcr5_b0i", "10.55.0.2"));
+    assert!(
+        !has_addr("pcr5_b0", "10.55.0.2"),
+        "IP must not sit on the bridge port"
+    );
+    for (k, v) in netctl::harden::IPV4_IFACE_SYSCTLS {
+        for ifc in ["pcr5_b0i", "pcr5_br"] {
+            assert_eq!(
+                read_sysctl(&format!("net.ipv4.conf.{ifc}.{k}"))
+                    .unwrap()
+                    .as_deref(),
+                Some(v),
+                "{ifc} {k}"
+            );
+        }
+    }
+    if let Some(v6) = read_sysctl("net.ipv6.conf.pcr5_b0i.disable_ipv6").unwrap() {
+        assert_eq!(v6, "1");
+    }
+    assert_eq!(
+        rule_count("raw", "outstation-run-5"),
+        2,
+        "DROP + one ACCEPT"
+    );
+    assert_eq!(
+        rule_count("filter", "outstation-run-5"),
+        2,
+        "FORWARD in + out"
+    );
+    let raw = sh(&["iptables", "-t", "raw", "-S", "PREROUTING"]);
+    let accept = raw.find("-j ACCEPT").unwrap();
+    let drop = raw
+        .find("-i pcr5_+ -m comment --comment outstation-run-5 -j DROP")
+        .unwrap();
+    assert!(accept < drop, "ACCEPT must precede the DROP:\n{raw}");
+    assert!(raw.contains("-s 10.55.0.1/32 -d 10.55.0.2/32"), "{raw}");
+
+    // The capture mirror: a dummy device, not a bridge port.
+    topo.add_capture_mirror("pcr5_cap").unwrap();
+    assert!(sh(&["ip", "-d", "link", "show", "pcr5_cap"]).contains("dummy"));
+    assert!(!sh(&["bridge", "link"]).contains("pcr5_cap"));
+    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_b0", "ingress"]);
+    assert!(
+        filters.contains("mirred") && filters.contains("pcr5_cap"),
+        "{filters}"
+    );
+    // A port added after the mirror is mirrored too.
+    topo.add_port("pcr5_t0", None).unwrap();
+    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_t0", "egress"]);
+    assert!(filters.contains("pcr5_cap"), "{filters}");
+
+    topo.teardown().unwrap();
+    for i in ["pcr5_br", "pcr5_b0", "pcr5_b0i", "pcr5_cap", "pcr5_t0"] {
+        assert!(!exists(i), "{i} left behind");
+    }
+    assert_eq!(rule_count("raw", "outstation-run-5"), 0);
+    assert_eq!(rule_count("filter", "outstation-run-5"), 0);
+    let j = std::fs::read_to_string(dir.join("state-guards.txt")).unwrap_or_default();
+    assert!(j.trim().is_empty(), "journal not empty: {j}");
 }
