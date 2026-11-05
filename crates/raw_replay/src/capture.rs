@@ -641,71 +641,146 @@ fn read_socket(
     SockRead::More(n_read, last_ts)
 }
 
+/// The kernel's `TPACKET_ALIGN(x)`: `x` rounded up to
+/// `TPACKET_ALIGNMENT` (16).
+const fn tpacket_align(x: usize) -> usize {
+    (x + libc::TPACKET_ALIGNMENT - 1) & !(libc::TPACKET_ALIGNMENT - 1)
+}
+
+/// Offset of the `sockaddr_ll` after a frame's `tpacket3_hdr`
+/// (`TPACKET_ALIGN(sizeof(struct tpacket3_hdr))`). Not
+/// `TPACKET3_HDRLEN`, which is the end of that `sockaddr_ll`.
+const RING_SLL_OFF: usize = tpacket_align(mem::size_of::<libc::tpacket3_hdr>());
+/// Where a frame's link-layer data may start at the earliest.
+const RING_DATA_MIN: usize = RING_SLL_OFF + mem::size_of::<libc::sockaddr_ll>();
+
+/// Outcome of parsing one ring block.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BlockParse {
+    /// Frames walked (including skipped loopback copies).
+    frames: usize,
+    /// Frame headers that were out of bounds or inconsistent: skipped
+    /// without reading their data. A bad chain stops the walk.
+    malformed: usize,
+    /// Latest timestamp handed to the sink, in microseconds.
+    last_ts: Option<u64>,
+}
+
+/// Walk the frames of one TPACKET_V3 block (`block` = the whole block,
+/// descriptor included) and hand each frame's kernel time (µs) and
+/// link-layer bytes to `sink`, skipping the outgoing copies on
+/// loopback. Every header field is bounds-checked against the block
+/// before anything it points at is read; a frame that fails a check is
+/// counted as malformed and not read, and a chain that would leave the
+/// block or not advance stops the walk.
+fn parse_block(block: &[u8], loopback: bool, mut sink: impl FnMut(u64, &[u8])) -> BlockParse {
+    let mut res = BlockParse::default();
+    let u32_at = |o: usize| -> Option<u32> {
+        block
+            .get(o..o + 4)
+            .map(|b| u32::from_ne_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    // tpacket_block_desc: version, offset_to_priv, then
+    // tpacket_hdr_v1 at 8: block_status, num_pkts, offset_to_first_pkt.
+    let (Some(num_pkts), Some(first)) = (u32_at(12), u32_at(16)) else {
+        res.malformed += 1;
+        return res;
+    };
+    let hdr_len = mem::size_of::<libc::tpacket3_hdr>();
+    // No more frames than could fit at the smallest possible stride.
+    let max_frames = block.len() / tpacket_align(RING_DATA_MIN);
+    let mut off = first as usize;
+    for i in 0..(num_pkts as usize).min(max_frames.max(1)) {
+        if off < mem::size_of::<libc::tpacket_block_desc>()
+            || off
+                .checked_add(RING_DATA_MIN)
+                .is_none_or(|e| e > block.len())
+        {
+            res.malformed += num_pkts as usize - i;
+            return res;
+        }
+        // SAFETY: `off + hdr_len <= off + RING_DATA_MIN <= block.len()`.
+        let h = unsafe { (block.as_ptr().add(off) as *const libc::tpacket3_hdr).read_unaligned() };
+        let start = off + h.tp_mac as usize;
+        let len = h.tp_snaplen as usize;
+        let data_ok = (h.tp_mac as usize) >= RING_DATA_MIN
+            && start.checked_add(len).is_some_and(|e| e <= block.len());
+        if data_ok {
+            res.frames += 1;
+            // SAFETY: `off + RING_SLL_OFF + sizeof(sockaddr_ll) <= block.len()`.
+            let sll = unsafe {
+                (block.as_ptr().add(off + RING_SLL_OFF) as *const libc::sockaddr_ll)
+                    .read_unaligned()
+            };
+            if !(loopback && sll.sll_pkttype == libc::PACKET_OUTGOING) {
+                let ts = u64::from(h.tp_sec) * 1_000_000 + u64::from(h.tp_nsec) / 1000;
+                res.last_ts = Some(res.last_ts.map_or(ts, |l| l.max(ts)));
+                sink(ts, &block[start..start + len]);
+            }
+        } else {
+            res.malformed += 1;
+        }
+        if i + 1 == num_pkts as usize {
+            break;
+        }
+        let next = h.tp_next_offset as usize;
+        if next < hdr_len || off.checked_add(next).is_none_or(|o| o >= block.len()) {
+            // The chain does not advance or leaves the block.
+            res.malformed += num_pkts as usize - i - 1;
+            return res;
+        }
+        off += next;
+    }
+    res
+}
+
 /// Read whole blocks of a TPACKET_V3 ring into `out`, starting at
 /// block `*next`, until a block is still the kernel's or at least
 /// `burst` frames were read. Each frame keeps its kernel receive time
-/// (nanoseconds in the ring, written with microseconds).
+/// (nanoseconds in the ring, written with microseconds). Malformed
+/// frame headers are counted in `malformed` and skipped.
 fn read_ring(
     base: usize,
     loopback: bool,
     burst: usize,
     next: &mut usize,
     out: &mut Reorder,
+    malformed: &mut u64,
 ) -> SockRead {
     use std::sync::atomic::{fence, AtomicU32};
     let now = Instant::now();
     let mut n_read = 0usize;
-    let mut last_ts = None;
-    let sll_off = libc::TPACKET3_HDRLEN;
+    let mut last_ts: Option<u64> = None;
     loop {
         if n_read >= burst {
             return SockRead::More(n_read, last_ts);
         }
         let block = (base + *next * RING_BLOCK_SIZE as usize) as *mut u8;
+        let desc = block as *mut libc::tpacket_block_desc;
         // SAFETY: the block lies inside the mapping (next < RING_BLOCKS);
         // block_status is the u32 the kernel hands over with release
         // semantics, read here with acquire.
-        let desc = block as *mut libc::tpacket_block_desc;
-        let status = unsafe {
-            let p = std::ptr::addr_of_mut!((*desc).hdr.bh1.block_status);
-            (*(p as *const AtomicU32)).load(Ordering::Acquire)
-        };
+        let status_ptr = unsafe { std::ptr::addr_of_mut!((*desc).hdr.bh1.block_status) };
+        let status = unsafe { (*(status_ptr as *const AtomicU32)).load(Ordering::Acquire) };
         if status & libc::TP_STATUS_USER == 0 {
             return SockRead::Empty(n_read);
         }
-        // SAFETY: a user-owned block holds `num_pkts` frames, each a
-        // tpacket3_hdr followed (at tp_mac) by tp_snaplen bytes, chained
-        // by tp_next_offset, all within the block.
-        unsafe {
-            let bh = std::ptr::addr_of!((*desc).hdr.bh1).read_unaligned();
-            let mut off = bh.offset_to_first_pkt as usize;
-            for _ in 0..bh.num_pkts {
-                if off + sll_off > RING_BLOCK_SIZE as usize {
-                    break;
-                }
-                let h = (block.add(off) as *const libc::tpacket3_hdr).read_unaligned();
-                let start = off + h.tp_mac as usize;
-                let len = h.tp_snaplen as usize;
-                if start + len <= RING_BLOCK_SIZE as usize {
-                    let sll =
-                        (block.add(off + sll_off) as *const libc::sockaddr_ll).read_unaligned();
-                    if !(loopback && sll.sll_pkttype == libc::PACKET_OUTGOING) {
-                        let ts = u64::from(h.tp_sec) * 1_000_000 + u64::from(h.tp_nsec) / 1000;
-                        last_ts = Some(last_ts.map_or(ts, |l: u64| l.max(ts)));
-                        out.push(ts, std::slice::from_raw_parts(block.add(start), len), now);
-                    }
-                }
-                n_read += 1;
-                if h.tp_next_offset == 0 {
-                    break;
-                }
-                off += h.tp_next_offset as usize;
-            }
-            // Hand the block back to the kernel.
-            fence(Ordering::Release);
-            let p = std::ptr::addr_of_mut!((*desc).hdr.bh1.block_status);
-            (*(p as *const AtomicU32)).store(libc::TP_STATUS_KERNEL, Ordering::Release);
+        // SAFETY: a user-owned block is ours to read until handed back;
+        // it is RING_BLOCK_SIZE bytes inside the mapping.
+        let bytes =
+            unsafe { std::slice::from_raw_parts(block as *const u8, RING_BLOCK_SIZE as usize) };
+        let r = parse_block(bytes, loopback, |ts, frame| out.push(ts, frame, now));
+        n_read += r.frames;
+        if let Some(t) = r.last_ts {
+            last_ts = Some(last_ts.map_or(t, |l| l.max(t)));
         }
+        *malformed += r.malformed as u64;
+        // Hand the block back to the kernel.
+        fence(Ordering::Release);
+        // SAFETY: as for the load above.
+        unsafe {
+            (*(status_ptr as *const AtomicU32)).store(libc::TP_STATUS_KERNEL, Ordering::Release)
+        };
         *next = (*next + 1) % RING_BLOCKS as usize;
     }
 }
@@ -760,6 +835,9 @@ fn read_loop(
     let mut held = Reorder::default();
     // Next block to read per ring (keyed by its mapping address).
     let mut ring_next: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    // Ring frame headers that failed their bounds checks (skipped).
+    let mut malformed = 0u64;
+    let mut malformed_warned = 0u64;
     let mut last_stats = Instant::now();
     let mut drained = 0usize;
     loop {
@@ -820,7 +898,7 @@ fn read_loop(
             let got = match v.ring {
                 Some(base) => {
                     let next = ring_next.entry(base).or_insert(0);
-                    let r = read_ring(base, v.loopback, burst, next, &mut held);
+                    let r = read_ring(base, v.loopback, burst, next, &mut held, &mut malformed);
                     if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
                         // The recvmsg path sees this as a failed read
                         // (e.g. the interface went away): drop the
@@ -883,6 +961,13 @@ fn read_loop(
             held.recycle(h.data);
         }
         if stopping || last_stats.elapsed() >= STATS_EVERY {
+            if malformed > malformed_warned {
+                warn!(
+                    malformed,
+                    "capture: skipped ring frames with inconsistent headers"
+                );
+                malformed_warned = malformed;
+            }
             collect_drops(&socks, &c.dropped);
             last_stats = Instant::now();
         }
@@ -1305,6 +1390,124 @@ mod tests {
         assert_eq!(tags, want);
         let ts: Vec<(u32, u32)> = recs.iter().map(|r| (r.0, r.1)).collect();
         assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+    }
+
+    /// A synthetic TPACKET_V3 block: descriptor, then `frames` as
+    /// (tp_next_offset or None for "computed", pkttype, payload).
+    fn v3_block(frames: &[(Option<u32>, u8, &[u8])]) -> Vec<u8> {
+        let mut b = vec![0u8; 4096];
+        let first = tpacket_align(mem::size_of::<libc::tpacket_block_desc>());
+        b[12..16].copy_from_slice(&(frames.len() as u32).to_ne_bytes());
+        b[16..20].copy_from_slice(&(first as u32).to_ne_bytes());
+        let mut off = first;
+        for (i, (next, pkttype, data)) in frames.iter().enumerate() {
+            let mac = tpacket_align(RING_DATA_MIN);
+            let stride = tpacket_align(mac + data.len());
+            let mut h: libc::tpacket3_hdr = unsafe { mem::zeroed() };
+            h.tp_next_offset = if i + 1 == frames.len() {
+                0
+            } else {
+                next.unwrap_or(stride as u32)
+            };
+            h.tp_sec = 1_700_000_000;
+            h.tp_nsec = 1_000 * (i as u32 + 1);
+            h.tp_snaplen = data.len() as u32;
+            h.tp_len = data.len() as u32;
+            h.tp_mac = mac as u16;
+            // SAFETY: within `b` (4096 bytes, small frames).
+            unsafe {
+                (b.as_mut_ptr().add(off) as *mut libc::tpacket3_hdr).write_unaligned(h);
+                let mut sll: libc::sockaddr_ll = mem::zeroed();
+                sll.sll_pkttype = *pkttype;
+                (b.as_mut_ptr().add(off + RING_SLL_OFF) as *mut libc::sockaddr_ll)
+                    .write_unaligned(sll);
+            }
+            b[off + mac..off + mac + data.len()].copy_from_slice(data);
+            off += stride;
+        }
+        b
+    }
+
+    /// The sockaddr_ll sits at TPACKET_ALIGN(sizeof(tpacket3_hdr)); the
+    /// kernel's TPACKET3_HDRLEN is that plus sizeof(sockaddr_ll).
+    #[test]
+    fn ring_header_offsets_match_the_kernel() {
+        assert_eq!(tpacket_align(0), 0);
+        assert_eq!(tpacket_align(1), 16);
+        assert_eq!(tpacket_align(16), 16);
+        assert_eq!(tpacket_align(17), 32);
+        assert_eq!(mem::size_of::<libc::tpacket3_hdr>(), 48);
+        assert_eq!(RING_SLL_OFF, 48);
+        assert_eq!(
+            libc::TPACKET3_HDRLEN,
+            RING_SLL_OFF + mem::size_of::<libc::sockaddr_ll>()
+        );
+        assert_eq!(RING_DATA_MIN, libc::TPACKET3_HDRLEN);
+    }
+
+    /// The block parser yields only the incoming frame on loopback, with
+    /// its bytes and time; both frames when not loopback.
+    #[test]
+    fn ring_block_parser_skips_outgoing_loopback_copies() {
+        let out_f: &[u8] = b"outgoing-copy-frame";
+        let in_f: &[u8] = b"incoming-frame-bytes-1234";
+        let b = v3_block(&[
+            (None, libc::PACKET_OUTGOING, out_f),
+            (None, libc::PACKET_HOST, in_f),
+        ]);
+        let mut got: Vec<(u64, Vec<u8>)> = Vec::new();
+        let r = parse_block(&b, true, |ts, f| got.push((ts, f.to_vec())));
+        assert_eq!(got, vec![(1_700_000_000_000_002, in_f.to_vec())]);
+        assert_eq!((r.frames, r.malformed), (2, 0));
+        assert_eq!(r.last_ts, Some(1_700_000_000_000_002));
+        got.clear();
+        parse_block(&b, false, |ts, f| got.push((ts, f.to_vec())));
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].1, out_f);
+    }
+
+    /// A corrupt chain stops safely: a tp_next_offset that does not
+    /// advance, one that leaves the block, a huge num_pkts, data that
+    /// runs past the block, and tp_mac pointing into the header.
+    #[test]
+    fn ring_block_parser_stops_on_corrupt_headers() {
+        let f: &[u8] = b"frame";
+        for bad_next in [0u32, 8, 1 << 30] {
+            let b = v3_block(&[
+                (Some(bad_next), libc::PACKET_HOST, f),
+                (None, libc::PACKET_HOST, f),
+            ]);
+            let mut n = 0;
+            let r = parse_block(&b, false, |_, d| {
+                assert_eq!(d, f);
+                n += 1;
+            });
+            assert_eq!(n, 1, "next {bad_next}");
+            assert_eq!(r.malformed, 1, "next {bad_next}");
+        }
+        // num_pkts far beyond what fits: bounded, no panic.
+        let mut b = v3_block(&[(None, libc::PACKET_HOST, f)]);
+        b[12..16].copy_from_slice(&u32::MAX.to_ne_bytes());
+        let r = parse_block(&b, false, |_, _| {});
+        assert_eq!(r.frames, 1);
+        // Snaplen past the end of the block: skipped, not read.
+        let mut b = v3_block(&[(None, libc::PACKET_HOST, f)]);
+        let first = tpacket_align(mem::size_of::<libc::tpacket_block_desc>());
+        let snap = first + 12; // tp_snaplen
+        b[snap..snap + 4].copy_from_slice(&100_000u32.to_ne_bytes());
+        let r = parse_block(&b, false, |_, _| panic!("read past the block"));
+        assert_eq!((r.frames, r.malformed), (0, 1));
+        // tp_mac inside the header area.
+        let mut b = v3_block(&[(None, libc::PACKET_HOST, f)]);
+        let mac = first + 24; // tp_mac
+        b[mac..mac + 2].copy_from_slice(&8u16.to_ne_bytes());
+        let r = parse_block(&b, false, |_, _| panic!("read the header as data"));
+        assert_eq!(r.malformed, 1);
+        // First frame offset past the block, or a truncated block.
+        let mut b = v3_block(&[(None, libc::PACKET_HOST, f)]);
+        b[16..20].copy_from_slice(&5000u32.to_ne_bytes());
+        assert_eq!(parse_block(&b, false, |_, _| panic!()).malformed, 1);
+        assert_eq!(parse_block(&b[..10], false, |_, _| panic!()).malformed, 1);
     }
 
     /// T17c: the reorder buffer releases frames up to the watermark,
