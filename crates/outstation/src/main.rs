@@ -85,6 +85,11 @@ struct ServeArgs {
     #[arg(long, value_name = "MIB")]
     capture_max_mb: Option<u64>,
 
+    /// Finished runs kept in memory; older ones are read from the
+    /// database when asked for. Default 500 or OUTSTATION_RUNS_IN_MEMORY.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    runs_in_memory: Option<u64>,
+
     /// Total size quota of the pcap library, in MiB; uploads that
     /// would exceed it are refused. Default: no quota, or
     /// OUTSTATION_LIBRARY_MAX_MB.
@@ -281,6 +286,9 @@ fn main() -> Result<()> {
             if let Some(ms) = args.cp56_tolerance_ms {
                 cfg.cp56_tolerance_ms = ms;
             }
+            if let Some(n) = args.runs_in_memory {
+                cfg.runs_in_memory = n as usize;
+            }
             if let Some(mb) = args.library_max_mb {
                 cfg.library_max_bytes = mb.saturating_mul(1024 * 1024);
             }
@@ -435,6 +443,8 @@ mod tests {
             "2048",
             "--cp56-tolerance-ms",
             "250",
+            "--runs-in-memory",
+            "50",
         ])
         .unwrap();
         let Cmd::Serve(a) = cli.cmd else {
@@ -451,6 +461,7 @@ mod tests {
         assert_eq!(a.max_upload_mb, Some(10));
         assert_eq!(a.library_max_mb, Some(2048));
         assert_eq!(a.cp56_tolerance_ms, Some(250.0));
+        assert_eq!(a.runs_in_memory, Some(50));
         assert!(Cli::try_parse_from(["outstation", "serve", "--cp56-tolerance-ms", "-5"]).is_err());
     }
 

@@ -215,6 +215,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
         library_max_bytes: 0,
+        runs_in_memory: crate::state::DEFAULT_RUNS_IN_MEMORY,
         heavy_concurrency: 2,
         cp56_tolerance_ms: crate::analysis::DEFAULT_CP56_TOLERANCE_MS,
         auto_analyze: true,
@@ -2269,4 +2270,78 @@ async fn failed_capture_skips_analysis_with_the_reason() {
     crate::restore(&st).unwrap();
     let rs = st.get_run(id).unwrap().lock_safe().clone();
     assert_eq!(rs.benchmark.unwrap().warnings.len(), 1);
+}
+
+/// F054: only the newest runs stay in memory; /api/runs pages through
+/// memory and then the database, and old runs are still served.
+#[tokio::test]
+async fn runs_are_paged_and_old_ones_come_from_the_db() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::Sessions(&[None]),
+        |c| c.runs_in_memory = 3,
+    );
+    h.add_pcap("pcr_1");
+    for _ in 0..6 {
+        h.run_to(bench_req("pcr_1"), "completed").await;
+    }
+    assert_eq!(
+        h.state.all_runs().len(),
+        3,
+        "only the newest stay in memory"
+    );
+    async fn page(h: &H, q: &str) -> (Vec<u64>, Option<String>) {
+        let req = Request::builder()
+            .uri(format!("/api/runs{q}"))
+            .header("host", HOST)
+            .body(Body::empty())
+            .unwrap();
+        let (s, headers, body) = h.send(req).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let ids = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect();
+        let next = headers
+            .get("x-next-before")
+            .map(|v| v.to_str().unwrap().to_string());
+        (ids, next)
+    }
+    assert_eq!(page(&h, "").await, (vec![6, 5, 4, 3, 2, 1], None));
+    assert_eq!(page(&h, "?limit=2").await, (vec![6, 5], Some("5".into())));
+    assert_eq!(
+        page(&h, "?limit=2&before=5").await,
+        (vec![4, 3], Some("3".into()))
+    );
+    assert_eq!(page(&h, "?limit=2&before=3").await, (vec![2, 1], None));
+    assert_eq!(
+        page(&h, "?status=completed&limit=4").await.0,
+        vec![6, 5, 4, 3]
+    );
+    assert_eq!(page(&h, "?status=failed").await.0, Vec::<u64>::new());
+    // A run that is only in the database: detail, rerun request, delete.
+    let (s, v) = h.call(Method::GET, "/api/runs/1", None).await;
+    assert_eq!(
+        (s, v["status"].as_str()),
+        (StatusCode::OK, Some("completed"))
+    );
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"completed\"}"], 6.0);
+    let (s, _) = h.call(Method::DELETE, "/api/runs/1", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = h.call(Method::GET, "/api/runs/1", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"completed\"}"], 5.0);
+    assert_eq!(page(&h, "").await.0, vec![6, 5, 4, 3, 2]);
+    // After a restart only the newest three are loaded into memory.
+    let st = AppState::open(h.state.cfg.as_ref().clone()).unwrap();
+    crate::restore(&st).unwrap();
+    let mut ids: Vec<u64> = st.all_runs().iter().map(|e| e.lock_safe().id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![4, 5, 6]);
+    assert!(st.get_run_any(2).is_some());
 }

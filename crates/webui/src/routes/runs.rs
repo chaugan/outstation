@@ -218,8 +218,8 @@ pub(crate) async fn api_run_rerun(
     ApiQuery(q): ApiQuery<RerunQuery>,
 ) -> Result<Json<RerunResp>, AppError> {
     let stored = {
-        let entry = state
-            .get_run(id)
+        let (entry, _) = state
+            .get_run_any(id)
             .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
         let rs = entry.lock_safe();
         rs.request.clone()
@@ -245,15 +245,30 @@ pub(crate) async fn api_run_rerun(
 pub(crate) struct RunsQuery {
     #[serde(default)]
     status: Option<String>,
+    /// Page size (default [`RUNS_PAGE_DEFAULT`], at most [`RUNS_PAGE_MAX`]).
+    #[serde(default)]
+    limit: Option<usize>,
+    /// Only runs with a smaller id: the `X-Next-Before` of the previous
+    /// page.
+    #[serde(default)]
+    before: Option<u64>,
 }
 
-/// Slim run list (F029, F054): no per-session rows, no latency
-/// histograms, and live per-source progress only for running runs.
-/// `?status=running` (or any status) filters.
+/// Default and largest page of `GET /api/runs` (F054).
+pub(crate) const RUNS_PAGE_DEFAULT: usize = 100;
+pub(crate) const RUNS_PAGE_MAX: usize = 1000;
+
+/// Slim run list (F029, F054), newest first, one page at a time: no
+/// per-session rows, no latency histograms, and live per-source
+/// progress only for running runs. `?status=running` (or any status)
+/// filters; `?limit=N&before=ID` pages. When older runs exist the
+/// response has `X-Next-Before: <id>` (pass it as `before`) and
+/// `X-Has-More: true`. Recent runs come from memory; older pages are
+/// read from the database.
 pub(crate) async fn api_runs(
     State(state): State<AppState>,
     ApiQuery(q): ApiQuery<RunsQuery>,
-) -> Result<Json<Vec<RunSummary>>, AppError> {
+) -> Result<(HeaderMap, Json<Vec<RunSummary>>), AppError> {
     let filter = match q.status.as_deref() {
         None | Some("") => None,
         Some(s) => {
@@ -265,14 +280,21 @@ pub(crate) async fn api_runs(
             Some(st)
         }
     };
+    let limit = q.limit.unwrap_or(RUNS_PAGE_DEFAULT).clamp(1, RUNS_PAGE_MAX);
+    let before = q.before.unwrap_or(u64::MAX);
     // Copy only the Arc handles under the global lock; each run is
     // then locked on its own while its summary is built.
-    let mut out: Vec<RunSummary> = state
-        .all_runs()
+    let resident = state.all_runs();
+    let oldest_resident = resident
+        .iter()
+        .map(|e| e.lock_safe().id)
+        .min()
+        .unwrap_or(u64::MAX);
+    let mut out: Vec<RunSummary> = resident
         .into_iter()
         .filter_map(|e| {
             let mut rs = e.lock_safe();
-            if filter.is_some_and(|f| f != rs.status) {
+            if rs.id >= before || filter.is_some_and(|f| f != rs.status) {
                 return None;
             }
             refresh_progress(&mut rs);
@@ -280,7 +302,35 @@ pub(crate) async fn api_runs(
         })
         .collect();
     out.sort_by_key(|r| std::cmp::Reverse(r.id));
-    Ok(Json(out))
+    // Every run only in the database is older than every run in
+    // memory, so the page continues there once memory runs out.
+    if out.len() <= limit {
+        let want = limit + 1 - out.len();
+        let from = before.min(oldest_resident);
+        let st = state.clone();
+        let status = filter.map(|f| f.as_str());
+        let older = tokio::task::spawn_blocking(move || {
+            st.db.load_page(from, status, want).map(|rows| {
+                rows.iter()
+                    .filter_map(|r| st.load_stored_run_from(r))
+                    .map(|rs| rs.summary())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("runs page task: {e}")))?
+        .map_err(|e| AppError::Internal(format!("read runs page: {e:#}")))?;
+        out.extend(older);
+    }
+    let mut headers = HeaderMap::new();
+    if out.len() > limit {
+        out.truncate(limit);
+        if let Some(last) = out.last() {
+            headers.insert("x-next-before", last.id.into());
+            headers.insert("x-has-more", axum::http::HeaderValue::from_static("true"));
+        }
+    }
+    Ok((headers, Json(out)))
 }
 
 /// Full detail of one run, including per-session rows and histograms,
@@ -296,8 +346,8 @@ pub(crate) async fn api_run_by_id(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<u64>,
 ) -> Result<Json<RunDetail>, AppError> {
-    let entry = state
-        .get_run(id)
+    let (entry, _) = state
+        .get_run_any(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
     let mut rs = entry.lock_safe().clone();
     refresh_progress(&mut rs);
@@ -314,8 +364,8 @@ pub(crate) async fn api_run_delete(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<u64>,
 ) -> Result<StatusCode, AppError> {
-    let entry = state
-        .get_run(id)
+    let (entry, resident) = state
+        .get_run_any(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
     let (running, capture) = {
         let rs = entry.lock_safe();
@@ -337,9 +387,14 @@ pub(crate) async fn api_run_delete(
     {
         // Fold the run's totals into the metrics before it disappears,
         // under the lock the scrape takes, so counters never go back.
+        // A run only in the database was folded when it left memory.
         let mut folded = state.metrics.folded.lock_safe();
-        crate::metrics::fold_deleted(&mut folded, &entry.lock_safe());
-        state.runs.lock_safe().remove(&id);
+        if resident {
+            crate::metrics::fold_deleted(&mut folded, &entry.lock_safe());
+            state.runs.lock_safe().remove(&id);
+        } else {
+            crate::metrics::unfold_deleted_evicted(&mut folded, entry.lock_safe().status);
+        }
     }
     state.workers.lock_safe().remove(&id);
     state.gap_cache.lock_safe().remove(&id);
@@ -448,8 +503,8 @@ pub(crate) async fn api_run_gaps(
         return Ok(Json((**v).clone()));
     }
     let (original_path, captured_path, pcap_id, terminal) = {
-        let entry = state
-            .get_run(id)
+        let (entry, _) = state
+            .get_run_any(id)
             .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
         let rs = entry.lock_safe();
         let cap = rs
@@ -514,8 +569,8 @@ pub(crate) async fn api_run_download(
     ApiPath(id): ApiPath<u64>,
 ) -> Result<Response, AppError> {
     let path = {
-        let entry = state
-            .get_run(id)
+        let (entry, _) = state
+            .get_run_any(id)
             .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
         let rs = entry.lock_safe();
         rs.capture_file.clone()

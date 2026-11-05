@@ -220,14 +220,15 @@ curl -H "Origin: $B" -H 'Content-Type: application/json' "$B/api/run" -d '{
 
 The request is validated completely before a run id is allocated. A rejected request leaves nothing behind.
 
-### `GET /api/runs[?status=S]`
+### `GET /api/runs[?status=S][&limit=N][&before=ID]`
 
-Slim summaries, newest first. `S` is one of `running`, `completed`, `partial`, `stopped`, `failed`; any other value is 400. Each row:
+Slim summaries, newest first, one page at a time. `S` is one of `running`, `completed`, `partial`, `stopped`, `failed`; any other value is 400. `limit` is the page size (default 100, at most 1000); `before` returns only runs with a smaller id. When older runs exist, the response carries the headers `X-Next-Before: <id>` (pass it as `before` for the next page) and `X-Has-More: true`. The newest runs come from memory (`--runs-in-memory`, default 500 finished runs); older pages, and `GET /api/runs/:id` of an older run, are read from the database. Each row:
 
 - identity and request echo: `id, status, started_at, finished_at, started_by, pcap, pcap_id, target_ip, target_mac, speed, top_speed, realtime, error, mode, role, target_port, proto`;
 - progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s), `per_source_progress` (only while running);
 - counts: `sources, sources_failed, sources_cancelled, has_capture`;
 - `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes, captured_dropped}`;
+- `report` and `benchmark` both also carry `warnings[]` (non-fatal problems: capture failures, guard restore or teardown errors) and, when the scheduler reports it, `capture_ok`;
 - `benchmark` (benchmark runs): `{total_messages_sent, total_messages_received, aggregate_latency_{min,p50,p90,p99,max}_us, aggregate_throughput_msgs_per_sec, capture_path, captured_packets, captured_bytes, captured_dropped, sessions, sessions_failed, sessions_cancelled, protocol_violations}`. `captured_dropped` counts frames the kernel dropped from the capture socket (it should be 0; non-zero adds a run warning and an analysis note that "missing" frames may be capture loss);
 - `rerun_of`, `latest_analysis` (`{id, verdict, score, source, created_at}` or `null`), `auto_analysis` (`{state, error, analysis_id}` or `null`; `state` is `queued`, `running`, `done`, `failed` or `skipped`).
 

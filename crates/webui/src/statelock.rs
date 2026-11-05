@@ -123,8 +123,18 @@ mod tests {
         assert!(held.to_string().contains("in use"));
         assert!(held_by(d.path()).is_some());
         drop(a);
-        assert!(held_by(d.path()).is_none());
-        let _b = StateLock::acquire(d.path(), "bench").unwrap();
+        // Other tests fork child processes; until a child execs, it
+        // shares our descriptors (and so the lock) for a moment.
+        let retry = || {
+            for _ in 0..200 {
+                if let Ok(l) = StateLock::acquire(d.path(), "bench") {
+                    return l;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            panic!("lock never became free");
+        };
+        let _b = retry();
         let held = held_by(d.path()).unwrap();
         assert!(held.holder.unwrap().contains("role=bench"));
     }

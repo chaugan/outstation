@@ -47,6 +47,9 @@ pub fn alias_state_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join("state-aliases.txt")
 }
 
+/// Default for [`ServeConfig::runs_in_memory`].
+pub const DEFAULT_RUNS_IN_MEMORY: usize = 500;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
@@ -73,6 +76,10 @@ pub struct ServeConfig {
     pub capture_max_total_bytes: u64,
     /// Maximum number of capture files kept.
     pub capture_max_count: usize,
+    /// Finished runs kept in memory; older ones are served from the
+    /// database on demand (F054). `--runs-in-memory` or
+    /// `OUTSTATION_RUNS_IN_MEMORY`; default 500.
+    pub runs_in_memory: usize,
     /// Total size quota of the pcap library in bytes; 0 = no quota
     /// (F051). `--library-max-mb` or `OUTSTATION_LIBRARY_MAX_MB`.
     pub library_max_bytes: u64,
@@ -129,6 +136,9 @@ impl ServeConfig {
             capture_max_count: env_u64("OUTSTATION_CAPTURE_MAX_COUNT")
                 .map(|v| v as usize)
                 .unwrap_or(200),
+            runs_in_memory: env_u64("OUTSTATION_RUNS_IN_MEMORY")
+                .map(|v| (v as usize).max(1))
+                .unwrap_or(DEFAULT_RUNS_IN_MEMORY),
             library_max_bytes: env_u64("OUTSTATION_LIBRARY_MAX_MB")
                 .map(|v| v * MIB)
                 .unwrap_or(0),
@@ -258,6 +268,45 @@ impl AppState {
 
     pub(crate) fn get_run(&self, id: u64) -> Option<RunEntry> {
         self.runs.lock_safe().get(&id).cloned()
+    }
+
+    /// A run from memory, or else from the database (F054). The second
+    /// value is false for a database copy: changes to it are not kept.
+    pub(crate) fn get_run_any(&self, id: u64) -> Option<(RunEntry, bool)> {
+        if let Some(e) = self.get_run(id) {
+            return Some((e, true));
+        }
+        let rs = self.load_stored_run(id)?;
+        Some((Arc::new(Mutex::new(rs)), false))
+    }
+
+    /// Decode a run that is not in memory from the database, with its
+    /// newest analysis.
+    pub(crate) fn load_stored_run(&self, id: u64) -> Option<RunState> {
+        let stored = match self.db.load_one(id) {
+            Ok(s) => s?,
+            Err(e) => {
+                tracing::warn!(id, error = %e, "could not read run from the database");
+                return None;
+            }
+        };
+        self.load_stored_run_from(&stored)
+    }
+
+    /// [`Self::load_stored_run`] for a row already read.
+    pub(crate) fn load_stored_run_from(&self, stored: &crate::db::StoredRun) -> Option<RunState> {
+        let id = stored.id;
+        let mut rs = crate::persist::stored_to_runstate(
+            stored,
+            &self.cfg.library_dir,
+            &self.cfg.captures_dir(),
+        )
+        .map_err(|e| tracing::warn!(id, error = %e, "skipping unreadable run"))
+        .ok()?;
+        if let Ok(list) = self.db.analyses_for_run(id) {
+            rs.latest_analysis = list.first().map(Into::into);
+        }
+        Some(rs)
     }
 
     pub(crate) fn all_runs(&self) -> Vec<RunEntry> {

@@ -179,10 +179,20 @@ pub(crate) fn restore(state: &AppState) -> Result<()> {
     let captures_dir = state.cfg.captures_dir();
     let stored = state.db.load_all().context("load run history")?;
     let mut restored = 0usize;
+    let mut db_only = 0usize;
+    // Only the newest `runs_in_memory` runs are kept in memory; older
+    // ones are served from the database on demand and only folded into
+    // the metrics here (F054). `load_all` is ordered by id.
+    let keep_from = stored.len().saturating_sub(state.cfg.runs_in_memory.max(1));
     {
+        let mut folded = state.metrics.folded.lock_safe();
         let mut map = state.runs.lock_safe();
-        for s in &stored {
+        for (i, s) in stored.iter().enumerate() {
             match persist::stored_to_runstate(s, &state.cfg.library_dir, &captures_dir) {
+                Ok(rs) if i < keep_from => {
+                    metrics::fold_evicted(&mut folded, &rs);
+                    db_only += 1;
+                }
                 Ok(rs) => {
                     map.insert(rs.id, std::sync::Arc::new(std::sync::Mutex::new(rs)));
                     restored += 1;
@@ -191,7 +201,13 @@ pub(crate) fn restore(state: &AppState) -> Result<()> {
             }
         }
     }
-    info!(restored, next_id = max_id + 1, "restored runs from sqlite");
+    drop(stored);
+    info!(
+        restored,
+        db_only,
+        next_id = max_id + 1,
+        "restored runs from sqlite"
+    );
     match state.db.latest_analyses() {
         Ok(list) => {
             for a in &list {

@@ -162,8 +162,8 @@ pub(crate) async fn api_analyze(
     let mut warnings = Vec::new();
     let (rs, selection) = match run_id {
         Some(id) => {
-            let e = state
-                .get_run(id)
+            let (e, _) = state
+                .get_run_any(id)
                 .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
             let rs = e.lock_safe().clone();
             (rs, "explicit")
@@ -339,8 +339,9 @@ pub(crate) async fn api_run_analyze(
         analysis::check_cp56_tolerance(q.cp56_tolerance_ms.unwrap_or(state.cfg.cp56_tolerance_ms))
             .map_err(AppError::BadRequest)?;
     let rs = state
-        .get_run(id)
+        .get_run_any(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?
+        .0
         .lock_safe()
         .clone();
     crate::analysis_run::check_analyzable(&rs)?;

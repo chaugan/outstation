@@ -443,7 +443,16 @@ fn dependent_runs(state: &AppState, id: &str, pcap_path: &StdPath) -> Vec<u64> {
             (rs.pcap_id.as_deref() == Some(id) || rs.pcap == pcap_path).then_some(rs.id)
         })
         .collect();
+    // Runs only in the database (F054).
+    match state
+        .db
+        .run_ids_using_pcap(id, &pcap_path.display().to_string())
+    {
+        Ok(ids) => v.extend(ids),
+        Err(e) => warn!(error = %e, "could not list dependent runs in the database"),
+    }
     v.sort_unstable();
+    v.dedup();
     v
 }
 

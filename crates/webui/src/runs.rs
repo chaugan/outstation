@@ -406,6 +406,7 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
     // protected, so a run's own capture is never evicted before it is
     // analysed (N13).
     crate::analysis_run::spawn_auto_analysis(state, id);
+    trim_resident(state);
     let keep = retention_keep(state, id);
     captures::enforce_retention(
         &state.cfg.captures_dir(),
@@ -413,6 +414,50 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
         state.cfg.capture_max_count,
         &keep,
     );
+}
+
+/// Keep at most `runs_in_memory` finished runs in memory (F054): the
+/// oldest finished runs leave the map (they stay in the database and
+/// are served from it on demand) and their totals are folded into the
+/// metrics. Eviction stops at the first run that is still busy (live
+/// worker or pending analysis), so every run left only in the database
+/// is older than every run in memory.
+pub(crate) fn trim_resident(state: &AppState) {
+    let cap = state.cfg.runs_in_memory.max(1);
+    let mut folded = state.metrics.folded.lock_safe();
+    let mut map = state.runs.lock_safe();
+    let finished = map
+        .values()
+        .filter(|e| e.lock_safe().status.is_terminal())
+        .count();
+    if finished <= cap {
+        return;
+    }
+    let mut ids: Vec<u64> = map.keys().copied().collect();
+    ids.sort_unstable();
+    let mut over = finished - cap;
+    for id in ids {
+        if over == 0 {
+            break;
+        }
+        let Some(e) = map.get(&id).cloned() else {
+            continue;
+        };
+        let rs = e.lock_safe();
+        let busy = !rs.status.is_terminal()
+            || state.worker_alive(id)
+            || rs
+                .auto_analysis
+                .as_ref()
+                .is_some_and(|a| matches!(a.state, "queued" | "running"));
+        if busy {
+            break;
+        }
+        crate::metrics::fold_evicted(&mut folded, &rs);
+        drop(rs);
+        map.remove(&id);
+        over -= 1;
+    }
 }
 
 /// Captures retention must not evict: the active run's, run `just_finished`'s
