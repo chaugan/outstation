@@ -183,7 +183,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O1: an unbounded master run with original pacing reconnects 8–12 times a second on short captures; an iteration should last the capture's span divided by speed.
   - O2: inject ports send IGMPv3 reports onto the LAN with the RTU's MAC.
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
-- [ ] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
+- [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
 
@@ -327,3 +327,6 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - A startup auto-analysis backlog (newest 20).
   - netns-smoke 10/10 on both runs; all privileged suites green.
 - 2026-11-05: Orchestrator added the `iteration_gap_ms` UI input and the `captured_dropped` docs, and made the ui-smoke compare flow auto-analysis aware. ui-smoke: 182/182 with auto-analysis, 204/204 without.
+- 2026-11-05: T17 started.
+  - Six independent re-audit agents check F000–F151 and P01–P12 against a frozen snapshot of `7750eae` (`/opt/code/outstation-wt/verify`).
+  - A measurement lane (t17) runs the 200/400-session scale benchmark, tests gateway with an egress NIC, writes the scale report, and refreshes the README screenshots.
