@@ -851,6 +851,10 @@ pub struct AckCadence {
     pub messages_acked: u64,
     /// Most messages retired by a single acknowledgement.
     pub max_messages_per_ack: u64,
+    /// Longest time, in microseconds, the oldest message covered by a
+    /// below-window acknowledgement had waited. The peer's t2 shows up
+    /// here even when it differs from the session's configured t2.
+    pub below_window_max_wait_us: u64,
 }
 
 impl AckCadence {
@@ -880,6 +884,8 @@ impl AckCadence {
             self.window_acks = self.window_acks.saturating_add(1);
         } else {
             self.below_window_acks = self.below_window_acks.saturating_add(1);
+            self.below_window_max_wait_us =
+                self.below_window_max_wait_us.max(oldest_wait_ns / 1_000);
             if t2_ns > 0 && oldest_wait_ns >= t2_ns / 10 * 9 {
                 self.timer_acks = self.timer_acks.saturating_add(1);
             }
@@ -895,6 +901,9 @@ impl AckCadence {
         self.piggybacked_acks = self.piggybacked_acks.saturating_add(o.piggybacked_acks);
         self.messages_acked = self.messages_acked.saturating_add(o.messages_acked);
         self.max_messages_per_ack = self.max_messages_per_ack.max(o.max_messages_per_ack);
+        self.below_window_max_wait_us = self
+            .below_window_max_wait_us
+            .max(o.below_window_max_wait_us);
     }
 }
 
@@ -1583,6 +1592,7 @@ mod tests {
         assert_eq!(a.piggybacked_acks, 1);
         assert_eq!(a.messages_acked, 28);
         assert_eq!(a.max_messages_per_ack, 12);
+        assert_eq!(a.below_window_max_wait_us, 9_500_000);
         let mut b = AckCadence::default();
         b.record(20, true, 8, 0, t2);
         let mut stats = ProtocolStats {

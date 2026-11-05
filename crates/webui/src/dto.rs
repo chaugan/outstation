@@ -511,6 +511,7 @@ pub struct AckCadenceJson {
     pub piggybacked_acks: u64,
     pub messages_acked: u64,
     pub max_messages_per_ack: u64,
+    pub below_window_max_wait_us: u64,
 }
 
 impl From<&protoplay::AckCadence> for AckCadenceJson {
@@ -523,6 +524,7 @@ impl From<&protoplay::AckCadence> for AckCadenceJson {
             piggybacked_acks: a.piggybacked_acks,
             messages_acked: a.messages_acked,
             max_messages_per_ack: a.max_messages_per_ack,
+            below_window_max_wait_us: a.below_window_max_wait_us,
         }
     }
 }
@@ -536,6 +538,9 @@ impl AckCadenceJson {
         self.piggybacked_acks = self.piggybacked_acks.saturating_add(o.piggybacked_acks);
         self.messages_acked = self.messages_acked.saturating_add(o.messages_acked);
         self.max_messages_per_ack = self.max_messages_per_ack.max(o.max_messages_per_ack);
+        self.below_window_max_wait_us = self
+            .below_window_max_wait_us
+            .max(o.below_window_max_wait_us);
     }
 
     /// One line for reports: how many acks, and what share came after
@@ -544,8 +549,16 @@ impl AckCadenceJson {
     pub fn summary(&self) -> String {
         let acks = self.standalone_acks + self.piggybacked_acks;
         let pct = |n: u64| (n * 100 + acks / 2).checked_div(acks).unwrap_or(0);
+        let wait = if self.below_window_acks > 0 {
+            format!(
+                ", waited up to {:.2} s",
+                self.below_window_max_wait_us as f64 / 1e6
+            )
+        } else {
+            String::new()
+        };
         format!(
-            "{acks} acks for {} messages · {}% after a full window · {}% before it ({} when t2 expired) · {}% on the peer's own data · up to {} per ack",
+            "{acks} acks for {} messages · {}% after a full window · {}% before it ({} when t2 expired{wait}) · {}% on the peer's own data · up to {} per ack",
             self.messages_acked,
             pct(self.window_acks),
             pct(self.below_window_acks),
@@ -1157,7 +1170,7 @@ mod tests {
         assert_eq!(s0.ack_cadence.unwrap().window_acks, 1);
         assert_eq!(
             f.summary(),
-            "3 acks for 13 messages · 33% after a full window · 33% before it (1 when t2 expired) · 33% on the peer's own data · up to 8 per ack"
+            "3 acks for 13 messages · 33% after a full window · 33% before it (1 when t2 expired, waited up to 0.00 s) · 33% on the peer's own data · up to 8 per ack"
         );
         // Old rows without cadence: computed on read, `None` when absent.
         let old = r#"{"per_session":[{"src_ip":"10.0.0.1","protocol":{"acks_sent":1}}]}"#;

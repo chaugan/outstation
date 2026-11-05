@@ -881,8 +881,10 @@ function ackCadenceHtml(c) {
   const parts = [];
   if (c.window_acks) parts.push(`${share(c.window_acks)} after a full window (≥ w)`);
   if (c.below_window_acks) {
-    parts.push(`${share(c.below_window_acks)} before the window filled` +
-      (c.timer_acks ? ` (${fmtInt(c.timer_acks)} of them when t2 expired)` : ''));
+    const sub = [];
+    if (c.timer_acks) sub.push(`${fmtInt(c.timer_acks)} of them when t2 expired`);
+    if (c.below_window_max_wait_us) sub.push(`the oldest message waited up to ${usFmt(c.below_window_max_wait_us)}`);
+    parts.push(`${share(c.below_window_acks)} before the window filled` + (sub.length ? ` (${sub.join('; ')})` : ''));
   }
   if (c.piggybacked_acks) parts.push(`${share(c.piggybacked_acks)} on the peer's own data`);
   let hint = '';

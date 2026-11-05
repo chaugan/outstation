@@ -263,6 +263,7 @@ fn peer_ack_cadence_is_classified() {
     assert_eq!(a.timer_acks, 1, "{a:?}");
     assert_eq!(a.piggybacked_acks, 1, "{a:?}");
     assert_eq!(a.max_messages_per_ack, 4, "{a:?}");
+    assert!(a.below_window_max_wait_us >= 300_000, "{a:?}");
 }
 
 /// F008/F147/F010: 15-bit wraparound of V(S) and of the peer's N(R),
