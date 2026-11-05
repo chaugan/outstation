@@ -66,6 +66,7 @@ use axum::Router;
 use tower_http::catch_panic::CatchPanicLayer;
 use tracing::{error, info, warn};
 
+pub use analysis::{check_cp56_tolerance, DEFAULT_CP56_TOLERANCE_MS};
 pub use cleanup::host_cleanup;
 pub use dto::{
     BenchmarkReportJson, LatencyHistogramJson, RunReportJson, RunState, RunStatus, RunSummary,

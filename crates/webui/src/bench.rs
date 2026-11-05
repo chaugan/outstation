@@ -30,7 +30,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::analysis::{self, AnalysisMode, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, AnalysisMode};
 use crate::dto::*;
 use crate::error::panic_message;
 use crate::runbuild::{self, RunMode};
@@ -442,6 +442,8 @@ pub struct BenchOptions {
     pub capture: Option<PathBuf>,
     /// Analyse in `correct` mode (target is the device in the pcap).
     pub correct_mode: bool,
+    /// CP56Time2a drift tolerance (ms) for the analysis (F066).
+    pub cp56_tolerance_ms: f64,
 }
 
 /// Load a profile file into a validated benchmark request. A missing
@@ -656,7 +658,7 @@ fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
         } else {
             AnalysisMode::Generic
         };
-        match crate::analysis_run::analyze_run(&rs, &capture, mode, DEFAULT_CP56_TOLERANCE_MS) {
+        match crate::analysis_run::analyze_run(&rs, &capture, mode, opts.cp56_tolerance_ms) {
             Ok(r) => Some(r.split().0),
             Err(e) => {
                 rep.analysis_error = Some(format!("{e:#}"));
@@ -739,6 +741,7 @@ pub fn summary_text(r: &BenchReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::DEFAULT_CP56_TOLERANCE_MS;
 
     fn a(s: &str) -> Assertion {
         s.parse().unwrap()
@@ -821,6 +824,7 @@ mod tests {
             state_dir: "/s".into(),
             capture: None,
             correct_mode: false,
+            cp56_tolerance_ms: DEFAULT_CP56_TOLERANCE_MS,
         });
         r.assertions = asserts;
         r.error = error.map(str::to_string);

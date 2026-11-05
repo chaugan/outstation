@@ -190,6 +190,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         capture_max_count: 1000,
         library_max_bytes: 0,
         heavy_concurrency: 2,
+        cp56_tolerance_ms: crate::analysis::DEFAULT_CP56_TOLERANCE_MS,
         auto_analyze: true,
     }
 }
@@ -1582,9 +1583,25 @@ async fn compare_runs() {
     let (s, _, _) = h.send(req).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
+    // F066: the drift tolerance is an option; a bad one is a 400.
+    for bad in ["-1", "NaN", "1e12", "x"] {
+        let (s, v) = h
+            .call(
+                Method::POST,
+                &format!("/api/runs/{a}/analyze?cp56_tolerance_ms={bad}"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
     for id in [a, b] {
         let (s, v) = h
-            .call(Method::POST, &format!("/api/runs/{id}/analyze"), None)
+            .call(
+                Method::POST,
+                &format!("/api/runs/{id}/analyze?cp56_tolerance_ms=250"),
+                None,
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["run_id"], id);

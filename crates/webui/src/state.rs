@@ -78,6 +78,10 @@ pub struct ServeConfig {
     pub library_max_bytes: u64,
     /// Concurrent heavy requests (analysis, uploads, gap histograms).
     pub heavy_concurrency: usize,
+    /// CP56Time2a drift tolerance (ms) for automatic and on-demand
+    /// analyses (F066). `--cp56-tolerance-ms` or
+    /// `OUTSTATION_CP56_TOLERANCE_MS`; default 50.
+    pub cp56_tolerance_ms: f64,
     /// Analyse every finished benchmark run's own capture automatically
     /// and store the result (T08). `serve --no-auto-analyze` or
     /// `OUTSTATION_AUTO_ANALYZE=0` turns it off.
@@ -129,6 +133,11 @@ impl ServeConfig {
                 .map(|v| v * MIB)
                 .unwrap_or(0),
             heavy_concurrency: 2,
+            cp56_tolerance_ms: std::env::var("OUTSTATION_CP56_TOLERANCE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .and_then(|v| crate::analysis::check_cp56_tolerance(v).ok())
+                .unwrap_or(crate::analysis::DEFAULT_CP56_TOLERANCE_MS),
             auto_analyze: std::env::var("OUTSTATION_AUTO_ANALYZE")
                 .ok()
                 .and_then(|v| env_flag(&v))

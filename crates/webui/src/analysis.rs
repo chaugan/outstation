@@ -51,6 +51,19 @@ use serde::Serialize;
 /// Default tolerance for the CP56Time2a drift analyzer: 50 ms is
 /// generous for a LAN SCADA session but keeps noise out of the count.
 pub const DEFAULT_CP56_TOLERANCE_MS: f64 = 50.0;
+/// Largest accepted CP56Time2a drift tolerance (one hour).
+pub const MAX_CP56_TOLERANCE_MS: f64 = 3_600_000.0;
+
+/// Check a configured CP56Time2a drift tolerance (F066).
+pub fn check_cp56_tolerance(v: f64) -> Result<f64, String> {
+    if v.is_finite() && (0.0..=MAX_CP56_TOLERANCE_MS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "cp56_tolerance_ms must be a number in 0..={MAX_CP56_TOLERANCE_MS}, got {v}"
+        ))
+    }
+}
 
 /// Cap on points emitted in the fleet timelines. Aggregate stats stay
 /// accurate beyond this; only the scatter is trimmed.
@@ -2314,5 +2327,14 @@ mod tests {
         assert!(r.verdict_reason.contains("stopped"));
         assert!(r.run_warning.as_deref().unwrap().contains("STOPPED"));
         assert!(r.notes[0].contains("STOPPED"), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn cp56_tolerance_is_bounded() {
+        assert_eq!(check_cp56_tolerance(0.0), Ok(0.0));
+        assert_eq!(check_cp56_tolerance(250.0), Ok(250.0));
+        for bad in [-1.0, f64::NAN, f64::INFINITY, MAX_CP56_TOLERANCE_MS + 1.0] {
+            assert!(check_cp56_tolerance(bad).is_err(), "{bad}");
+        }
     }
 }

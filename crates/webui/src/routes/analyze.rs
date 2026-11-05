@@ -20,7 +20,7 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::atomic::Ordering;
 
-use crate::analysis::{self, AnalysisMode, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, AnalysisMode};
 use crate::analysis_run::{analyze_run, note_analysis, store_blocking};
 use crate::db::StoredAnalysis;
 use crate::dto::*;
@@ -85,7 +85,7 @@ pub(crate) async fn api_analyze(
     let mut size: u64 = 0;
     let mut mode: AnalysisMode = AnalysisMode::Generic;
     let mut field_run_id: Option<u64> = None;
-    let mut cp56_tolerance_ms: f64 = DEFAULT_CP56_TOLERANCE_MS;
+    let mut cp56_tolerance_ms: f64 = state.cfg.cp56_tolerance_ms;
     while let Some(mut field) = mp.next_field().await.map_err(multipart_error)? {
         let name = field.name().map(|s| s.to_string()).unwrap_or_default();
         match name.as_str() {
@@ -130,10 +130,8 @@ pub(crate) async fn api_analyze(
                 let v: f64 = s.trim().parse().map_err(|_| {
                     AppError::BadRequest(format!("cp56_tolerance_ms {s:?} is not a number"))
                 })?;
-                if !(v.is_finite() && v >= 0.0) {
-                    return Err(AppError::BadRequest("cp56_tolerance_ms must be >= 0"));
-                }
-                cp56_tolerance_ms = v;
+                cp56_tolerance_ms =
+                    analysis::check_cp56_tolerance(v).map_err(AppError::BadRequest)?;
             }
             _ => {}
         }
@@ -316,10 +314,22 @@ pub(crate) struct RunAnalyzeResp {
 /// capture now and store it (source `on_demand`). Mutating, so it sits
 /// behind the same-origin guard and the heavy-work limit (429 `busy`).
 /// 409 `capture_missing` when the run has no capture on disk.
+#[derive(Deserialize, Default)]
+pub(crate) struct RunAnalyzeQuery {
+    /// CP56Time2a drift tolerance for this analysis; default the
+    /// server's `--cp56-tolerance-ms` (F066).
+    #[serde(default)]
+    cp56_tolerance_ms: Option<f64>,
+}
+
 pub(crate) async fn api_run_analyze(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<u64>,
+    ApiQuery(q): ApiQuery<RunAnalyzeQuery>,
 ) -> Result<Json<RunAnalyzeResp>, AppError> {
+    let tol =
+        analysis::check_cp56_tolerance(q.cp56_tolerance_ms.unwrap_or(state.cfg.cp56_tolerance_ms))
+            .map_err(AppError::BadRequest)?;
     let rs = state
         .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?
@@ -339,7 +349,7 @@ pub(crate) async fn api_run_analyze(
         .try_acquire_owned()
         .map_err(|_| busy())?;
     let (a, _) =
-        crate::analysis_run::analyze_and_store(&state, rs, capture, AnalysisSource::OnDemand)
+        crate::analysis_run::analyze_and_store(&state, rs, capture, AnalysisSource::OnDemand, tol)
             .await?;
     Ok(Json(RunAnalyzeResp {
         analysis_id: a.id,

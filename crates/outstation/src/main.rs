@@ -91,6 +91,11 @@ struct ServeArgs {
     #[arg(long, value_name = "MIB")]
     library_max_mb: Option<u64>,
 
+    /// CP56Time2a drift tolerance for automatic and on-demand
+    /// analyses, in ms. Default 50 or OUTSTATION_CP56_TOLERANCE_MS.
+    #[arg(long, value_name = "MS", value_parser = parse_cp56_tolerance)]
+    cp56_tolerance_ms: Option<f64>,
+
     /// Do not analyse finished benchmark runs automatically. Also
     /// OUTSTATION_AUTO_ANALYZE=0.
     #[arg(long)]
@@ -133,6 +138,11 @@ struct BenchArgs {
     /// the pcap, so its replies are compared byte for byte too.
     #[arg(long)]
     correct: bool,
+
+    /// CP56Time2a drift tolerance for the analysis, in ms (default 50).
+    #[arg(long, value_name = "MS", default_value_t = webui::DEFAULT_CP56_TOLERANCE_MS,
+          value_parser = parse_cp56_tolerance)]
+    cp56_tolerance_ms: f64,
 }
 
 fn parse_assertion(s: &str) -> Result<webui::bench::Assertion, String> {
@@ -268,6 +278,9 @@ fn main() -> Result<()> {
             if let Some(mb) = args.capture_max_mb {
                 cfg.capture_max_total_bytes = mb.saturating_mul(1024 * 1024);
             }
+            if let Some(ms) = args.cp56_tolerance_ms {
+                cfg.cp56_tolerance_ms = ms;
+            }
             if let Some(mb) = args.library_max_mb {
                 cfg.library_max_bytes = mb.saturating_mul(1024 * 1024);
             }
@@ -289,6 +302,11 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn parse_cp56_tolerance(s: &str) -> Result<f64, String> {
+    let v: f64 = s.trim().parse().map_err(|e| format!("{e}"))?;
+    webui::check_cp56_tolerance(v)
 }
 
 /// `outstation cleanup`: refuse while a live server or bench holds the
@@ -320,6 +338,7 @@ fn bench_cmd(args: BenchArgs) -> i32 {
         state_dir: args.state_dir.unwrap_or_else(webui::default_state_dir),
         capture: args.capture,
         correct_mode: args.correct,
+        cp56_tolerance_ms: args.cp56_tolerance_ms,
     };
     let mut report = webui::bench::run(&opts);
     if let Some(path) = &opts.report {
@@ -414,6 +433,8 @@ mod tests {
             "10",
             "--library-max-mb",
             "2048",
+            "--cp56-tolerance-ms",
+            "250",
         ])
         .unwrap();
         let Cmd::Serve(a) = cli.cmd else {
@@ -429,6 +450,8 @@ mod tests {
         assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
         assert_eq!(a.max_upload_mb, Some(10));
         assert_eq!(a.library_max_mb, Some(2048));
+        assert_eq!(a.cp56_tolerance_ms, Some(250.0));
+        assert!(Cli::try_parse_from(["outstation", "serve", "--cp56-tolerance-ms", "-5"]).is_err());
     }
 
     #[test]

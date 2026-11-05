@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 
 use tracing::{info, warn};
 
-use crate::analysis::{self, analyze, AnalysisMode, RoleHint, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, analyze, AnalysisMode, RoleHint};
 use crate::db::{Db, StoredAnalysis};
 use crate::dto::*;
 use crate::error::{AppError, LockExt};
@@ -190,18 +190,14 @@ pub(crate) async fn analyze_and_store(
     rs: RunState,
     capture: PathBuf,
     source: AnalysisSource,
+    cp56_tolerance_ms: f64,
 ) -> Result<(StoredAnalysis, analysis::AnalysisReport), AppError> {
     let db = state.db.clone();
     let m = state.metrics.clone();
     m.analyses_running.fetch_add(1, Ordering::Relaxed);
     let res = tokio::task::spawn_blocking(move || {
-        let report = analyze_run(
-            &rs,
-            &capture,
-            AnalysisMode::Generic,
-            DEFAULT_CP56_TOLERANCE_MS,
-        )
-        .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
+        let report = analyze_run(&rs, &capture, AnalysisMode::Generic, cp56_tolerance_ms)
+            .map_err(|e| AppError::BadRequest(format!("analyze run {}: {e:#}", rs.id)))?;
         let stored = store_blocking(&db, report.clone(), source)
             .map_err(|e| AppError::Internal(format!("store analysis: {e:#}")))?;
         Ok::<_, AppError>((stored, report))
@@ -299,7 +295,8 @@ pub(crate) fn spawn_auto_analysis(state: &AppState, id: u64) {
                 analysis_id: None,
             },
         );
-        match analyze_and_store(&st, rs, capture, AnalysisSource::Auto).await {
+        let tol = st.cfg.cp56_tolerance_ms;
+        match analyze_and_store(&st, rs, capture, AnalysisSource::Auto, tol).await {
             Ok((a, report)) => {
                 info!(
                     id,

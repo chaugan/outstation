@@ -88,6 +88,7 @@ Otherwise restrict port 8080 at the network layer. The Host and Origin checks ([
 | | `OUTSTATION_MIN_FREE_MB` | 512 | Free-space reserve in the state directory |
 | `--library-max-mb N` | `OUTSTATION_LIBRARY_MAX_MB` | none | Total size quota of the pcap library; an upload that would exceed it is refused with 507 `quota_exceeded` |
 | `--no-auto-analyze` | `OUTSTATION_AUTO_ANALYZE=0` | on | Do not analyse finished benchmark runs automatically |
+| `--cp56-tolerance-ms N` | `OUTSTATION_CP56_TOLERANCE_MS` | 50 | CP56Time2a drift tolerance of automatic and on-demand analyses (`outstation bench` takes the same flag) |
 | | `OUTSTATION_LIBRARY_DIR` | `/var/lib/outstation/library` | Library directory. The state directory is its parent |
 | | `RUST_LOG` | `info` | Log filter, e.g. `RUST_LOG=debug,hyper=info` |
 

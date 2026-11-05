@@ -319,9 +319,9 @@ Analysis compares a capture of a benchmark run against the run's source pcap. Th
 
 Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. A run that finished while the server was shutting down (SIGTERM), or was cut off by a crash, is analysed after the next start: the newest 20 finished benchmark runs with a capture and no analysis are queued, older ones get `auto_analysis` `skipped` and can be analysed on demand. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
 
-### `POST /api/runs/:id/analyze`
+### `POST /api/runs/:id/analyze[?cp56_tolerance_ms=N]`
 
-Analyse the run's own capture now and store the result. Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
+Analyse the run's own capture now and store the result. `cp56_tolerance_ms` (0 to 3 600 000) sets the CP56Time2a drift tolerance for this analysis; the default is the server's `--cp56-tolerance-ms` (50 unless configured). Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
 
 ### `POST /api/analyze[?run_id=N]` (multipart)
 
@@ -332,7 +332,7 @@ Analyse a capture you took yourself (for example with Wireshark on the target si
 | `file` | The captured pcap (required) |
 | `mode` | `generic` (default) or `correct`: also compare the target's replies byte for byte, when the target is the device recorded in the pcap |
 | `run_id` | The run to compare against; may also be given in the query string (both must agree) |
-| `cp56_tolerance_ms` | CP56Time2a drift tolerance, default 50 |
+| `cp56_tolerance_ms` | CP56Time2a drift tolerance in ms (0 to 3 600 000); default the server's `--cp56-tolerance-ms` |
 
 Without `run_id` the newest finished benchmark run is used, and a warning says so. The response is the full analysis report plus `run_selection` (`explicit` or `latest`), `warnings[]` and `analysis_id`.
 
