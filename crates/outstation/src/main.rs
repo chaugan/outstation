@@ -40,9 +40,10 @@ enum Cmd {
     /// report. Exit 0 = all assertions passed, 1 = an assertion
     /// failed, 2 = the run failed or was interrupted.
     Bench(BenchArgs),
-    /// Undo host network changes left by runs (IP aliases, bridges,
-    /// veths and, once available, iptables/sysctl state). Safe to run
-    /// at any time; used as the systemd unit's ExecStopPost.
+    /// Undo host network changes left by runs: IP aliases, our marked
+    /// bridges and veths, journaled sysctls and NIC offloads, and
+    /// iptables rules tagged `outstation-run-<id>`. Idempotent; used as
+    /// the systemd unit's ExecStopPost.
     Cleanup {
         /// State directory (default: parent of OUTSTATION_LIBRARY_DIR,
         /// i.e. /var/lib/outstation).

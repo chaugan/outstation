@@ -118,7 +118,7 @@ Every host change a run makes is journaled before it is made and undone when the
 - SQLite history with schema migrations; captures under the state directory with size and count caps.
 - Graceful SIGTERM: runs are stopped and host changes undone before exit.
 
-The UI covers the run lifecycle (library, configure, runs, analysis). Re-run, profiles and run compare are available through the [HTTP API](doc/api.md) and `bench`; their UI is still being built.
+The UI covers the whole lifecycle: library, configure (with saved profiles), runs (re-run, load settings back into the form, live auto-analysis state), analysis and run-to-run compare. Everything is also available through the [HTTP API](doc/api.md) and the `bench` CLI.
 
 ## Protocol support
 

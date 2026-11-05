@@ -278,7 +278,7 @@ The full list of verdicts is in the [IEC 104 reference](iec104-config.md#analysi
 
   Exit code 0 means every assertion passed, 1 an assertion failed, 2 the run failed.
 
-The UI for re-runs, profiles and compare is still being built; the API and `bench` work now. See the [API reference](api.md) for examples; scripts must send an `Origin` header.
+Re-runs, profiles and compare are available in the UI (run cards, Configure → Profiles, the Compare view), through the API and through `bench`. See the [API reference](api.md) for examples; scripts must send an `Origin` header.
 
 ---
 

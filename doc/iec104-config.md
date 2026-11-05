@@ -221,7 +221,7 @@ Each session of a benchmark run (`benchmark.per_session[]` in `GET /api/runs/:id
 | `idle_serve_ms` | Slave: time spent serving after the script ended |
 | `acks_sent`, `keepalives_sent` | S-frames and TESTFR acts we sent |
 
-The engine also records, per session, per-command-type round trips (`commands[]`: `{type_id, commands, act_con, negative, act_term, deact_con, unanswered, actcon_us[], actterm_us[]}`), `negative_confirmations[]`, `faults_injected[]` (`{at_ms, kind, detail, frames_affected}`) and `fault_reaction` (`{peer_closed, peer_reset, peer_stopdt, protocol_errors[], first_reaction_ms, summary}`). These four are not yet part of the HTTP or `bench` report; the analyzer's `faults` section covers the fault side from the capture.
+The engine also records, per session, per-command-type round trips (`commands[]`: `{type_id, commands, act_con, negative, act_term, deact_con, unanswered, actcon_us[], actterm_us[]}`), `negative_confirmations[]`, `faults_injected[]` (`{at_ms, kind, detail, frames_affected}`) and `fault_reaction` (`{peer_closed, peer_reset, peer_stopdt, protocol_errors[], first_reaction_ms, summary}`). All four appear in each session's `protocol` object in `GET /api/runs/:id` and in the `bench` JSON report; the analyzer's `faults` section additionally judges the fault side from the capture.
 
 Latency (`latency_*_us`) is the time from sending an I-frame to the peer acknowledging it (the S-frame or I-frame N(R) that covers it, timestamped on receipt). It is not a command round trip.
 

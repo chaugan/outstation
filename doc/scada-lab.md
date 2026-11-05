@@ -278,7 +278,7 @@ Den fullstendige listen over dommer står i [IEC 104-referansen](iec104-config.m
 
   Avslutningskode 0 betyr at alle påstandene holdt, 1 at en påstand feilet, 2 at kjøringen feilet.
 
-UI-et for ny kjøring, profiler og sammenligning er fortsatt under arbeid; API-et og `bench` fungerer nå. Se [API-referansen](api.md) for eksempler; skript må sende en `Origin`-header.
+Ny kjøring, profiler og sammenligning finnes i UI-et (kjøringskort, Konfigurer → Profiler og Sammenlign-visningen), i API-et og i `bench`. Se [API-referansen](api.md) for eksempler; skript må sende en `Origin`-header.
 
 ---
 
