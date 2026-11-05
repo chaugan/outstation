@@ -144,19 +144,27 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   4. Stale `listen_port_base + n − 1 ≤ 65535` check, although every slave shares one port on its own IP.
   5. Analysing a run that sent 0 messages gives a `partial` verdict rather than a clear failure or inconclusive result.
 
-- [~] **T12b Fault and command caveats** (from the T11/T12 lane).
+- [x] **T12b Fault and command caveats** (from the T11/T12 lane).
   - With `return_info` on, captured COT 11/12 return-information frames are still replayed next to the live ones; strip them when echo plus return info is on.
   - GI after a command with return info can be judged non-compliant, because the analyzer's inventory comes from the capture. Track the command-updated values in the audit.
 
 ## Wave 3: product features
 
-- [~] **T08 Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
-- [~] **T09 Headless bench CLI.** `outstation bench --profile run.json --assert score>=99 --assert p99_ms<=500 --report out.json`. It runs, captures, analyses its own mirror and exits non-zero on failure. Refs: F131; product item #2.
-- [~] **T10 Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
+- [~] **T08 (backend done; UI is in T19) Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
+- [x] **T09 Headless bench CLI.** `outstation bench --profile run.json --assert score>=99 --assert p99_ms<=500 --report out.json`. It runs, captures, analyses its own mirror and exits non-zero on failure. Refs: F131; product item #2.
+- [~] **T10 (backend done; UI is in T19) Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
 - [x] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
 - [x] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
-- [~] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
+- [x] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
 - [x] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
+
+- [ ] **T18 Slave-mode capture.** Slave runs (the main "test a SCADA master" scenario) have no mirror capture, so auto-analysis and `bench` score assertions cannot cover them. Capture the RTU listen-IP traffic on the alias NIC with a BPF filter limited to the run's listen IPs and port, store it like the other captures, and enable auto-analysis and bench scoring for slave runs.
+- [ ] **T19 UI for the wave-3 features.**
+  - Re-run and "Load config" from a run, plus named profiles (save, load, delete).
+  - Compare view with a run picker, regression highlighting and thresholds; when an analysis is missing, POST `/api/runs/:id/analyze` and retry.
+  - Auto-analysis state on run cards; SSE `analysis_finished` and `analysis_failed` trigger a refresh.
+  - Command and fault report sections (`commands[]`, `negative_confirmations`, `faults_injected`, `fault_reaction`, the analyzer's `faults` dimension), plus configuration editors for `commands` and `faults` under advanced IEC 104.
+  - Health detail from `degraded_detail`, and a link to `/metrics`.
 
 ## Wave 4: docs, privileged validation, final audit
 
@@ -251,3 +259,18 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Per-type command ActCon and ActTerm latency in both roles.
   - A FaultPlan with ten fault kinds, peer-reaction detection and a `faults` verdict dimension.
   - Two minor caveats logged as T12b.
+- 2026-11-05: T08, T09, T10 and T13 (backends) merged. Workspace tests: 384 passed.
+  - Run requests persisted, plus re-run, profiles and auto-analysis.
+  - The `outstation bench` CLI with assertions and exit codes.
+  - Compare: GET is read-only; on-demand analysis is a POST.
+  - `/metrics` and `degraded_detail`.
+  - The e2e test found two existing bugs, both fixed: master-role sessions could never connect, and the mirror capture missed unicast traffic.
+  - Host isolation for run interfaces: per-interface sysctls, tagged raw/FORWARD DROP rules, and capture via tc mirred instead of hub mode.
+- 2026-11-05: Orchestrator security fixes.
+  - Session ACCEPT narrowed to the target's TCP source port.
+  - Isolation rules kept when interface teardown is incomplete.
+  - Privileged suites: `netns-test.sh` 7/7, `netns-bench-test.sh` 3/3; host interface and iptables counts unchanged.
+- 2026-11-05: T12b merged. Workspace tests: 389 passed. Captured COT 11 frames are stripped when return info is synthesized, and the GI audit follows command-driven inventory changes.
+- 2026-11-05: New tasks.
+  - T18: slave runs have no mirror capture (an existing gap).
+  - T19: UI for the wave-3 features.
