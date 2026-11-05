@@ -317,7 +317,7 @@ curl -s "$B/api/profiles/1" > rtu-fleet-slave.json   # usable with outstation be
 
 Analysis compares a capture of a benchmark run against the run's source pcap. The report format is described in [IEC 104 configuration](iec104-config.md#analysis-report). Raw-replay runs cannot be analysed (400 `not_benchmark`).
 
-Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
+Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. A run that finished while the server was shutting down (SIGTERM), or was cut off by a crash, is analysed after the next start: the newest 20 finished benchmark runs with a capture and no analysis are queued, older ones get `auto_analysis` `skipped` and can be analysed on demand. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
 
 ### `POST /api/runs/:id/analyze`
 
@@ -408,6 +408,7 @@ The body of `POST /api/run`, the `request` of a stored run and a profile, and th
 | `speed` | 1.0 | 0.001 to 1000. Original pacing and raw replay |
 | `concurrency` | `all_at_once` | Master: `all_at_once` or `staggered` (start sessions at their captured offsets) |
 | `iterations` | 1 | Passes over the script; 0 = until stopped |
+| `iteration_gap_ms` | 1000 | Master: pause between two iterations (connections) of a session, at most 3600000. With `original` pacing an iteration also lasts at least the captured flow's span / `speed`. An unbounded run (`iterations` 0) retries a refused connection, backing off from max(gap, 0.5 s) up to 30 s |
 | `loop_within_session` | false | Slave: loop inside one TCP session instead of reconnecting per iteration |
 | `warmup_secs` | 5 | Delay after setup, before traffic (at most 3600) |
 | `selected_rtus` | all | Subset of endpoints: server IPs in slave role, client IPs in master role |

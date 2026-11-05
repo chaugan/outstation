@@ -864,6 +864,7 @@ dependencies = [
  "libc",
  "pcapload",
  "rewrite",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]
@@ -937,11 +938,14 @@ name = "sched"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "libc",
  "netctl",
  "pcapload",
+ "proto_iec104",
  "protoplay",
  "raw_replay",
  "rewrite",
+ "tempfile",
  "tracing",
 ]
 

@@ -98,8 +98,11 @@ pub struct Topology {
     enslaved: Vec<String>,
     /// Host-stack isolation of the run's interfaces ([`harden`]).
     hardening: Option<harden::Hardening>,
-    /// Capture device every port is mirrored to (`tc mirred`).
+    /// Capture device every port's ingress is mirrored to (`tc mirred`).
     mirror: Option<String>,
+    /// MAC of every port's source identity (the end that sends its
+    /// frames), see [`Topology::port_macs`].
+    port_macs: Vec<MacAddr>,
     done: bool,
 }
 
@@ -117,6 +120,7 @@ impl Topology {
             enslaved: Vec::new(),
             hardening: None,
             mirror: None,
+            port_macs: Vec::new(),
             done: false,
         })
     }
@@ -170,12 +174,25 @@ impl Topology {
                 ),
             }
         }
-        ip(["link", "add", &self.bridge, "type", "bridge"])?;
+        // No multicast snooping: a snooping bridge joins the
+        // all-snoopers group (224.0.0.106) and sends IGMPv3 reports onto
+        // the LAN, from the bridge's MAC, which is a replayed source's
+        // (O2).
+        ip([
+            "link",
+            "add",
+            &self.bridge,
+            "type",
+            "bridge",
+            "mcast_snooping",
+            "0",
+        ])?;
         self.bridge_created = true;
         mark_owned(&self.bridge, self.run_id)?;
         if self.hardening.is_some() {
             harden::harden_iface(&self.bridge, harden::RpFilter::Strict)?;
         }
+        harden::quiet_iface(&self.bridge)?;
         ip(["link", "set", "dev", &self.bridge, "up"])?;
         Ok(())
     }
@@ -287,6 +304,22 @@ impl Topology {
                 h.allow_session(ip_addr)?;
             }
         }
+        // Neither end originates anything of its own (IGMP, IPv6
+        // DAD/RS/MLD): only replayed or session frames reach the LAN.
+        harden::quiet_iface(&inject_side)?;
+        harden::quiet_iface(&bridge_side)?;
+        if src_ip.is_some() {
+            // The kernel builds session frames on the inject end. With
+            // checksum offload (and so TSO/GSO) left on, they enter the
+            // bridge with partial checksums or as one oversized
+            // segment, and the port mirror would record them so;
+            // computed in software they are recorded as they leave on
+            // the wire. Our own interface: nothing to restore.
+            if let Err(e) = guard::set_tx_checksum(&inject_side, false) {
+                warn!(iface = %inject_side, error = %format!("{e:#}"),
+                    "could not turn checksum offload off; the capture may show partial checksums");
+            }
+        }
         ip(["link", "set", "dev", &bridge_side, "master", &self.bridge])?;
         ip(["link", "set", "dev", &bridge_side, "up"])?;
         ip(["link", "set", "dev", &inject_side, "up"])?;
@@ -294,21 +327,50 @@ impl Topology {
             let cidr = format!("{ip_addr}/32");
             ip(["addr", "add", &cidr, "dev", &inject_side])?;
         }
+        let identity = if src_ip.is_some() {
+            &inject_side
+        } else {
+            &bridge_side
+        };
+        self.port_macs.push(match mac {
+            Some(m) => m,
+            None => read_mac(identity)?,
+        });
         if let Some(cap) = self.mirror.clone() {
             mirror_port(&bridge_side, &cap)?;
         }
         Ok(inject_side)
     }
 
+    /// The source MAC of every port added with [`Topology::add_port`] /
+    /// [`Topology::add_port_with_ip`]: replies from the LAN are
+    /// addressed to these.
+    pub fn port_macs(&self) -> &[MacAddr] {
+        &self.port_macs
+    }
+
+    /// Pre-existing NICs enslaved with [`Topology::enslave_existing`].
+    pub fn enslaved(&self) -> &[String] {
+        &self.enslaved
+    }
+
     /// Create the capture device `name`: a `dummy` interface, not a
     /// bridge port, that every port of this topology (present and
-    /// future) mirrors its ingress and egress frames to with
-    /// `tc ... matchall action mirred egress mirror`. A capture on it
-    /// sees each frame to or from the run's ports exactly once while
-    /// the bridge keeps learning MACs (no hub mode), and nothing on the
+    /// future) mirrors its *ingress* to with
+    /// `tc ... ingress matchall action mirred egress mirror`. Ingress
+    /// of a run port is what enters the bridge from the port's inject
+    /// end, i.e. every replayed or session frame, and a frame enters
+    /// the bridge exactly once however often the bridge then floods it,
+    /// so a capture on the device holds each of them exactly once. The
+    /// bridge keeps learning MACs (no hub mode), and nothing on the
     /// host NICs is touched: the filters live on our own ports and go
-    /// away with them. Needs `tc` (iproute2) with clsact, matchall and
-    /// mirred.
+    /// away with them.
+    ///
+    /// Frames from the LAN enter the bridge through the enslaved NIC,
+    /// which carries no filter: capture them on the NIC itself
+    /// (incoming direction only), see [`Topology::enslaved`] and
+    /// [`Topology::port_macs`]. Needs `tc` (iproute2) with clsact,
+    /// matchall and mirred.
     pub fn add_capture_mirror(&mut self, name: &str) -> Result<()> {
         names::validate_owned_ifname(name)?;
         if self.mirror.is_some() {
@@ -324,6 +386,7 @@ impl Topology {
             harden::harden_iface(name, harden::RpFilter::Strict)?;
         }
         ip(["link", "set", "dev", name, "arp", "off"])?;
+        harden::quiet_iface(name)?;
         ip(["link", "set", "dev", name, "up"])?;
         let ports: Vec<String> = self.taps.iter().filter(|t| *t != name).cloned().collect();
         for p in &ports {
@@ -367,6 +430,7 @@ impl Topology {
     fn do_teardown(&mut self) -> usize {
         let mut errors = 0usize;
         self.mirror = None;
+        self.port_macs.clear();
         for nic in std::mem::take(&mut self.enslaved) {
             if let Err(e) = ip(["link", "set", "dev", &nic, "nomaster"]) {
                 warn!(iface = %nic, error = %e, "release of enslaved NIC failed");
@@ -442,16 +506,23 @@ impl Drop for Topology {
     }
 }
 
-/// Mirror ingress and egress of `port` to `cap` with tc.
+/// Mirror the ingress of `port` to `cap` with tc. Only ingress: a
+/// frame the bridge floods leaves through every other port, and
+/// mirroring egress too recorded it once per port (B1).
 fn mirror_port(port: &str, cap: &str) -> Result<()> {
     tc(["qdisc", "add", "dev", port, "clsact"])?;
-    for dir in ["ingress", "egress"] {
-        tc([
-            "filter", "add", "dev", port, dir, "matchall", "action", "mirred", "egress", "mirror",
-            "dev", cap,
-        ])?;
-    }
+    tc([
+        "filter", "add", "dev", port, "ingress", "matchall", "action", "mirred", "egress",
+        "mirror", "dev", cap,
+    ])?;
     Ok(())
+}
+
+/// The MAC address of `iface`, from sysfs.
+fn read_mac(iface: &str) -> Result<MacAddr> {
+    let p = format!("/sys/class/net/{iface}/address");
+    let s = std::fs::read_to_string(&p).with_context(|| format!("read {p}"))?;
+    parse_mac(s.trim())
 }
 
 fn tc<const N: usize>(args: [&str; N]) -> Result<()> {

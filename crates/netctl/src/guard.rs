@@ -116,7 +116,7 @@ pub fn parse_tx_checksum(text: &str) -> Option<(bool, bool)> {
     })
 }
 
-fn set_tx_checksum(nic: &str, on: bool) -> Result<()> {
+pub(crate) fn set_tx_checksum(nic: &str, on: bool) -> Result<()> {
     validate_host_ifname(nic)?;
     let val = if on { "on" } else { "off" };
     let out = Command::new("ethtool")

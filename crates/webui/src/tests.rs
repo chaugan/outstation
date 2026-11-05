@@ -1446,6 +1446,64 @@ async fn finished_benchmark_is_analysed_automatically() {
     assert_eq!(rs.latest_analysis.unwrap().id, la["id"].as_u64().unwrap());
 }
 
+/// O3: runs that finished without an analysis (stopped by SIGTERM,
+/// or while auto-analysis was off) are analysed after a restart, the
+/// newest first up to the limit; the rest are marked skipped.
+#[tokio::test]
+async fn restart_analyses_the_backlog_of_finished_runs() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.auto_analyze = false,
+    );
+    add_fixture(&h, "pcr_1");
+    let mut ids = Vec::new();
+    for _ in 0..3 {
+        ids.push(h.run_to(slave_req("pcr_1"), "completed").await);
+    }
+    // A run without a capture is never picked.
+    h.add_pcap("pcr_2");
+    let H { state, dir, .. } = h;
+    drop(state);
+
+    let h = harness_cfg(dir, Behaviour::SessionsWithCapture(&[None]), |c| {
+        c.auto_analyze = true
+    });
+    for id in &ids {
+        let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+        assert_eq!(v["latest_analysis"], Value::Null, "{v}");
+    }
+    let queued = crate::analysis_run::queue_startup_backlog(&h.state, 2);
+    assert_eq!(queued, vec![ids[1], ids[2]], "the newest two, oldest first");
+    for id in &ids[1..] {
+        let v = h.wait_analysis(*id).await;
+        assert_eq!(v["latest_analysis"]["source"], "auto", "{v}");
+        assert_eq!(v["auto_analysis"]["state"], "done", "{v}");
+    }
+    let (_, v) = h
+        .call(Method::GET, &format!("/api/runs/{}", ids[0]), None)
+        .await;
+    assert_eq!(v["latest_analysis"], Value::Null, "{v}");
+    assert_eq!(v["auto_analysis"]["state"], "skipped", "{v}");
+    assert!(
+        v["auto_analysis"]["error"]
+            .as_str()
+            .unwrap()
+            .contains("on demand"),
+        "{v}"
+    );
+    // Nothing is queued twice.
+    assert!(crate::analysis_run::queue_startup_backlog(&h.state, 2).is_empty());
+
+    // With auto-analysis off nothing is queued.
+    let H { state, dir, .. } = h;
+    drop(state);
+    let h = harness_cfg(dir, Behaviour::SessionsWithCapture(&[None]), |c| {
+        c.auto_analyze = false
+    });
+    assert!(crate::analysis_run::queue_startup_backlog(&h.state, 20).is_empty());
+}
+
 #[tokio::test]
 async fn auto_analysis_can_be_disabled_and_is_skipped_without_capture() {
     let h = harness_cfg(

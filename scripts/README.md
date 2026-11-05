@@ -16,7 +16,7 @@ CI machine, not on a host that is replaying traffic at the time.
 | `netns-smoke.sh` | yes | End-to-end smoke suite for the real `outstation serve` (release build), driven only over HTTP. See below. |
 | `netns-smoke-helper.py` | no | Helper for `netns-smoke.sh`: JSON queries, a pcap reader that compares a raw-replay capture with its source, SSE and Prometheus parsers. Python stdlib only. |
 | `netns-test.sh` | yes | netctl's host-safety tests (`crates/netctl/tests/netns.rs`) in one namespace: veths, bridges, aliases, iptables rules, sysctl journals, cleanup. |
-| `netns-bench-test.sh` | yes | `outstation bench` in master role (`crates/outstation/tests/bench_netns.rs`): assertions and exit codes, SIGINT cleanup, and isolation (a LAN host can neither reach the host's own addresses through a session port nor route into its management network). |
+| `netns-bench-test.sh` | yes | `outstation bench` in master role (`crates/outstation/tests/bench_netns.rs`): assertions and exit codes, SIGINT cleanup, and isolation (a LAN host can neither reach the host's own addresses through a session port nor route into its management network). Then raw and master runs watched from the LAN side (`crates/sched/tests/capture_netns.rs`): the run's capture holds every wire frame exactly once, sent and received, also at top speed; only replayed or session frames reach the LAN; an unbounded master run spaces its connections and closes each with STOPDT and a FIN. |
 | `netns-slave-test.sh` | yes | `outstation bench` in slave role (`crates/outstation/tests/slave_netns.rs`): a mock master against impersonated RTUs, score, and a capture that holds only the run's own sessions. |
 | `iec104-mock-slave.py` | no | Minimal IEC 104 controlled station: answers STARTDT/STOPDT/TESTFR and S-acks every I-frame. Target for master-role runs. |
 | `iec104-mock-master.py` | no | Minimal IEC 104 controlling station: connects to each given RTU IP, STARTDT, one general interrogation, acks, closes when the slave goes quiet. Peer for slave-role runs. |
@@ -45,9 +45,11 @@ Cases, in order (later cases reuse the server and runs of earlier ones):
 
 1. Upload a pcap, inspect it, viability verdict and notes present; a
    POST without `Origin` is refused.
-2. Raw replay with a mirror capture: `has_capture`, download, the
-   capture holds every replayed frame (compared frame by frame with the
-   source), gap histogram.
+2. Raw replay with a mirror capture, 1 and 5 sources, top speed and
+   paced: `has_capture`, download, the capture holds every replayed
+   frame exactly once and nothing else (compared frame by frame with
+   the source), `captured_packets` equals the file, nothing dropped,
+   gap histogram.
 3. Master benchmark against the mock slave: completed, auto-analysis
    `done` with verdict `all_correct`, and `/api/events` (read with
    `curl -N`) delivered `run_started`, `run_finished`,
@@ -64,7 +66,9 @@ Cases, in order (later cases reuse the server and runs of earlier ones):
    are all leased): the server exits within `TimeoutStopSec` (30 s) and
    the namespace is back to its baseline: no `pcr*` interfaces, no
    `outstation-run-*` rules, sysctls, offloads, addresses and routes
-   restored. After a restart the run is `stopped` with `finished_at`.
+   restored. After a restart the run is `stopped` with `finished_at`,
+   and the restart auto-analyses it (it finished too late during the
+   shutdown).
 8. SIGKILL mid-run: the leftovers are there, `outstation cleanup
    --state-dir` restores the baseline (and is a no-op the second time),
    the restarted server's startup cleanup undoes nothing, and the run is
@@ -89,19 +93,13 @@ each case took, and exits non-zero on any `FAIL` or `SKIP`. Logs, the
 server's state directory and every snapshot are kept in the work dir
 when something failed (or with `KEEP_WORK=1`).
 
-Known product bugs the suite marks as expected failures:
-
-- **SMOKE-B1** (raw replay capture): the capture device mirrors ingress
-  *and* egress of every run port, so a frame the run bridge floods
-  (the target MAC is not learned, which is normal for a passive target)
-  is recorded once per run port. With 5 sources each frame appears 5
-  times (147 frames sent, 735 captured), `captured_packets` and the gap
-  histogram are inflated, and at top speed the amplified burst makes
-  the capture drop frames outright.
-- **SMOKE-B2** (raw and master capture counters): `captured_packets` is
-  read before the capture thread is stopped, so frames written after
-  the read are in the file but not in the count. A race; it is reported
-  only on runs that hit it.
+No product bug is currently marked as an expected failure. Mark a
+check that fails because of a reported bug with
+`known_bug ID MSG CMD...`; it then reports `XFAIL` (or `XPASS` once
+the bug is fixed, as a reminder to drop the marker). The raw-capture
+bugs SMOKE-B1 (flooded frames recorded once per run port) and SMOKE-B2
+(`captured_packets` read before the capture stopped) were fixed in
+T16b.
 
 ### Scripted clients and the Origin header
 

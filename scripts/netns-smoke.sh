@@ -20,8 +20,9 @@
 #   1  upload a pcap (generated with examples/gen_iec104_traffic.py),
 #      inspect it, viability notes present; Origin guard refuses a POST
 #      without Origin
-#   2  raw replay with a mirror capture: has_capture, download, the
-#      capture holds exactly the replayed frames, gap histogram
+#   2  raw replay with a mirror capture (1 and 5 sources, top speed
+#      and paced): has_capture, download, the capture holds each
+#      replayed frame exactly once and nothing else, gap histogram
 #   3  master benchmark against the mock slave: completed, auto-analysis
 #      done with verdict all_correct, SSE run_started / run_finished /
 #      analysis_finished
@@ -36,7 +37,8 @@
 #      so sysctls, aliases, NAT rules and NIC offloads are all leased):
 #      exits within TimeoutStopSec (30 s), no pcr* interfaces, no
 #      outstation-run-* rules, sysctls/offloads/addresses restored; the
-#      run is "stopped" with finished_at after a restart
+#      run is "stopped" with finished_at after a restart, and the
+#      restart auto-analyses it
 #   8  SIGKILL mid-run: leftovers exist, `outstation cleanup` restores
 #      everything (twice: idempotent), restart is a no-op cleanup, run
 #      is failed/orphaned with finished_at
@@ -58,7 +60,8 @@
 #        CARGO_TARGET_DIR           honoured by cargo
 # Needs: sudo, iproute2, iptables, ethtool, curl, python3 (stdlib only).
 # Exit:  0 when every case passed (expected failures of known product
-#        bugs, marked XFAIL, do not fail the suite), 1 otherwise.
+#        bugs, marked XFAIL with known_bug, do not fail the suite), 1
+#        otherwise.
 set -uo pipefail
 
 NS_A="${NS_A:-ostest-smoke-a}"
@@ -548,14 +551,14 @@ raw_run() {
   echo "      capture: $RAW_CMP"
   local file_frames
   file_frames=$(jvs "$RAW_CMP" 'd["captured_frames"]')
-  check "$2: report.captured_packets <= frames in the downloaded file" ge "$file_frames" "$RAW_CAP_PK"
-  # SMOKE-B2 is a race: only reported when this run hit it.
-  if [ "$RAW_CAP_PK" = "$file_frames" ]; then
-    ok "$2: report.captured_packets == frames in the file"
-  else
-    known_bug SMOKE-B2 "$2: report.captured_packets ($RAW_CAP_PK) == frames in the file ($file_frames)" false
-  fi
+  check "$2: report.captured_packets == frames in the file" eq "$RAW_CAP_PK" "$file_frames"
+  check "$2: capture dropped nothing" eq "$(jv 'd["report"].get("captured_dropped", 0)')" 0
   check "$2: every replayed frame is in the capture" eq "$(jvs "$RAW_CMP" 'd["missing"]')" 0
+  # Each replayed frame exactly once, and nothing else: the fake target
+  # MAC answers nothing, and the run's own interfaces send nothing of
+  # their own (no IGMP from the bridge, no IPv6).
+  check "$2: each frame captured exactly once, nothing else" eq \
+    "$(jvs "$RAW_CMP" '[d["captured_to_target"], d["unexpected"], d["captured_other"]]')" "[$RAW_SENT, 0, 0]"
 }
 
 case_raw_capture() {
@@ -563,14 +566,11 @@ case_raw_capture() {
   # One source at top speed: one bridge port, so the capture must hold
   # each replayed frame exactly once.
   raw_run ',"top_speed":true,"only_src":["192.168.10.3"]' "1 source, top speed" || return 1
-  check "1 source: each frame captured exactly once" eq \
-    "$(jvs "$RAW_CMP" '[d["captured_to_target"], d["unexpected"]]')" "[$RAW_SENT, 0]"
-  # All five sources, paced: the frames to the (unlearned) target MAC
-  # are flooded across the run bridge.
+  # All five sources: the frames to the (unlearned) target MAC are
+  # flooded across the run bridge, yet each is captured once (B1).
+  raw_run ',"top_speed":true' "5 sources, top speed" || return 1
   raw_run ',"speed":4.0' "5 sources, speed 4" || return 1
   RAW_RUN=$RID
-  known_bug SMOKE-B1 "5 sources: each frame captured exactly once (captured $(jvs "$RAW_CMP" 'd["captured_to_target"]') copies of $RAW_SENT frames)" \
-    eq "$(jvs "$RAW_CMP" '[d["captured_to_target"], d["unexpected"]]')" "[$RAW_SENT, 0]"
   api GET "/api/runs/$RAW_RUN/gaps"
   check "gap histogram -> 200" eq "$HTTP" 200
   check "gap histogram: original and captured gaps counted" eq \
@@ -725,6 +725,12 @@ case_sigterm() {
   api GET "/api/runs/$RID"
   check "after restart: run is stopped" eq "$(jv 'd["status"]')" stopped
   check "after restart: finished_at set" eq "$(jv 'd["finished_at"] is not None')" true
+  # It finished during shutdown, too late to be analysed: the restart
+  # picks it up (O3).
+  wait_auto "$RID" 60
+  check "after restart: stopped run auto-analysed" eq \
+    "$AUTO_STATE/$(jv '(d.get("latest_analysis") or {}).get("source")')" done/auto
+  check "startup backlog logged" contains "$(cat "$SERVE_LOG")" "queueing auto-analysis of finished runs"
 }
 
 case_sigkill() {
@@ -895,7 +901,10 @@ case_persistence() {
     "$(grep -c '^capture ' "$WORK/api-before.txt")"
   stop_server TERM
   check "SIGTERM while idle: exited" eq "$?" 0
-  start_server || { bad "restart"; return 1; }
+  # Without auto-analysis: the orphaned run of case 8 has no analysis
+  # and would otherwise be analysed by the startup backlog (case 7
+  # checks that), changing the state compared here.
+  start_server --no-auto-analyze || { bad "restart"; return 1; }
   api_state >"$WORK/api-after.txt"
   if diff -u "$WORK/api-before.txt" "$WORK/api-after.txt" >"$WORK/api.diff"; then
     ok "run history, captures (sha256), analyses, profiles and library identical after restart"

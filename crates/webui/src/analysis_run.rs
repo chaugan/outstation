@@ -336,6 +336,71 @@ pub(crate) fn spawn_auto_analysis(state: &AppState, id: u64) {
     });
 }
 
+/// Most runs [`queue_startup_backlog`] analyses after a restart.
+pub(crate) const STARTUP_BACKLOG_LIMIT: usize = 20;
+
+/// After a restart: queue auto-analysis for finished benchmark runs
+/// that never got one (O3): a run stopped by SIGTERM finishes while the
+/// server shuts down, too late to be analysed, and one cut off by a
+/// crash is only marked failed on the next start. Only runs with a
+/// capture, no stored analysis, nothing tried in this process, and
+/// that analysis accepts are picked; the newest `limit` are queued
+/// (oldest first, so the newest lands last on the event stream) and
+/// the rest are marked skipped, with the reason, and logged. Returns
+/// the queued run ids. A no-op when auto-analysis is off.
+pub(crate) fn queue_startup_backlog(state: &AppState, limit: usize) -> Vec<u64> {
+    if !state.cfg.auto_analyze {
+        return Vec::new();
+    }
+    let captures_dir = state.cfg.captures_dir();
+    let mut due: Vec<u64> = state
+        .all_runs()
+        .iter()
+        .filter_map(|e| {
+            let rs = e.lock_safe();
+            let due = rs.mode == "benchmark"
+                && rs.latest_analysis.is_none()
+                && rs.auto_analysis.is_none()
+                && run_capture(&rs, &captures_dir).is_some()
+                && check_analyzable(&rs).is_ok();
+            due.then_some(rs.id)
+        })
+        .collect();
+    due.sort_unstable_by(|a, b| b.cmp(a));
+    let older = due.split_off(due.len().min(limit));
+    if !older.is_empty() {
+        warn!(
+            queued = due.len(),
+            skipped = older.len(),
+            ids = ?older,
+            "startup: too many finished runs without an analysis; \
+             analysing only the newest, the rest can be analysed on demand"
+        );
+        for id in &older {
+            set_auto(
+                state,
+                *id,
+                AutoAnalysis {
+                    state: "skipped",
+                    error: Some(format!(
+                        "not analysed after the restart (only the newest {limit} are); \
+                         analyse it on demand"
+                    )),
+                    analysis_id: None,
+                },
+            );
+        }
+    }
+    if !due.is_empty() {
+        info!(ids = ?due, "startup: queueing auto-analysis of finished runs");
+    }
+    due.reverse();
+    for id in &due {
+        spawn_auto_analysis(state, *id);
+    }
+    due
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

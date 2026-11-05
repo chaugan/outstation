@@ -484,10 +484,41 @@ fn session_ports_are_isolated_and_mirrored() {
         filters.contains("mirred") && filters.contains("pcr5_cap"),
         "{filters}"
     );
+    // Ingress only (B1): a flooded frame leaves through every port, so
+    // egress mirrors recorded it once per port.
+    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_b0", "egress"]);
+    assert!(!filters.contains("mirred"), "{filters}");
     // A port added after the mirror is mirrored too.
     topo.add_port("pcr5_t0", None).unwrap();
-    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_t0", "egress"]);
+    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_t0", "ingress"]);
     assert!(filters.contains("pcr5_cap"), "{filters}");
+    let filters = sh(&["tc", "filter", "show", "dev", "pcr5_t0", "egress"]);
+    assert!(!filters.contains("mirred"), "{filters}");
+    // Source MACs: the session's inject end, the raw port's bridge end.
+    assert_eq!(topo.port_macs().len(), 2);
+    for (mac, end) in topo.port_macs().iter().zip(["pcr5_b0i", "pcr5_t0"]) {
+        let addr = std::fs::read_to_string(format!("/sys/class/net/{end}/address")).unwrap();
+        assert_eq!(netctl::format_mac(*mac), addr.trim(), "{end}");
+    }
+
+    // O2: no interface of the run originates frames of its own: no
+    // multicast (IGMP), no IPv6 (DAD, RS, MLD), no snooping bridge
+    // (all-snoopers IGMP reports).
+    for i in ["pcr5_br", "pcr5_b0", "pcr5_b0i", "pcr5_t0", "pcr5_t0i"] {
+        let l = sh(&["ip", "-o", "link", "show", "dev", i]);
+        assert!(!l.contains("MULTICAST"), "{i}: {l}");
+        if let Some(v6) = read_sysctl(&format!("net.ipv6.conf.{i}.disable_ipv6")).unwrap() {
+            assert_eq!(v6, "1", "{i}");
+        }
+    }
+    let br = sh(&["ip", "-d", "link", "show", "dev", "pcr5_br"]);
+    assert!(br.contains("mcast_snooping 0"), "{br}");
+    // Session frames are checksummed in software, so the mirror
+    // records them as they go on the wire.
+    assert_eq!(
+        read_tx_checksum("pcr5_b0i").unwrap().map(|t| t.0),
+        Some(false)
+    );
 
     topo.teardown().unwrap();
     for i in ["pcr5_br", "pcr5_b0", "pcr5_b0i", "pcr5_cap", "pcr5_t0"] {

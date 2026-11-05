@@ -15,3 +15,8 @@ pcapload = { path = "../pcapload" }
 rewrite = { path = "../rewrite" }
 raw_replay = { path = "../raw_replay" }
 protoplay = { path = "../protoplay" }
+
+[dev-dependencies]
+tempfile = "3"
+libc = { workspace = true }
+proto_iec104 = { path = "../proto_iec104" }
