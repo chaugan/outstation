@@ -752,7 +752,7 @@ function benchSessionsHtml(runId, sessions, proto) {
   const page = rows.slice(u.benchPage * ROWS_PER_PAGE, (u.benchPage + 1) * ROWS_PER_PAGE);
   let h = '<h4>Per-session results</h4><p class="hint">Sessions with errors or protocol violations are listed first.</p>';
   h += '<div class="table-scroll"><table class="t"><thead><tr><th scope="col">Source IP</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Received</th>' +
-    '<th scope="col" class="num">Ack p50 (µs)</th><th scope="col" class="num">Ack p99 (µs)</th><th scope="col" class="num">Ack max (µs)</th><th scope="col" class="num">msg/s</th>' +
+    '<th scope="col" class="num">Ack p50 (ms)</th><th scope="col" class="num">Ack p99 (ms)</th><th scope="col" class="num">Ack max (ms)</th><th scope="col" class="num">msg/s</th>' +
     '<th scope="col" class="num">Window stalls</th><th scope="col" class="num">Violations</th><th scope="col">Status</th><th scope="col"><span class="sr-only">More</span></th></tr></thead><tbody>';
   for (const { s, i, v } of page) {
     const pf = s.protocol || {};
@@ -762,7 +762,7 @@ function benchSessionsHtml(runId, sessions, proto) {
     const status = (s.error ? '<span class="bad">error</span>' : (s.connected ? '<span class="ok">ok</span>' : 'not connected')) + (flags.length ? ' ' + flags.join(' ') : '');
     const open = u.open.has(i);
     h += `<tr${s.error || v ? ' class="row-problem"' : ''}><td><code>${esc(s.src_ip)}</code></td><td class="num">${fmtInt(s.messages_sent)}</td><td class="num">${fmtInt(s.messages_received)}</td>` +
-      `<td class="num">${fmtInt(s.latency_p50_us)}</td><td class="num">${fmtInt(s.latency_p99_us)}</td><td class="num">${fmtInt(s.latency_max_us)}</td>` +
+      `<td class="num">${msNum(s.latency_p50_us)}</td><td class="num">${msNum(s.latency_p99_us)}</td><td class="num">${msNum(s.latency_max_us)}</td>` +
       `<td class="num">${fmt(s.throughput_msgs_per_sec)}</td><td class="num">${fmtInt(s.window_stalls)}</td>` +
       `<td class="num ${v ? 'bad' : ''}">${fmtInt(v)}</td><td>${status}</td>` +
       `<td><button type="button" class="btn btn-text" data-act="bench-row" data-id="${runId}" data-idx="${i}" data-fk="bench-${runId}-${i}" aria-expanded="${open}">${open ? 'Less' : 'More'}</button></td></tr>`;
@@ -1022,6 +1022,12 @@ const chartData = new Map();   // uid -> tooltip data
 function nsRange(lo, hi) {
   const f = ns => (ns < 1000 ? ns.toFixed(0) + ' ns' : ns < 1e6 ? (ns / 1000).toFixed(0) + ' µs' : ns < 1e9 ? (ns / 1e6).toFixed(0) + ' ms' : (ns / 1e9).toFixed(1) + ' s');
   return `${f(lo)} – ${f(hi)}`;
+}
+// µs as a bare ms number for "(ms)" columns: one decimal, two below 1 ms.
+function msNum(us) {
+  if (typeof us !== 'number' || isNaN(us)) return '—';
+  const d = us < 1000 ? 2 : 1;
+  return (us / 1000).toLocaleString(undefined, { minimumFractionDigits: d, maximumFractionDigits: d });
 }
 function usFmt(us) {
   if (us < 1000) return us.toFixed(0) + ' µs';
