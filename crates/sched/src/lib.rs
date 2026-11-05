@@ -604,7 +604,23 @@ fn start_capture(
     let mut complete = true;
     let filter = raw_replay::bpf::incoming_to_macs_filter(topo.port_macs());
     for nic in topo.enslaved() {
-        if let Err(e) = cap.add_iface_with_filter(nic, &filter) {
+        let added = cap.add_iface_with_filter(nic, &filter).or_else(|e| {
+            // The kernel charges a socket filter against
+            // net.core.optmem_max: with a few hundred session MACs the
+            // per-MAC filter no longer fits (ENOMEM above ~527 MACs at
+            // the 128 KiB default, ~81 at the older 20 KiB one). Record
+            // every incoming frame instead of no replies at all.
+            warn!(nic, error = %format!("{e:#}"),
+                "capture: per-MAC reply filter rejected; recording every incoming frame on the NIC");
+            warnings.push(format!(
+                "capture on {nic}: the per-MAC reply filter for {} sessions did not fit \
+                 ({e:#}); every incoming frame on {nic} is recorded, including other LAN traffic",
+                topo.port_macs().len()
+            ));
+            let all = raw_replay::bpf::skip_outgoing(&raw_replay::bpf::accept_all());
+            cap.add_iface_with_filter(nic, &all)
+        });
+        if let Err(e) = added {
             warn!(nic, error = %format!("{e:#}"), "capture: cannot record replies on the NIC");
             warnings.push(format!(
                 "capture records no replies from the target: capture on {nic} failed: {e:#}"

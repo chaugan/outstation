@@ -761,3 +761,95 @@ fn master_unbounded_run_is_spaced_quiet_and_captured_once() {
     assert!(replies.len() >= syns.len() * 3, "{} replies", replies.len());
     assert_same_frames("capture, replies", &to_session(&cap_lan), &replies);
 }
+
+/// Sets a sysctl of this network namespace and restores it on drop.
+struct SysctlOverride {
+    path: PathBuf,
+    old: String,
+}
+
+impl SysctlOverride {
+    fn set(key: &str, value: &str) -> Self {
+        let path = Path::new("/proc/sys").join(key.replace('.', "/"));
+        let old = std::fs::read_to_string(&path).unwrap().trim().to_string();
+        std::fs::write(&path, value).unwrap();
+        Self { path, old }
+    }
+}
+
+impl Drop for SysctlOverride {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.path, &self.old);
+    }
+}
+
+/// The kernel charges a socket filter against `net.core.optmem_max`:
+/// with a few hundred sessions the per-MAC reply filter on the egress
+/// NIC no longer fits (ENOMEM, measured at 528 MACs with the 128 KiB
+/// default and at 82 with the older 20 KiB default). The capture then
+/// recorded no replies at all and the analysis reported every endpoint
+/// as never connected. Now it falls back to recording every incoming
+/// frame and says so. A tiny optmem_max in this namespace makes even a
+/// one-session filter too big (and leaves room for the fallback).
+#[test]
+#[ignore = "privileged: run via scripts/netns-bench-test.sh inside ostest-* netns"]
+fn master_capture_keeps_replies_when_the_mac_filter_does_not_fit() {
+    require_test_netns();
+    let dir = tempfile::tempdir().unwrap();
+    let pcap = Arc::new(pcapload::load(master_pcap(dir.path(), 200)).unwrap());
+    let capture = dir.path().join("run.pcap");
+    let cfg = BenchmarkConfig {
+        run_id: 75,
+        target_ip: target_ip(),
+        target_port: 2404,
+        egress_nic: Some(env("OUTSTATION_BENCH_NIC")),
+        force_protected_nic: true,
+        capture_path: Some(capture.clone()),
+        iterations: 1,
+        state_dir: Some(netns_state_dir(dir.path())),
+        ..Default::default()
+    };
+    let report = {
+        let _optmem = SysctlOverride::set("net.core.optmem_max", "512");
+        sched::run_benchmark(
+            pcap,
+            cfg,
+            Arc::new(proto_iec104::Iec104Replayer::new()),
+            RunContext::new(),
+        )
+        .unwrap()
+    };
+    assert!(no_outstation_ifaces(), "run left interfaces behind");
+    assert_eq!(report.per_session.len(), 1, "{report:?}");
+    assert!(
+        report.per_session[0].proto_report.error.is_none(),
+        "{:?}",
+        report.per_session[0].proto_report.error
+    );
+    assert!(
+        report
+            .warnings
+            .iter()
+            .any(|w| w.contains("every incoming frame")),
+        "no fallback warning: {:?}",
+        report.warnings
+    );
+    assert!(
+        !report
+            .warnings
+            .iter()
+            .any(|w| w.contains("records no replies")),
+        "{:?}",
+        report.warnings
+    );
+    // The target's replies to the session are in the capture.
+    let mac = src_mac(2);
+    let replies = read_pcap(&capture)
+        .into_iter()
+        .filter(|f| dst_mac_of(f) == mac && tcp_flags(f).is_some() && ip_src(f) == target_ip())
+        .count();
+    assert!(
+        replies >= 3,
+        "{replies} replies from the target in the capture"
+    );
+}

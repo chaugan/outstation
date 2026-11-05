@@ -225,6 +225,39 @@ fn use_ansi() -> bool {
         && std::io::stdout().is_terminal()
 }
 
+/// Most file-descriptor limit we ask for.
+const NOFILE_TARGET: u64 = 1 << 20;
+
+/// Raise the soft open-file limit towards the hard limit (at most
+/// [`NOFILE_TARGET`]). Each session holds a few descriptors: about 2
+/// per master session and 4 per slave-role RTU (sockets, listener,
+/// capture), so 400 RTUs need about 1,500, more than the soft limit of
+/// 1,024 that systemd services and many login shells start with.
+/// Returns `(before, after)`, or `None` when the limit cannot be read.
+// `rlim_t` is u64 on 64-bit Linux but not everywhere.
+#[allow(clippy::unnecessary_cast)]
+fn raise_nofile_limit() -> Option<(u64, u64)> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return None;
+    }
+    let before = r.rlim_cur as u64;
+    let want = (r.rlim_max as u64).min(NOFILE_TARGET);
+    if before >= want {
+        return Some((before, before));
+    }
+    r.rlim_cur = want as libc::rlim_t;
+    // SAFETY: setrlimit only reads the struct we pass.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) } != 0 {
+        return Some((before, before));
+    }
+    Some((before, want))
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -232,6 +265,16 @@ fn main() -> Result<()> {
         )
         .with_ansi(use_ansi())
         .init();
+    if let Some((before, after)) = raise_nofile_limit() {
+        if after > before {
+            tracing::debug!(before, after, "raised the open-file limit");
+        } else if after < 4096 {
+            tracing::warn!(
+                limit = after,
+                "open-file limit is low; runs with a few hundred sessions may fail (raise LimitNOFILE / ulimit -n)"
+            );
+        }
+    }
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::ListSources { pcap } => {
@@ -433,6 +476,27 @@ fn run_cmd(args: RunArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn nofile_limit_is_raised_to_the_hard_limit() {
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit/setrlimit only touch the struct we pass.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
+        let hard = r.rlim_max as u64;
+        // Start from the soft limit systemd gives services.
+        r.rlim_cur = hard.min(1024) as libc::rlim_t;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }, 0);
+        let want = hard.min(NOFILE_TARGET).max(hard.min(1024));
+        assert_eq!(raise_nofile_limit(), Some((hard.min(1024), want)));
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
+        assert_eq!(r.rlim_cur as u64, want);
+        // Idempotent.
+        assert_eq!(raise_nofile_limit(), Some((want, want)));
+    }
 
     #[test]
     fn serve_flags_parse() {

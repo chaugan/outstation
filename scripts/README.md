@@ -16,8 +16,13 @@ CI machine, not on a host that is replaying traffic at the time.
 | `netns-smoke.sh` | yes | End-to-end smoke suite for the real `outstation serve` (release build), driven only over HTTP. See below. |
 | `netns-smoke-helper.py` | no | Helper for `netns-smoke.sh`: JSON queries, a pcap reader that compares a raw-replay capture with its source, SSE and Prometheus parsers. Python stdlib only. |
 | `netns-test.sh` | yes | netctl's host-safety tests (`crates/netctl/tests/netns.rs`) in one namespace: veths, bridges, aliases, iptables rules, sysctl journals, cleanup. |
-| `netns-bench-test.sh` | yes | `outstation bench` in master role (`crates/outstation/tests/bench_netns.rs`): assertions and exit codes, SIGINT cleanup, and isolation (a LAN host can neither reach the host's own addresses through a session port nor route into its management network). Then raw and master runs watched from the LAN side (`crates/sched/tests/capture_netns.rs`): the run's capture holds every wire frame exactly once, sent and received, also at top speed; only replayed or session frames reach the LAN; an unbounded master run spaces its connections and closes each with STOPDT and a FIN. |
+| `netns-bench-test.sh` | yes | `outstation bench` in master role (`crates/outstation/tests/bench_netns.rs`): assertions and exit codes, SIGINT cleanup, and isolation (a LAN host can neither reach the host's own addresses through a session port nor route into its management network). Then raw and master runs watched from the LAN side (`crates/sched/tests/capture_netns.rs`): the run's capture holds every wire frame exactly once, sent and received, also at top speed, and keeps the target's replies when the per-MAC NIC filter does not fit in the socket's option memory; only replayed or session frames reach the LAN; an unbounded master run spaces its connections and closes each with STOPDT and a FIN. |
 | `netns-slave-test.sh` | yes | `outstation bench` in slave role (`crates/outstation/tests/slave_netns.rs`): a mock master against impersonated RTUs, score, and a capture that holds only the run's own sessions. |
+| `netns-scale.sh` | yes | Scale benchmark: `outstation bench` in master role (N captured masters, against a slave peer) and slave role (N RTUs, a master peer), as fast as possible or at original timing (`slave-200@10`). Records msgs/s, ack latency, CPU, RSS, threads, fds, setup and teardown time, `captured_dropped` and the analysis verdict per run, and the median of `REPEAT` runs. Results in [reports/2026-11-05-scale-benchmark.md](../reports/2026-11-05-scale-benchmark.md). |
+| `netns-scale-helper.py` | no | Helper for `netns-scale.sh` and `netns-screenshots.sh`: pcap merge, a /proc sampler, event-driven IEC 104 peers (`fast-slave`, `fast-master`, several processes each), the wire I-frame rate of a capture, per-run summaries and the results table. Python stdlib only. |
+| `netns-gateway-egress.sh` | yes | Does SCADA-gateway mode work in master role with an egress NIC? Five `outstation bench` cases against an RTU whose default gateway does not exist (it does not; see the scale report). |
+| `netns-screenshots.sh` | yes | Refreshes `doc/images/ui-*.jpg` from a real `outstation serve` with real runs (200-RTU slave run with its live diagram, a re-run at speed 2, a master run), using `ui-screenshots.mjs` with Chromium inside the namespace. |
+| `ui-screenshots.mjs` | no | Playwright screenshots of Library, Configure, Runs, Analysis and Compare (1440 wide, JPEG). |
 | `iec104-mock-slave.py` | no | Minimal IEC 104 controlled station: answers STARTDT/STOPDT/TESTFR and S-acks every I-frame. Target for master-role runs. |
 | `iec104-mock-master.py` | no | Minimal IEC 104 controlling station: connects to each given RTU IP, STARTDT, one general interrogation, acks, closes when the slave goes quiet. Peer for slave-role runs. |
 | `check-spa-js.py` | no | `node --check` over the SPA's JavaScript, as `build.rs` splices it (run in CI). |
@@ -114,3 +119,36 @@ curl -H "Origin: http://10.0.0.5:8080" -H 'Content-Type: application/json' \
 ```
 
 GET requests (including `/api/events` and `/metrics`) need no Origin.
+
+## netns-screenshots.sh
+
+```sh
+cargo build --release -p outstation
+OUTSTATION_BIN=target/release/outstation scripts/netns-screenshots.sh   # writes doc/images/ui-*.jpg
+scripts/netns-screenshots.sh /tmp/shots                                 # somewhere else
+```
+
+Rebuilds the README screenshots from scratch: four namespaces, a real
+`outstation serve`, the 200-RTU example capture played in slave role at
+original timing against a master peer (the live diagram is taken while
+it runs), a re-run at speed 2, a 20-master run, auto-analyses, then
+Chromium (Playwright, run as the invoking user inside the management
+namespace) takes Library, Configure, Runs, Analysis and Compare. It
+needs Playwright with Chromium (`PLAYWRIGHT_DIR`, default
+`/opt/code/tools/browser/node_modules/playwright`). Each image is 1440
+wide, JPEG quality 80; the script fails when one is over 400 KB. Look at
+every image before committing it.
+
+## netns-scale.sh
+
+```sh
+OUTSTATION_BIN=target/release/outstation scripts/netns-scale.sh                  # master-200 slave-200 master-400 slave-400, 3 runs each
+REPEAT=1 scripts/netns-scale.sh slave-200@10 master-800                          # @SPEED = original timing
+PEER=mock scripts/netns-scale.sh master-200                                      # the threaded Python mocks
+NOFILE=1024:65536 REALTIME=1 KEEP_CAPTURES=1 scripts/netns-scale.sh slave-400
+```
+
+Each run gets fresh namespaces; the work directory keeps every bench
+report, log and sample, `results.jsonl` and `results.md` (every run and
+the median per scenario). Run it on an otherwise idle host: outstation
+and its peers share the CPU.
