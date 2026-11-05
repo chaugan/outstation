@@ -207,6 +207,17 @@ impl Capture {
     }
 
     fn spawn(path: PathBuf, inner: Inner, rt_priority: Option<i32>) -> Result<Self> {
+        Self::spawn_with_burst(path, inner, rt_priority, BURST)
+    }
+
+    /// [`Capture::spawn`] reading at most `burst` frames per socket and
+    /// wakeup (tests use a small one).
+    fn spawn_with_burst(
+        path: PathBuf,
+        inner: Inner,
+        rt_priority: Option<i32>,
+        burst: usize,
+    ) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
@@ -244,7 +255,7 @@ impl Capture {
                 if let Some(prio) = rt_priority {
                     crate::try_set_realtime(prio);
                 }
-                read_loop(&inner_c, &stop_c, &mut writer, &counters);
+                read_loop(&inner_c, &stop_c, &mut writer, &counters, burst);
                 if let Err(e) = writer.flush() {
                     warn!(error = %e, "capture flush failed");
                 }
@@ -335,40 +346,150 @@ fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
     }
 }
 
-/// One frame read in a wakeup, waiting to be written in time order.
-struct Pending {
-    ts_sec: u32,
-    ts_us: u32,
-    /// Range of the frame in the batch arena.
-    start: usize,
-    len: usize,
+/// How long a frame is held back so that a frame with an earlier kernel
+/// timestamp, still on its way through another socket of the capture,
+/// can be written before it (T17c). The capture reads several sockets
+/// (the ports' ingress mirror and the enslaved NIC) in turns; written
+/// in arrival order, a reply could land in the file before its request
+/// (a SYN-ACK before its SYN), and pcapload would split the flow.
+const REORDER_HOLD_US: u64 = 5_000;
+/// Upper bounds on what the reorder buffer holds. Beyond them the
+/// oldest frames are written even if a socket might still hold an
+/// earlier one (a reader that cannot keep up must not grow without
+/// bound).
+const REORDER_MAX_FRAMES: usize = 1 << 17;
+const REORDER_MAX_BYTES: usize = 64 << 20;
+/// A frame is never held longer than this in wall time, whatever its
+/// timestamp says (a clock step must not hold the capture back).
+const REORDER_MAX_WAIT: Duration = Duration::from_millis(500);
+/// Spare frame buffers kept for reuse.
+const REORDER_POOL: usize = 4096;
+
+/// One frame waiting in the reorder buffer.
+struct Held {
+    /// Kernel receive time in microseconds since the epoch.
+    ts_us: u64,
+    /// Read order, to keep frames with equal timestamps in arrival order.
+    seq: u64,
+    held_at: Instant,
+    data: Vec<u8>,
+}
+
+impl PartialEq for Held {
+    fn eq(&self, o: &Self) -> bool {
+        (self.ts_us, self.seq) == (o.ts_us, o.seq)
+    }
+}
+impl Eq for Held {}
+impl PartialOrd for Held {
+    fn partial_cmp(&self, o: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(o))
+    }
+}
+impl Ord for Held {
+    /// Reversed, so the max-heap pops the earliest frame first.
+    fn cmp(&self, o: &Self) -> std::cmp::Ordering {
+        (o.ts_us, o.seq).cmp(&(self.ts_us, self.seq))
+    }
+}
+
+/// k-way merge of the capture's sockets by kernel timestamp: frames are
+/// held until no socket can still deliver an earlier one (the
+/// watermark, see [`read_loop`]), then written earliest first.
+#[derive(Default)]
+struct Reorder {
+    heap: std::collections::BinaryHeap<Held>,
+    bytes: usize,
+    seq: u64,
+    pool: Vec<Vec<u8>>,
+}
+
+impl Reorder {
+    fn push(&mut self, ts_us: u64, frame: &[u8], now: Instant) {
+        let mut data = self.pool.pop().unwrap_or_default();
+        data.clear();
+        data.extend_from_slice(frame);
+        self.bytes += data.len();
+        self.seq += 1;
+        self.heap.push(Held {
+            ts_us,
+            seq: self.seq,
+            held_at: now,
+            data,
+        });
+    }
+
+    fn is_empty(&self) -> bool {
+        self.heap.is_empty()
+    }
+
+    /// The earliest frame if it may be written: its timestamp is at or
+    /// below `watermark_us` (`None` = flush everything), or a bound is
+    /// exceeded.
+    fn pop_ready(&mut self, watermark_us: Option<u64>, now: Instant) -> Option<Held> {
+        let top = self.heap.peek()?;
+        let ready = watermark_us.is_none_or(|w| top.ts_us <= w)
+            || self.heap.len() > REORDER_MAX_FRAMES
+            || self.bytes > REORDER_MAX_BYTES
+            || now.duration_since(top.held_at) >= REORDER_MAX_WAIT;
+        if !ready {
+            return None;
+        }
+        let h = self.heap.pop()?;
+        self.bytes -= h.data.len();
+        Some(h)
+    }
+
+    /// Give a written frame's buffer back for reuse.
+    fn recycle(&mut self, data: Vec<u8>) {
+        if self.pool.len() < REORDER_POOL {
+            self.pool.push(data);
+        }
+    }
+}
+
+/// Wall-clock time in microseconds since the epoch, the clock
+/// `SO_TIMESTAMP` uses.
+fn realtime_us() -> u64 {
+    let mut tv: libc::timeval = unsafe { mem::zeroed() };
+    // SAFETY: plain gettimeofday into a local.
+    unsafe {
+        libc::gettimeofday(&mut tv, std::ptr::null_mut());
+    }
+    tv_us(&tv)
+}
+
+fn tv_us(tv: &libc::timeval) -> u64 {
+    (tv.tv_sec.max(0) as u64) * 1_000_000 + tv.tv_usec.max(0) as u64
 }
 
 /// Outcome of reading one socket.
 enum SockRead {
-    /// Read `n` frames; the socket may hold more (the burst ran out).
-    More(usize),
+    /// Read frames; the socket may hold more (the burst ran out).
+    /// Carries the latest timestamp read.
+    More(usize, Option<u64>),
     /// Read `n` frames and the socket is empty.
     Empty(usize),
     /// The socket failed; drop it.
     Dead,
 }
 
-/// Read up to `burst` frames from `fd` into `arena`/`batch`, stamping
-/// each with its kernel receive time (`SO_TIMESTAMP`; the read time if
-/// the kernel gave none).
+/// Read up to `burst` frames from `fd` into `out`, stamping each with
+/// its kernel receive time (`SO_TIMESTAMP`; the read time if the kernel
+/// gave none).
 fn read_socket(
     fd: RawFd,
     loopback: bool,
     iface: &str,
     burst: usize,
     buf: &mut [u8],
-    arena: &mut Vec<u8>,
-    batch: &mut Vec<Pending>,
+    out: &mut Reorder,
 ) -> SockRead {
     // u64 storage keeps the control buffer aligned for cmsghdr.
     let mut cbuf = [0u64; 16];
     let mut n_read = 0usize;
+    let mut last_ts = None;
+    let now = Instant::now();
     for _ in 0..burst {
         let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
         let mut iov = libc::iovec {
@@ -403,24 +524,11 @@ fn read_socket(
         if loopback && from.sll_pkttype == libc::PACKET_OUTGOING {
             continue;
         }
-        let tv = cmsg_timestamp(&msg).unwrap_or_else(|| {
-            let mut tv: libc::timeval = unsafe { mem::zeroed() };
-            // SAFETY: plain gettimeofday into a local.
-            unsafe {
-                libc::gettimeofday(&mut tv, std::ptr::null_mut());
-            }
-            tv
-        });
-        let frame = &buf[..n as usize];
-        batch.push(Pending {
-            ts_sec: tv.tv_sec as u32,
-            ts_us: tv.tv_usec as u32,
-            start: arena.len(),
-            len: frame.len(),
-        });
-        arena.extend_from_slice(frame);
+        let ts = cmsg_timestamp(&msg).map_or_else(realtime_us, |tv| tv_us(&tv));
+        last_ts = Some(last_ts.map_or(ts, |l: u64| l.max(ts)));
+        out.push(ts, &buf[..n as usize], now);
     }
-    SockRead::More(n_read)
+    SockRead::More(n_read, last_ts)
 }
 
 /// The `SCM_TIMESTAMP` of a received message, if present.
@@ -441,10 +549,15 @@ fn cmsg_timestamp(msg: &libc::msghdr) -> Option<libc::timeval> {
     None
 }
 
-fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c: &Counters) {
+fn read_loop(
+    inner: &Mutex<Inner>,
+    stop: &AtomicBool,
+    writer: &mut impl Write,
+    c: &Counters,
+    burst: usize,
+) {
     let mut buf = vec![0u8; 65536];
-    let mut arena: Vec<u8> = Vec::with_capacity(1 << 20);
-    let mut batch: Vec<Pending> = Vec::with_capacity(BURST * 2);
+    let mut held = Reorder::default();
     let mut last_stats = Instant::now();
     let mut drained = 0usize;
     loop {
@@ -467,8 +580,16 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
             })
             .collect();
         // SAFETY: `pfds` is a valid array of `pfds.len()` pollfds; with
-        // no sockets yet this just sleeps for the timeout.
-        let timeout = if stopping { 0 } else { 200 };
+        // no sockets yet this just sleeps for the timeout. Held frames
+        // are written within about a hold time even when nothing new
+        // arrives.
+        let timeout = if stopping {
+            0
+        } else if held.is_empty() {
+            200
+        } else {
+            (REORDER_HOLD_US / 1000).max(1) as libc::c_int
+        };
         let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             let err = io::Error::last_os_error();
@@ -478,31 +599,38 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
             warn!(error = %err, "capture poll failed");
             return;
         }
+        // Every socket was empty or readable at this instant: a frame
+        // a socket delivers later was stamped after it (less a small
+        // in-flight delay the hold covers).
+        let polled_us = realtime_us();
+        let mut watermark = polled_us.saturating_sub(REORDER_HOLD_US);
         let mut dead: Vec<RawFd> = Vec::new();
         let mut more = false;
-        arena.clear();
-        batch.clear();
         for (p, (fd, loopback, iface)) in pfds.iter().zip(&socks) {
             if p.revents == 0 {
                 continue;
             }
-            match read_socket(
-                *fd, *loopback, iface, BURST, &mut buf, &mut arena, &mut batch,
-            ) {
-                SockRead::More(n) => {
+            match read_socket(*fd, *loopback, iface, burst, &mut buf, &mut held) {
+                SockRead::More(n, last) => {
                     more = true;
                     drained += n;
+                    // Frames still queued on this socket are no earlier
+                    // than the last one read from it.
+                    if let Some(t) = last {
+                        watermark = watermark.min(t.saturating_sub(1));
+                    }
                 }
                 SockRead::Empty(n) => drained += n,
                 SockRead::Dead => dead.push(*fd),
             }
         }
-        // Several sockets (the port mirror and the enslaved NIC) are
-        // read in turns: write this wakeup's frames in kernel time
-        // order, so a reply never lands before its request.
-        batch.sort_by_key(|p| (p.ts_sec, p.ts_us));
-        for p in &batch {
-            let frame = &arena[p.start..p.start + p.len];
+        // Write in kernel time order across sockets (T17c). When the
+        // stop has drained every socket, everything goes.
+        let finishing = stopping && !(more && drained < DRAIN_MAX);
+        let mark = (!finishing).then_some(watermark);
+        let now = Instant::now();
+        while let Some(h) = held.pop_ready(mark, now) {
+            let frame = &h.data;
             let file_bytes = PCAP_GLOBAL_HEADER
                 + c.packets.load(Ordering::Relaxed) * PCAP_RECORD_HEADER
                 + c.bytes.load(Ordering::Relaxed);
@@ -520,12 +648,14 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
                 inner.socks.clear();
                 return;
             }
-            if let Err(e) = write_record(writer, p.ts_sec, p.ts_us, frame) {
+            let (sec, us) = ((h.ts_us / 1_000_000) as u32, (h.ts_us % 1_000_000) as u32);
+            if let Err(e) = write_record(writer, sec, us, frame) {
                 warn!(error = %e, "capture write failed");
                 return;
             }
             c.packets.fetch_add(1, Ordering::Relaxed);
             c.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+            held.recycle(h.data);
         }
         if stopping || last_stats.elapsed() >= STATS_EVERY {
             collect_drops(&socks, &c.dropped);
@@ -541,7 +671,7 @@ fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c
         if stopping {
             // Keep draining while a socket still holds frames, bounded
             // so a socket that keeps receiving cannot hold the stop up.
-            if more && drained < DRAIN_MAX {
+            if !finishing {
                 continue;
             }
             return;
@@ -786,6 +916,10 @@ mod tests {
     }
 
     fn capture_on(path: &Path, socks: Vec<OwnedFd>) -> Capture {
+        capture_with_burst(path, socks, BURST)
+    }
+
+    fn capture_with_burst(path: &Path, socks: Vec<OwnedFd>, burst: usize) -> Capture {
         let socks = socks
             .into_iter()
             .enumerate()
@@ -795,7 +929,7 @@ mod tests {
                 loopback: false,
             })
             .collect();
-        Capture::spawn(
+        Capture::spawn_with_burst(
             path.to_path_buf(),
             Inner {
                 socks,
@@ -803,6 +937,7 @@ mod tests {
                 closed: false,
             },
             None,
+            burst,
         )
         .unwrap()
     }
@@ -897,6 +1032,83 @@ mod tests {
             );
             assert_eq!(st.dropped, 0);
         }
+    }
+
+    /// T17c: when one socket holds more than a read burst of older
+    /// frames and another has newer ones, the newer frames wait until
+    /// the older socket is drained: the file is in timestamp order
+    /// across wakeups, not only within one (a SYN-ACK read from the NIC
+    /// used to land before its SYN still queued on the port mirror).
+    #[test]
+    fn frames_are_merged_by_timestamp_across_wakeups() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("merge.pcap");
+        let (rx_a, tx_a) = pair();
+        let (rx_b, tx_b) = pair();
+        // Several read bursts (a small burst keeps the queue within
+        // what an AF_UNIX socket buffers before the reader starts).
+        let burst = 8;
+        let n_a = (burst * 4 + 3) as u16;
+        for i in 0..n_a {
+            send(&tx_a, &frame(i));
+        }
+        std::thread::sleep(Duration::from_millis(3));
+        for i in 0..10 {
+            send(&tx_b, &frame(10_000 + i));
+        }
+        // b is read first in each wakeup: the old code wrote b's ten
+        // frames after a's first burst.
+        let cap = capture_with_burst(&path, vec![rx_b, rx_a], burst);
+        std::thread::sleep(Duration::from_millis(300));
+        let st = cap.finish();
+        assert_eq!(st.packets, u64::from(n_a) + 10);
+        let recs = records(&path);
+        let tags: Vec<u16> = recs
+            .iter()
+            .map(|r| u16::from_be_bytes([r.2[0], r.2[1]]))
+            .collect();
+        let want: Vec<u16> = (0..n_a).chain(10_000..10_010).collect();
+        assert_eq!(tags, want);
+        let ts: Vec<(u32, u32)> = recs.iter().map(|r| (r.0, r.1)).collect();
+        assert!(ts.windows(2).all(|w| w[0] <= w[1]), "{ts:?}");
+    }
+
+    /// T17c: the reorder buffer releases frames up to the watermark,
+    /// earliest first (equal timestamps in read order), everything on
+    /// a final flush, and the oldest frames when a bound is hit.
+    #[test]
+    fn reorder_buffer_releases_by_watermark_and_bounds() {
+        let now = Instant::now();
+        let mut r = Reorder::default();
+        for (ts, tag) in [(50u64, 1u8), (10, 2), (30, 3), (10, 4), (70, 5)] {
+            r.push(ts, &[tag], now);
+        }
+        let mut out = Vec::new();
+        while let Some(h) = r.pop_ready(Some(30), now) {
+            out.push(h.data[0]);
+            r.recycle(h.data);
+        }
+        assert_eq!(out, [2, 4, 3], "up to the watermark, earliest first");
+        assert!(r.pop_ready(Some(49), now).is_none());
+        out.clear();
+        while let Some(h) = r.pop_ready(None, now) {
+            out.push(h.data[0]);
+        }
+        assert_eq!(out, [1, 5], "a final flush releases everything");
+        assert!(r.is_empty() && r.bytes == 0);
+
+        // A frame held too long goes whatever the watermark says.
+        r.push(1_000, &[9], now);
+        assert!(r.pop_ready(Some(0), now).is_none());
+        let late = now + REORDER_MAX_WAIT;
+        assert_eq!(r.pop_ready(Some(0), late).unwrap().data, [9]);
+
+        // Past the frame bound the oldest goes first.
+        for i in 0..=REORDER_MAX_FRAMES as u64 {
+            r.push(1_000 + i, &[0], now);
+        }
+        assert_eq!(r.pop_ready(Some(0), now).unwrap().ts_us, 1_000);
+        assert!(r.pop_ready(Some(0), now).is_none());
     }
 
     /// Frames read from several sockets in one wakeup are written in

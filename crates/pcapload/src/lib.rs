@@ -647,6 +647,9 @@ struct FlowTrack {
     src_recorded: [bool; 2],
     /// Any payload-bearing segment seen.
     payload_seen: bool,
+    /// Acknowledgement number of the first SYN-ACK: the client ISN + 1
+    /// of the SYN it answers.
+    syn_ack_ack: Option<u32>,
 }
 
 /// Shared packet-ingest state used by both classic pcap and pcapng
@@ -891,11 +894,20 @@ impl IngestBuilder {
                 // different ISN, or after data has flowed (a reconnect
                 // reusing a fixed ISN without FIN/RST, N17) is a new
                 // connection. A retransmitted SYN (same ISN, before any
-                // data) is not.
-                split = f.saw_fin
-                    || f.saw_rst
-                    || t.payload_seen
-                    || f.client_isn.is_some_and(|isn| isn != seg.seq);
+                // data) is not. Nor is the flow's own SYN recorded after
+                // the SYN-ACK that acknowledges its ISN (a capture
+                // merged from two vantage points slightly out of
+                // order, T17c): the ISN match is exact, so a reconnect
+                // is never mistaken for it.
+                let own_late_syn = !f.saw_syn
+                    && !f.saw_fin
+                    && !f.saw_rst
+                    && t.syn_ack_ack == Some(seg.seq.wrapping_add(1));
+                split = !own_late_syn
+                    && (f.saw_fin
+                        || f.saw_rst
+                        || t.payload_seen
+                        || f.client_isn.is_some_and(|isn| isn != seg.seq));
             } else if flags & TCP_SYN == 0 {
                 let cur = self.seq_dist(idx, dir, seg.seq);
                 if cur != Some(0) {
@@ -955,6 +967,7 @@ impl IngestBuilder {
         if is_syn_ack {
             flow.saw_syn_ack = true;
             flow.server_isn.get_or_insert(seg.seq);
+            track.syn_ack_ack.get_or_insert(seg.ack);
             // In case SYN wasn't observed.
             if flow.client.is_none() {
                 flow.client = Some((dst_ip, dst_port));
@@ -1130,6 +1143,8 @@ pub(crate) struct TcpSegment<'a> {
     pub(crate) src_port: u16,
     pub(crate) dst_port: u16,
     pub(crate) seq: u32,
+    /// Acknowledgement number (meaningful with ACK set).
+    pub(crate) ack: u32,
     pub(crate) flags: u8,
     /// Captured payload bytes (shorter than declared when the capture
     /// used a snaplen).
@@ -1157,6 +1172,7 @@ impl<'a> TcpSegment<'a> {
             src_port: u16::from_be_bytes([tcp[0], tcp[1]]),
             dst_port: u16::from_be_bytes([tcp[2], tcp[3]]),
             seq: u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+            ack: u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
             flags: tcp[13],
             payload,
             payload_len_declared: (ip.declared_l4 - data_off) as u32,
