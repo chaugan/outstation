@@ -219,6 +219,28 @@ pub fn validate_ifname(field: &str, name: &str, max_len: usize) -> Result<(), Re
     }
 }
 
+/// A unicast address a run can send to: not unspecified, loopback,
+/// multicast or the limited broadcast (N9). Raw replay and the master
+/// role send to `target_ip`; a slave's `target_ip` is only a filter
+/// (0.0.0.0 = any master) and is not checked.
+pub fn check_target_ip(ip: Ipv4Addr) -> Result<(), RequestError> {
+    let why = if ip.is_unspecified() {
+        "unspecified"
+    } else if ip.is_loopback() {
+        "loopback"
+    } else if ip.is_multicast() {
+        "multicast"
+    } else if ip.is_broadcast() {
+        "broadcast"
+    } else {
+        return Ok(());
+    };
+    Err(RequestError {
+        code: "invalid_target_ip",
+        message: format!("target_ip {ip} is a {why} address; give the live device's unicast IP"),
+    })
+}
+
 /// Every check except "which pcap": used for profiles (which may be
 /// pcap-agnostic) and by the CLI (which takes `--pcap`). Raw paths are
 /// still rejected.
@@ -278,6 +300,9 @@ pub fn validate_settings(req: &RunRequest) -> Result<(), RequestError> {
                 message: format!("pcap_id {id:?} is not a library id"),
             });
         }
+    }
+    if req.mode == RunMode::Raw || req.role == RoleReq::Master {
+        check_target_ip(req.target_ip)?;
     }
     match req.mode {
         RunMode::Raw => {
@@ -503,6 +528,37 @@ mod tests {
         assert_eq!(cfg.iteration_gap, sched::DEFAULT_ITERATION_GAP);
         let r = bench(json!({"iteration_gap_ms": MAX_ITERATION_GAP_MS + 1}));
         assert!(validate_settings(&r).is_err());
+    }
+
+    #[test]
+    fn target_ip_must_be_unicast_for_master_and_raw() {
+        for ip in [
+            "0.0.0.0",
+            "127.0.0.1",
+            "127.9.9.9",
+            "224.0.0.1",
+            "239.1.2.3",
+            "255.255.255.255",
+        ] {
+            let r = bench(json!({"target_ip": ip, "role": "master"}));
+            assert_eq!(
+                validate_settings(&r).unwrap_err().code,
+                "invalid_target_ip",
+                "{ip}"
+            );
+            let r =
+                bench(json!({"target_ip": ip, "mode": "raw", "target_mac": "02:00:00:00:00:01"}));
+            assert_eq!(
+                validate_settings(&r).unwrap_err().code,
+                "invalid_target_ip",
+                "{ip}"
+            );
+        }
+        // A slave's target_ip is a filter; 0.0.0.0 means any master.
+        let r = bench(json!({"target_ip": "0.0.0.0", "role": "slave"}));
+        assert!(validate_settings(&r).is_ok());
+        let r = bench(json!({"target_ip": "10.0.0.1", "role": "master"}));
+        assert!(validate_settings(&r).is_ok());
     }
 
     #[test]
