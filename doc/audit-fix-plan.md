@@ -185,6 +185,17 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [x] **T17a Re-audit fixes, core engine (fx1).** New defects N1–N5, N8, N10, N12 and N16–N19 from the independent re-audit, plus the remaining gaps in F028, F039, F055/F072, F079, P06 and P07. The full list is in the session scratchpad, `T17_new_defects.md`.
 - [x] **T17b Re-audit fixes, webui, UI, ops and docs (fx2).** New defects N6, N7, N9, N11, N13–N15 and N20–N22, plus the remaining gaps in F043, F044, F051, F053, F054, F056, F066, F067, F103, F131 and P08. Also any items from the UI/a11y re-audit slice.
+- [ ] **T20 UI polish** (requested by the user 2026-11-05: "no problem with changes to the better"). Starts after the t17 lane lands; README screenshots are then retaken with the t17 screenshot script.
+  - Analysis overview first: a verdict hero, a 200-tile RTU heatmap coloured by verdict with click-through, and a dimension summary; detail sections collapsed. The current page is about 12,400 px.
+  - Run cards: one primary action plus an overflow menu instead of 8 buttons; a clear status line (no "→ listening" on a stopped run); progress hidden when meaningless.
+  - Runs: a live dashboard strip (throughput sparkline, p50/p99 ack latency, session-state bar).
+  - Library: viability as stat chips and a readable verdict instead of log-style bullets.
+  - Configure: scenario presets ("Test a SCADA master", "Test an RTU") that pre-fill the form, plus a sticky summary of what will run (collapsed on phones).
+  - First-run empty states that guide upload → configure → run.
+  - Dark mode (prefers-color-scheme plus a toggle) with AA contrast in both themes.
+  - Delete with an undo toast instead of a confirm dialog where it is safe.
+  - Keyboard shortcuts (g l / g c / g r / g a, `/` to filter) with a `?` help overlay.
+  - Typography pass: consistent mono/sans use and number alignment in tables.
 - [~] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
