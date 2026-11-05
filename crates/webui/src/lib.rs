@@ -998,11 +998,12 @@ async fn api_run(
             _ => ConcurrencyModel::AllAtOnce,
         };
         let bcfg = BenchmarkConfig {
+            run_id: id,
             target_ip: req.target_ip,
             target_port: req.target_port,
             proto_name: req.proto_name.clone(),
-            bridge_name: req.bridge.clone(),
-            tap_prefix: req.tap_prefix.clone(),
+            bridge_name: Some(req.bridge.clone()),
+            tap_prefix: Some(req.tap_prefix.clone()),
             egress_nic: req.nic.clone(),
             concurrency,
             connect_timeout_secs: 5,
@@ -1022,7 +1023,7 @@ async fn api_run(
             scada_gateway_ip: req.scada_gateway_ip,
             scada_gateway_iface: req.scada_gateway_iface.clone(),
             upstream_nat_iface: req.upstream_nat_iface.clone(),
-            alias_state_path: Some(alias_state_path()),
+            state_dir: alias_state_path().parent().map(|p| p.to_path_buf()),
             master_bind_ip: req.master_bind_ip,
             tcp_nodelay: req.tcp_nodelay,
             selected_endpoints: if req.selected_rtus.is_empty() {
@@ -1031,6 +1032,7 @@ async fn api_run(
                 Some(req.selected_rtus.iter().copied().collect())
             },
             loop_within_session: req.loop_within_session,
+            ..BenchmarkConfig::default()
         };
         let db_bench = state.db.clone();
         thread::Builder::new()
@@ -1082,10 +1084,11 @@ async fn api_run(
         let target_mac_bytes =
             parse_mac(&req.target_mac).map_err(|e| AppError::BadRequest(format!("{e}")))?;
         let cfg = RunConfig {
+            run_id: id,
             target_ip: req.target_ip,
             target_mac: target_mac_bytes,
-            bridge_name: req.bridge.clone(),
-            tap_prefix: req.tap_prefix.clone(),
+            bridge_name: Some(req.bridge.clone()),
+            tap_prefix: Some(req.tap_prefix.clone()),
             egress_nic: req.nic.clone(),
             speed: req.speed,
             top_speed: req.top_speed,
@@ -1099,6 +1102,8 @@ async fn api_run(
             startup_delay_secs: req.warmup_secs,
             capture_path: Some(capture_pb.clone()),
             iterations: req.iterations,
+            state_dir: alias_state_path().parent().map(|p| p.to_path_buf()),
+            ..RunConfig::default()
         };
         let db_raw = state.db.clone();
         thread::Builder::new()
@@ -2092,7 +2097,7 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
         Ok(_) => {}
         Err(e) => warn!(error = %e, "reclaim_recorded_aliases failed"),
     }
-    match netctl::reclaim_stale("pcr_br0", "pcr_") {
+    match netctl::reclaim_stale("pcr") {
         Ok(n) if n > 0 => warn!(
             count = n,
             "reclaimed {n} stale pcr_* interface(s) at startup"
