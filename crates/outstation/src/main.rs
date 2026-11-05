@@ -164,8 +164,8 @@ fn run_cmd(args: RunArgs) -> Result<()> {
     let cfg = RunConfig {
         target_ip: args.target_ip,
         target_mac,
-        bridge_name: args.bridge,
-        tap_prefix: args.tap_prefix,
+        bridge_name: Some(args.bridge),
+        tap_prefix: Some(args.tap_prefix),
         egress_nic: args.nic,
         speed: args.speed,
         top_speed: args.top_speed,
@@ -179,6 +179,7 @@ fn run_cmd(args: RunArgs) -> Result<()> {
         startup_delay_secs: args.warmup,
         capture_path: None,
         iterations: 1,
+        ..RunConfig::default()
     };
 
     let report = run_sched(pcap, cfg, RunContext::default()).context("run failed")?;
