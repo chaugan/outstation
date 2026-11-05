@@ -142,8 +142,8 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 - [~] **T08 Run profiles, re-run and auto-analysis.** Persist the full RunRequest. Add "Re-run" and "Load config", with config kept in the URL and local storage. Run analysis automatically when a run ends, and add an explicit run picker for manual analysis. Refs: F100, F108, F131 (part); product items #3 and #4.
 - [~] **T09 Headless bench CLI.** `outstation bench --profile run.json --assert score>=99 --assert p99_ms<=500 --report out.json`. It runs, captures, analyses its own mirror and exits non-zero on failure. Refs: F131; product item #2.
 - [~] **T10 Run-to-run compare.** `/api/runs/:a/compare/:b` returns per-RTU score, delivered and latency deltas, with a UI view. Product item #5.
-- [ ] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
-- [ ] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
+- [~] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
+- [~] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [~] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
 - [~] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
@@ -224,3 +224,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - F009 is partly fixed: the metric is documented as ack latency and a command-response metric was added, but the peer's ack cadence is not recorded.
   - Orchestrator change: slave idle-serve defaults to 30 s, so runs still finish on their own.
   - New report fields for the UI: `protocol_violations`, `protocol_errors`, `stripped_capture_frames`, `synthesized_frames`, `idle_serve_ms`, `command_response_us`, `acks_sent` and `keepalives_sent`.
+- 2026-11-05: T11 and T12 started in `/opt/code/outstation-wt/proto-features`.
