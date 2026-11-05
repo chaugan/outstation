@@ -270,10 +270,11 @@ mod tests {
 
     #[test]
     fn creates_missing_state_dir() {
-        let d = tmpdir("mk").join("nested/deeper");
-        let p = d.join("j.txt");
+        let root = tmpdir("mk");
+        let p = root.join("nested/deeper").join("j.txt");
         add_line(&p, "x").unwrap();
         assert_eq!(read_journal(&p).unwrap(), vec!["x"]);
+        fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
@@ -281,6 +282,7 @@ mod tests {
         let d = tmpdir("ml");
         assert!(add_line(&d.join("j"), "a\nb").is_err());
         assert!(add_line(&d.join("j"), "  ").is_err());
+        fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
