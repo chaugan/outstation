@@ -32,7 +32,7 @@ use crate::asdu::{
     Iec104ProtoConfig, RewriteMap, DUI_LEN, IOA_LEN,
 };
 use crate::inventory::Inventory;
-use crate::responder::{build_ci_response, build_gi_response, RequestEcho};
+use crate::responder::{respond_ci, respond_gi, RequestEcho};
 
 #[inline]
 fn wall_clock_unix_ns() -> u64 {
@@ -620,17 +620,22 @@ fn try_queue_master_command_response(
         ca: common_address(asdu),
         oa: asdu[3],
         test: asdu[2] & 0x80 != 0,
-        negative: false,
     };
     let element_byte = asdu[DUI_LEN + IOA_LEN]; // QOI for type 100, QCC for 101
-    let frames = match type_id {
-        100 => build_gi_response(inventory, echo, element_byte),
-        101 => build_ci_response(inventory, echo, element_byte),
+    let response = match type_id {
+        100 => respond_gi(inventory, echo, element_byte),
+        101 => respond_ci(inventory, echo, element_byte),
         _ => return,
     };
-    for f in frames {
-        queue.push_back(f);
+    if response.negative() {
+        debug!(
+            type_id,
+            ca = echo.ca,
+            qualifier = element_byte,
+            "interrogation rejected with negative ActCon"
+        );
     }
+    queue.extend(response.into_asdus());
 }
 
 /// emit an S-frame when our receive window hits `w`.
@@ -788,13 +793,11 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // Spec-strict: see crate::responder for the per-IEC-60870-5-101
     // semantics (ActCon -> values -> ActTerm, QOI/QCC echo, group
     // filtering, k-window aware chunking).
+    // Built from the resynced, CA/IOA-rewritten frames so the
+    // responder's CA filter matches the addresses the live master uses.
     let mut inventory = crate::inventory::Inventory::default();
-    {
-        let mut full = Vec::new();
-        for seg in &cfg.client_segments {
-            full.extend_from_slice(&seg.bytes);
-        }
-        inventory.ingest_payload(&full);
+    for asdu in &server_iframes {
+        inventory.ingest_asdu(asdu);
     }
     info!(
         points = inventory.len(),

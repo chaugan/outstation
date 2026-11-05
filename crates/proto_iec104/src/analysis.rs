@@ -1502,7 +1502,6 @@ pub fn audit_master_commands(
             ca: req.ca,
             oa: req.oa,
             test: req.cot_byte & 0x80 != 0,
-            negative: req.cot_byte & 0x40 != 0,
         };
         let expected: Vec<Vec<u8>> = if req.type_id == 100 {
             build_gi_response(src_inv, echo, req.qualifier)
@@ -1847,7 +1846,6 @@ mod tests {
             ca: 1,
             oa: 42,
             test: false,
-            negative: false,
         };
         let resp = build_gi_response(&inv, echo, 20);
         assert_eq!(resp.len(), 3);
@@ -1917,7 +1915,6 @@ mod tests {
             ca: 1,
             oa: 0,
             test: false,
-            negative: false,
         };
         let resp = build_gi_response(&inv, echo, 20);
         // Drop the ActTerm to simulate a misbehaving slave.
