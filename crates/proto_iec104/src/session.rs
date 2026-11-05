@@ -449,16 +449,27 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     });
     // The live master gets synthesized answers to its own GI/CI and
     // commands; replaying the captured exchanges too would hand it
-    // unsolicited confirmations and duplicate data.
+    // unsolicited confirmations and duplicate data (and, with return
+    // information on, the capture's COT 11 reports of remote commands
+    // it never sent). Same rule as the analyzer:
+    // `crate::interrogation::CaptureStrip`.
+    let strip = crate::interrogation::CaptureStrip::new(synthesize, &pc.commands);
     let before = script.frames.len();
-    script.frames.retain(|f| {
-        !(synthesize && crate::interrogation::is_captured_interrogation_frame(&f.asdu)
-            || echo_commands && crate::commands::is_captured_command_frame(&f.asdu))
+    let mut stripped_return_info = 0u64;
+    script.frames.retain(|f| match strip.classify(&f.asdu) {
+        None => true,
+        Some(kind) => {
+            if kind == crate::interrogation::Stripped::ReturnInfo {
+                stripped_return_info += 1;
+            }
+            false
+        }
     });
     report.protocol.stripped_capture_frames = (before - script.frames.len()) as u64;
     info!(
         count = script.frames.len(),
         stripped = report.protocol.stripped_capture_frames,
+        stripped_return_info,
         port = cfg.listen_port,
         "slave: extracted server-originated I-frame ASDUs"
     );

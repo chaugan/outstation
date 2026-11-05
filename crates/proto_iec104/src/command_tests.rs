@@ -58,14 +58,16 @@ pub(crate) fn command_script() -> Vec<Vec<u8>> {
         vec![1, 1, 11, 0, 1, 0, 100, 0, 0, 1], // captured return info
         vec![45, 1, 10, 0, 1, 0, 100, 0, 0, 1], // captured ActTerm
         vec![13, 1, 3, 0, 1, 0, 0x2c, 1, 0, 0, 0, 0, 0, 0],
+        vec![1, 1, 12, 0, 1, 0, 100, 0, 0, 0], // local command at the RTU
     ]
 }
 
 /// T11 / F139: the slave answers every command class like a real RTU:
 /// select-before-operate, execute with return information, deactivate,
 /// the four rejection classes, a stale time tag, clock sync, read,
-/// test and reset process; captured command confirmations are not
-/// replayed; per-type round trips are reported.
+/// test and reset process; captured command confirmations and remote
+/// return information (COT 11) are not replayed, local return
+/// information (COT 12) is; per-type round trips are reported.
 #[test]
 fn slave_echoes_commands() {
     let port = free_port();
@@ -83,10 +85,11 @@ fn slave_echoes_commands() {
         script.push(asdu_of(&a).unwrap().to_vec());
     }
     p.ack();
-    // The captured ActCon / ActTerm are stripped; the return info
-    // (COT 11) is ordinary data and stays.
+    // The captured ActCon / ActTerm and, with return information on,
+    // the captured remote return info (COT 11) are stripped; the local
+    // return info (COT 12) is ordinary data and stays.
     let s = command_script();
-    assert_eq!(script, vec![s[0].clone(), s[2].clone(), s[4].clone()]);
+    assert_eq!(script, vec![s[0].clone(), s[4].clone(), s[5].clone()]);
 
     let sc = |sco: u8| vec![45, 1, 6, 0, 1, 0, 100, 0, 0, sco];
     // Select, execute (ActCon, return info, ActTerm), deactivate.
@@ -140,7 +143,7 @@ fn slave_echoes_commands() {
 
     let (rep, _, _) = run.join_within(ms(3000));
     assert!(rep.error.is_none(), "{:?}", rep.error);
-    assert_eq!(rep.protocol.stripped_capture_frames, 2);
+    assert_eq!(rep.protocol.stripped_capture_frames, 3);
     let sc = stats(&rep, 45);
     assert_eq!(
         (
@@ -190,7 +193,7 @@ fn slave_command_echo_off_replays_captured_confirmations() {
     let mut p = Peer::connect(port);
     master_handshake(&mut p);
     let mut got = Vec::new();
-    while got.len() < 5 {
+    while got.len() < 6 {
         let a = p.recv_until(ms(1000), is_i).expect("script frame");
         got.push(asdu_of(&a).unwrap().to_vec());
     }
@@ -356,6 +359,7 @@ fn replay_with_live_commands_scores_100() {
     let pb = &a.protocol_specific["playback"];
     assert_eq!(pb["command_echo"], true);
     assert_eq!(pb["source_command_stripped"], 2);
+    assert_eq!(pb["source_return_info_stripped"], 1);
     assert_eq!(pb["command_responses_excluded"], 7);
     assert_eq!(pb["synthesized_excluded"], 11);
     assert_eq!(pb["delivered_iframes"], 3);

@@ -20,10 +20,37 @@
 //!
 //! The rule is per frame, so it also catches the tail of an exchange
 //! whose ActCon fell before the start of a mid-flow capture.
+//!
+//! # Every stripped capture frame
+//!
+//! [`CaptureStrip`] is the one definition of *all* captured frames the
+//! slave leaves out of its script because it answers the live master
+//! itself; the replayer (`session`) and the analyzer both classify
+//! through it, so `stripped_capture_frames` and the analyzer's
+//! expected side always agree:
+//!
+//! * captured interrogation exchanges (above), with GI/CI synthesis on;
+//! * captured command confirmations
+//!   ([`crate::commands::is_captured_command_frame`]), with command
+//!   echo on;
+//! * captured return information caused by a **remote** command
+//!   (monitor-direction data with COT 11,
+//!   [`is_captured_remote_return_info`]), with command echo on *and*
+//!   `commands.return_info` other than `"none"`. The slave then sends
+//!   its own return information for each live command it executes, so
+//!   replaying the capture's COT 11 frames as well would report remote
+//!   commands the live master never sent, next to the live ones.
+//!
+//! Return information caused by a **local** command (COT 12) is kept:
+//! it reports an operator action at the RTU itself (a local switch, a
+//! bay controller), not an answer to the controlling station, so it is
+//! ordinary process data that the live master has no part in and the
+//! command echo never synthesizes.
 
 use std::ops::Range;
 
 use crate::asdu::{cot_value, DUI_LEN};
+use crate::commands::{self, CommandsConfig, ReturnInfo, COT_RETREM};
 
 /// `proto_config` key that turns GI/CI response synthesis off
 /// (`{"gi_ci_synthesis": false}`). Absent = on.
@@ -57,6 +84,63 @@ pub fn is_captured_interrogation_frame(asdu: &[u8]) -> bool {
         return true;
     }
     (20..=41).contains(&cot)
+}
+
+/// Is this ASDU captured return information caused by a remote command:
+/// monitor-direction data (type < 45) with COT 11? Stripped from the
+/// script when the slave synthesizes its own return information (see
+/// the module docs). COT 12 (local command) is not.
+pub fn is_captured_remote_return_info(asdu: &[u8]) -> bool {
+    asdu.len() >= DUI_LEN && asdu[0] < 45 && cot_value(asdu) == COT_RETREM
+}
+
+/// Why a captured frame is left out of the slave's script.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Stripped {
+    /// Part of a captured GI/CI exchange.
+    Interrogation,
+    /// A captured command confirmation or read reply.
+    Command,
+    /// Captured return information caused by a remote command (COT 11).
+    ReturnInfo,
+}
+
+/// Which captured frames the slave strips from its script because it
+/// answers the live master itself. One definition for the replayer and
+/// the analyzer; see the module docs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CaptureStrip {
+    /// GI/CI synthesis is on.
+    pub interrogations: bool,
+    /// Command echo is on.
+    pub commands: bool,
+    /// Command echo synthesizes return information.
+    pub return_info: bool,
+}
+
+impl CaptureStrip {
+    /// The rule for a slave run with GI/CI synthesis `gi_ci` and the
+    /// command-echo settings `commands`.
+    pub fn new(gi_ci: bool, commands: &CommandsConfig) -> Self {
+        Self {
+            interrogations: gi_ci,
+            commands: commands.enabled,
+            return_info: commands.enabled && commands.return_info != ReturnInfo::None,
+        }
+    }
+
+    /// Why `asdu` is stripped, or `None` if it is replayed.
+    pub fn classify(&self, asdu: &[u8]) -> Option<Stripped> {
+        if self.interrogations && is_captured_interrogation_frame(asdu) {
+            Some(Stripped::Interrogation)
+        } else if self.commands && commands::is_captured_command_frame(asdu) {
+            Some(Stripped::Command)
+        } else if self.return_info && is_captured_remote_return_info(asdu) {
+            Some(Stripped::ReturnInfo)
+        } else {
+            None
+        }
+    }
 }
 
 /// Index ranges (into `asdus`) of the captured interrogation exchanges,
@@ -107,6 +191,63 @@ mod tests {
         assert!(!is_captured_interrogation_frame(&a(45, 7)));
         assert!(is_captured_interrogation_frame(&a(100, 7 | 0x40)));
         assert!(!is_captured_interrogation_frame(&[100, 1]));
+    }
+
+    #[test]
+    fn return_info_is_stripped_only_with_echo_and_return_info_on() {
+        let cfg = |enabled: bool, ri: ReturnInfo| CommandsConfig {
+            enabled,
+            return_info: ri,
+            ..CommandsConfig::default()
+        };
+        let retrem = a(1, 11);
+        let local = a(1, 12);
+        let spont = a(1, 3);
+        for ri in [ReturnInfo::Spontaneous, ReturnInfo::Retrem] {
+            let s = CaptureStrip::new(true, &cfg(true, ri));
+            assert_eq!(s.classify(&retrem), Some(Stripped::ReturnInfo));
+            assert_eq!(s.classify(&a(31, 11 | 0x80)), Some(Stripped::ReturnInfo));
+            // COT 12: a local operator action, ordinary data.
+            assert_eq!(s.classify(&local), None);
+            assert_eq!(s.classify(&spont), None);
+        }
+        for s in [
+            CaptureStrip::new(true, &cfg(true, ReturnInfo::None)),
+            CaptureStrip::new(true, &cfg(false, ReturnInfo::Retrem)),
+        ] {
+            assert_eq!(s.classify(&retrem), None);
+        }
+        // A command type never counts as return information.
+        assert!(!is_captured_remote_return_info(&a(45, 11)));
+        assert!(!is_captured_remote_return_info(&[1, 1, 11]));
+    }
+
+    #[test]
+    fn capture_strip_classifies_every_kind() {
+        let s = CaptureStrip::new(
+            true,
+            &CommandsConfig {
+                return_info: ReturnInfo::Spontaneous,
+                ..CommandsConfig::default()
+            },
+        );
+        assert_eq!(s.classify(&a(100, 7)), Some(Stripped::Interrogation));
+        assert_eq!(s.classify(&a(1, 20)), Some(Stripped::Interrogation));
+        assert_eq!(s.classify(&a(45, 7)), Some(Stripped::Command));
+        assert_eq!(s.classify(&a(1, 5)), Some(Stripped::Command));
+        assert_eq!(s.classify(&a(1, 11)), Some(Stripped::ReturnInfo));
+        assert_eq!(s.classify(&a(13, 3)), None);
+        let off = CaptureStrip::new(
+            false,
+            &CommandsConfig {
+                enabled: false,
+                ..CommandsConfig::default()
+            },
+        );
+        assert_eq!(off, CaptureStrip::default());
+        for x in [a(100, 7), a(1, 20), a(45, 7), a(1, 11)] {
+            assert_eq!(off.classify(&x), None);
+        }
     }
 
     #[test]

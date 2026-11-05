@@ -24,7 +24,11 @@
 //!   confirmations are not expected ([`commands::is_captured_command_frame`]),
 //!   and the confirmations, return information and ActTerms the slave
 //!   sent in answer to the live master's commands are removed from the
-//!   delivered side, like synthesized GI/CI responses.
+//!   delivered side, like synthesized GI/CI responses. With return
+//!   information on, the capture's own remote return information
+//!   (COT 11) is not expected either; local (COT 12) is. The expected
+//!   side is filtered by the replayer's own rule,
+//!   [`interrogation::CaptureStrip`].
 //! * **Injected faults** (`proto_config.faults`): frames the replayer
 //!   deliberately dropped (an N(S) gap on the wire), duplicated (a
 //!   repeated N(S) with identical content) or sent with a corrupted
@@ -155,6 +159,11 @@ pub struct PlaybackReport {
     /// Captured command confirmations removed from the expected side
     /// because the replayer strips them when command echo is on.
     pub source_command_stripped: usize,
+    /// Captured return information caused by a remote command (COT 11)
+    /// removed from the expected side because the replayer strips it
+    /// when command echo synthesizes return information. COT 12 (local
+    /// command) stays expected.
+    pub source_return_info_stripped: usize,
     /// Delivered I-frames identified as synthesized command responses
     /// (also counted in `synthesized_excluded`).
     pub command_responses_excluded: usize,
@@ -475,27 +484,34 @@ pub fn analyze_iec104_flow(
     // --- Expected side ---
     // With GI/CI synthesis on, the slave strips the captured
     // interrogation exchanges from its script (it answers live requests
-    // instead), so they are not expected either. Same rule as the
-    // replayer: `crate::interrogation`. Likewise for captured command
-    // confirmations with command echo on (`crate::commands`).
+    // instead), so they are not expected either. Likewise for captured
+    // command confirmations with command echo on, and captured remote
+    // return information (COT 11) when the echo synthesizes its own.
+    // Same rule as the replayer: `interrogation::CaptureStrip`.
     let synthesis_on =
         ctx.role == Role::Slave && interrogation::synthesis_enabled(ctx.proto_config.as_deref());
     let command_cfg = commands::commands_config(ctx.proto_config.as_deref());
     let echo_on = ctx.role == Role::Slave && command_cfg.enabled;
+    let strip = if ctx.role == Role::Slave {
+        interrogation::CaptureStrip::new(synthesis_on, &command_cfg)
+    } else {
+        interrogation::CaptureStrip::default()
+    };
     let mut source_interrogation_stripped = 0usize;
     let mut source_command_stripped = 0usize;
+    let mut source_return_info_stripped = 0usize;
     let expected_frames: Vec<IFrame> = src
         .iframes
         .iter()
-        .filter(|f| {
-            if synthesis_on && interrogation::is_captured_interrogation_frame(f.asdu) {
-                source_interrogation_stripped += 1;
+        .filter(|f| match strip.classify(f.asdu) {
+            None => true,
+            Some(kind) => {
+                *match kind {
+                    interrogation::Stripped::Interrogation => &mut source_interrogation_stripped,
+                    interrogation::Stripped::Command => &mut source_command_stripped,
+                    interrogation::Stripped::ReturnInfo => &mut source_return_info_stripped,
+                } += 1;
                 false
-            } else if echo_on && commands::is_captured_command_frame(f.asdu) {
-                source_command_stripped += 1;
-                false
-            } else {
-                true
             }
         })
         .copied()
@@ -508,6 +524,11 @@ pub fn analyze_iec104_flow(
     if source_command_stripped > 0 {
         notes.push(format!(
             "command echo was on: {source_command_stripped} captured command confirmations are not replayed and not expected"
+        ));
+    }
+    if source_return_info_stripped > 0 {
+        notes.push(format!(
+            "command echo with return information was on: {source_return_info_stripped} captured return-information frames (COT 11, remote command) are not replayed and not expected"
         ));
     }
 
@@ -638,6 +659,7 @@ pub fn analyze_iec104_flow(
     playback.source_interrogation_stripped = source_interrogation_stripped;
     playback.command_echo = echo_on;
     playback.source_command_stripped = source_command_stripped;
+    playback.source_return_info_stripped = source_return_info_stripped;
     playback.command_responses_excluded = command_responses_excluded;
     playback.fault_duplicates_excluded = scan.duplicates;
     // Deliberately dropped frames are not replay infidelity.
@@ -3545,6 +3567,37 @@ mod tests {
             }),
             c,
         )
+    }
+
+    /// T12b: with command echo and return information on, captured COT 11
+    /// return information is not expected; COT 12 (local command) is.
+    #[test]
+    fn captured_remote_return_info_is_not_expected_with_return_info_on() {
+        let script = vec![sp(3, 1, 0), sp(11, 1, 1), sp(12, 2, 1), me(3, 3, 7)];
+        let replayed = vec![script[0].clone(), script[2].clone(), script[3].clone()];
+        for cfg in [
+            r#"{"commands":{"return_info":"spontaneous"}}"#,
+            r#"{"commands":{"return_info":"retrem"}}"#,
+        ] {
+            let o = run_with(
+                &script,
+                &replayed,
+                &ctx_with(RunFacts::default(), Some(cfg)),
+            );
+            assert_eq!(o.r.score_pct, 100.0, "{cfg}: {:?}", o.r.notes);
+            assert_eq!(o.n("source_return_info_stripped"), 1);
+            assert_eq!(o.n("expected_iframes"), 3);
+        }
+        // Return information off, or command echo off: replayed verbatim.
+        for cfg in [
+            r#"{"commands":{"return_info":"none"}}"#,
+            r#"{"commands":{"enabled":false,"return_info":"retrem"}}"#,
+        ] {
+            let o = run_with(&script, &script, &ctx_with(RunFacts::default(), Some(cfg)));
+            assert_eq!(o.r.score_pct, 100.0, "{cfg}: {:?}", o.r.notes);
+            assert_eq!(o.n("source_return_info_stripped"), 0);
+            assert_eq!(o.n("expected_iframes"), 4);
+        }
     }
 
     fn inventory_of(script: &[Vec<u8>]) -> Inventory {
