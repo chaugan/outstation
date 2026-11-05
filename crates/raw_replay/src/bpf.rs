@@ -54,6 +54,28 @@ pub fn reject_all() -> Vec<Insn> {
     vec![stmt(RET | K, 0)]
 }
 
+/// A program that accepts every frame (snapped to [`SNAPLEN`]).
+pub fn accept_all() -> Vec<Insn> {
+    vec![stmt(RET | K, SNAPLEN)]
+}
+
+/// Ancillary load of the packet type (`SKF_AD_OFF + SKF_AD_PKTTYPE`).
+const AD_PKTTYPE: u32 = (libc::SKF_AD_OFF + libc::SKF_AD_PKTTYPE) as u32;
+
+/// `prog`, but dropping outgoing frames first. On `lo` every frame is
+/// seen twice (outgoing, then incoming); dropping one copy in the
+/// kernel halves what the socket must queue. The rest of `prog` only
+/// uses relative jumps, so prefixing it is safe.
+pub fn skip_outgoing(prog: &[Insn]) -> Vec<Insn> {
+    let mut v = vec![
+        stmt(LD | W | ABS, AD_PKTTYPE),
+        jump(JMP | JEQ | K, u32::from(libc::PACKET_OUTGOING), 0, 1),
+        stmt(RET | K, 0),
+    ];
+    v.extend_from_slice(prog);
+    v
+}
+
 /// Labels of [`tcp_endpoints_filter`].
 #[derive(Clone, Copy)]
 enum Label {
@@ -149,6 +171,13 @@ pub fn tcp_endpoints_filter(ips: &[Ipv4Addr], port: u16) -> Result<Vec<Insn>> {
 /// packet). Test-only.
 #[cfg(test)]
 pub(crate) fn run(prog: &[Insn], pkt: &[u8]) -> u32 {
+    run_typed(prog, pkt, 0)
+}
+
+/// [`run`] for a frame of the given packet type (`PACKET_HOST` = 0,
+/// `PACKET_OUTGOING` = 4).
+#[cfg(test)]
+pub(crate) fn run_typed(prog: &[Insn], pkt: &[u8], pkttype: u8) -> u32 {
     let (mut a, mut x): (u32, u32) = (0, 0);
     let mut pc = 0usize;
     let load = |off: usize, size: usize| -> Option<u32> {
@@ -164,6 +193,9 @@ pub(crate) fn run(prog: &[Insn], pkt: &[u8]) -> u32 {
             _ => 1,
         };
         match i.code & 0x07 {
+            c if c == LD && i.code & 0xe0 == ABS && i.k == AD_PKTTYPE => {
+                a = u32::from(pkttype);
+            }
             c if c == LD => {
                 let off = match i.code & 0xe0 {
                     ABS => i.k as usize,
@@ -327,6 +359,20 @@ mod tests {
             0
         );
         assert_eq!(run(&p, &[]), 0);
+    }
+
+    #[test]
+    fn outgoing_copies_are_skipped() {
+        let ips = [ip("127.0.10.49")];
+        let p = skip_outgoing(&tcp_endpoints_filter(&ips, 2404).unwrap());
+        let f = tcp("127.0.0.1", 41000, "127.0.10.49", 2404);
+        assert_eq!(run_typed(&p, &f, 0), SNAPLEN, "incoming copy kept");
+        assert_eq!(run_typed(&p, &f, libc::PACKET_OUTGOING), 0);
+        let other = tcp("127.0.0.1", 41000, "127.0.0.5", 2404);
+        assert_eq!(run_typed(&p, &other, 0), 0, "the filter still applies");
+        let all = skip_outgoing(&accept_all());
+        assert_eq!(run_typed(&all, &other, 0), SNAPLEN);
+        assert_eq!(run_typed(&all, &other, libc::PACKET_OUTGOING), 0);
     }
 
     #[test]

@@ -399,6 +399,9 @@ pub struct RunReport {
     pub capture_path: Option<PathBuf>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (the capture file
+    /// is missing them; its analysis under-counts delivery).
+    pub captured_dropped: u64,
     /// Non-fatal problems (guard warnings, realtime policy, worker
     /// errors) worth showing in the run's status.
     pub warnings: Vec<String>,
@@ -528,18 +531,33 @@ fn start_capture(
     }
 }
 
-/// Stop the capture (after a short flush delay) and copy its counters.
-fn collect_capture(res: &mut RunResources) -> (Option<PathBuf>, u64, u64) {
-    let Some(c) = res.capture.take() else {
-        return (None, 0, 0);
-    };
+/// Stop the capture (after a short delay for frames still in flight)
+/// and return its counters; a lossy capture adds a warning.
+fn finish_capture(c: Capture, warnings: &mut Vec<String>) -> raw_replay::CaptureStats {
     std::thread::sleep(Duration::from_millis(200));
-    let packets = c.packets.load(Ordering::Relaxed);
-    let bytes = c.bytes.load(Ordering::Relaxed);
-    let path = c.path.clone();
-    c.stop();
-    info!(packets, bytes, "capture stopped");
-    (Some(path), packets, bytes)
+    let st = c.finish();
+    info!(
+        packets = st.packets,
+        bytes = st.bytes,
+        dropped = st.dropped,
+        "capture stopped"
+    );
+    if st.dropped > 0 {
+        warnings.push(format!(
+            "capture lost {} frames (kernel receive queue full); its analysis may report \
+             frames as missing that were delivered",
+            st.dropped
+        ));
+    }
+    st
+}
+
+/// [`finish_capture`] for a run's mirror capture.
+fn collect_capture(
+    res: &mut RunResources,
+    warnings: &mut Vec<String>,
+) -> Option<raw_replay::CaptureStats> {
+    res.capture.take().map(|c| finish_capture(c, warnings))
 }
 
 // -----------------------------------------------------------------------------
@@ -1005,10 +1023,12 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
     }
 
     // 5. Stop the capture (flush first), then tear everything down.
-    let (cp, cpk, cby) = collect_capture(&mut res);
-    report.capture_path = cp;
-    report.captured_packets = cpk;
-    report.captured_bytes = cby;
+    if let Some(st) = collect_capture(&mut res, &mut warnings) {
+        report.capture_path = Some(st.path);
+        report.captured_packets = st.packets;
+        report.captured_bytes = st.bytes;
+        report.captured_dropped = st.dropped;
+    }
     report.warnings.extend(warnings);
     res.finish(&mut report.warnings);
     Ok(report)
@@ -1233,6 +1253,9 @@ pub struct BenchmarkReport {
     pub capture_path: Option<PathBuf>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (the capture file
+    /// is missing them; its analysis under-counts delivery).
+    pub captured_dropped: u64,
     /// Non-fatal problems worth showing in the run's status.
     pub warnings: Vec<String>,
 }
@@ -1742,10 +1765,12 @@ pub fn run_benchmark(
     let mut report = join_sessions(handles, run_start_ns);
 
     // 9. Stop capture, teardown.
-    let (cp, cpk, cby) = collect_capture(&mut res);
-    report.capture_path = cp;
-    report.captured_packets = cpk;
-    report.captured_bytes = cby;
+    if let Some(st) = collect_capture(&mut res, &mut warnings) {
+        report.capture_path = Some(st.path);
+        report.captured_packets = st.packets;
+        report.captured_bytes = st.bytes;
+        report.captured_dropped = st.dropped;
+    }
     report.warnings.extend(warnings);
     res.finish(&mut report.warnings);
     Ok(report)
@@ -1769,7 +1794,13 @@ struct SlaveCapture {
 
 impl SlaveCapture {
     fn start(path: &Path, port: u16, peer: Ipv4Addr) -> Result<Self> {
-        let cap = Capture::start_filtered(path, raw_replay::bpf::reject_all())?;
+        // The reader only blocks in poll and drains bursts; at RT
+        // priority a loaded host cannot starve it into dropping frames.
+        let cap = Capture::start_filtered(
+            path,
+            raw_replay::bpf::reject_all(),
+            Some(CAPTURE_RT_PRIORITY),
+        )?;
         info!(path = %path.display(), port, "slave capture started");
         Ok(Self {
             cap,
@@ -1827,20 +1858,16 @@ impl SlaveCapture {
         }
     }
 
-    /// Stop after a short flush delay; `(path, packets, bytes, warnings)`.
-    fn finish(self) -> (PathBuf, u64, u64, Vec<String>) {
-        std::thread::sleep(Duration::from_millis(200));
-        let packets = self.cap.packets.load(Ordering::Relaxed);
-        let bytes = self.cap.bytes.load(Ordering::Relaxed);
-        let path = self.cap.path.clone();
+    /// Stop after a short flush delay: the counters and the warnings.
+    fn finish(self) -> (raw_replay::CaptureStats, Vec<String>) {
         let ifaces = self.cap.ifaces();
-        self.cap.stop();
-        info!(packets, bytes, ?ifaces, "slave capture stopped");
-        let w = self
+        let mut w = self
             .warnings
             .into_inner()
             .unwrap_or_else(|e| e.into_inner());
-        (path, packets, bytes, w)
+        let st = finish_capture(self.cap, &mut w);
+        info!(?ifaces, "slave capture stopped");
+        (st, w)
     }
 }
 
@@ -2228,10 +2255,11 @@ fn run_benchmark_slave(
     if let Some(c) = capture {
         match Arc::try_unwrap(c) {
             Ok(c) => {
-                let (path, packets, bytes, w) = c.finish();
-                report.capture_path = Some(path);
-                report.captured_packets = packets;
-                report.captured_bytes = bytes;
+                let (st, w) = c.finish();
+                report.capture_path = Some(st.path);
+                report.captured_packets = st.packets;
+                report.captured_bytes = st.bytes;
+                report.captured_dropped = st.dropped;
                 report.warnings.extend(w);
             }
             // Only a session thread that never returned still holds it;

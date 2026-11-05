@@ -21,7 +21,7 @@ use tracing::{debug, warn};
 
 pub mod bpf;
 pub mod capture;
-pub use capture::Capture;
+pub use capture::{Capture, CaptureStats};
 
 /// A single frame plus its target send time relative to the start of the
 /// replay window (nanoseconds).

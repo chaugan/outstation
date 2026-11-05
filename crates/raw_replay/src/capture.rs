@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context, Result};
 use tracing::{debug, info, warn};
@@ -45,7 +46,26 @@ pub struct Capture {
     pub path: PathBuf,
     pub packets: Arc<AtomicU64>,
     pub bytes: Arc<AtomicU64>,
+    /// Frames the kernel dropped because a socket's receive queue was
+    /// full (PACKET_STATISTICS): the capture file is missing them.
+    /// Updated about once a second and when the capture stops.
+    pub dropped: Arc<AtomicU64>,
 }
+
+/// Final counters of a capture, see [`Capture::finish`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureStats {
+    pub path: PathBuf,
+    pub packets: u64,
+    pub bytes: u64,
+    /// Frames the kernel dropped (receive queue full).
+    pub dropped: u64,
+}
+
+/// Receive buffer requested for every capture socket. The default
+/// (`net.core.rmem_default`, ~200 KiB) holds only a few hundred
+/// loopback frames, which a briefly descheduled reader overflows.
+pub const CAPTURE_RCVBUF: i32 = 32 << 20;
 
 impl Capture {
     /// Start a capture on `iface`, writing frames to `path`. The
@@ -81,14 +101,19 @@ impl Capture {
     /// [`Capture::add_iface`] and narrow or widen the filter with
     /// [`Capture::set_filter`]. Every socket gets the filter before it
     /// is bound, so not one frame outside the filter is ever read.
-    pub fn start_filtered(path: impl Into<PathBuf>, filter: Vec<bpf::Insn>) -> Result<Self> {
+    /// `rt_priority` as for [`Capture::start_with_priority`].
+    pub fn start_filtered(
+        path: impl Into<PathBuf>,
+        filter: Vec<bpf::Insn>,
+        rt_priority: Option<i32>,
+    ) -> Result<Self> {
         Self::spawn(
             path.into(),
             Inner {
                 socks: Vec::new(),
                 filter: Some(filter),
             },
-            None,
+            rt_priority,
         )
     }
 
@@ -119,7 +144,8 @@ impl Capture {
         }
         let mut first_err = None;
         for s in &inner.socks {
-            if let Err(e) = attach_filter(s.fd.as_raw_fd(), &filter) {
+            if let Err(e) = attach_filter(s.fd.as_raw_fd(), &effective_filter(s.loopback, &filter))
+            {
                 warn!(iface = %s.iface, error = %format!("{e:#}"), "capture filter update failed");
                 first_err.get_or_insert(e);
             }
@@ -146,9 +172,13 @@ impl Capture {
         let stop = Arc::new(AtomicBool::new(false));
         let packets = Arc::new(AtomicU64::new(0));
         let bytes = Arc::new(AtomicU64::new(0));
+        let dropped = Arc::new(AtomicU64::new(0));
         let stop_c = Arc::clone(&stop);
-        let packets_c = Arc::clone(&packets);
-        let bytes_c = Arc::clone(&bytes);
+        let counters = Counters {
+            packets: Arc::clone(&packets),
+            bytes: Arc::clone(&bytes),
+            dropped: Arc::clone(&dropped),
+        };
         let inner_c = Arc::clone(&inner);
         let name = path
             .file_stem()
@@ -161,7 +191,7 @@ impl Capture {
                 if let Some(prio) = rt_priority {
                     crate::try_set_realtime(prio);
                 }
-                read_loop(&inner_c, &stop_c, &mut writer, &packets_c, &bytes_c);
+                read_loop(&inner_c, &stop_c, &mut writer, &counters);
                 if let Err(e) = writer.flush() {
                     warn!(error = %e, "capture flush failed");
                 }
@@ -176,7 +206,23 @@ impl Capture {
             path,
             packets,
             bytes,
+            dropped,
         })
+    }
+
+    /// Stop (draining what the sockets still hold), flush, and return
+    /// the final counters.
+    pub fn finish(mut self) -> CaptureStats {
+        self.stop.store(true, Ordering::Relaxed);
+        if let Some(h) = self.thread.take() {
+            let _ = h.join();
+        }
+        CaptureStats {
+            path: self.path.clone(),
+            packets: self.packets.load(Ordering::Relaxed),
+            bytes: self.bytes.load(Ordering::Relaxed),
+            dropped: self.dropped.load(Ordering::Relaxed),
+        }
     }
 
     /// Signal the capture thread to stop and wait for it to finish
@@ -191,16 +237,49 @@ impl Capture {
 
 /// Frames read from one socket per wakeup before the next is served.
 const BURST: usize = 256;
+/// Frames drained from one socket when the capture stops (bounded, so
+/// a socket that keeps receiving cannot hold the stop up).
+const DRAIN_MAX: usize = 1 << 16;
 
-fn read_loop(
-    inner: &Mutex<Inner>,
-    stop: &AtomicBool,
-    writer: &mut impl Write,
-    packets: &AtomicU64,
-    bytes: &AtomicU64,
-) {
+/// Counters shared with the handle.
+struct Counters {
+    packets: Arc<AtomicU64>,
+    bytes: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
+}
+
+/// How often the kernel's per-socket drop counters are collected.
+const STATS_EVERY: Duration = Duration::from_secs(1);
+
+/// Add the kernel drop counts of `fds` (reset by reading) to `dropped`.
+fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
+    for (fd, _, iface) in fds {
+        let mut st: libc::tpacket_stats = unsafe { mem::zeroed() };
+        let mut len = mem::size_of::<libc::tpacket_stats>() as libc::socklen_t;
+        // SAFETY: `st` is a valid tpacket_stats of `len` bytes.
+        let rc = unsafe {
+            libc::getsockopt(
+                *fd,
+                libc::SOL_PACKET,
+                libc::PACKET_STATISTICS,
+                &mut st as *mut libc::tpacket_stats as *mut libc::c_void,
+                &mut len,
+            )
+        };
+        if rc == 0 && st.tp_drops > 0 {
+            warn!(iface, drops = st.tp_drops, "capture: kernel dropped frames");
+            dropped.fetch_add(u64::from(st.tp_drops), Ordering::Relaxed);
+        }
+    }
+}
+
+fn read_loop(inner: &Mutex<Inner>, stop: &AtomicBool, writer: &mut impl Write, c: &Counters) {
     let mut buf = vec![0u8; 65536];
-    while !stop.load(Ordering::Relaxed) {
+    let mut last_stats = Instant::now();
+    loop {
+        // Once stopping, drain what is queued, collect the drop counts
+        // and exit.
+        let stopping = stop.load(Ordering::Relaxed);
         let socks: Vec<(RawFd, bool, String)> = inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -218,7 +297,8 @@ fn read_loop(
             .collect();
         // SAFETY: `pfds` is a valid array of `pfds.len()` pollfds; with
         // no sockets yet this just sleeps for the timeout.
-        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
+        let timeout = if stopping { 0 } else { 200 };
+        let rc = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, timeout) };
         if rc < 0 {
             let err = io::Error::last_os_error();
             if err.raw_os_error() == Some(libc::EINTR) {
@@ -232,7 +312,8 @@ fn read_loop(
             if p.revents == 0 {
                 continue;
             }
-            for _ in 0..BURST {
+            let burst = if stopping { DRAIN_MAX } else { BURST };
+            for _ in 0..burst {
                 let mut from: libc::sockaddr_ll = unsafe { mem::zeroed() };
                 let mut from_len = mem::size_of::<libc::sockaddr_ll>() as libc::socklen_t;
                 // SAFETY: `buf` and `from` are valid for the given sizes.
@@ -260,6 +341,8 @@ fn read_loop(
                 if n == 0 {
                     break;
                 }
+                // The kernel filter already drops these on lo; this
+                // also covers an unfiltered or older socket.
                 if *loopback && from.sll_pkttype == libc::PACKET_OUTGOING {
                     continue;
                 }
@@ -273,9 +356,13 @@ fn read_loop(
                     warn!(error = %e, "capture write failed");
                     return;
                 }
-                packets.fetch_add(1, Ordering::Relaxed);
-                bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
+                c.packets.fetch_add(1, Ordering::Relaxed);
+                c.bytes.fetch_add(frame.len() as u64, Ordering::Relaxed);
             }
+        }
+        if stopping || last_stats.elapsed() >= STATS_EVERY {
+            collect_drops(&socks, &c.dropped);
+            last_stats = Instant::now();
         }
         if !dead.is_empty() {
             inner
@@ -284,7 +371,43 @@ fn read_loop(
                 .socks
                 .retain(|s| !dead.contains(&s.fd.as_raw_fd()));
         }
+        if stopping {
+            return;
+        }
     }
+}
+
+/// The filter a socket actually carries: on loopback, outgoing copies
+/// are dropped in the kernel first.
+fn effective_filter(loopback: bool, filter: &[bpf::Insn]) -> Vec<bpf::Insn> {
+    if loopback {
+        bpf::skip_outgoing(filter)
+    } else {
+        filter.to_vec()
+    }
+}
+
+/// Ask for [`CAPTURE_RCVBUF`] bytes of receive buffer: SO_RCVBUFFORCE
+/// (needs CAP_NET_ADMIN) and else SO_RCVBUF, which the kernel caps at
+/// `net.core.rmem_max`. Best effort.
+fn grow_rcvbuf(fd: RawFd, iface: &str) {
+    let size: libc::c_int = CAPTURE_RCVBUF;
+    for opt in [libc::SO_RCVBUFFORCE, libc::SO_RCVBUF] {
+        // SAFETY: `size` is a valid c_int.
+        let rc = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                opt,
+                &size as *const libc::c_int as *const libc::c_void,
+                mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc == 0 {
+            return;
+        }
+    }
+    debug!(iface, "capture: could not grow the receive buffer");
 }
 
 /// Link types a capture can record as LINKTYPE_ETHERNET.
@@ -353,8 +476,12 @@ fn open_socket(iface: &str, filter: Option<&[bpf::Insn]>) -> Result<CapSock> {
     }
     // SAFETY: `fd` is a fresh descriptor we own.
     let fd = unsafe { OwnedFd::from_raw_fd(fd) };
-    if let Some(f) = filter {
-        attach_filter(fd.as_raw_fd(), f)?;
+    let loopback = ltype == ARPHRD_LOOPBACK;
+    grow_rcvbuf(fd.as_raw_fd(), iface);
+    match (filter, loopback) {
+        (Some(f), _) => attach_filter(fd.as_raw_fd(), &effective_filter(loopback, f))?,
+        (None, true) => attach_filter(fd.as_raw_fd(), &bpf::skip_outgoing(&bpf::accept_all()))?,
+        (None, false) => {}
     }
     let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
@@ -375,7 +502,7 @@ fn open_socket(iface: &str, filter: Option<&[bpf::Insn]>) -> Result<CapSock> {
     Ok(CapSock {
         fd,
         iface: iface.to_string(),
-        loopback: ltype == ARPHRD_LOOPBACK,
+        loopback,
     })
 }
 

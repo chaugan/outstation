@@ -146,6 +146,9 @@ pub struct RunInfo {
     /// Server port of the endpoint flows in the source pcap. `None` =
     /// the analysis target port, else detected.
     pub source_port: Option<u16>,
+    /// Frames the run's own capture lost to a full kernel queue. Any
+    /// loss makes "missing" frames in the verdict suspect.
+    pub capture_dropped: u64,
 }
 
 /// Everything [`analyze`] needs.
@@ -750,6 +753,15 @@ fn analyze_loaded(
             .then_with(|| a.slave_ip.cmp(&b.slave_ip))
     });
 
+    if run.capture_dropped > 0 {
+        fleet_notes.insert(
+            0,
+            format!(
+                "WARNING: the capture lost {} frames (kernel receive queue full); frames reported missing may have been delivered",
+                run.capture_dropped
+            ),
+        );
+    }
     let (fleet, verdict, verdict_reason, score_pct) = roll_up_fleet(&summaries);
     let RunJudgement {
         verdict,
@@ -1786,6 +1798,26 @@ mod tests {
         assert_eq!(s.outcome, VerdictOutcome::Fail);
         assert!((s.score_pct - 100.0 / 3.0).abs() < 1e-9, "{}", s.score_pct);
         assert_ne!(r.verdict, "all_correct");
+    }
+
+    #[test]
+    fn a_lossy_capture_is_flagged() {
+        let source = source_pcap(&[2]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        let captured = cap.load();
+        let r = run_analysis(&source, &captured, completed_run(&[2]));
+        assert!(!r.notes.iter().any(|n| n.contains("capture lost")));
+        let lossy = RunInfo {
+            capture_dropped: 17,
+            ..completed_run(&[2])
+        };
+        let r = run_analysis(&source, &captured, lossy);
+        assert!(
+            r.notes[0].starts_with("WARNING: the capture lost 17 frames"),
+            "{:?}",
+            r.notes
+        );
     }
 
     #[test]

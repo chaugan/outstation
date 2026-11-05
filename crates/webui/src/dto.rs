@@ -202,6 +202,9 @@ pub struct RunReportJson {
     pub capture_path: Option<String>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (T18b); 0 in old
+    /// rows.
+    pub captured_dropped: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -249,6 +252,7 @@ impl From<&RunReport> for RunReportJson {
             capture_path: r.capture_path.as_ref().map(|p| p.display().to_string()),
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
+            captured_dropped: r.captured_dropped,
         }
     }
 }
@@ -366,6 +370,9 @@ pub struct BenchmarkReportJson {
     pub capture_path: Option<String>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (T18b); 0 in old
+    /// rows.
+    pub captured_dropped: u64,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -609,6 +616,7 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
             capture_path: r.capture_path.as_ref().map(|p| p.display().to_string()),
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
+            captured_dropped: r.captured_dropped,
         }
     }
 }
@@ -629,6 +637,9 @@ pub struct RunReportSummary {
     pub capture_path: Option<String>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (T18b); 0 in old
+    /// rows.
+    pub captured_dropped: u64,
 }
 
 /// Benchmark report without per-session rows or histograms.
@@ -645,6 +656,8 @@ pub struct BenchmarkSummary {
     pub capture_path: Option<String>,
     pub captured_packets: u64,
     pub captured_bytes: u64,
+    /// Frames the capture lost to a full kernel queue (T18b).
+    pub captured_dropped: u64,
     pub sessions: usize,
     /// Sessions that ended with an error (cancelled ones excluded).
     pub sessions_failed: usize,
@@ -747,6 +760,7 @@ impl RunState {
                 capture_path: r.capture_path.clone(),
                 captured_packets: r.captured_packets,
                 captured_bytes: r.captured_bytes,
+                captured_dropped: r.captured_dropped,
             }),
             benchmark: self.benchmark.as_ref().map(|b| BenchmarkSummary {
                 total_messages_sent: b.total_messages_sent,
@@ -760,6 +774,7 @@ impl RunState {
                 capture_path: b.capture_path.clone(),
                 captured_packets: b.captured_packets,
                 captured_bytes: b.captured_bytes,
+                captured_dropped: b.captured_dropped,
                 sessions: b.per_session.len(),
                 sessions_failed: b.sessions_failed(),
                 sessions_cancelled: b.sessions_cancelled(),
