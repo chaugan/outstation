@@ -80,6 +80,11 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Real `/api/status` health (DB writable, free disk, capabilities, active guards).
   - Plain-text logs under journald; run-id tracing spans.
 
+- [ ] **T04b Integration of T03 and T04** (orchestrator, after both merge).
+  - `host_cleanup()` → `netctl::cleanup_all(state_dir)`, wired to SIGTERM, `outstation cleanup` and ExecStopPost.
+  - `api_run` fills `protected_addrs` for RunConfig and BenchmarkConfig with the request's local socket address (ConnectInfo / the bound listener address), from a security review.
+  - Thread the `force` override through RunReq with a UI confirmation.
+
 ## Wave 2: depends on wave 1
 
 - [~] **T05 IEC 104 session state machine** (`proto_iec104/src/session.rs`). Refs: F000, F001, F002, F003, F004, F005, F006, F008, F009, F010, F013, F017, F018, F023, F024, F025, F140, F141, F142, F143, F144, F145, F147, F150.
