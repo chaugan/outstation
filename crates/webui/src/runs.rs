@@ -29,10 +29,6 @@ use crate::events::now_secs;
 use crate::persist::runstate_to_stored;
 use crate::state::{ActiveRun, AppState};
 
-pub(crate) fn get_proto(name: &str) -> Option<Arc<dyn protoplay::ProtoReplayer>> {
-    proto_registry::lookup(name)
-}
-
 /// What actually executes a run. Production uses [`SchedExecutor`];
 /// tests inject fakes so the lifecycle can be exercised without
 /// CAP_NET_ADMIN.
@@ -377,6 +373,7 @@ pub(crate) fn finalize(state: &AppState, id: u64, outcome: RunOutcome) {
     );
     state.emit("run_finished", id, &started_by, None, status.as_str());
     info!(id, status = status.as_str(), "run finished");
+    crate::analysis_run::spawn_auto_analysis(state, id);
 }
 
 fn release_active(state: &AppState, id: u64) {

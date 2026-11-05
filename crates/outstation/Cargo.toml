@@ -20,3 +20,8 @@ protoplay = { path = "../protoplay" }
 proto_registry = { path = "../proto_registry" }
 webui = { path = "../webui" }
 tokio = { workspace = true }
+
+[dev-dependencies]
+libc = { workspace = true }
+serde_json = { workspace = true }
+tempfile = "3"

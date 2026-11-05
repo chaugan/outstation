@@ -55,9 +55,52 @@ pub struct RunState {
     pub throughput_history: Vec<u64>,
     /// Absolute path of this run's capture file.
     pub capture_file: Option<PathBuf>,
+    /// Canonical JSON of the validated request the run was started
+    /// with (T08); `None` for runs that predate it.
+    pub request: Option<serde_json::Value>,
+    /// The run this one re-ran (`POST /api/runs/:id/rerun`).
+    pub rerun_of: Option<u64>,
+    /// Newest stored analysis of this run.
+    pub latest_analysis: Option<AnalysisRef>,
+    /// Automatic post-run analysis progress (this process only).
+    pub auto_analysis: Option<AutoAnalysis>,
     /// Live shared counters from sched. Not serialized.
     #[serde(skip)]
     pub ctx: RunContext,
+}
+
+/// Reference to a stored analysis, carried on run summaries.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AnalysisRef {
+    pub id: u64,
+    pub verdict: String,
+    /// Fleet score in percent.
+    pub score: f64,
+    /// `manual`, `auto` or `on_demand`.
+    pub source: String,
+    pub created_at: u64,
+}
+
+impl From<&crate::db::StoredAnalysis> for AnalysisRef {
+    fn from(a: &crate::db::StoredAnalysis) -> Self {
+        Self {
+            id: a.id,
+            verdict: a.verdict.clone(),
+            score: a.score_pct,
+            source: a.source.clone(),
+            created_at: a.created_at,
+        }
+    }
+}
+
+/// State of the automatic analysis of a finished benchmark run.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct AutoAnalysis {
+    /// `queued`, `running`, `done`, `failed` or `skipped`.
+    pub state: &'static str,
+    /// Why it failed or was skipped.
+    pub error: Option<String>,
+    pub analysis_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -628,6 +671,12 @@ pub struct RunSummary {
     pub has_capture: bool,
     pub report: Option<RunReportSummary>,
     pub benchmark: Option<BenchmarkSummary>,
+    /// The run this one re-ran.
+    pub rerun_of: Option<u64>,
+    /// Newest stored analysis: `{id, verdict, score, source, created_at}`.
+    pub latest_analysis: Option<AnalysisRef>,
+    /// Automatic analysis progress: `{state, error, analysis_id}`.
+    pub auto_analysis: Option<AutoAnalysis>,
 }
 
 impl RunState {
@@ -691,6 +740,9 @@ impl RunState {
                 sessions_failed: b.sessions_failed(),
                 protocol_violations: b.protocol_violations(),
             }),
+            rerun_of: self.rerun_of,
+            latest_analysis: self.latest_analysis.clone(),
+            auto_analysis: self.auto_analysis.clone(),
         }
     }
 }

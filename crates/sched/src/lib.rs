@@ -435,6 +435,7 @@ fn bring_up_topology(
     res: &mut RunResources,
     names: &IfaceNames,
     egress_nic: Option<&str>,
+    peer: Ipv4Addr,
     state_dir: &Path,
     prot: &Protection,
     warnings: &mut Vec<String>,
@@ -449,6 +450,10 @@ fn bring_up_topology(
         Err(e) => warn!(error = %e, "reclaim of stale run interfaces failed"),
     }
     let mut topo = Topology::new(&names.bridge, names.run_id)?;
+    // Isolate the run's interfaces from the host stack before any
+    // exists (fail closed): only `peer` may reach session addresses.
+    topo.harden(&names.tap_prefix, Some(peer), state_dir)
+        .context("isolate run interfaces from the host")?;
     topo.create_bridge().context("create bridge")?;
     res.topo = Some(topo);
     if let Some(nic) = egress_nic {
@@ -471,10 +476,10 @@ fn start_capture(
     rt_priority: Option<i32>,
     warnings: &mut Vec<String>,
 ) {
-    // Capture on a dedicated mirror port attached to the bridge, not on
-    // the bridge device itself: AF_PACKET on the bridge device only
-    // sees a fraction of forwarded traffic, whereas a bridge port sees
-    // every frame the bridge floods or unicasts toward it.
+    // Capture on a dedicated dummy device that every run port mirrors
+    // its ingress and egress to (tc mirred), not on the bridge device
+    // (which only sees a fraction of forwarded traffic) nor on an
+    // extra bridge port (which only sees floods once MACs are learned).
     let port = match names.capture_port() {
         Ok(p) => p,
         Err(e) => {
@@ -485,8 +490,8 @@ fn start_capture(
     let Some(topo) = res.topo.as_mut() else {
         return;
     };
-    match topo.add_port(&port, None) {
-        Ok(_inject) => match Capture::start_with_priority(&port, path, rt_priority) {
+    match topo.add_capture_mirror(&port) {
+        Ok(()) => match Capture::start_with_priority(&port, path, rt_priority) {
             Ok(c) => {
                 info!(path = %path.display(), iface = %port, "capture started");
                 res.capture = Some(c);
@@ -497,8 +502,8 @@ fn start_capture(
             }
         },
         Err(e) => {
-            warn!(error = %e, "could not create capture mirror port");
-            warnings.push(format!("could not create capture port: {e:#}"));
+            warn!(error = %format!("{e:#}"), "could not create capture mirror");
+            warnings.push(format!("could not create capture mirror: {e:#}"));
         }
     }
 }
@@ -639,6 +644,7 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
         &mut res,
         &names,
         cfg.egress_nic.as_deref(),
+        cfg.target_ip,
         &state_dir,
         &prot,
         &mut warnings,
@@ -1392,6 +1398,7 @@ pub fn run_benchmark(
         &mut res,
         &names,
         cfg.egress_nic.as_deref(),
+        cfg.target_ip,
         &state_dir,
         &prot,
         &mut warnings,
@@ -1620,7 +1627,9 @@ pub fn run_benchmark(
                     sp.begin_iteration(iter_idx + 1);
                     let run_cfg = ProtoRunCfg {
                         bind_ip: src_ip,
-                        bind_iface: Some(bridge_side.clone()),
+                        // The source IP lives on the inject end; frames
+                        // sent there enter the bridge via its peer.
+                        bind_iface: Some(inject_side.clone()),
                         target_ip: cfg_w.target_ip,
                         target_port: cfg_w.target_port,
                         tcp_nodelay: cfg_w.tcp_nodelay.unwrap_or(false),

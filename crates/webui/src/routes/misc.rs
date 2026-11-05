@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{ApiJson, AppError};
 use crate::library::library_pcap_path;
 use crate::state::{ActiveRun, AppState};
-use crate::sysinfo::{capabilities, free_bytes, Capabilities};
+use crate::sysinfo::Capabilities;
 
 // Populated by `build.rs` after it splices each proto crate's
 // `static/*.js` into the `@@PROTO_STATIC_JS@@` placeholder in
@@ -60,60 +60,60 @@ pub(crate) struct StatusJson {
     capabilities: Option<Capabilities>,
     active_run: Option<ActiveRun>,
     shutting_down: bool,
+    /// Human-readable degraded reasons (empty when healthy).
     degraded: Vec<String>,
+    /// The same reasons with stable codes: `db_not_writable`,
+    /// `ephemeral`, `low_disk`, `disk_unknown`, `missing_capabilities`,
+    /// `capabilities_unknown`, `journal_unreadable`, `cleanup_pending`,
+    /// `shutting_down`.
+    degraded_detail: Vec<crate::health::Degraded>,
+    /// Entries in netctl's host-state journals.
+    journal_pending: crate::health::JournalPending,
+    /// Whether finished benchmark runs are analysed automatically.
+    auto_analyze: bool,
 }
 
 pub(crate) async fn api_status(State(state): State<AppState>) -> Json<StatusJson> {
-    let st = state.clone();
-    let (db_res, free, caps) = tokio::task::spawn_blocking(move || {
-        (
-            st.db.check_writable(),
-            free_bytes(&st.cfg.state_dir),
-            capabilities(),
-        )
-    })
-    .await
-    .unwrap_or_else(|e| (Err(anyhow::anyhow!("status task: {e}")), None, None));
-    let mut degraded = Vec::new();
-    if let Err(e) = &db_res {
-        degraded.push(format!("run database is not writable: {e:#}"));
-    }
-    if state.cfg.ephemeral {
-        degraded.push("ephemeral mode: run history is not persisted".into());
-    }
-    match free {
-        Some(f) if f < state.cfg.min_free_bytes => degraded.push(format!(
-            "low disk: {f} bytes free in {}",
-            state.cfg.state_dir.display()
-        )),
-        None => degraded.push("free disk space unknown".into()),
-        _ => {}
-    }
-    if let Some(c) = &caps {
-        if !(c.net_admin && c.net_raw) {
-            degraded.push("missing CAP_NET_ADMIN/CAP_NET_RAW: runs will fail".into());
-        }
-    }
+    let h = crate::health::gather(&state).await;
     Json(StatusJson {
-        ok: degraded.is_empty(),
+        ok: h.degraded.is_empty(),
         version: env!("CARGO_PKG_VERSION"),
         uptime_secs: state.started.elapsed().as_secs(),
         db: DbStatus {
             path: state.db.path().map(|p| p.display().to_string()),
             ephemeral: state.cfg.ephemeral,
-            writable: db_res.is_ok(),
-            error: db_res.err().map(|e| format!("{e:#}")),
+            writable: h.db.is_ok(),
+            error: h.db.clone().err(),
         },
         state_dir: state.cfg.state_dir.display().to_string(),
         library_dir: state.cfg.library_dir.display().to_string(),
         captures_dir: state.cfg.captures_dir().display().to_string(),
-        free_disk_bytes: free,
+        free_disk_bytes: h.free,
         min_free_bytes: state.cfg.min_free_bytes,
-        capabilities: caps,
+        capabilities: h.caps.clone(),
         active_run: state.active_run(),
         shutting_down: state.shutdown.is_cancelled(),
-        degraded,
+        degraded: h.degraded.iter().map(|d| d.message.clone()).collect(),
+        degraded_detail: h.degraded.clone(),
+        journal_pending: h.journal.clone(),
+        auto_analyze: state.cfg.auto_analyze,
     })
+}
+
+/// `GET /metrics`: Prometheus text exposition (T13).
+pub(crate) async fn api_metrics(State(state): State<AppState>) -> Response {
+    let h = crate::health::gather(&state).await;
+    let st = state.clone();
+    let body = tokio::task::spawn_blocking(move || crate::metrics::render(&st, &h))
+        .await
+        .unwrap_or_else(|e| format!("# metrics render failed: {e}\n"));
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    (headers, body).into_response()
 }
 
 #[derive(Serialize)]

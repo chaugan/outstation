@@ -28,6 +28,7 @@ use tracing::{debug, warn};
 pub mod alias;
 pub mod cleanup;
 pub mod guard;
+pub mod harden;
 pub mod journal;
 pub mod names;
 pub mod protect;
@@ -93,6 +94,10 @@ pub struct Topology {
     bridge_created: bool,
     /// Pre-existing NICs we enslaved; released (`nomaster`) on teardown.
     enslaved: Vec<String>,
+    /// Host-stack isolation of the run's interfaces ([`harden`]).
+    hardening: Option<harden::Hardening>,
+    /// Capture device every port is mirrored to (`tc mirred`).
+    mirror: Option<String>,
     done: bool,
 }
 
@@ -108,8 +113,33 @@ impl Topology {
             run_id,
             bridge_created: false,
             enslaved: Vec::new(),
+            hardening: None,
+            mirror: None,
             done: false,
         })
+    }
+
+    /// Isolate every interface this topology creates from the host
+    /// stack (see [`harden`]): `prefix` is the run's interface prefix
+    /// (`pcr<tag>_`), `peer` the run's target, the only address allowed
+    /// to reach session source IPs. Call before [`Topology::create_bridge`].
+    /// Ports with a source IP are refused without it.
+    pub fn harden(
+        &mut self,
+        prefix: &str,
+        peer: Option<std::net::Ipv4Addr>,
+        state_dir: &std::path::Path,
+    ) -> Result<()> {
+        if self.hardening.is_some() {
+            bail!("topology is already hardened");
+        }
+        self.hardening = Some(harden::Hardening::install(
+            prefix,
+            peer,
+            self.run_id,
+            state_dir,
+        )?);
+        Ok(())
     }
 
     pub fn run_id(&self) -> u64 {
@@ -139,6 +169,9 @@ impl Topology {
         ip(["link", "add", &self.bridge, "type", "bridge"])?;
         self.bridge_created = true;
         mark_owned(&self.bridge, self.run_id)?;
+        if self.hardening.is_some() {
+            harden::harden_iface(&self.bridge, harden::RpFilter::Strict)?;
+        }
         ip(["link", "set", "dev", &self.bridge, "up"])?;
         Ok(())
     }
@@ -162,9 +195,16 @@ impl Topology {
         self.add_port_with_ip(id, mac, None, &Protection::default())
     }
 
-    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` to
-    /// the bridge-side end so that the kernel can own TCP sockets bound
-    /// to that IP. Needed for protocol-aware modules.
+    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` (and
+    /// `mac`) to the returned inject-side end, so the kernel can own TCP
+    /// sockets bound to that IP. Needed for protocol-aware modules,
+    /// whose sockets must bind to the inject side: a socket bound to the
+    /// bridge-enslaved end transmits into its veth peer, not into the
+    /// bridge, and never reaches the target.
+    ///
+    /// On a hardened topology ([`Topology::harden`]) the inject end is
+    /// isolated before it comes up, and only the run's peer may reach
+    /// `src_ip`. A source IP on an unhardened topology is refused.
     ///
     /// `src_ip` is checked with [`protect::validate_port_ip`] before
     /// anything is created: loopback/multicast/broadcast/reserved
@@ -187,6 +227,16 @@ impl Topology {
                 .chain(own_inject.iter().map(String::as_str))
                 .collect();
             protect::validate_port_ip(ip, prot, &own)?;
+            match &self.hardening {
+                None => bail!(
+                    "refusing a port with source IP {ip} on a topology without host-stack \
+                     isolation (Topology::harden)"
+                ),
+                Some(h) if h.peer.is_none() => {
+                    bail!("a port with source IP {ip} needs the run's peer address")
+                }
+                Some(_) => {}
+            }
         }
         let inject_side = format!("{bridge_side}i");
         names::validate_owned_ifname(&bridge_side)?;
@@ -213,16 +263,70 @@ impl Topology {
         mark_owned(&bridge_side, self.run_id)?;
         mark_owned(&inject_side, self.run_id)?;
         if let Some(mac) = mac {
-            set_mac(&bridge_side, mac)?;
+            // With a source IP the kernel builds the frames on the
+            // inject end, so that end carries the source identity.
+            set_mac(
+                if src_ip.is_some() {
+                    &inject_side
+                } else {
+                    &bridge_side
+                },
+                mac,
+            )?;
+        }
+        if let Some(h) = self.hardening.as_mut() {
+            // Loose reverse-path check on session ends: the host's own
+            // route to the target normally uses another interface, and
+            // the raw ACCEPT rule already pins the source to the peer.
+            harden::harden_iface(&inject_side, harden::RpFilter::Loose)?;
+            if let Some(ip_addr) = src_ip {
+                h.allow_session(ip_addr)?;
+            }
         }
         ip(["link", "set", "dev", &bridge_side, "master", &self.bridge])?;
         ip(["link", "set", "dev", &bridge_side, "up"])?;
         ip(["link", "set", "dev", &inject_side, "up"])?;
         if let Some(ip_addr) = src_ip {
             let cidr = format!("{ip_addr}/32");
-            ip(["addr", "add", &cidr, "dev", &bridge_side])?;
+            ip(["addr", "add", &cidr, "dev", &inject_side])?;
+        }
+        if let Some(cap) = self.mirror.clone() {
+            mirror_port(&bridge_side, &cap)?;
         }
         Ok(inject_side)
+    }
+
+    /// Create the capture device `name`: a `dummy` interface, not a
+    /// bridge port, that every port of this topology (present and
+    /// future) mirrors its ingress and egress frames to with
+    /// `tc ... matchall action mirred egress mirror`. A capture on it
+    /// sees each frame to or from the run's ports exactly once while
+    /// the bridge keeps learning MACs (no hub mode), and nothing on the
+    /// host NICs is touched: the filters live on our own ports and go
+    /// away with them. Needs `tc` (iproute2) with clsact, matchall and
+    /// mirred.
+    pub fn add_capture_mirror(&mut self, name: &str) -> Result<()> {
+        names::validate_owned_ifname(name)?;
+        if self.mirror.is_some() {
+            bail!("topology already has a capture mirror");
+        }
+        if iface_exists(name)? {
+            bail!("interface {name} already exists");
+        }
+        ip(["link", "add", name, "type", "dummy"])?;
+        self.taps.push(name.to_string());
+        mark_owned(name, self.run_id)?;
+        if self.hardening.is_some() {
+            harden::harden_iface(name, harden::RpFilter::Strict)?;
+        }
+        ip(["link", "set", "dev", name, "arp", "off"])?;
+        ip(["link", "set", "dev", name, "up"])?;
+        let ports: Vec<String> = self.taps.iter().filter(|t| *t != name).cloned().collect();
+        for p in &ports {
+            mirror_port(p, name)?;
+        }
+        self.mirror = Some(name.to_string());
+        Ok(())
     }
 
     /// Create a persistent TAP interface and enslave it. Retained for
@@ -258,6 +362,7 @@ impl Topology {
 
     fn do_teardown(&mut self) -> usize {
         let mut errors = 0usize;
+        self.mirror = None;
         for nic in std::mem::take(&mut self.enslaved) {
             if let Err(e) = ip(["link", "set", "dev", &nic, "nomaster"]) {
                 warn!(iface = %nic, error = %e, "release of enslaved NIC failed");
@@ -280,6 +385,10 @@ impl Topology {
             }
         }
         self.bridge_created = false;
+        // Interfaces are gone; only now drop the isolation rules.
+        if let Some(mut h) = self.hardening.take() {
+            errors += h.release();
+        }
         self.done = true;
         errors
     }
@@ -296,7 +405,10 @@ impl Topology {
     }
 
     /// Keep the interfaces after this value is dropped (CLI tools).
+    /// Their isolation rules are kept too (still journaled, so
+    /// [`cleanup_all`] removes them with the interfaces).
     pub fn leak(mut self) {
+        std::mem::forget(self.hardening.take());
         self.done = true;
     }
 }
@@ -312,6 +424,34 @@ impl Drop for Topology {
             self.do_teardown();
         }
     }
+}
+
+/// Mirror ingress and egress of `port` to `cap` with tc.
+fn mirror_port(port: &str, cap: &str) -> Result<()> {
+    tc(["qdisc", "add", "dev", port, "clsact"])?;
+    for dir in ["ingress", "egress"] {
+        tc([
+            "filter", "add", "dev", port, dir, "matchall", "action", "mirred", "egress", "mirror",
+            "dev", cap,
+        ])?;
+    }
+    Ok(())
+}
+
+fn tc<const N: usize>(args: [&str; N]) -> Result<()> {
+    debug!(args = ?args, "tc");
+    let out = Command::new("tc")
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn `tc {}`", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "`tc {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 pub fn set_mac(iface: &str, mac: MacAddr) -> Result<()> {

@@ -1,6 +1,5 @@
 //! Run start, list, detail, stop, delete, gaps and capture download.
 
-use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -8,273 +7,43 @@ use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
 use axum::Json;
-use netctl::parse_mac;
 use pcapload::load;
-use sched::{BenchmarkConfig, ConcurrencyModel, RunConfig, RunContext};
+use sched::RunContext;
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::dto::*;
 use crate::error::{ApiJson, ApiPath, ApiQuery, AppError, LockExt};
 use crate::library::*;
+use crate::runbuild::{self, RequestError, RoleReq, RunMode, RunRequest};
 use crate::runs::*;
 use crate::security::{client_id, ClientIp, LocalIp};
 use crate::state::*;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RunMode {
-    Raw,
-    Benchmark,
-}
+/// Request body of `POST /api/run` (see [`crate::runbuild`]).
+pub(crate) type RunReq = RunRequest;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum RoleReq {
-    Master,
-    Slave,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum PacingReq {
-    Fast,
-    Original,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ConcurrencyReq {
-    AllAtOnce,
-    Staggered,
-}
-
-/// Body of `POST /api/run`. Unknown enum values are rejected with 422
-/// (F056); the pcap is referenced by library id only (F052, F148).
-#[derive(Deserialize)]
-pub(crate) struct RunReq {
-    /// Rejected when present: raw filesystem paths are not accepted.
-    #[serde(default)]
-    pub(crate) pcap: Option<serde_json::Value>,
-    #[serde(default)]
-    pub(crate) pcap_id: Option<String>,
-    pub(crate) target_ip: Ipv4Addr,
-    /// Required for raw replay; ignored in benchmark mode.
-    #[serde(default)]
-    pub(crate) target_mac: String,
-    #[serde(default)]
-    pub(crate) nic: Option<String>,
-    #[serde(default = "default_bridge")]
-    pub(crate) bridge: String,
-    #[serde(default = "default_tap_prefix")]
-    pub(crate) tap_prefix: String,
-    #[serde(default = "default_speed")]
-    pub(crate) speed: f64,
-    #[serde(default)]
-    pub(crate) top_speed: bool,
-    #[serde(default)]
-    pub(crate) realtime: bool,
-    #[serde(default)]
-    pub(crate) skip_non_ip: bool,
-    #[serde(default)]
-    pub(crate) only_src: Vec<Ipv4Addr>,
-    /// Pre-run RTU subset (slave: server IPs; master: client IPs).
-    #[serde(default)]
-    pub(crate) selected_rtus: Vec<Ipv4Addr>,
-    /// Slave-mode only: loop the script within one TCP session.
-    #[serde(default)]
-    pub(crate) loop_within_session: bool,
-    #[serde(default = "default_warmup")]
-    pub(crate) warmup_secs: u64,
-    #[serde(default = "default_mode")]
-    pub(crate) mode: RunMode,
-    #[serde(default = "default_target_port")]
-    pub(crate) target_port: u16,
-    #[serde(default = "default_proto_name")]
-    pub(crate) proto_name: String,
-    #[serde(default = "default_concurrency")]
-    pub(crate) concurrency: ConcurrencyReq,
-    #[serde(default)]
-    pub(crate) proto_config: Option<String>,
-    #[serde(default = "default_role")]
-    pub(crate) role: RoleReq,
-    #[serde(default = "default_listen_port_base")]
-    pub(crate) listen_port_base: u16,
-    #[serde(default = "default_pacing")]
-    pub(crate) pacing: PacingReq,
-    /// Number of times to repeat the captured script. `0` = unlimited.
-    #[serde(default = "default_iterations")]
-    pub(crate) iterations: u64,
-    #[serde(default)]
-    pub(crate) scada_gateway_ip: Option<Ipv4Addr>,
-    #[serde(default)]
-    pub(crate) scada_gateway_iface: Option<String>,
-    #[serde(default)]
-    pub(crate) upstream_nat_iface: Option<String>,
-    #[serde(default)]
-    pub(crate) master_bind_ip: Option<Ipv4Addr>,
-    #[serde(default)]
-    pub(crate) tcp_nodelay: Option<bool>,
-    /// Slave mode: interface that receives RTU listen-IP aliases when
-    /// they are not already local. Defaults to the default-route NIC,
-    /// which is protected (refused unless `force`).
-    #[serde(default)]
-    pub(crate) alias_iface: Option<String>,
-    /// Operator override for netctl's NIC / address protection (default
-    /// route NIC, the address this UI is reached on, bridge ports,
-    /// addresses held by other interfaces). Absolute refusals
-    /// (loopback, gateway, multicast, …) still apply.
-    #[serde(default)]
-    pub(crate) force: bool,
-}
-
-fn default_iterations() -> u64 {
-    1
-}
-fn default_pacing() -> PacingReq {
-    PacingReq::Fast
-}
-fn default_role() -> RoleReq {
-    RoleReq::Master
-}
-fn default_listen_port_base() -> u16 {
-    2404
-}
-fn default_mode() -> RunMode {
-    RunMode::Raw
-}
-fn default_target_port() -> u16 {
-    2404
-}
-fn default_concurrency() -> ConcurrencyReq {
-    ConcurrencyReq::AllAtOnce
-}
-fn default_warmup() -> u64 {
-    5
-}
-fn default_bridge() -> String {
-    "pcr_br0".into()
-}
-fn default_tap_prefix() -> String {
-    "pcr_t".into()
-}
-fn default_speed() -> f64 {
-    1.0
-}
-
-/// Longest warmup accepted, in seconds.
-const MAX_WARMUP_SECS: u64 = 3600;
-
-/// Interface-name check: kernel IFNAMSIZ (15 usable chars), no
-/// wildcard (`+`), no option-like leading `-` (F042).
+/// Interface-name check with the API error shape (F042).
 pub(crate) fn validate_ifname(field: &str, name: &str, max_len: usize) -> Result<(), AppError> {
-    let ok = !name.is_empty()
-        && name.len() <= max_len
-        && !name.starts_with('-')
-        && name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
-    if ok {
-        Ok(())
-    } else {
-        Err(AppError::BadRequest(format!(
-            "{field}: {name:?} is not a valid interface name (1..={max_len} chars of \
-             [A-Za-z0-9._-], not starting with '-')"
-        ))
-        .code("invalid_request"))
-    }
+    runbuild::validate_ifname(field, name, max_len).map_err(AppError::from)
 }
 
-fn bad(msg: impl Into<String>) -> AppError {
-    AppError::BadRequest(msg).code("invalid_request")
+impl From<RequestError> for AppError {
+    fn from(e: RequestError) -> Self {
+        AppError::BadRequest(e.message).code(e.code)
+    }
 }
 
 /// Cheap field checks that need no I/O.
 pub(crate) fn validate_fields(req: &RunReq) -> Result<(), AppError> {
-    if req.pcap.is_some() {
-        return Err(AppError::BadRequest(
-            "raw filesystem paths are not accepted; upload the pcap to the library and \
-             pass its pcap_id",
-        )
-        .code("raw_path_rejected"));
-    }
-    if req.pcap_id.as_deref().unwrap_or("").is_empty() {
-        return Err(bad("pcap_id is required"));
-    }
-    if !(req.speed.is_finite() && (0.001..=1000.0).contains(&req.speed)) {
-        return Err(bad(format!(
-            "speed must be a finite number in 0.001..=1000, got {}",
-            req.speed
-        )));
-    }
-    if req.warmup_secs > MAX_WARMUP_SECS {
-        return Err(bad(format!("warmup_secs must be <= {MAX_WARMUP_SECS}")));
-    }
-    validate_ifname("bridge", &req.bridge, 15)?;
-    validate_ifname("tap_prefix", &req.tap_prefix, 10)?;
-    for (field, v) in [
-        ("nic", &req.nic),
-        ("scada_gateway_iface", &req.scada_gateway_iface),
-        ("upstream_nat_iface", &req.upstream_nat_iface),
-        ("alias_iface", &req.alias_iface),
-    ] {
-        if let Some(n) = v.as_deref().filter(|s| !s.is_empty()) {
-            validate_ifname(field, n, 15)?;
-        }
-    }
-    if req.scada_gateway_ip.is_some()
-        != req
-            .scada_gateway_iface
-            .as_deref()
-            .is_some_and(|s| !s.is_empty())
-    {
-        return Err(bad(
-            "scada_gateway_ip and scada_gateway_iface must be given together",
-        ));
-    }
-    if let Some(pc) = req.proto_config.as_deref().filter(|s| !s.trim().is_empty()) {
-        serde_json::from_str::<serde_json::Value>(pc)
-            .map_err(|e| bad(format!("proto_config is not valid JSON: {e}")))?;
-    }
-    match req.mode {
-        RunMode::Raw => {
-            parse_mac(&req.target_mac).map_err(|e| bad(format!("target_mac: {e}")))?;
-        }
-        RunMode::Benchmark => {
-            if req.target_port == 0 {
-                return Err(bad("target_port must be 1..=65535"));
-            }
-            if req.role == RoleReq::Slave {
-                if req.listen_port_base == 0 {
-                    return Err(bad("listen_port_base must be 1..=65535"));
-                }
-                let n = req.selected_rtus.len().max(1) as u32;
-                if u32::from(req.listen_port_base) + n - 1 > u32::from(u16::MAX) {
-                    return Err(bad(
-                        "listen_port_base + number of selected RTUs exceeds 65535",
-                    ));
-                }
-            }
-            let Some(rep) = get_proto(&req.proto_name) else {
-                return Err(bad(format!("unknown proto_name: {}", req.proto_name)));
-            };
-            if rep.readiness() == protoplay::Readiness::Stub {
-                return Err(AppError::BadRequest(format!(
-                    "protocol {} is a stub and cannot run benchmarks yet",
-                    req.proto_name
-                ))
-                .code("protocol_not_ready"));
-            }
-        }
-    }
-    Ok(())
+    runbuild::validate_request(req).map_err(AppError::from)
 }
 
 /// Build the scheduler job and the RunState template for a validated
 /// request.
-fn build_job(
+pub(crate) fn build_job(
     req: &RunReq,
-    cfg: &ServeConfig,
+    state_dir: &std::path::Path,
     protected_addrs: Vec<std::net::IpAddr>,
 ) -> (RunJob, RunState) {
     let is_bench = req.mode == RunMode::Benchmark;
@@ -317,81 +86,17 @@ fn build_job(
         per_source_progress: Vec::new(),
         throughput_history: Vec::new(),
         capture_file: None,
+        request: Some(runbuild::canonical_json(req)),
+        rerun_of: None,
+        latest_analysis: None,
+        auto_analysis: None,
         ctx: RunContext::new(),
     };
     let job = if is_bench {
-        let replayer = get_proto(&req.proto_name).expect("validated proto");
-        RunJob::Benchmark(
-            BenchmarkConfig {
-                // run_id is set by `launch` once the id is allocated;
-                // bridge/tap names are then derived from it (F035).
-                run_id: 0,
-                target_ip: req.target_ip,
-                target_port: req.target_port,
-                proto_name: req.proto_name.clone(),
-                bridge_name: None,
-                tap_prefix: None,
-                egress_nic: req.nic.clone().filter(|s| !s.is_empty()),
-                concurrency: match req.concurrency {
-                    ConcurrencyReq::Staggered => ConcurrencyModel::StaggeredPcapTiming,
-                    ConcurrencyReq::AllAtOnce => ConcurrencyModel::AllAtOnce,
-                },
-                connect_timeout_secs: 5,
-                startup_delay_secs: req.warmup_secs,
-                capture_path: None,
-                proto_config: req.proto_config.clone(),
-                role: match req.role {
-                    RoleReq::Slave => protoplay::Role::Slave,
-                    RoleReq::Master => protoplay::Role::Master,
-                },
-                listen_port_base: req.listen_port_base,
-                pacing: match req.pacing {
-                    PacingReq::Original => protoplay::Pacing::OriginalTiming { speed: req.speed },
-                    PacingReq::Fast => protoplay::Pacing::AsFastAsPossible,
-                },
-                iterations: req.iterations,
-                scada_gateway_ip: req.scada_gateway_ip,
-                scada_gateway_iface: req.scada_gateway_iface.clone(),
-                upstream_nat_iface: req.upstream_nat_iface.clone().filter(|s| !s.is_empty()),
-                state_dir: Some(cfg.state_dir.clone()),
-                protected_addrs: protected_addrs.clone(),
-                force_protected_nic: req.force,
-                alias_iface: req.alias_iface.clone().filter(|s| !s.is_empty()),
-                master_bind_ip: req.master_bind_ip,
-                tcp_nodelay: req.tcp_nodelay,
-                selected_endpoints: if req.selected_rtus.is_empty() {
-                    None
-                } else {
-                    Some(req.selected_rtus.iter().copied().collect())
-                },
-                loop_within_session: req.loop_within_session,
-            },
-            replayer,
-        )
+        let (cfg, replayer) = runbuild::benchmark_config(req, state_dir, protected_addrs);
+        RunJob::Benchmark(cfg, replayer)
     } else {
-        RunJob::Raw(RunConfig {
-            run_id: 0,
-            target_ip: req.target_ip,
-            target_mac: parse_mac(&req.target_mac).expect("validated mac"),
-            bridge_name: None,
-            tap_prefix: None,
-            egress_nic: req.nic.clone().filter(|s| !s.is_empty()),
-            speed: req.speed,
-            top_speed: req.top_speed,
-            realtime: req.realtime,
-            filter_sources: if req.only_src.is_empty() {
-                None
-            } else {
-                Some(req.only_src.clone())
-            },
-            include_non_ip: !req.skip_non_ip,
-            startup_delay_secs: req.warmup_secs,
-            capture_path: None,
-            iterations: req.iterations,
-            state_dir: Some(cfg.state_dir.clone()),
-            protected_addrs,
-            force_protected_nic: req.force,
-        })
+        RunJob::Raw(runbuild::raw_config(req, state_dir, protected_addrs))
     };
     (job, template)
 }
@@ -416,6 +121,21 @@ pub(crate) async fn api_run(
     headers: HeaderMap,
     ApiJson(req): ApiJson<RunReq>,
 ) -> Result<Json<RunResp>, AppError> {
+    let id = start_run(&state, client_ip, local_ip, &headers, req, None).await?;
+    Ok(Json(RunResp { id }))
+}
+
+/// Validate, load the pcap and launch: the one path behind
+/// `POST /api/run` and `POST /api/runs/:id/rerun`, with the same
+/// validation and single-run rule (409 `run_active`).
+pub(crate) async fn start_run(
+    state: &AppState,
+    client_ip: String,
+    local_ip: Option<std::net::IpAddr>,
+    headers: &HeaderMap,
+    req: RunReq,
+    rerun_of: Option<u64>,
+) -> Result<u64, AppError> {
     validate_fields(&req)?;
     // Fail fast before the (possibly slow) pcap load; `launch`
     // re-checks atomically when it takes the slot.
@@ -428,20 +148,72 @@ pub(crate) async fn api_run(
     // The address the operator reached this UI on must never be taken
     // over by a run (security review of T03/T04).
     let protected: Vec<std::net::IpAddr> = local_ip.into_iter().collect();
-    let (job, template) = build_job(&req, &state.cfg, protected);
-    let id = launch(
-        &state,
+    let (job, mut template) = build_job(&req, &state.cfg.state_dir, protected);
+    template.rerun_of = rerun_of;
+    launch(
+        state,
         Launch {
             pcap,
             pcap_path,
             pcap_id,
             client_ip,
-            client_id: client_id(&headers),
+            client_id: client_id(headers),
             job,
             template,
         },
-    )?;
-    Ok(Json(RunResp { id }))
+    )
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct RerunQuery {
+    /// Re-confirm `force` for the new run. A stored `force: true` is
+    /// never inherited silently: without this the re-run starts with
+    /// `force: false`.
+    #[serde(default)]
+    force: Option<bool>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct RerunResp {
+    id: u64,
+    rerun_of: u64,
+    /// The request the new run was started with.
+    request: serde_json::Value,
+}
+
+/// `POST /api/runs/:id/rerun[?force=true]`: start a new run with the
+/// stored request of run `id`. Same validation and 409 rules as
+/// `POST /api/run`; the new run's `rerun_of` is `id`.
+pub(crate) async fn api_run_rerun(
+    State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
+    LocalIp(local_ip): LocalIp,
+    headers: HeaderMap,
+    ApiPath(id): ApiPath<u64>,
+    ApiQuery(q): ApiQuery<RerunQuery>,
+) -> Result<Json<RerunResp>, AppError> {
+    let stored = {
+        let entry = state
+            .get_run(id)
+            .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
+        let rs = entry.lock_safe();
+        rs.request.clone()
+    }
+    .ok_or_else(|| {
+        AppError::Conflict(
+            "request_missing",
+            format!("run {id} predates stored run requests and cannot be re-run"),
+        )
+    })?;
+    let mut req = runbuild::from_json(stored).map_err(AppError::from)?;
+    req.force = q.force.unwrap_or(false);
+    let request = runbuild::canonical_json(&req);
+    let new_id = start_run(&state, client_ip, local_ip, &headers, req, Some(id)).await?;
+    Ok(Json(RerunResp {
+        id: new_id,
+        rerun_of: id,
+        request,
+    }))
 }
 
 #[derive(Deserialize, Default)]
@@ -462,7 +234,8 @@ pub(crate) async fn api_runs(
         Some(s) => {
             let st = RunStatus::from_str(s);
             if st.as_str() != s {
-                return Err(bad(format!("unknown status filter {s:?}")));
+                return Err(AppError::BadRequest(format!("unknown status filter {s:?}"))
+                    .code("invalid_request"));
             }
             Some(st)
         }
@@ -536,7 +309,13 @@ pub(crate) async fn api_run_delete(
             RunOutcome::Abandoned("run had no live worker".into()),
         );
     }
-    state.runs.lock_safe().remove(&id);
+    {
+        // Fold the run's totals into the metrics before it disappears,
+        // under the lock the scrape takes, so counters never go back.
+        let mut folded = state.metrics.folded.lock_safe();
+        crate::metrics::fold_deleted(&mut folded, &entry.lock_safe());
+        state.runs.lock_safe().remove(&id);
+    }
     state.workers.lock_safe().remove(&id);
     state.gap_cache.lock_safe().remove(&id);
     if let Err(e) = state.db.delete(id) {
