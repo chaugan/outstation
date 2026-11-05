@@ -26,6 +26,111 @@ struct CapSock {
     /// On `lo` every frame is seen twice, once outgoing and once
     /// incoming; the outgoing copy is skipped (as libpcap does).
     loopback: bool,
+    /// The socket's TPACKET_V3 receive ring, when the kernel gave one
+    /// (else frames are read with `recvmsg`).
+    ring: Option<Ring>,
+}
+
+/// Size of one block of a capture's receive ring, and their number:
+/// 32 MiB per socket, like the receive buffer of the `recvmsg` path,
+/// but a block packs frames back to back (about 100 bytes for a small
+/// IEC 104 frame instead of a socket buffer's ~1 KiB per frame), so the
+/// ring holds several times as many frames, and the reader takes a
+/// whole block per wakeup without a system call per frame (T17c).
+const RING_BLOCK_SIZE: u32 = 1 << 20;
+const RING_BLOCKS: u32 = 32;
+/// A block the kernel has started filling is handed to the reader at
+/// the latest this many ms later, even when not full.
+const RING_BLOCK_TIMEOUT_MS: u32 = 2;
+/// TPACKET_V3 (`enum tpacket_versions`).
+const TPACKET_V3: libc::c_int = 2;
+
+/// A TPACKET_V3 receive ring mapped from an AF_PACKET socket.
+struct Ring {
+    base: *mut u8,
+    len: usize,
+}
+
+// SAFETY: the mapping is plain shared memory; only the reader thread
+// touches its contents, and the handle only drops it (after the reader
+// removed the socket or exited).
+unsafe impl Send for Ring {}
+
+impl Drop for Ring {
+    fn drop(&mut self) {
+        // SAFETY: `base`/`len` are the mapping made in `setup_ring`.
+        unsafe {
+            libc::munmap(self.base as *mut libc::c_void, self.len);
+        }
+    }
+}
+
+/// What the reader needs of a socket, copied out of the lock.
+#[derive(Clone)]
+struct SockView {
+    fd: RawFd,
+    loopback: bool,
+    iface: String,
+    /// Ring base address (the mapping outlives the view: only the
+    /// reader removes sockets).
+    ring: Option<usize>,
+}
+
+/// Switch `fd` to TPACKET_V3 and map a receive ring. Fails (and the
+/// socket stays as it was) when the kernel refuses, e.g. for lack of
+/// memory.
+fn setup_ring(fd: RawFd) -> Result<Ring> {
+    let set = |opt: libc::c_int, val: *const libc::c_void, len: usize, what: &str| -> Result<()> {
+        // SAFETY: `val` points at `len` valid bytes.
+        let rc =
+            unsafe { libc::setsockopt(fd, libc::SOL_PACKET, opt, val, len as libc::socklen_t) };
+        if rc < 0 {
+            return Err(io::Error::last_os_error()).with_context(|| format!("set {what}"));
+        }
+        Ok(())
+    };
+    let v = TPACKET_V3;
+    set(
+        libc::PACKET_VERSION,
+        &v as *const libc::c_int as *const libc::c_void,
+        mem::size_of::<libc::c_int>(),
+        "PACKET_VERSION",
+    )?;
+    let frame_size: u32 = 2048;
+    let req = libc::tpacket_req3 {
+        tp_block_size: RING_BLOCK_SIZE,
+        tp_block_nr: RING_BLOCKS,
+        tp_frame_size: frame_size,
+        tp_frame_nr: RING_BLOCK_SIZE / frame_size * RING_BLOCKS,
+        tp_retire_blk_tov: RING_BLOCK_TIMEOUT_MS,
+        tp_sizeof_priv: 0,
+        tp_feature_req_word: 0,
+    };
+    set(
+        libc::PACKET_RX_RING,
+        &req as *const libc::tpacket_req3 as *const libc::c_void,
+        mem::size_of::<libc::tpacket_req3>(),
+        "PACKET_RX_RING",
+    )?;
+    let len = (RING_BLOCK_SIZE as usize) * (RING_BLOCKS as usize);
+    // SAFETY: maps the ring the kernel just allocated for `fd`.
+    let base = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if base == libc::MAP_FAILED {
+        return Err(io::Error::last_os_error()).context("mmap the capture ring");
+    }
+    Ok(Ring {
+        base: base as *mut u8,
+        len,
+    })
 }
 
 /// Sockets and filter shared between the handle and the reader thread.
@@ -325,8 +430,8 @@ const PCAP_RECORD_HEADER: u64 = 16;
 const STATS_EVERY: Duration = Duration::from_secs(1);
 
 /// Add the kernel drop counts of `fds` (reset by reading) to `dropped`.
-fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
-    for (fd, _, iface) in fds {
+fn collect_drops(socks: &[SockView], dropped: &AtomicU64) {
+    for SockView { fd, iface, .. } in socks {
         let mut st: libc::tpacket_stats = unsafe { mem::zeroed() };
         let mut len = mem::size_of::<libc::tpacket_stats>() as libc::socklen_t;
         // SAFETY: `st` is a valid tpacket_stats of `len` bytes.
@@ -340,7 +445,7 @@ fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
             )
         };
         if rc == 0 && st.tp_drops > 0 {
-            warn!(iface, drops = st.tp_drops, "capture: kernel dropped frames");
+            warn!(iface = %iface, drops = st.tp_drops, "capture: kernel dropped frames");
             dropped.fetch_add(u64::from(st.tp_drops), Ordering::Relaxed);
         }
     }
@@ -352,7 +457,12 @@ fn collect_drops(fds: &[(RawFd, bool, String)], dropped: &AtomicU64) {
 /// (the ports' ingress mirror and the enslaved NIC) in turns; written
 /// in arrival order, a reply could land in the file before its request
 /// (a SYN-ACK before its SYN), and pcapload would split the flow.
-const REORDER_HOLD_US: u64 = 5_000;
+///
+/// It also covers a receive ring's block timeout: a frame can wait in
+/// the block the kernel is filling for [`RING_BLOCK_TIMEOUT_MS`]
+/// (rounded up to the timer tick, 10 ms at HZ=100) before the reader
+/// sees it.
+const REORDER_HOLD_US: u64 = 20_000;
 /// Upper bounds on what the reorder buffer holds. Beyond them the
 /// oldest frames are written even if a socket might still hold an
 /// earlier one (a reader that cannot keep up must not grow without
@@ -531,6 +641,96 @@ fn read_socket(
     SockRead::More(n_read, last_ts)
 }
 
+/// Read whole blocks of a TPACKET_V3 ring into `out`, starting at
+/// block `*next`, until a block is still the kernel's or at least
+/// `burst` frames were read. Each frame keeps its kernel receive time
+/// (nanoseconds in the ring, written with microseconds).
+fn read_ring(
+    base: usize,
+    loopback: bool,
+    burst: usize,
+    next: &mut usize,
+    out: &mut Reorder,
+) -> SockRead {
+    use std::sync::atomic::{fence, AtomicU32};
+    let now = Instant::now();
+    let mut n_read = 0usize;
+    let mut last_ts = None;
+    let sll_off = libc::TPACKET3_HDRLEN;
+    loop {
+        if n_read >= burst {
+            return SockRead::More(n_read, last_ts);
+        }
+        let block = (base + *next * RING_BLOCK_SIZE as usize) as *mut u8;
+        // SAFETY: the block lies inside the mapping (next < RING_BLOCKS);
+        // block_status is the u32 the kernel hands over with release
+        // semantics, read here with acquire.
+        let desc = block as *mut libc::tpacket_block_desc;
+        let status = unsafe {
+            let p = std::ptr::addr_of_mut!((*desc).hdr.bh1.block_status);
+            (*(p as *const AtomicU32)).load(Ordering::Acquire)
+        };
+        if status & libc::TP_STATUS_USER == 0 {
+            return SockRead::Empty(n_read);
+        }
+        // SAFETY: a user-owned block holds `num_pkts` frames, each a
+        // tpacket3_hdr followed (at tp_mac) by tp_snaplen bytes, chained
+        // by tp_next_offset, all within the block.
+        unsafe {
+            let bh = std::ptr::addr_of!((*desc).hdr.bh1).read_unaligned();
+            let mut off = bh.offset_to_first_pkt as usize;
+            for _ in 0..bh.num_pkts {
+                if off + sll_off > RING_BLOCK_SIZE as usize {
+                    break;
+                }
+                let h = (block.add(off) as *const libc::tpacket3_hdr).read_unaligned();
+                let start = off + h.tp_mac as usize;
+                let len = h.tp_snaplen as usize;
+                if start + len <= RING_BLOCK_SIZE as usize {
+                    let sll =
+                        (block.add(off + sll_off) as *const libc::sockaddr_ll).read_unaligned();
+                    if !(loopback && sll.sll_pkttype == libc::PACKET_OUTGOING) {
+                        let ts = u64::from(h.tp_sec) * 1_000_000 + u64::from(h.tp_nsec) / 1000;
+                        last_ts = Some(last_ts.map_or(ts, |l: u64| l.max(ts)));
+                        out.push(ts, std::slice::from_raw_parts(block.add(start), len), now);
+                    }
+                }
+                n_read += 1;
+                if h.tp_next_offset == 0 {
+                    break;
+                }
+                off += h.tp_next_offset as usize;
+            }
+            // Hand the block back to the kernel.
+            fence(Ordering::Release);
+            let p = std::ptr::addr_of_mut!((*desc).hdr.bh1.block_status);
+            (*(p as *const AtomicU32)).store(libc::TP_STATUS_KERNEL, Ordering::Release);
+        }
+        *next = (*next + 1) % RING_BLOCKS as usize;
+    }
+}
+
+/// The pending error of a socket (cleared by reading it).
+fn sock_error(fd: RawFd) -> io::Error {
+    let mut err: libc::c_int = 0;
+    let mut len = mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `err` is a valid c_int of `len` bytes.
+    let rc = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_ERROR,
+            &mut err as *mut libc::c_int as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc < 0 {
+        io::Error::last_os_error()
+    } else {
+        io::Error::from_raw_os_error(err)
+    }
+}
+
 /// The `SCM_TIMESTAMP` of a received message, if present.
 fn cmsg_timestamp(msg: &libc::msghdr) -> Option<libc::timeval> {
     // SAFETY: `msg` was filled by recvmsg; the CMSG_* walk stays
@@ -558,23 +758,30 @@ fn read_loop(
 ) {
     let mut buf = vec![0u8; 65536];
     let mut held = Reorder::default();
+    // Next block to read per ring (keyed by its mapping address).
+    let mut ring_next: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     let mut last_stats = Instant::now();
     let mut drained = 0usize;
     loop {
         // Once stopping, drain what is queued, collect the drop counts
         // and exit.
         let stopping = stop.load(Ordering::Relaxed);
-        let socks: Vec<(RawFd, bool, String)> = inner
+        let socks: Vec<SockView> = inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .socks
             .iter()
-            .map(|s| (s.fd.as_raw_fd(), s.loopback, s.iface.clone()))
+            .map(|s| SockView {
+                fd: s.fd.as_raw_fd(),
+                loopback: s.loopback,
+                iface: s.iface.clone(),
+                ring: s.ring.as_ref().map(|r| r.base as usize),
+            })
             .collect();
         let mut pfds: Vec<libc::pollfd> = socks
             .iter()
-            .map(|(fd, _, _)| libc::pollfd {
-                fd: *fd,
+            .map(|v| libc::pollfd {
+                fd: v.fd,
                 events: libc::POLLIN,
                 revents: 0,
             })
@@ -606,11 +813,29 @@ fn read_loop(
         let mut watermark = polled_us.saturating_sub(REORDER_HOLD_US);
         let mut dead: Vec<RawFd> = Vec::new();
         let mut more = false;
-        for (p, (fd, loopback, iface)) in pfds.iter().zip(&socks) {
+        for (p, v) in pfds.iter().zip(&socks) {
             if p.revents == 0 {
                 continue;
             }
-            match read_socket(*fd, *loopback, iface, burst, &mut buf, &mut held) {
+            let got = match v.ring {
+                Some(base) => {
+                    let next = ring_next.entry(base).or_insert(0);
+                    let r = read_ring(base, v.loopback, burst, next, &mut held);
+                    if p.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+                        // The recvmsg path sees this as a failed read
+                        // (e.g. the interface went away): drop the
+                        // socket after taking what its ring holds.
+                        warn!(iface = %v.iface, error = %sock_error(v.fd),
+                            "capture socket failed; dropping interface");
+                        ring_next.remove(&base);
+                        SockRead::Dead
+                    } else {
+                        r
+                    }
+                }
+                None => read_socket(v.fd, v.loopback, &v.iface, burst, &mut buf, &mut held),
+            };
+            match got {
                 SockRead::More(n, last) => {
                     more = true;
                     drained += n;
@@ -621,7 +846,7 @@ fn read_loop(
                     }
                 }
                 SockRead::Empty(n) => drained += n,
-                SockRead::Dead => dead.push(*fd),
+                SockRead::Dead => dead.push(v.fd),
             }
         }
         // Write in kernel time order across sockets (T17c). When the
@@ -808,6 +1033,13 @@ fn open_socket(iface: &str, filter: Option<&[bpf::Insn]>) -> Result<CapSock> {
         (None, true) => attach_filter(fd.as_raw_fd(), &bpf::skip_outgoing(&bpf::accept_all()))?,
         (None, false) => {}
     }
+    let ring = match setup_ring(fd.as_raw_fd()) {
+        Ok(r) => Some(r),
+        Err(e) => {
+            debug!(iface, error = %format!("{e:#}"), "capture: no receive ring; reading frame by frame");
+            None
+        }
+    };
     let mut addr: libc::sockaddr_ll = unsafe { mem::zeroed() };
     addr.sll_family = libc::AF_PACKET as u16;
     addr.sll_protocol = (libc::ETH_P_ALL as u16).to_be();
@@ -828,6 +1060,7 @@ fn open_socket(iface: &str, filter: Option<&[bpf::Insn]>) -> Result<CapSock> {
         fd,
         iface: iface.to_string(),
         loopback,
+        ring,
     })
 }
 
@@ -927,6 +1160,7 @@ mod tests {
                 fd,
                 iface: format!("test{i}"),
                 loopback: false,
+                ring: None,
             })
             .collect();
         Capture::spawn_with_burst(
