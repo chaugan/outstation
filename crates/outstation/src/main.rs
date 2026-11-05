@@ -29,7 +29,7 @@ enum Cmd {
     ListSources { pcap: PathBuf },
     /// List all registered protocol-aware replayer modules.
     ListProtocols,
-    /// Replay a pcap. Every IPv4 source gets its own TAP on an
+    /// Replay a pcap. Every IPv4 source gets its own veth port on an
     /// auto-managed bridge; the bridge optionally enslaves a physical
     /// NIC for real egress.
     Run(RunArgs),
@@ -147,13 +147,15 @@ struct RunArgs {
 
     /// Physical interface to enslave to the bridge so traffic can leave
     /// the host. Omit for isolated loopback/dev runs — the bridge and
-    /// its TAPs will still be created, but nothing will reach the LAN.
+    /// its veth ports will still be created, but nothing will reach the LAN.
     #[arg(long)]
     nic: Option<String>,
 
     #[arg(long, default_value = "pcr_br0")]
     bridge: String,
 
+    /// Name prefix of the per-source veth ports (the option keeps its
+    /// historical name).
     #[arg(long, default_value = "pcr_t")]
     tap_prefix: String,
 

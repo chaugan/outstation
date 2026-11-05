@@ -45,12 +45,25 @@ Host tools the service calls: `ip` and `tc` (iproute2), `iptables` (with the `co
 | `ExecStopPost=-/usr/local/bin/outstation cleanup` | Undo host network changes even after a crash or a SIGKILL. A no-op after a clean stop. The `-` keeps a cleanup failure from failing the unit |
 | `TimeoutStopSec=30`, `KillMode=mixed` | Time for the graceful shutdown below |
 | `Restart=on-failure`, `RestartSec=2` | |
-| `User=outstation`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE` | Not root. Ambient capabilities are inherited by the `ip`, `tc`, `iptables`, `sysctl` and `ethtool` subprocesses |
+| `User=outstation`, `AmbientCapabilities=` and `CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_NICE` | Not root. Ambient capabilities are inherited by the `ip`, `tc`, `iptables`, `sysctl`, `ethtool` and `arping` subprocesses |
 | `NoNewPrivileges`, `ProtectSystem=strict`, `ProtectHome`, `PrivateTmp`, `PrivateDevices`, `ProtectKernelModules`, `ProtectKernelLogs`, `ProtectControlGroups`, `ProtectClock`, `ProtectHostname`, `LockPersonality`, `RestrictSUIDSGID`, `RestrictNamespaces`, `SystemCallArchitectures=native`, `UMask=0027` | Hardening |
 | `ProtectKernelTunables=no` | The run guards write sysctls (`bridge-nf-call-iptables`, `ip_forward`, per-interface settings) |
 | `RestrictAddressFamilies=AF_INET AF_INET6 AF_NETLINK AF_PACKET AF_UNIX` | Sessions, netlink, raw replay and capture, journald |
 | `RestrictRealtime=no` | SCHED_FIFO for raw replay with `realtime` |
 | `StateDirectory=outstation`, `ReadWritePaths=/var/lib/outstation` | Everything the service writes lives here. Nothing lives in its private `/tmp` |
+| `ReadWritePaths=-/run/xtables.lock` | `ProtectSystem=strict` makes `/run` read-only, and iptables-legacy takes its lock at `/run/xtables.lock`. iptables-nft does not use that file. The leading `-` makes systemd ignore the path when it does not exist |
+| `MemoryDenyWriteExecute=yes` | Hardening: no memory mapping that is both writable and executable |
+
+**No system call filter.** The unit sets no `SystemCallFilter`. The service runs helper programs (`ip`, `tc`, `iptables` in its legacy or nft variant, `sysctl`, `ethtool`, `arping`), and the system calls they need vary by distribution and version. A filter cannot be checked without a live privileged run on your host. To try one, add a drop-in with `systemctl edit outstation`:
+
+```ini
+[Service]
+# Untested: verify with a full run (slave, master, raw, gateway) and `outstation cleanup`.
+SystemCallFilter=@system-service @network-io
+SystemCallErrorNumber=EPERM
+```
+
+With `EPERM`, a blocked call fails instead of killing the process, so the run errors at setup or cleanup and the cause is in the service log. Remove the drop-in (`systemctl revert outstation`) if runs or cleanup start failing.
 
 **Graceful stop.** On SIGTERM or SIGINT the server refuses new runs, closes event streams, cancels the active run, waits up to 20 s for run workers to unwind (each restores its host changes as it ends), waits up to 5 s for open HTTP connections, then runs the same cleanup as `outstation cleanup`. A run cut short by a stop is recorded as stopped.
 
@@ -184,6 +197,8 @@ Runs recorded before schema 4 have no stored run request, so they cannot be re-r
 **The run fails with an `iptables` error.** Install `iptables` with the `comment` match and the `raw` table. Every call uses `iptables -w`, so it waits for the xtables lock instead of failing when firewalld, Docker or another tool holds it; a run that hangs at setup may be waiting for that lock. The guards fail closed: when a rule cannot be installed the run fails at setup and what was already done is rolled back.
 
 **No capture, so no analysis.** Raw and master-role runs mirror the ingress of their bridge ports into a capture device with `tc` (`clsact` qdisc, `matchall` filter, `mirred` action), and record the target's replies on the enslaved NIC (incoming frames to the run's MACs, broadcast and multicast, through an AF_PACKET filter), so each wire frame is in the capture exactly once. Without `tc` or those kernel modules the run still goes ahead, but without a capture: the run has no download, and `auto_analysis` is `skipped` with "the run left no capture". The reason is in the service log ("could not create capture mirror"). Slave-role capture uses a filtered AF_PACKET socket and does not need `tc`.
+
+**Raw replay frames arrive untagged.** Raw replay removes 802.1Q VLAN tags (stacked tags and 802.1ad too) from IPv4 frames before sending, so captured traffic replayed onto a trunk port goes out untagged. There is no option to keep the tags. To get the traffic onto a VLAN, send it from an access port in that VLAN, or from a VLAN subinterface used as the egress NIC. Tagged non-IP frames (GOOSE, SV) are sent as captured, tags included. Captures on SLL/SLL2 or raw-IP link types get a synthesized untagged Ethernet header.
 
 **`missing_capabilities` or "Operation not permitted".** Run through the systemd unit, or start the server with `sudo`. Do not rely on `setcap` on the binary: file capabilities are not passed to the `ip`, `tc` and `iptables` subprocesses, which need them too.
 

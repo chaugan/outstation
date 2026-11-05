@@ -94,7 +94,7 @@ Unknown keys and other zones are errors. With rewriting on, the analyzer accepts
 | `t3` | 20 | > 0, ≤ 86400 s | After t3 without receiving anything we send TESTFR act |
 | `idle_serve_secs` | 30 | ≥ 0 | Slave role: keep serving the master (GI/CI, commands, TESTFR, acks) this long after the script ends, unless the master closes first or the run is stopped |
 
-Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3).
+Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3). `w` and `t2` here govern how fast *we* acknowledge; the latency we measure depends on the *peer's* `w` and `t2` ([Session report fields](#session-report-fields)).
 
 **t0 default.** When `t0` is absent the run's connect timeout is used, which is **5 s**, not the IEC default of 30 s. Set `t0` explicitly for slow targets. In slave role t0 is not used: an armed listener waits up to 600 s for the master to connect, then up to 60 s for STARTDT act. Both limits are fixed.
 
@@ -224,6 +224,8 @@ Each session of a benchmark run (`benchmark.per_session[]` in `GET /api/runs/:id
 The engine also records, per session, per-command-type round trips (`commands[]`: `{type_id, commands, act_con, negative, act_term, deact_con, unanswered, actcon_us[], actterm_us[]}`), `negative_confirmations[]`, `faults_injected[]` (`{at_ms, kind, detail, frames_affected}`) and `fault_reaction` (`{peer_closed, peer_reset, peer_stopdt, protocol_errors[], first_reaction_ms, summary}`). All four appear in each session's `protocol` object in `GET /api/runs/:id` and in the `bench` JSON report; the analyzer's `faults` section additionally judges the fault side from the capture.
 
 Latency (`latency_*_us`) is the time from sending an I-frame to the peer acknowledging it (the S-frame or I-frame N(R) that covers it, timestamped on receipt). It is not a command round trip.
+
+**Ack latency is bounded by the peer's w and t2, not the network.** The peer acknowledges on its own schedule: after it has received `w` I-frames, or `t2` after the first unacknowledged one, whichever comes first (the `w` and `t2` that matter are the peer's, not the ones in `session` above). In slave role the live master sends few or no I-frames of its own, so it acknowledges with S-frames by that rule: with sparse telemetry the latency approaches the master's t2 (often 10 s), with dense telemetry it is the time `w` frames take to go out. Read slave-role latency as the master's acknowledgement policy, and compare runs only against the same master settings. In master role an RTU that sends data carries N(R) in its own I-frames and so usually acknowledges sooner.
 
 ## Analysis report
 

@@ -1,5 +1,11 @@
 # 165-RTU IEC 104 fleet replay — fidelity and scale demonstration
 
+> **Errata (2026-11-05).** The body below is left as written on 2026-04-17. Three statements in it are wrong; see also the general caveats in [README.md](README.md#caveats-on-the-2026-04-17-report).
+>
+> 1. **t1/t2/t3.** §2 lists "Per-session state machines (APCI / NS / NR / k-window / t1 / t2 / t3)" and §7 lists "within the slave's k-window and t1 bounds" and "no t1 timeout" as conditions of the result. The engine that ran this test did not implement those timers: it waited a fixed 30 s for an acknowledgement only while the k-window (k = 12) was full and called that t1, it acknowledged after w = 8 received I-frames with no t2 timer, it answered TESTFR act but never sent one (no t3), and it tracked N(S)/N(R) without validating the peer's values. The current engine runs t1, t2 and t3 in both roles (defaults 15 s, 10 s and 20 s, configurable in `proto_config.session`) and checks every N(S) and N(R); see [IEC 104 configuration](../doc/iec104-config.md#what-the-link-engine-does). The analyzer of the time also did not check windows, timers or session close.
+> 2. **"pcapreplay logic"** (§5). There is no pcapreplay component. Read it as "outstation's replay logic": the constant ~55 ms offset comes from the clocks of the two hosts, not from outstation.
+> 3. **"Start All Slaves"** (§8, step 4). No button had that label. At the time it read **START ALL (n)**; today it is **Start all pending (n)** on the run card, and it arms every pending slave listener (`POST /api/runs/:id/slaves/start_all`).
+
 **Date:** 2026-04-17
 **Source pcap:** anonymised real-world IEC 60870-5-104 capture, 222 074 packets, 31.6 MB, 3 minutes 43 seconds wall-clock, 165 distinct RTU servers + 1 master.
 **Replay host:** Ubuntu 24.04 VM on Proxmox, 12 GB RAM, 12 vCPU; chrony-synced to upstream NTP (system-clock offset 51 µs).

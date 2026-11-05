@@ -47,7 +47,7 @@ Det finnes to avspillingsmoduser:
 | Modus | Hva som skjer | Bruk |
 |---|---|---|
 | **Tilstandsfull sesjon** (benchmark) | Ekte TCP-sesjoner som kjører IEC 104-linklaget: STARTDT, k/w-vinduer, kvitteringer, t1/t2/t3, TESTFR. Forsinkelsen måles. | Test av SCADA-mastere, RTU-er og frontender |
-| **Rå L2-avspilling** | Hver opptatte ramme sendes slik den var, fra de opprinnelige avsenderadressene; bare mottakeren skrives om. Ingen TCP-tilstand. | IDS, loggere, analyse av nettverkstrafikk |
+| **Rå L2-avspilling** | Hver opptatte ramme sendes slik den var, fra de opprinnelige avsenderadressene; bare mottakeren skrives om. VLAN-tagger (802.1Q, også stablede) fjernes fra IPv4-rammer, så de går ut utaggede også på en trunk-port; det finnes ikke noe valg for å beholde dem. Taggede ikke-IP-rammer (GOOSE, SV) beholder taggene. Ingen TCP-tilstand. | IDS, loggere, analyse av nettverkstrafikk |
 
 Denne veiledningen handler om tilstandsfulle sesjoner.
 
@@ -122,7 +122,7 @@ outstation spiller RTU-ene i opptaket. Hver RTU får en lytter på sin opptatte 
 
 Under **Configure**:
 
-1. **Source pcap**: opptaket. Biblioteket viser hvor mange RTU-er det inneholder, og en vurdering av om det egner seg (`ok`, `caution`, `heavy`, `not recommended`) med et anslag over minnebruken.
+1. **Source pcap**: opptaket. Biblioteket viser hvor mange RTU-er det inneholder, og en vurdering av om det egner seg (`ok`, `caution`, `heavy`, `not_recommended`) med et anslag over minnebruken.
 2. **Replay mode**: *Stateful session*. **Protocol**: `iec104`. **Role**: *Target is a master*.
 3. **Master IP** (valgfritt): SCADA-masterens adresse. Den brukes til å finne nettverkskortet masterens trafikk kommer inn på, slik at den også blir tatt opp.
 4. **Listen port base**: `2404`, med mindre masteren din bruker en annen port.
@@ -153,7 +153,7 @@ Når kjøringen er ferdig, analyseres den automatisk ut fra outstations eget opp
 
 outstation spiller masteren. Hver master i opptaket (hver klient-IP som snakker med målporten) blir én sesjon som kobler seg til **mål-IP-en** og spiller av masterens side av samtalen: STARTDT, utspørringer, kommandoer, klokkesynkronisering, kvitteringer.
 
-**Én sesjon per master i opptaket.** Et opptak av én SCADA-master som spør 200 RTU-er gir **én** sesjon: masterens første samtale i opptaket som lar seg sette sammen feilfritt. For å teste en bestemt RTU bruker du et opptak av den RTU-ens forbindelse (filtrer pcap-en først om nødvendig). Opptak med flere mastere, for eksempel en frontend som betjener flere driftssentraler, gir én sesjon per master; velgeren (*Masters to replay*) lar deg velge blant dem.
+**Én sesjon per master i opptaket.** Et opptak av én SCADA-master som spør 200 RTU-er gir **én** sesjon: masterens første samtale i opptaket som inneholder data fra masteren. Segmenter som mangler i opptaket, diskvalifiserer den ikke: sammensettingen skjøter bytene på hver side av hullet, sesjonen starter rammingen på nytt etter hullet og dropper rammer som krysser det, og sesjonens detaljer viser dette som **Capture gaps** (antall hull, hoppede bytes, droppede rammer). For å teste en bestemt RTU bruker du et opptak av den RTU-ens forbindelse (filtrer pcap-en først om nødvendig). Opptak med flere mastere, for eksempel en frontend som betjener flere driftssentraler, gir én sesjon per master; velgeren (*Masters to replay*) lar deg velge blant dem.
 
 ### 6.1 Nettverk
 
@@ -245,7 +245,7 @@ sudo virsh net-define isolated.xml && sudo virsh net-start isolated-test && sudo
 
 Kjøringskortet viser status (`completed`, `partial` når noen sesjoner feilet, `stopped`, `failed`), sendte og mottatte meldinger, og nedlasting av opptaket. **Details** viser i tillegg:
 
-- **Ack latency** min/p50/p90/p99/maks: tiden fra en I-ramme sendes til motparten kvitterer, over alle sesjoner, med histogram.
+- **Ack latency** min/p50/p90/p99/maks: tiden fra en I-ramme sendes til motparten kvitterer, over alle sesjoner, med histogram. I scenario A gjenspeiler dette mest masterens egne `w` og `t2`: den kvitterer etter `w` I-rammer eller `t2` etter den første ukvitterte, så glissen telemetri gir forsinkelser nær masterens `t2`. Det er ikke rundturstid i nettet ([detaljer](iec104-config.md#session-report-fields)).
 - **Per sesjon**: sendte og mottatte meldinger, forsinkelsesprosentiler, meldinger per sekund, **window stalls** (hvor ofte sesjonen ventet fordi motparten ikke hadde kvittert for k rammer; et høyt tall betyr at motparten er treg med kvitteringene), **unacked at end**, og eventuell feilmelding.
 - **Gap-histogrammet** sammenligner avstanden mellom rammene i kilden og i avspillingen.
 
