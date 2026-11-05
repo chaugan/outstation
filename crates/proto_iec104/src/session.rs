@@ -24,15 +24,15 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
 use crate::apdu::{
-    write_apdu, Apdu, ApduReader, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT, U_STARTDT_CON,
-    U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
+    write_apdu, Apdu, ApduReader, U_STARTDT_ACT, U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON,
+    U_TESTFR_ACT, U_TESTFR_CON,
 };
 use crate::asdu::{
-    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone,
+    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned,
     Iec104ProtoConfig, RewriteMap, DUI_LEN, IOA_LEN,
 };
 use crate::inventory::Inventory;
-use crate::responder::{build_ci_response, build_gi_response, RequestEcho};
+use crate::responder::{respond_ci, respond_gi, RequestEcho};
 
 #[inline]
 fn wall_clock_unix_ns() -> u64 {
@@ -211,57 +211,26 @@ fn extract_iframes(cfg: &ProtoRunCfg, side_label: &str) -> Vec<Vec<u8>> {
     for seg in &cfg.client_segments {
         stream.extend_from_slice(&seg.bytes);
     }
-    // Mid-flow capture: the byte stream may begin partway through an
-    // APCI frame. Scan forward for the first self-consistent boundary
-    // (0x68 LEN ... where the next frame also starts on 0x68) and
-    // discard the leading partial-frame bytes.
-    let resync = find_apci_resync(&stream);
-    if resync > 0 {
+    // Canonical capture framing (crate::apci): resyncs past a leading
+    // partial frame on a mid-flow capture and past junk after a gap, so
+    // the I-frame list lines up with the pacing timestamps from
+    // `extract_message_times_ns`.
+    let mut frames = crate::apci::frames(&stream);
+    let out: Vec<Vec<u8>> = frames
+        .by_ref()
+        .filter_map(|f| f.asdu().map(<[u8]>::to_vec))
+        .collect();
+    if frames.skipped_bytes() > 0 || frames.trailing_bytes() > 0 {
         info!(
             side = side_label,
-            dropped_bytes = resync,
+            dropped_bytes = frames.skipped_bytes(),
+            resyncs = frames.resyncs(),
+            trailing_bytes = frames.trailing_bytes(),
             total_bytes = stream.len(),
-            "skipped leading mid-frame bytes for APCI resync"
+            "skipped unframed bytes for APCI resync"
         );
     }
-    let mut reader = ApduReader::new(&stream[resync..]);
-    let mut out = Vec::new();
-    loop {
-        match reader.next_apdu() {
-            Ok(Some(Apdu::I { asdu, .. })) => out.push(asdu),
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => {
-                warn!(error = %e, side = side_label, "parse error; stopping reassembly");
-                break;
-            }
-        }
-    }
     out
-}
-
-/// Find the first byte offset where an APCI frame both parses cleanly
-/// and is followed by another frame boundary (or clean EOF). The
-/// two-frame self-consistency check rejects coincidental 0x68 bytes
-/// that appear inside ASDU payload. Returns 0 if the stream already
-/// begins on a frame; returns `stream.len()` if no boundary is found.
-pub(crate) fn find_apci_resync(stream: &[u8]) -> usize {
-    let mut i = 0usize;
-    while i + 2 + APCI_LEN <= stream.len() {
-        if stream[i] == START_BYTE {
-            let len = stream[i + 1] as usize;
-            if (APCI_LEN..=MAX_APDU_LEN).contains(&len) {
-                let next = i + 2 + len;
-                let boundary_ok =
-                    next == stream.len() || (next < stream.len() && stream[next] == START_BYTE);
-                if boundary_ok && Apdu::parse(&stream[i + 2..i + 2 + APCI_LEN]).is_ok() {
-                    return i;
-                }
-            }
-        }
-        i += 1;
-    }
-    stream.len()
 }
 
 pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
@@ -276,8 +245,14 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
+    let cp56_cfg = match Iec104ProtoConfig::parse(cfg.proto_config.as_deref()) {
+        Ok(c) => c.cp56,
+        Err(e) => {
+            report.error = Some(format!("{e}"));
+            return report;
+        }
+    };
+    let cp56_zone = cp56_cfg.zone();
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),
@@ -645,17 +620,22 @@ fn try_queue_master_command_response(
         ca: common_address(asdu),
         oa: asdu[3],
         test: asdu[2] & 0x80 != 0,
-        negative: false,
     };
     let element_byte = asdu[DUI_LEN + IOA_LEN]; // QOI for type 100, QCC for 101
-    let frames = match type_id {
-        100 => build_gi_response(inventory, echo, element_byte),
-        101 => build_ci_response(inventory, echo, element_byte),
+    let response = match type_id {
+        100 => respond_gi(inventory, echo, element_byte),
+        101 => respond_ci(inventory, echo, element_byte),
         _ => return,
     };
-    for f in frames {
-        queue.push_back(f);
+    if response.negative() {
+        debug!(
+            type_id,
+            ca = echo.ca,
+            qualifier = element_byte,
+            "interrogation rejected with negative ActCon"
+        );
     }
+    queue.extend(response.into_asdus());
 }
 
 /// emit an S-frame when our receive window hits `w`.
@@ -777,8 +757,14 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
+    let cp56_cfg = match Iec104ProtoConfig::parse(cfg.proto_config.as_deref()) {
+        Ok(c) => c.cp56,
+        Err(e) => {
+            report.error = Some(format!("{e}"));
+            return report;
+        }
+    };
+    let cp56_zone = cp56_cfg.zone();
     if !rewrite_map.is_empty() {
         info!(
             ca = rewrite_map.common_address.len(),
@@ -807,13 +793,11 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // Spec-strict: see crate::responder for the per-IEC-60870-5-101
     // semantics (ActCon -> values -> ActTerm, QOI/QCC echo, group
     // filtering, k-window aware chunking).
+    // Built from the resynced, CA/IOA-rewritten frames so the
+    // responder's CA filter matches the addresses the live master uses.
     let mut inventory = crate::inventory::Inventory::default();
-    {
-        let mut full = Vec::new();
-        for seg in &cfg.client_segments {
-            full.extend_from_slice(&seg.bytes);
-        }
-        inventory.ingest_payload(&full);
+    for asdu in &server_iframes {
+        inventory.ingest_asdu(asdu);
     }
     info!(
         points = inventory.len(),
@@ -1536,7 +1520,7 @@ mod tests {
         // 0x68 to confirm two-frame self-consistency rejects it.
         let mut junk = vec![0x42, 0x68, 0xff, 0x00, 0x07, 0x99, 0xaa];
         junk.extend_from_slice(&clean);
-        let offset = super::find_apci_resync(&junk);
+        let offset = crate::apci::find_resync(&junk);
         assert_eq!(offset, 7, "should skip 7 junk bytes");
         // Decode from resync point and confirm we recover all 3 I-frames.
         let mut reader = crate::apdu::ApduReader::new(&junk[offset..]);
@@ -1561,12 +1545,12 @@ mod tests {
             }
             .serialize(),
         );
-        assert_eq!(super::find_apci_resync(&clean), 0);
+        assert_eq!(crate::apci::find_resync(&clean), 0);
     }
 
     #[test]
     fn resync_returns_len_when_no_boundary_found() {
         let garbage = vec![0xff; 32];
-        assert_eq!(super::find_apci_resync(&garbage), garbage.len());
+        assert_eq!(crate::apci::find_resync(&garbage), garbage.len());
     }
 }

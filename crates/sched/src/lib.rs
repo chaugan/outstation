@@ -833,7 +833,7 @@ pub fn run(pcap: Arc<LoadedPcap>, cfg: RunConfig, ctx: RunContext) -> Result<Run
                         let mut rewrite_failures = 0u64;
                         for i in &packet_indices {
                             let pkt = &pcap.packets[*i];
-                            let mut data = pkt.data.clone();
+                            let mut data = pkt.ether_frame().into_owned();
                             if kind == SourceKind::Ipv4 {
                                 if let Err(e) = rewrite_in_place(&mut data, target_ip, target_mac) {
                                     warn!(error = %e, "frame rewrite failed, skipping");

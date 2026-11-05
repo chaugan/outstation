@@ -482,7 +482,7 @@ pub fn plan_for_source(pcap: &pcapload::LoadedPcap, src_ip: std::net::Ipv4Addr) 
     let mut plan = Plan::default();
     for &idx in &src.packet_indices {
         let pkt = &pcap.packets[idx];
-        plan.push(pkt.rel_ts_ns, pkt.data.clone());
+        plan.push(pkt.rel_ts_ns, pkt.ether_frame().into_owned());
     }
     Ok(plan)
 }
@@ -602,6 +602,30 @@ mod tests {
         });
         assert_eq!(sent.load(Ordering::Relaxed), 1);
         assert_eq!(global.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn run_plan_at_backwards_timestamps_send_immediately() {
+        // pcapload rel times are non-negative but may go backwards; a
+        // frame whose slot is already past goes out at once, no underflow.
+        let mut plan = Plan::default();
+        plan.push(20_000_000, vec![0u8; 20]);
+        plan.push(0, vec![1u8; 20]);
+        plan.push(10_000_000, vec![2u8; 20]);
+        let sink = VecSink(Default::default());
+        let epoch = now_ns();
+        let stats = run_plan_at(
+            &sink,
+            &plan,
+            Pace::Original { speed: 1.0 },
+            epoch,
+            Default::default(),
+        );
+        assert_eq!(stats.sent, 3);
+        let sent = sink.0.lock().unwrap();
+        // The two late frames follow the first one without waiting.
+        assert!(sent[2].0 - sent[0].0 < 5_000_000);
+        assert!(stats.elapsed_ns < 100_000_000);
     }
 
     #[test]
