@@ -545,6 +545,45 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
 .health-list li + li { margin-top: 4px; }
 .health-list:focus { outline: none; }
 
+/* ---------- profiles, re-run, auto-analysis ---------- */
+.profile-bar { display: flex; flex-wrap: wrap; gap: 10px 14px; align-items: flex-end; }
+.profile-bar .field { flex: 1 1 280px; }
+#prof-status:empty { display: none; }
+.an-state { font-size: var(--fs-xs); color: var(--ink-2); margin-top: 8px; display: flex; flex-wrap: wrap; gap: 4px 14px; align-items: center; }
+.an-link { text-decoration: none; display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.an-link:hover .an-link-id { text-decoration: underline; }
+.an-link-id { color: var(--blue); }
+.auto-st { font-weight: 600; }
+.auto-st.busy { color: var(--blue); }
+.auto-st.auto-running::before { content: '◌ '; }
+.auto-err { font-weight: 400; overflow-wrap: anywhere; }
+.run-msg { font-size: var(--fs-sm); margin-top: 6px; overflow-wrap: anywhere; }
+.run-msg.ok { color: var(--ok); }
+.run-msg.bad { color: var(--err); }
+.run-msg.muted { color: var(--dim); }
+.run-msg .hint-strong { display: block; margin-top: 2px; }
+.err-hint { font-size: var(--fs-xs); margin-top: 2px; }
+.sess-err { display: block; color: var(--err); font-size: var(--fs-xs); overflow-wrap: anywhere; max-width: 32em; }
+.badge.fault-badge { color: var(--warn); }
+.badge.neg-badge { color: var(--err); }
+.fault-reaction { background: var(--surface-2); border-left: 3px solid var(--warn); padding: 6px 10px; font-size: var(--fs-xs); margin: 6px 0; }
+.fault-reaction p + p { margin-top: 4px; }
+.an-faults-dim { font-size: var(--fs-xs); }
+.an-run-state, .an-own { display: block; margin-top: 4px; }
+.ok-box { background: var(--ok-soft); border-left: 3px solid var(--ok); color: var(--ink); padding: 8px 12px; font-size: var(--fs-sm); margin: 6px 0; }
+
+/* ---------- IEC 104 commands and faults ---------- */
+.fault-sum.warn { color: var(--warn); font-weight: 600; }
+.fault-warn { margin: 0 0 12px; }
+.fault-editor { margin-top: 12px; }
+.fault-editor[aria-invalid="true"] { background: transparent; }
+.fault-rows { list-style: none; margin: 0 0 8px; padding: 0; display: flex; flex-direction: column; gap: 10px; }
+.fault-row { border: 1px solid var(--rule); border-left: 3px solid var(--warn); padding: 8px 12px 10px; background: var(--surface); }
+.fault-row > legend { font-size: var(--fs-sm); font-weight: 600; color: var(--ink); padding: 0 4px; margin-bottom: 4px; }
+.fault-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(170px, 1fr)); gap: 10px 14px; align-items: start; }
+.fault-remove { justify-content: flex-end; align-self: end; }
+.fault-remove .btn { align-self: flex-start; }
+
 /* ---------- footer ---------- */
 .footer {
   max-width: 1200px; margin: 0 auto; padding: 16px 24px 32px; border-top: 1px solid var(--rule);
@@ -585,6 +624,7 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
   .an-slave-head > :nth-child(3), .an-slave-head > :nth-child(5) { display: none; }
   .an-slave-sum > :nth-child(4), .an-slave-head > :nth-child(4) { display: none; }
   .an-slave-detail { padding: 8px 6px 12px; }
+  .fault-grid { grid-template-columns: minmax(0, 1fr); }
   .statusbar { flex-wrap: wrap; }
   .an-tid-hist { grid-template-columns: minmax(0, 1fr); }
   .an-anomaly-list .row { grid-template-columns: 60px minmax(0, 1fr) 70px; }

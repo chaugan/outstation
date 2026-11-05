@@ -2,7 +2,9 @@
 // choices, pre-flight validation with inline errors, persisted form
 // state, the RTU picker (filter, sort, shift-range select, selection
 // kept per pcap and role), NIC pickers that flag protected NICs, the
-// override (force) confirmation, and starting a run.
+// override (force) confirmation, and starting a run. The IEC 104
+// command and fault editors live in 35-iec104-config.js, profiles and
+// "load a request into the form" in 32-profiles.js.
 'use strict';
 
 const CFG_INPUTS = [
@@ -11,7 +13,8 @@ const CFG_INPUTS = [
   'cfg-warmup', 'cfg-loop-within-session', 'cfg-top-speed', 'cfg-realtime', 'cfg-skip-non-ip',
   'cfg-fresh-ts', 'cfg-proto-config', 'cfg-k', 'cfg-w', 'cfg-t0', 'cfg-t1', 'cfg-t2', 'cfg-t3',
   'cfg-idle-serve', 'cfg-gi-ci-synth', 'cfg-scada-gw', 'cfg-scada-gw-ip', 'cfg-scada-gw-iface',
-  'cfg-scada-upstream',
+  'cfg-scada-upstream', 'cfg-cmd-enabled', 'cfg-cmd-return-info', 'cfg-cmd-max-age', 'cfg-cmd-unknown-ioa',
+  'cfg-fault-seed',
 ];
 const CFG_RADIOS = ['mode', 'role', 'pacing', 'concurrency', 'cp56-zone'];
 const FORM_KEY = 'runForm.v1';
@@ -36,6 +39,7 @@ function saveForm() {
     o.inputs[id] = n.type === 'checkbox' ? n.checked : (n.value || n.dataset.want || '');
   }
   for (const r of CFG_RADIOS) o.radios[r] = radio(r);
+  o.faults = faultFormState();
   prefs.set(FORM_KEY, o);
 }
 let _saveT = null;
@@ -55,6 +59,7 @@ function loadForm() {
     const r = v && qs(`input[name="${name}"][value="${CSS.escape(v)}"]`);
     if (r) r.checked = true;
   }
+  restoreFaultForm(o.faults);
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +418,9 @@ function validators() {
       for (const id of ['cfg-k', 'cfg-w', 'cfg-t0', 'cfg-t1', 'cfg-t2', 'cfg-t3', 'cfg-idle-serve']) {
         v[id] = () => linkParamErrors()[id] || '';
       }
+      if (c.role === 'slave') v['cfg-cmd-max-age'] = cmdMaxAgeError;
+      v['cfg-fault-seed'] = faultSeedError;
+      v['fault-editor'] = faultEditorError;
     }
     if (val('cfg-scada-gw')) {
       v['cfg-scada-gw-ip'] = () => { const ip = val('cfg-scada-gw-ip'); return !ip ? 'Enter the gateway IP, or turn off gateway mode.' : (isIPv4(ip) ? '' : `"${ip}" is not an IPv4 address.`); };
@@ -473,6 +481,7 @@ function buildProtoConfig() {
   if (c.role === 'slave' && optNum('cfg-idle-serve') != null) session.idle_serve_secs = optNum('cfg-idle-serve');
   if (Object.keys(session).length) obj.session = Object.assign({}, obj.session || {}, session);
   if (!el('cfg-gi-ci-synth').checked) obj.gi_ci_synthesis = false;
+  addIec104Editors(obj, c.role);
   return Object.keys(obj).length ? JSON.stringify(obj) : null;
 }
 
@@ -533,6 +542,7 @@ function renderStartSummary() {
     parts.push(`Stateful ${c.proto}`, c.role === 'slave' ? 'we act as slaves' : 'we act as master');
     const set = pickerSel.get(picker.key);
     if (set && picker.key) parts.push(`${set.size} of ${picker.rows.length} ${c.role === 'slave' ? 'RTUs' : 'masters'}`);
+    if (c.proto === 'iec104' && faultRows.length) parts.push(`${faultPlanSummary()} (breaks the session on purpose)`);
   } else {
     parts.push('Raw L2 replay');
   }
@@ -570,14 +580,14 @@ async function startRun(e) {
   if (btn.disabled) return;
   showRunError('');
   setText(el('run-result'), '');
+  clearIec104ServerErrors();
   const v = validateAll();
   if (!v.ok) {
     setText(el('run-result'), `Fix ${plural(v.count, 'field')} before starting.`);
     const n = el(v.first);
     if (n) {
-      const card = n.closest('details');
-      if (card) card.open = true;
-      (n.tagName === 'DIV' ? (qs('input', n) || n) : n).focus();
+      for (let d = n.closest('details'); d; d = d.parentElement && d.parentElement.closest('details')) d.open = true;
+      (n.tagName === 'DIV' ? (qs('[aria-invalid="true"]', n) || qs('input, select', n) || n) : n).focus();
     }
     return;
   }
@@ -610,9 +620,11 @@ async function startRun(e) {
         `<p><a href="#/runs/${esc(d.active_run_id)}">Open run #${esc(d.active_run_id)}</a></p>`);
       return;
     }
-    const m = String(res.error).match(/^(?:proto_config \(\w+\): )?([a-z_]+)\b/);
-    const field = res.error.startsWith('proto_config') ? 'cfg-proto-config' : (m && FIELD_FOR_PARAM[m[1]]);
-    if (field) fieldError(field, res.error);
+    if (!showIec104ConfigError(res.error)) {
+      const m = String(res.error).match(/^(?:proto_config \(\w+\): )?([a-z_]+)\b/);
+      const field = res.error.startsWith('proto_config') ? 'cfg-proto-config' : (m && FIELD_FOR_PARAM[m[1]]);
+      if (field) fieldError(field, res.error);
+    }
     showRunError(`The server refused the run: ${res.error}`);
     return;
   }
@@ -640,6 +652,10 @@ function updateWatchedRun() {
   }
   setHTML(el('run-result'), `Run #${esc(r.id)} ${esc(r.status)}. ${link}`, { force: true });
   if (r.status === 'failed' || r.error) {
+    // A proto_config error (from the run or its sessions) goes back on
+    // the editor field it came from.
+    const cfgErr = [r.error].concat((r.per_source_progress || []).map(x => x.error)).find(e => /proto_config \((faults|commands)\)/.test(e || ''));
+    if (cfgErr) showIec104ConfigError(cfgErr);
     const forceable = /set force|protected/i.test(r.error || '') && !_usedForce;
     showRunError(`Run #${r.id} ${r.status}: ${r.error || 'no error text recorded'}`,
       forceable ? '<p><button type="button" class="btn btn-secondary" data-act="retry-force">Retry with override…</button></p>' : '');
@@ -673,11 +689,13 @@ actions({
 });
 
 function initConfigure() {
+  initIec104Config();
   loadForm();
   const form = el('run-form');
   form.addEventListener('submit', startRun);
   form.addEventListener('change', e => {
     const t = e.target;
+    if (t.dataset && t.dataset.flt) return;   // fault rows: 35-iec104-config.js
     if (t.id === 'cfg-pcap') { selectPcap(t.value || null); }
     if (t.name === 'mode' || t.name === 'role' || t.name === 'pacing' || t.id === 'cfg-proto') applyVisibility();
     if (t.id === 'cfg-force' || t.tagName === 'SELECT') updateNicWarnings();
@@ -688,7 +706,7 @@ function initConfigure() {
   });
   form.addEventListener('input', e => {
     const t = e.target;
-    if (t.id === 'rtu-filter' || t.classList.contains('rtu-cb')) return;
+    if (t.id === 'rtu-filter' || t.classList.contains('rtu-cb') || (t.dataset && t.dataset.flt)) return;
     // Live feedback once a field has been touched, and always for JSON.
     if (t.id === 'cfg-proto-config' || _touched.has(t.id) || t.getAttribute('aria-invalid') === 'true') validateField(t.id);
     saveFormSoon();
@@ -701,4 +719,5 @@ function initConfigure() {
   on('runs', updateWatchedRun);
   renderNicSelects();
   applyVisibility();
+  initProfiles();
 }

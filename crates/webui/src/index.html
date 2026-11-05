@@ -75,6 +75,25 @@
     <span class="meta">settings are remembered in this browser</span>
   </div>
 
+  <div class="card profiles" id="profiles-card">
+    <h3 class="card-title">Profiles <span class="opt">named run settings, stored on the server</span></h3>
+    <div class="profile-bar">
+      <div class="field">
+        <label for="prof-select">Saved profile</label>
+        <select id="prof-select" aria-describedby="prof-status"></select>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-secondary" id="prof-load" data-act="prof-load">Load into form</button>
+        <button type="button" class="btn btn-secondary" id="prof-save" data-act="prof-save">Save form as new…</button>
+        <button type="button" class="btn btn-secondary" id="prof-overwrite" data-act="prof-overwrite">Overwrite with form</button>
+        <button type="button" class="btn btn-text" id="prof-rename" data-act="prof-rename">Rename…</button>
+        <button type="button" class="btn btn-text danger" id="prof-delete" data-act="prof-delete">Delete</button>
+      </div>
+    </div>
+    <p class="hint" id="prof-status" role="status" aria-live="polite"></p>
+    <div class="run-error" id="prof-error" role="alert"></div>
+  </div>
+
   <form id="run-form" class="run-form" novalidate>
     <fieldset class="seg" id="mode-seg">
       <legend>Replay mode</legend>
@@ -286,6 +305,61 @@
           <div class="field span-4 checks">
             <label class="check"><input id="cfg-gi-ci-synth" type="checkbox" checked aria-describedby="cfg-gi-ci-synth-hint"> Answer GI/CI live (synthesize interrogation responses)</label>
             <p class="hint" id="cfg-gi-ci-synth-hint">Off: captured interrogation bursts are replayed as they were recorded.</p>
+          </div>
+        </div>
+      </details>
+      <details class="sub-collapsible" id="cmd-params" data-role="slave">
+        <summary>Command handling <span class="opt">how our slaves answer the master's commands</span></summary>
+        <div class="grid">
+          <div class="field span-4 checks">
+            <label class="check"><input id="cfg-cmd-enabled" type="checkbox" checked aria-describedby="cfg-cmd-enabled-hint"> Answer commands live (ActCon, ActTerm, negative confirmations)</label>
+            <p class="hint" id="cfg-cmd-enabled-hint">Off: commands are not answered; captured confirmations are replayed as they were recorded.</p>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-return-info">Return information after a command</label>
+            <select id="cfg-cmd-return-info" aria-describedby="cfg-cmd-return-info-hint">
+              <option value="none">None</option>
+              <option value="spontaneous">Monitor update, COT 3 (spontaneous)</option>
+              <option value="retrem">Monitor update, COT 11 (return information, remote command)</option>
+            </select>
+            <p class="hint" id="cfg-cmd-return-info-hint">Sent only when the capture has a monitor point at the commanded address.</p>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-unknown-ioa">Command for an IOA the capture never showed</label>
+            <select id="cfg-cmd-unknown-ioa">
+              <option value="negative">Reject: negative ActCon, COT 47</option>
+              <option value="accept">Accept it as if it were known</option>
+            </select>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-max-age">Max age of time-tagged commands (ms)</label>
+            <input id="cfg-cmd-max-age" type="number" min="0" max="86400000" step="1" placeholder="10000" aria-describedby="cfg-cmd-max-age-hint cfg-cmd-max-age-err">
+            <p class="hint" id="cfg-cmd-max-age-hint">A command whose CP56Time2a is further than this from our clock gets a negative ActCon. 0 turns the check off.</p>
+            <p class="field-err" id="cfg-cmd-max-age-err"></p>
+          </div>
+        </div>
+        <p class="field-err" id="cmd-params-err"></p>
+      </details>
+      <details class="sub-collapsible" id="fault-params">
+        <summary>Fault injection <span class="opt fault-sum" id="fault-summary">none planned</span></summary>
+        <div class="warn-box fault-warn">
+          <p><b>Faults deliberately break the IEC 104 session.</b> They drop, duplicate, corrupt or delay frames, withhold acknowledgements, or reset the connection, so the peer may raise alarms, close the link or fail over. Use them only against test equipment, never against a live control system.</p>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="cfg-fault-seed">Fault seed <span class="opt">optional</span></label>
+            <input id="cfg-fault-seed" type="number" min="0" step="1" placeholder="server default" aria-describedby="cfg-fault-seed-hint cfg-fault-seed-err">
+            <p class="hint" id="cfg-fault-seed-hint">Seeds the percentage faults, so the same plan repeats frame for frame.</p>
+            <p class="field-err" id="cfg-fault-seed-err"></p>
+          </div>
+        </div>
+        <div class="fault-editor" id="fault-editor">
+          <ol class="fault-rows" id="fault-rows" aria-label="Fault plan"></ol>
+          <p class="hint" id="fault-empty">No faults planned: the session runs normally.</p>
+          <p class="field-err" id="fault-editor-err"></p>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="fault-add" data-act="fault-add">Add fault</button>
+            <span class="hint" id="fault-count"></span>
           </div>
         </div>
       </details>
