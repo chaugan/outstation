@@ -296,3 +296,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - ui-smoke: 203 checks pass in Chromium 1440/390 and WebKit 1440.
   - With this, T08 and T10 are complete.
 - 2026-11-05: Orchestrator: IEC 104 `proto_config` is validated at submit through `ProtoReplayer::validate_config`, returning 400 `invalid_proto_config`.
+- 2026-11-05: Orchestrator fixed a race found by a flaky test: the single-run slot was released after the terminal status became visible, giving a spurious 409. A too-tight timing assertion in raw_replay was also relaxed. The full suite then passed 4 runs in a row (406 tests). Note: commit 804c131 was pushed after a red test run; the cause was this race, now fixed.
