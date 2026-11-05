@@ -708,7 +708,7 @@ function renderDetail(box, r, expanded) {
     h += `<dt>Sessions</dt><dd>${fmtInt((b.per_session || []).length)}</dd>`;
     h += `<dt>Messages</dt><dd>${fmtInt(b.total_messages_sent)} sent · ${fmtInt(b.total_messages_received)} received</dd>`;
     h += `<dt>Throughput</dt><dd>${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</dd>`;
-    h += `<dt>Ack latency</dt><dd>min ${fmtInt(b.aggregate_latency_min_us)} µs · p50 ${fmtInt(b.aggregate_latency_p50_us)} µs · p90 ${fmtInt(b.aggregate_latency_p90_us)} µs · p99 ${fmtInt(b.aggregate_latency_p99_us)} µs · max ${fmtInt(b.aggregate_latency_max_us)} µs</dd>`;
+    h += `<dt>Ack latency</dt><dd>min ${usFmt(b.aggregate_latency_min_us || 0)} · p50 ${usFmt(b.aggregate_latency_p50_us || 0)} · p90 ${usFmt(b.aggregate_latency_p90_us || 0)} · p99 ${usFmt(b.aggregate_latency_p99_us || 0)} · max ${usFmt(b.aggregate_latency_max_us || 0)}</dd>`;
     h += `<dt>Protocol violations</dt><dd class="${violations ? 'bad' : 'ok'}">${fmtInt(violations)}</dd>`;
     h += commandFaultTotals(b.per_session || []);
     if (b.capture_path) h += `<dt>Capture</dt><dd>${fmtInt(b.captured_packets)} frames · ${fmtBytes(b.captured_bytes)}</dd>`;
@@ -881,7 +881,7 @@ function protoStatsHtml(s, proto) {
     h += `<dt>Keep-alives (TESTFR)</dt><dd>${fmtInt(p.keepalives_sent)}</dd>`;
     h += `<dt>Synthesized frames</dt><dd>${fmtInt(p.synthesized_frames)} (captured frames stripped: ${fmtInt(p.stripped_capture_frames)})</dd>`;
     if (p.command_response_count) {
-      h += `<dt>Command response</dt><dd>${fmtInt(p.command_response_count)} commands · p50 ${fmtInt(p.command_response_p50_us)} µs · max ${fmtInt(p.command_response_max_us)} µs</dd>`;
+      h += `<dt>Command response</dt><dd>${fmtInt(p.command_response_count)} commands · p50 ${usFmt(p.command_response_p50_us || 0)} · max ${usFmt(p.command_response_max_us || 0)}</dd>`;
     }
     h += `<dt>Idle serve</dt><dd>${fmtDuration(p.idle_serve_ms)}</dd>`;
     h += `<dt>Capture gaps</dt><dd>${fmtInt(p.capture_gaps)} · ${fmtInt(p.script_skipped_bytes)} bytes skipped · ${fmtInt(p.script_dropped_frames)} frames dropped</dd>`;
