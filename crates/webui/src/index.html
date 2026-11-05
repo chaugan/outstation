@@ -20,9 +20,11 @@
       <a href="#/configure" data-view="configure">Configure</a>
       <a href="#/runs" data-view="runs">Runs <span class="nav-badge" id="nav-running" hidden></span></a>
       <a href="#/analysis" data-view="analysis">Analysis</a>
+      <a href="#/compare" data-view="compare">Compare</a>
     </nav>
     <div class="statusbar">
       <a class="active-run" id="active-run" href="#/runs" hidden></a>
+      <button type="button" class="health-chip" id="health-chip" data-act="show-health" hidden></button>
       <span class="conn" id="conn" data-state="connecting" role="status" aria-live="polite">
         <span class="conn-dot" aria-hidden="true"></span><span id="conn-text">connecting…</span>
       </span>
@@ -32,7 +34,7 @@
 
 <div class="banners">
   <div class="banner warn" id="degraded-banner" role="status" hidden>
-    <div class="banner-body"><strong>Server health:</strong> <span id="degraded-text"></span></div>
+    <div class="banner-body"><strong>Server health</strong><div id="degraded-text"></div></div>
     <button type="button" class="btn btn-text" data-act="dismiss-banner" data-target="degraded-banner">Dismiss</button>
   </div>
   <div class="banner info" id="run-banner" role="status" aria-live="polite" hidden>
@@ -72,6 +74,25 @@
   <div class="view-head">
     <h2 id="h-configure" tabindex="-1">Configure run</h2>
     <span class="meta">settings are remembered in this browser</span>
+  </div>
+
+  <div class="card profiles" id="profiles-card">
+    <h3 class="card-title">Profiles <span class="opt">named run settings, stored on the server</span></h3>
+    <div class="profile-bar">
+      <div class="field">
+        <label for="prof-select">Saved profile</label>
+        <select id="prof-select" aria-describedby="prof-status"></select>
+      </div>
+      <div class="btn-row">
+        <button type="button" class="btn btn-secondary" id="prof-load" data-act="prof-load">Load into form</button>
+        <button type="button" class="btn btn-secondary" id="prof-save" data-act="prof-save">Save form as new…</button>
+        <button type="button" class="btn btn-secondary" id="prof-overwrite" data-act="prof-overwrite">Overwrite with form</button>
+        <button type="button" class="btn btn-text" id="prof-rename" data-act="prof-rename">Rename…</button>
+        <button type="button" class="btn btn-text danger" id="prof-delete" data-act="prof-delete">Delete</button>
+      </div>
+    </div>
+    <p class="hint" id="prof-status" role="status" aria-live="polite"></p>
+    <div class="run-error" id="prof-error" role="alert"></div>
   </div>
 
   <form id="run-form" class="run-form" novalidate>
@@ -288,6 +309,61 @@
           </div>
         </div>
       </details>
+      <details class="sub-collapsible" id="cmd-params" data-role="slave">
+        <summary>Command handling <span class="opt">how our slaves answer the master's commands</span></summary>
+        <div class="grid">
+          <div class="field span-4 checks">
+            <label class="check"><input id="cfg-cmd-enabled" type="checkbox" checked aria-describedby="cfg-cmd-enabled-hint"> Answer commands live (ActCon, ActTerm, negative confirmations)</label>
+            <p class="hint" id="cfg-cmd-enabled-hint">Off: commands are not answered; captured confirmations are replayed as they were recorded.</p>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-return-info">Return information after a command</label>
+            <select id="cfg-cmd-return-info" aria-describedby="cfg-cmd-return-info-hint">
+              <option value="none">None</option>
+              <option value="spontaneous">Monitor update, COT 3 (spontaneous)</option>
+              <option value="retrem">Monitor update, COT 11 (return information, remote command)</option>
+            </select>
+            <p class="hint" id="cfg-cmd-return-info-hint">Sent only when the capture has a monitor point at the commanded address.</p>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-unknown-ioa">Command for an IOA the capture never showed</label>
+            <select id="cfg-cmd-unknown-ioa">
+              <option value="negative">Reject: negative ActCon, COT 47</option>
+              <option value="accept">Accept it as if it were known</option>
+            </select>
+          </div>
+          <div class="field span-2">
+            <label for="cfg-cmd-max-age">Max age of time-tagged commands (ms)</label>
+            <input id="cfg-cmd-max-age" type="number" min="0" max="86400000" step="1" placeholder="10000" aria-describedby="cfg-cmd-max-age-hint cfg-cmd-max-age-err">
+            <p class="hint" id="cfg-cmd-max-age-hint">A command whose CP56Time2a is further than this from our clock gets a negative ActCon. 0 turns the check off.</p>
+            <p class="field-err" id="cfg-cmd-max-age-err"></p>
+          </div>
+        </div>
+        <p class="field-err" id="cmd-params-err"></p>
+      </details>
+      <details class="sub-collapsible" id="fault-params">
+        <summary>Fault injection <span class="opt fault-sum" id="fault-summary">none planned</span></summary>
+        <div class="warn-box fault-warn">
+          <p><b>Faults deliberately break the IEC 104 session.</b> They drop, duplicate, corrupt or delay frames, withhold acknowledgements, or reset the connection, so the peer may raise alarms, close the link or fail over. Use them only against test equipment, never against a live control system.</p>
+        </div>
+        <div class="grid">
+          <div class="field">
+            <label for="cfg-fault-seed">Fault seed <span class="opt">optional</span></label>
+            <input id="cfg-fault-seed" type="number" min="0" step="1" placeholder="server default" aria-describedby="cfg-fault-seed-hint cfg-fault-seed-err">
+            <p class="hint" id="cfg-fault-seed-hint">Seeds the percentage faults, so the same plan repeats frame for frame.</p>
+            <p class="field-err" id="cfg-fault-seed-err"></p>
+          </div>
+        </div>
+        <div class="fault-editor" id="fault-editor">
+          <ol class="fault-rows" id="fault-rows" aria-label="Fault plan"></ol>
+          <p class="hint" id="fault-empty">No faults planned: the session runs normally.</p>
+          <p class="field-err" id="fault-editor-err"></p>
+          <div class="btn-row">
+            <button type="button" class="btn btn-secondary" id="fault-add" data-act="fault-add">Add fault</button>
+            <span class="hint" id="fault-count"></span>
+          </div>
+        </div>
+      </details>
     </div>
 
     <details class="card collapsible" data-mode="benchmark" id="scada-gw-card">
@@ -438,6 +514,40 @@
   <div id="an-result"></div>
 </section>
 
+<!-- ================ compare ================ -->
+<section class="view" id="view-compare" data-view="compare" aria-labelledby="h-compare" hidden>
+  <div class="view-head">
+    <h2 id="h-compare" tabindex="-1">Compare runs</h2>
+    <span class="meta">baseline A against candidate B · the address bar keeps the selection, so it can be shared</span>
+  </div>
+  <form class="card" id="cmp-form" novalidate>
+    <div class="grid">
+      <div class="field span-2">
+        <label for="cmp-a">Baseline run (A)</label>
+        <select id="cmp-a" aria-describedby="cmp-a-err"></select>
+        <p class="field-err" id="cmp-a-err"></p>
+      </div>
+      <div class="field span-2">
+        <label for="cmp-b">Candidate run (B)</label>
+        <select id="cmp-b" aria-describedby="cmp-b-err"></select>
+        <p class="field-err" id="cmp-b-err"></p>
+      </div>
+    </div>
+    <p class="hint">Only stateful (benchmark) runs can be compared. Each run needs a stored analysis; the newest one is used.</p>
+    <details class="sub-collapsible" id="cmp-th">
+      <summary>Regression thresholds <span class="opt" id="cmp-th-sum">server defaults</span></summary>
+      <div class="grid" id="cmp-th-grid"></div>
+    </details>
+    <div class="start-actions">
+      <button type="submit" class="btn btn-primary" id="cmp-btn">Compare</button>
+      <button type="button" class="btn btn-secondary" data-act="cmp-swap">Swap A and B</button>
+      <span class="run-result" id="cmp-msg" role="status" aria-live="polite"></span>
+    </div>
+    <div class="run-error" id="cmp-error" role="alert"></div>
+  </form>
+  <div id="cmp-result"></div>
+</section>
+
 </main>
 
 <footer class="footer">
@@ -445,6 +555,8 @@
   <span><span class="k">Topology</span> <span class="v">veth per source</span></span>
   <span><span class="k">Protocols</span> <span class="v" id="foot-protocols">—</span></span>
   <span><span class="k">UI</span> <span class="v" id="foot-version">—</span></span>
+  <span><span class="k">Auto-analysis</span> <span class="v" id="foot-auto">—</span></span>
+  <span><span class="k">Metrics</span> <a class="v" href="/metrics">/metrics</a> <span class="muted">(Prometheus)</span></span>
 </footer>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>

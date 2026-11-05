@@ -2,8 +2,9 @@
 // that shows each run's status (F108, F093), the captured-pcap drop
 // zone, the report with the new verdicts, run warnings and fleet
 // counters, endpoint drill-downs rendered only when opened (F115),
-// stored analyses of a run, and a JSON download that does not leak
-// blob URLs.
+// stored analyses of a run (with their source: manual, auto or
+// on-demand), analysing a run's own replay capture, and a JSON download
+// that does not leak blob URLs.
 'use strict';
 
 const an = { file: null, report: null, analysisId: null, details: new Map(), filter: '', verdict: '' };
@@ -33,7 +34,9 @@ function renderRunPicker() {
   const want = sel.value || sel.dataset.want || '';
   let h = runs.length ? '' : '<option value="">No benchmark runs yet</option>';
   for (const r of runs) {
-    const label = `${runNum(r.id)} · ${r.status} · ${r.role} · ${libraryName(r.pcap_id, r.pcap)} · ${fmtClock(r.started_at)}`;
+    const la = r.latest_analysis;
+    const done = la ? ` · analysed: ${String(la.verdict).replace(/_/g, ' ')} ${Number(la.score).toFixed(1)}%` : '';
+    const label = `${runNum(r.id)} · ${r.status} · ${r.role} · ${libraryName(r.pcap_id, r.pcap)} · ${fmtClock(r.started_at)}${done}`;
     h += `<option value="${r.id}"${r.status === 'running' ? ' disabled' : ''}>${esc(label)}${r.status === 'running' ? ' (still running)' : ''}</option>`;
   }
   if (sel._html !== h) {
@@ -66,9 +69,14 @@ function renderRunInfo() {
   if (r.status === 'failed' || (b && !b.total_messages_sent)) {
     h += `<span class="warn-line">This run ${r.status === 'failed' ? 'failed' : 'sent nothing'}${r.error ? ': ' + esc(r.error) : ''}. The analysis will say so instead of certifying delivery.</span>`;
   }
+  const st = analysisStateHtml(r);
+  if (st) h += `<span class="an-run-state">${st}</span>`;
+  if (r.has_capture && r.status !== 'running') {
+    h += `<span class="an-own">This run has its own replay capture: <button type="button" class="btn btn-text" data-act="an-own" data-id="${r.id}" data-fk="an-own-${r.id}"${an.ownBusy ? ' disabled' : ''}>${an.ownBusy ? 'Analysing…' : 'Analyze it (no upload needed)'}</button></span>`;
+  }
   h += `<span class="prev-analyses" id="an-prev"></span>`;
-  setHTML(box, h);
-  if (_prevListFor !== r.id) { _prevListFor = r.id; loadPrevAnalyses(r.id); }
+  // A re-render empties the stored-analyses list: load it again.
+  if (setHTML(box, h) || _prevListFor !== r.id) { _prevListFor = r.id; loadPrevAnalyses(r.id); }
   updateAnalyzeBtn();
 }
 
@@ -77,8 +85,8 @@ async function loadPrevAnalyses(runId) {
   const box = el('an-prev');
   if (!box || _prevListFor !== runId) return;
   if (!res.ok || !Array.isArray(res.data) || !res.data.length) { box.textContent = ''; return; }
-  box.innerHTML = ' Earlier analyses: ' + res.data.slice(0, 5).map(a =>
-    `<button type="button" class="btn btn-text" data-act="an-open" data-id="${esc(a.id)}">#${esc(a.id)} ${esc(String(a.verdict).replace(/_/g, ' '))} ${Number(a.score_pct).toFixed(1)}% (${esc(fmtClock(a.created_at))})</button>`).join(' ');
+  box.innerHTML = ' Stored analyses: ' + res.data.slice(0, 5).map(a =>
+    `<button type="button" class="btn btn-text" data-act="an-open" data-id="${esc(a.id)}">#${esc(a.id)} ${esc(String(a.verdict).replace(/_/g, ' '))} ${Number(a.score_pct).toFixed(1)}% (${a.source ? esc(String(a.source).replace(/_/g, '-')) + ', ' : ''}${esc(fmtClock(a.created_at))})</button>`).join(' ');
 }
 
 function updateAnalyzeBtn() {
@@ -130,6 +138,38 @@ async function runAnalysis() {
   renderRunInfo();
 }
 
+// POST /api/runs/:id/analyze: analyse the run's own replay capture.
+async function analyzeOwnCapture(runId) {
+  if (an.ownBusy) return;
+  an.ownBusy = true;
+  renderRunInfo();
+  setText(el('an-msg'), `Analysing the replay capture of ${runNum(runId)}…`);
+  setHTML(el('an-error'), '', { force: true });
+  const res = await api(`/api/runs/${runId}/analyze`, 'POST', null, { timeout: 0 });
+  an.ownBusy = false;
+  renderRunInfo();
+  if (!res.ok || !res.data) {
+    setText(el('an-msg'), '');
+    setHTML(el('an-error'), `<div class="err-box">Analysis of ${esc(runNum(runId))} failed: ${esc(res.error || 'bad reply')}${analyzeErrorHint(res.code) ? `<p class="hint-strong">${esc(analyzeErrorHint(res.code))}</p>` : ''}</div>`, { force: true });
+    return;
+  }
+  _prevListFor = null;
+  renderRunInfo();
+  pollRunsSoon();
+  await openStoredAnalysis(res.data.analysis_id);
+}
+
+// Why POST /api/runs/:id/analyze was refused, in operator terms.
+function analyzeErrorHint(code) {
+  return {
+    capture_missing: 'The run has no replay capture (slave-mode runs, and runs that failed before sending, have none). Upload a capture taken on the target side instead.',
+    run_running: 'The run is still running; analyse it once it has finished.',
+    not_benchmark: 'Only stateful (benchmark) runs can be analysed.',
+    source_pcap_missing: 'The run\'s source pcap is no longer in the library, so there is nothing to compare the capture against. Upload it again.',
+    busy: 'The server is already running as many analyses as it allows. Wait a moment and try again.',
+  }[code] || '';
+}
+
 async function openStoredAnalysis(id) {
   setText(el('an-msg'), `Loading analysis #${id}…`);
   const res = await api(`/api/analyses/${encodeURIComponent(id)}`);
@@ -165,6 +205,7 @@ actions({
   analyze: runAnalysis,
   'analysis-download': downloadReport,
   'an-open': b => openStoredAnalysis(b.dataset.id),
+  'an-own': b => analyzeOwnCapture(Number(b.dataset.id)),
 });
 
 // ---------------------------------------------------------------------------
@@ -333,10 +374,18 @@ function initAnalysis() {
   el('an-run').addEventListener('change', () => { _prevListFor = null; renderRunInfo(); });
   on('runs', () => { if (S.view === 'analysis') renderRunPicker(); });
   on('library', () => { if (S.view === 'analysis') renderRunPicker(); });
-  on('route', ({ view, arg }) => {
+  on('route', ({ view, arg, args }) => {
     if (view !== 'analysis') return;
     if (arg && /^\d+$/.test(arg)) { el('an-run').dataset.want = arg; el('an-run').value = ''; }
     renderRunPicker();
+    // #/analysis/<run>/<analysis>: open that stored analysis.
+    const aid = args && args[1];
+    if (aid && /^\d+$/.test(aid) && an.analysisId !== Number(aid)) openStoredAnalysis(aid);
+  });
+  on('analysis-event', ({ data }) => {
+    if (S.view !== 'analysis') return;
+    const r = selectedRun();
+    if (r && Number(data.run_id) === r.id) { _prevListFor = null; renderRunInfo(); }
   });
   let rt = null;
   window.addEventListener('resize', () => {

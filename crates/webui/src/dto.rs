@@ -429,6 +429,64 @@ pub struct ProtocolStatsJson {
     pub idle_serve_ms: u64,
     pub acks_sent: u64,
     pub keepalives_sent: u64,
+    /// Per command type round-trip figures (T11), sorted by type ID.
+    /// The sample arrays are capped by the session; the UI computes
+    /// percentiles from them.
+    pub commands: Vec<CommandTypeStatsJson>,
+    /// Negative command confirmations, capped by the session.
+    pub negative_confirmations: Vec<NegativeConfirmationJson>,
+    /// Deliberately injected faults (T12), capped by the session.
+    pub faults_injected: Vec<FaultRecordJson>,
+    /// Peer reaction to the injected faults; `None` when none fired.
+    pub fault_reaction: Option<FaultReactionJson>,
+}
+
+/// [`protoplay::CommandTypeStats`] for the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CommandTypeStatsJson {
+    pub type_id: u8,
+    pub commands: u64,
+    pub act_con: u64,
+    pub negative: u64,
+    pub act_term: u64,
+    pub deact_con: u64,
+    pub unanswered: u64,
+    pub actcon_us: Vec<u64>,
+    pub actterm_us: Vec<u64>,
+}
+
+/// [`protoplay::NegativeConfirmation`] for the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct NegativeConfirmationJson {
+    pub at_ms: u64,
+    pub type_id: u8,
+    pub ca: u16,
+    pub ioa: u32,
+    pub cot: u8,
+}
+
+/// [`protoplay::FaultRecord`] for the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FaultRecordJson {
+    pub at_ms: u64,
+    pub kind: String,
+    pub detail: String,
+    pub frames_affected: u64,
+}
+
+/// [`protoplay::FaultReaction`] for the UI.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct FaultReactionJson {
+    pub peer_closed: bool,
+    pub peer_reset: bool,
+    pub peer_stopdt: bool,
+    pub protocol_errors: Vec<String>,
+    pub first_reaction_ms: Option<u64>,
+    pub summary: String,
 }
 
 impl From<&protoplay::ProtocolStats> for ProtocolStatsJson {
@@ -458,6 +516,50 @@ impl From<&protoplay::ProtocolStats> for ProtocolStatsJson {
             idle_serve_ms: p.idle_serve_ms,
             acks_sent: p.acks_sent,
             keepalives_sent: p.keepalives_sent,
+            commands: p
+                .commands
+                .iter()
+                .map(|c| CommandTypeStatsJson {
+                    type_id: c.type_id,
+                    commands: c.commands,
+                    act_con: c.act_con,
+                    negative: c.negative,
+                    act_term: c.act_term,
+                    deact_con: c.deact_con,
+                    unanswered: c.unanswered,
+                    actcon_us: c.actcon_us.clone(),
+                    actterm_us: c.actterm_us.clone(),
+                })
+                .collect(),
+            negative_confirmations: p
+                .negative_confirmations
+                .iter()
+                .map(|n| NegativeConfirmationJson {
+                    at_ms: n.at_ms,
+                    type_id: n.type_id,
+                    ca: n.ca,
+                    ioa: n.ioa,
+                    cot: n.cot,
+                })
+                .collect(),
+            faults_injected: p
+                .faults_injected
+                .iter()
+                .map(|f| FaultRecordJson {
+                    at_ms: f.at_ms,
+                    kind: f.kind.clone(),
+                    detail: f.detail.clone(),
+                    frames_affected: f.frames_affected,
+                })
+                .collect(),
+            fault_reaction: p.fault_reaction.as_ref().map(|r| FaultReactionJson {
+                peer_closed: r.peer_closed,
+                peer_reset: r.peer_reset,
+                peer_stopdt: r.peer_stopdt,
+                protocol_errors: r.protocol_errors.clone(),
+                first_reaction_ms: r.first_reaction_ms,
+                summary: r.summary.clone(),
+            }),
         }
     }
 }
@@ -860,6 +962,60 @@ mod tests {
         // Old rows without the field still load.
         let old: SessionReportJson = serde_json::from_str(r#"{"src_ip":"10.0.0.1"}"#).unwrap();
         assert!(old.protocol.is_none());
+    }
+
+    #[test]
+    fn session_json_carries_commands_and_faults() {
+        let mut s = session(vec![10], 5);
+        let p = &mut s.proto_report.protocol;
+        p.commands = vec![protoplay::CommandTypeStats {
+            type_id: 45,
+            commands: 2,
+            act_con: 1,
+            negative: 1,
+            act_term: 1,
+            actcon_us: vec![300, 100],
+            actterm_us: vec![900],
+            ..Default::default()
+        }];
+        p.negative_confirmations = vec![protoplay::NegativeConfirmation {
+            at_ms: 12,
+            type_id: 45,
+            ca: 1,
+            ioa: 4001,
+            cot: 47,
+        }];
+        p.faults_injected = vec![protoplay::FaultRecord {
+            at_ms: 500,
+            kind: "rst".into(),
+            detail: "connection reset".into(),
+            frames_affected: 0,
+        }];
+        p.fault_reaction = Some(protoplay::FaultReaction {
+            peer_reset: true,
+            first_reaction_ms: Some(3),
+            summary: "1 fault injected".into(),
+            ..Default::default()
+        });
+        let r = BenchmarkReport {
+            per_session: vec![s],
+            ..Default::default()
+        };
+        let v = serde_json::to_value(BenchmarkReportJson::from(&r)).unwrap();
+        let p = &v["per_session"][0]["protocol"];
+        assert_eq!(p["commands"][0]["type_id"], 45);
+        assert_eq!(p["commands"][0]["actcon_us"], serde_json::json!([300, 100]));
+        assert_eq!(p["negative_confirmations"][0]["cot"], 47);
+        assert_eq!(p["faults_injected"][0]["kind"], "rst");
+        assert_eq!(p["fault_reaction"]["peer_reset"], true);
+        assert_eq!(p["fault_reaction"]["first_reaction_ms"], 3);
+        // A stored report round-trips, and rows written before these
+        // fields existed still load with empty defaults.
+        let back: BenchmarkReportJson = serde_json::from_value(v).unwrap();
+        let bp = back.per_session[0].protocol.as_ref().unwrap();
+        assert_eq!(bp.commands[0].actterm_us, vec![900]);
+        let old: ProtocolStatsJson = serde_json::from_str(r#"{"protocol_violations":1}"#).unwrap();
+        assert!(old.commands.is_empty() && old.fault_reaction.is_none());
     }
 
     #[test]

@@ -330,6 +330,10 @@
         h += `<li class="${cls}"><span aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '–'}</span> ${esc(label)}: ${word}</li>`;
       }
       h += `</ul>`;
+      // Injected faults are not pass/fail: a summary string, or null.
+      if (typeof dims.faults === 'string' && dims.faults) {
+        h += `<div class="warn-box an-faults-dim"><b>Fault injection:</b> ${esc(dims.faults)}</div>`;
+      }
     }
 
     if (pb) {
@@ -339,6 +343,16 @@
       if (pb.gi_ci_synthesis != null) {
         h += `<div class="k">GI/CI synthesis</div><div class="v">${pb.gi_ci_synthesis ? 'on' : 'off'}${pb.source_interrogation_stripped ? ` · ${pb.source_interrogation_stripped} captured interrogation frames not expected` : ''}${pb.synthesized_excluded ? ` · ${pb.synthesized_excluded} synthesized frames excluded` : ''}</div>`;
       }
+      const cmdParts = [];
+      if (pb.command_echo != null) cmdParts.push(`command echo ${pb.command_echo ? 'on' : 'off'}`);
+      if (pb.source_command_stripped) cmdParts.push(`${pb.source_command_stripped} captured command confirmations not expected`);
+      if (pb.source_return_info_stripped) cmdParts.push(`${pb.source_return_info_stripped} captured return-information frames (COT 11) not expected`);
+      if (pb.command_responses_excluded) cmdParts.push(`${pb.command_responses_excluded} synthesized command responses excluded`);
+      if (cmdParts.length) h += `<div class="k">commands</div><div class="v">${esc(cmdParts.join(' · '))}</div>`;
+      const faultParts = [];
+      if (pb.fault_dropped_excused) faultParts.push(`${pb.fault_dropped_excused} missing frames excused (dropped on purpose)`);
+      if (pb.fault_duplicates_excluded) faultParts.push(`${pb.fault_duplicates_excluded} duplicates excluded (sent on purpose)`);
+      if (faultParts.length) h += `<div class="k">fault effects</div><div class="v warn">${esc(faultParts.join(' · '))}</div>`;
       if (pb.iterations_observed != null) {
         h += `<div class="k">iterations</div><div class="v">${pb.iterations_observed} observed${pb.iterations_configured ? ' of ' + pb.iterations_configured : ''} · ${pb.iterations_complete || 0} complete · ${pb.iterations_clean || 0} clean${pb.stopped_tail ? ` · stopped in iteration ${pb.stopped_tail.iteration} after ${pb.stopped_tail.sent}/${pb.stopped_tail.script_iframes} frames${pb.stopped_tail.clean ? ' (clean)' : ''}` : ''}</div>`;
       }
@@ -523,11 +537,30 @@
       h += renderGiCiAudit(audit);
     }
 
+    if (ps.faults) h += renderFaultsSection(ps.faults);
+
     if (d.notes && d.notes.length) {
       h += `<div class="an-h">Notes</div>`;
       for (const n of d.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
     }
 
+    return h;
+  }
+
+  // Analyzer's view of the injected faults (protocol_specific.faults):
+  // what the capture shows of them and how the peer reacted.
+  function renderFaultsSection(f) {
+    const ms = v => (v == null ? '—' : `${Number(v).toFixed(0)} ms`);
+    let h = `<div class="an-h">Injected faults</div>`;
+    if (f.summary) h += `<p class="hint">${esc(f.summary)}</p>`;
+    h += `<div class="an-kv">`;
+    h += `<div class="k">configured</div><div class="v">${esc(f.configured)}${(f.kinds || []).length ? ' · ' + (f.kinds || []).map(k => `<code>${esc(k)}</code>`).join(', ') : ''}${f.seed != null ? ` · seed ${esc(f.seed)}` : ''}</div>`;
+    h += `<div class="k">in the capture</div><div class="v">${esc(f.dropped_ns || 0)} dropped N(S) · ${esc(f.duplicates || 0)} duplicates · ${esc(f.corrupted_ns || 0)} corrupted N(S) · ${esc(f.malformed_bytes || 0)} unframeable bytes · ${esc(f.stopdt_sent || 0)} STOPDT sent</div>`;
+    h += `<div class="k">first fault</div><div class="v">${f.first_fault_ms == null ? 'did not fire in the captured session' : 'at ' + ms(f.first_fault_ms)}</div>`;
+    if (f.first_fault_ms != null) {
+      h += `<div class="k">peer reaction</div><div class="v">${f.peer_stopdt ? '<span class="warn">sent STOPDT</span> · ' : ''}${esc(f.peer_frames_after_first_fault || 0)} frames after the first fault · session ended ${ms(f.session_end_after_first_fault_ms)} after it</div>`;
+    }
+    h += `</div>`;
     return h;
   }
 
@@ -704,5 +737,5 @@
   }
 
   window.PROTOCOL_RENDERERS = window.PROTOCOL_RENDERERS || {};
-  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts, renderFleetExtras };
+  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts, renderFleetExtras, tidName };
 })();

@@ -6,15 +6,22 @@
 
 // ---------------------------------------------------------------------------
 // Router. Routes: #/library, #/configure, #/runs, #/runs/<id>, #/analysis,
-// #/analysis/<runId>. Reload keeps the view.
+// #/analysis/<runId>[/<analysisId>], #/compare[/<runA>/<runB>][?thresholds].
+// Reload keeps the view. `args` holds every path segment after the
+// view, `query` the part after "?".
 
-const VIEWS = ['library', 'configure', 'runs', 'analysis'];
-const VIEW_TITLES = { library: 'Library', configure: 'Configure', runs: 'Runs', analysis: 'Analysis' };
+const VIEWS = ['library', 'configure', 'runs', 'analysis', 'compare'];
+const VIEW_TITLES = { library: 'Library', configure: 'Configure', runs: 'Runs', analysis: 'Analysis', compare: 'Compare' };
 
 function parseRoute() {
   const h = (location.hash || '').replace(/^#\/?/, '');
-  const [view, arg] = h.split('/');
-  return { view: VIEWS.includes(view) ? view : null, arg: arg || null };
+  const qi = h.indexOf('?');
+  const path = qi < 0 ? h : h.slice(0, qi);
+  const parts = path.split('/');
+  const view = parts[0];
+  let query;
+  try { query = new URLSearchParams(qi < 0 ? '' : h.slice(qi + 1)); } catch (_) { query = new URLSearchParams(); }
+  return { view: VIEWS.includes(view) ? view : null, arg: parts[1] || null, args: parts.slice(1), query };
 }
 
 function go(view, arg) {
@@ -37,7 +44,7 @@ function applyRoute(userNav) {
     else a.removeAttribute('aria-current');
   }
   document.title = `${VIEW_TITLES[view]} · outstation`;
-  emit('route', { view, arg: r.arg, changed });
+  emit('route', { view, arg: r.arg, args: r.args, query: r.query, changed });
   if (userNav && changed) {
     const h = el('h-' + view);
     if (h) h.focus({ preventScroll: true });
@@ -115,7 +122,66 @@ function renderActiveRun() {
 on('runs', renderActiveRun);
 
 // ---------------------------------------------------------------------------
-// Server status: version, health (degraded[]), capabilities.
+// Server status: version, health (degraded_detail[] with codes, journal
+// cleanup pending), capabilities, auto-analysis.
+
+// What each degraded code means for the operator, and what to do.
+const HEALTH_TEXT = {
+  db_not_writable: ['Run history is not being saved', 'New runs, analyses and profiles are lost on restart. Check the state directory\'s permissions and free space.'],
+  ephemeral: ['History kept in memory only', 'Runs, analyses and profiles are lost on restart.'],
+  low_disk: ['Disk space is low', 'Uploads and replay captures may be refused; the oldest captures are evicted first.'],
+  disk_unknown: ['Free disk space unknown', 'The server cannot guard against a full disk.'],
+  missing_capabilities: ['Runs will fail at network setup', 'Start the server through the systemd unit, or grant those capabilities to the binary.'],
+  capabilities_unknown: ['Network privileges unknown', 'Runs may fail at network setup.'],
+  journal_unreadable: ['Host-state journal unreadable', 'The server cannot tell whether an earlier run left network changes behind.'],
+  cleanup_pending: ['Host cleanup pending', ''],
+  shutting_down: ['Server shutting down', 'New runs are refused.'],
+};
+
+function healthItems(st) {
+  const detail = Array.isArray(st.degraded_detail) ? st.degraded_detail : null;
+  const items = detail
+    ? detail.map(d => ({ code: d.code, message: d.message }))
+    : (st.degraded || []).map(m => ({ code: '', message: String(m) }));
+  // Journal entries are shown even when no code reports them (a run is
+  // active and owns them, or an older server without the code).
+  const jp = st.journal_pending;
+  const pending = jp ? (jp.guards || 0) + (jp.aliases || 0) : 0;
+  if (pending && !items.some(i => i.code === 'cleanup_pending') && !(st.active_run)) {
+    items.push({ code: 'cleanup_pending', message: `${pending} host-state journal entr${pending === 1 ? 'y' : 'ies'} (${jp.guards || 0} guard, ${jp.aliases || 0} alias)` });
+  }
+  return items;
+}
+
+function renderHealth(st) {
+  const items = healthItems(st);
+  const banner = el('degraded-banner');
+  const chip = el('health-chip');
+  const sig = JSON.stringify(items);
+  if (!items.length) {
+    banner.hidden = true;
+    banner.dataset.sig = '';
+    chip.hidden = true;
+    return;
+  }
+  const html = '<ul class="health-list">' + items.map(i => {
+    const t = HEALTH_TEXT[i.code];
+    const title = t ? t[0] : 'Degraded';
+    const msg = String(i.message || '').replace(/\.\s*$/, '');
+    const advice = t && t[1] ? ` ${t[1]}` : '';
+    return `<li data-code="${esc(i.code)}"><b>${esc(title)}.</b> ${esc(msg.charAt(0).toUpperCase() + msg.slice(1))}.${esc(advice)}</li>`;
+  }).join('') + '</ul>';
+  setHTML(el('degraded-text'), html);
+  chip.hidden = false;
+  const bad = items.some(i => ['db_not_writable', 'missing_capabilities', 'shutting_down', 'low_disk'].includes(i.code));
+  chip.dataset.level = bad ? 'bad' : 'warn';
+  setText(chip, `${items.length} health ${items.length === 1 ? 'issue' : 'issues'}`);
+  // A new set of problems re-opens a dismissed banner.
+  if (banner.dataset.sig !== sig) {
+    banner.dataset.sig = sig;
+    banner.hidden = false;
+  }
+}
 
 async function loadStatus() {
   const res = await api('/api/status');
@@ -124,19 +190,22 @@ async function loadStatus() {
   const v = 'v' + res.data.version;
   setText(el('version'), v);
   setText(el('foot-version'), v);
-  const deg = res.data.degraded || [];
-  const banner = el('degraded-banner');
-  const text = deg.join(' · ');
-  if (deg.length && banner.dataset.text !== text) {
-    banner.dataset.text = text;
-    setText(el('degraded-text'), text);
-    banner.hidden = false;
-  } else if (!deg.length) {
-    banner.hidden = true;
-    banner.dataset.text = '';
+  if (typeof res.data.auto_analyze === 'boolean') {
+    setText(el('foot-auto'), res.data.auto_analyze ? 'on' : 'off');
   }
+  renderHealth(res.data);
   emit('status', S.status);
 }
+
+actions({
+  'show-health': () => {
+    const b = el('degraded-banner');
+    b.hidden = false;
+    b.scrollIntoView({ block: 'nearest' });
+    const t = qs('.health-list', b);
+    if (t) { t.setAttribute('tabindex', '-1'); t.focus({ preventScroll: true }); }
+  },
+});
 
 // ---------------------------------------------------------------------------
 // Run events (SSE). Every event triggers a runs refresh; runs started or
@@ -183,6 +252,15 @@ function startRunEvents() {
   es.addEventListener('run_started', onRunEvent);
   es.addEventListener('run_stopped', onRunEvent);
   es.addEventListener('run_finished', onRunEvent);
+  // Auto (and on-demand) analysis results: refetch that run, no banner.
+  const onAnalysisEvent = ev => {
+    let d;
+    try { d = JSON.parse(ev.data); } catch (_) { return; }
+    emit('analysis-event', { type: ev.type, data: d });
+    if (typeof refetchRun === 'function' && d.run_id != null) refetchRun(Number(d.run_id));
+  };
+  es.addEventListener('analysis_finished', onAnalysisEvent);
+  es.addEventListener('analysis_failed', onAnalysisEvent);
 }
 
 // ---------------------------------------------------------------------------

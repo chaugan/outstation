@@ -9,6 +9,11 @@
 //   --pcap    pcap to upload (default examples/synth_iec104_rtus200_ts.pcap)
 //   --no-runs skip the steps that start runs (they are skipped anyway
 //             when another run is already active)
+//   --captures-dir DIR  the server's captures directory, when it is on
+//             this machine and writable: the compare flow then gives
+//             its candidate run a replay capture (a copy of --pcap), so
+//             the live "analysis_missing → Analyze → retry" path runs
+//             end to end instead of stopping at "no capture"
 //
 // Playwright is loaded from $PLAYWRIGHT_DIR (default
 // /opt/code/tools/browser/node_modules/playwright). Runs Chromium at
@@ -20,6 +25,13 @@
 // keeping its selection, the post-upload panel refreshing by itself,
 // the start-failure message, and the concurrent-run banner plus the
 // 409 run_active message across two browser contexts.
+// Wave 3 (T19): profiles CRUD with the 409 profile_exists message, the
+// IEC 104 fault-plan and command editors (client validation, proto_config
+// serialisation, persistence), re-run (whose failure on an unprivileged
+// server must be explained) and "Load into Configure", auto-analysis
+// state on cards, the health chip and /metrics link, and the Compare
+// view: hash-kept selection and thresholds, analysis_missing → Analyze
+// → automatic retry, fleet and per-RTU tables, sort and filter.
 // Exits non-zero when any check fails. Runs it starts are stopped and
 // deleted at the end; the uploaded pcap is left in the library.
 
@@ -38,6 +50,7 @@ const flag = (name, dflt) => {
 const NO_RUNS = argv.includes('--no-runs');
 if (NO_RUNS) argv.splice(argv.indexOf('--no-runs'), 1);
 const OUT = flag('--out', 'ui-smoke-shots');
+const CAPTURES_DIR = flag('--captures-dir', null);
 const PCAP = flag('--pcap', 'examples/synth_iec104_rtus200_ts.pcap');
 const BASE = (argv[0] || process.env.UI_BASE || 'http://127.0.0.1:18105').replace(/\/$/, '');
 const PW = process.env.PLAYWRIGHT_DIR || '/opt/code/tools/browser/node_modules/playwright';
@@ -179,6 +192,40 @@ function trackConsole(page, bucket) {
 
 const pcapName = path.basename(PCAP);
 const startedRuns = [];
+const flow = { firstId: null, slaveId: null, cmpA: null, cmpB: null };
+const SMOKE_PROFILE = `smoke-profile-${process.pid}`;
+
+async function waitRun(id, pred, ms = 30000) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    const r = (await apiGet('/api/runs')).find(x => x.id === id);
+    if (r && pred(r)) return r;
+    await sleep(500);
+  }
+  return null;
+}
+
+// Upload PCAP as the target-side capture of run `id` (a manual analysis).
+async function uploadAnalysis(id) {
+  const fd = new FormData();
+  fd.append('file', new Blob([fs.readFileSync(PCAP)]), pcapName);
+  fd.append('mode', 'generic');
+  fd.append('run_id', String(id));
+  const r = await fetch(`${BASE}/api/analyze?run_id=${id}`, { method: 'POST', headers: { Origin: BASE }, body: fd });
+  return r.ok;
+}
+
+// A stopped slave run (starts fine unprivileged: its sessions stay pending).
+async function stoppedSlaveRun(pcapId) {
+  const r = await apiSend('/api/run', 'POST', { pcap_id: pcapId, mode: 'benchmark', role: 'slave', target_ip: '0.0.0.0', warmup_secs: 0, iterations: 1 });
+  if (!r.ok) return null;
+  const { id } = await r.json();
+  startedRuns.push(id);
+  await sleep(1000);
+  await apiSend(`/api/runs/${id}/stop`, 'POST');
+  await waitRun(id, x => x.status !== 'running', 20000);
+  return id;
+}
 
 async function ensurePcap(page) {
   const lib = await apiGet('/api/pcaps');
@@ -288,6 +335,14 @@ async function engineWalk(browser, name, viewport, deep) {
   await audit(page, 'runs', 'runs');
   await go(page, 'analysis');
   await audit(page, 'analysis', 'analysis');
+  if (flow.cmpA && flow.cmpB) {
+    await go(page, `compare/${flow.cmpA}/${flow.cmpB}`);
+    await page.waitForSelector('#cmp-tbody tr', { timeout: 15000 }).catch(() => {});
+    await audit(page, 'compare (result)', 'compare');
+  } else {
+    await go(page, 'compare');
+    await audit(page, 'compare', 'compare');
+  }
 
   const live = await page.evaluate(() => (window.__ws || []).filter(s => s.readyState <= 1).length);
   check(live <= 1, `at most one live WebSocket (${live})`);
@@ -324,6 +379,7 @@ async function runFlows(browser, pcapId) {
   const m1 = (await a.textContent('#run-result')).match(/Run #(\d+)/);
   const firstId = m1 ? Number(m1[1]) : null;
   if (firstId) startedRuns.push(firstId);
+  flow.firstId = firstId;
   // Wait for the run to end (an unprivileged server fails it at network setup).
   await a.waitForFunction(() => /Run #\d+ (failed|completed|stopped|partial)/.test(document.querySelector('#run-result').textContent), null, { timeout: 30000 }).catch(() => {});
   const resText = (await a.textContent('#run-result')) + ' ' + (await a.textContent('#run-error'));
@@ -344,6 +400,7 @@ async function runFlows(browser, pcapId) {
   await a.waitForFunction(() => /Run #\d+ (started|is running)/.test(document.querySelector('#run-result').textContent), null, { timeout: 20000 });
   const slaveId = Number((await a.textContent('#run-result')).match(/#(\d+)/)[1]);
   startedRuns.push(slaveId);
+  flow.slaveId = slaveId;
   const banner = await b.waitForSelector('#run-banner:not([hidden])', { timeout: 10000 }).then(() => b.textContent('#run-banner-text')).catch(() => '');
   check(new RegExp(`Run #${slaveId} was started by`).test(banner), `other tab shows the concurrent-run banner (${banner.trim()})`);
   const own = await a.isVisible('#run-banner');
@@ -440,7 +497,373 @@ async function runFlows(browser, pcapId) {
   await ctxB.close();
 }
 
+// ---------------------------------------------------------------------------
+// Wave 3 (T19).
+
+async function healthChecks(browser) {
+  current = 'health';
+  console.log('\n== health, metrics ==');
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await go(page, 'library');
+  const st = await apiGet('/api/status');
+  const detail = st.degraded_detail || [];
+  if (detail.length) {
+    const chip = await page.textContent('#health-chip').catch(() => '');
+    check(/health issue/.test(chip), `health chip shown for degraded server (${chip.trim()})`);
+    const items = await page.locator('#degraded-text li').count();
+    check(items === detail.length, `banner lists every degraded_detail entry (${items}/${detail.length})`);
+    if (detail.some(d => d.code === 'missing_capabilities')) {
+      const t = await page.textContent('#degraded-text');
+      check(/Runs will fail at network setup/.test(t) && /systemd unit/.test(t), 'missing_capabilities gets its own advice');
+    }
+    await page.click('#degraded-banner [data-act="dismiss-banner"]');
+    await page.click('#health-chip');
+    check(await page.isVisible('#degraded-banner'), 'the health chip re-opens a dismissed banner');
+  } else notes.push('server is healthy: health banner checks skipped');
+  const href = await page.getAttribute('footer a[href="/metrics"]', 'href').catch(() => null);
+  check(href === '/metrics', 'footer links to /metrics');
+  const m = await fetch(BASE + '/metrics');
+  const body = await m.text();
+  check(m.ok && /^# (HELP|TYPE) /m.test(body), `/metrics serves Prometheus text (${m.status})`);
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+async function dialogInput(page, value) {
+  await page.waitForSelector('#dlg[open] #dlg-input');
+  await page.fill('#dlg-input', value);
+  await page.click('#dlg-ok');
+}
+async function dialogConfirm(page) {
+  await page.waitForSelector('#dlg[open]');
+  await page.click('#dlg-ok');
+}
+
+async function profileFlow(browser, pcapId) {
+  current = 'profiles';
+  console.log('\n== profiles ==');
+  for (const p of await apiGet('/api/profiles')) {
+    if (p.name.startsWith(SMOKE_PROFILE)) await apiSend(`/api/profiles/${p.id}`, 'DELETE');
+  }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await go(page, 'configure');
+  await page.selectOption('#cfg-pcap', pcapId);
+  await page.click('label[for="mode-benchmark"]');
+  await page.click('label[for="role-master"]');
+  await page.fill('#cfg-target-ip', '10.20.30.40');
+  await page.fill('#cfg-iterations', '3');
+
+  await page.click('#prof-save');
+  await dialogInput(page, SMOKE_PROFILE);
+  await page.waitForFunction(() => /Saved profile/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  const opt = await page.textContent('#prof-select');
+  check(opt.includes(SMOKE_PROFILE), 'profile saved and listed');
+  const stored = (await apiGet('/api/profiles')).find(p => p.name === SMOKE_PROFILE);
+  check(stored && stored.request.target_ip === '10.20.30.40' && stored.request.iterations === 3 && !stored.request.force,
+    `stored request matches the form, without the override (${stored && JSON.stringify({ ip: stored.request.target_ip, it: stored.request.iterations, force: stored.request.force })})`);
+
+  // Duplicate name: 409 profile_exists, shown clearly.
+  await page.click('#prof-save');
+  await dialogInput(page, SMOKE_PROFILE);
+  await page.waitForFunction(() => document.querySelector('#prof-error').textContent.trim(), null, { timeout: 10000 }).catch(() => {});
+  const dup = await page.textContent('#prof-error');
+  check(/already exists/.test(dup) && dup.includes(SMOKE_PROFILE), `409 profile_exists is explained (${dup.trim().slice(0, 100)})`);
+
+  // Load restores the form.
+  await page.fill('#cfg-iterations', '7');
+  await page.fill('#cfg-target-ip', '10.0.0.99');
+  await page.click('#prof-load');
+  await page.waitForFunction(() => /Loaded profile/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  const it = await page.inputValue('#cfg-iterations');
+  const ip = await page.inputValue('#cfg-target-ip');
+  check(it === '3' && ip === '10.20.30.40', `Load fills the form from the profile (iterations ${it}, target ${ip})`);
+
+  // Rename.
+  await page.click('#prof-rename');
+  await dialogInput(page, SMOKE_PROFILE + '-renamed');
+  await page.waitForFunction(() => /Renamed/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  check((await page.textContent('#prof-select')).includes(SMOKE_PROFILE + '-renamed'), 'rename is listed');
+
+  // Overwrite (with confirmation).
+  await page.fill('#cfg-iterations', '9');
+  await page.click('#prof-overwrite');
+  await dialogConfirm(page);
+  await page.waitForFunction(() => /Overwrote/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  const ow = (await apiGet('/api/profiles')).find(p => p.name === SMOKE_PROFILE + '-renamed');
+  check(ow && ow.request.iterations === 9, `overwrite stores the current form (iterations ${ow && ow.request.iterations})`);
+  await audit(page, 'configure (profiles)', 'profiles');
+
+  // Delete (with confirmation).
+  await page.click('#prof-delete');
+  await dialogConfirm(page);
+  await page.waitForFunction(() => /Deleted/.test(document.querySelector('#prof-status').textContent), null, { timeout: 10000 }).catch(() => {});
+  const gone = !(await apiGet('/api/profiles')).some(p => p.name.startsWith(SMOKE_PROFILE));
+  check(gone, 'delete removes the profile');
+  await page.fill('#cfg-iterations', '1');
+  await page.fill('#cfg-target-ip', '10.9.8.7');
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+async function faultEditorFlow(browser, pcapId, viewport, label) {
+  current = `faults-${label}`;
+  console.log(`\n== fault and command editors (${label}) ==`);
+  const ctx = await browser.newContext({ viewport });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  const runPosts = [];
+  page.on('request', r => { if (r.url().endsWith('/api/run') && r.method() === 'POST') runPosts.push(r); });
+  await go(page, 'configure');
+  await page.selectOption('#cfg-pcap', pcapId);
+  await page.click('label[for="mode-benchmark"]');
+  await page.click('label[for="role-slave"]');
+  await page.click('#fault-params > summary');
+  check(/deliberately break/i.test(await page.textContent('#fault-params .fault-warn')), 'fault editor warns that faults break the session');
+  await page.click('#fault-add');
+  const row = page.locator('#fault-rows > li').first();
+  await row.locator('[data-flt="kind"]').selectOption('drop_iframes');
+  await row.locator('[data-flt="pct"]').fill('150');
+  await row.locator('[data-flt="duration_ms"]').fill('2000');
+  const before = runPosts.length;
+  await page.click('#start-btn');
+  await page.waitForTimeout(300);
+  const pctErr = await row.locator('[data-flt="pct"] ~ .field-err').textContent();
+  check(/more than 0 and at most 100/.test(pctErr) && runPosts.length === before, `pct 150 is rejected inline and blocks start (${pctErr.trim()})`);
+  const focused = await page.evaluate(() => document.activeElement && document.activeElement.dataset.flt);
+  check(focused === 'pct', `focus moves to the invalid fault field (${focused})`);
+  await row.locator('[data-flt="pct"]').fill('25');
+  await row.locator('[data-flt="atType"]').selectOption('frame');
+  await row.locator('[data-flt="at"]').fill('10');
+  await page.fill('#cfg-fault-seed', '42');
+  await page.click('#cmd-params > summary');
+  await page.selectOption('#cfg-cmd-return-info', 'retrem');
+  await page.fill('#cfg-cmd-max-age', '86400001');
+  await page.click('#start-btn');
+  await page.waitForTimeout(300);
+  const maErr = await page.textContent('#cfg-cmd-max-age-err');
+  check(/0 to 86,400,000/.test(maErr), `command max age is range-checked (${maErr.trim()})`);
+  await page.fill('#cfg-cmd-max-age', '5000');
+  const pc = JSON.parse(await page.evaluate(() => buildProtoConfig()) || '{}');
+  const f0 = (pc.faults || [])[0] || {};
+  check(f0.kind === 'drop_iframes' && f0.at && f0.at.frame === 10 && f0.pct === 25 && f0.duration_ms === 2000 && pc.fault_seed === 42,
+    `fault plan serialises into proto_config (${JSON.stringify(pc.faults)}, seed ${pc.fault_seed})`);
+  check(pc.commands && pc.commands.return_info === 'retrem' && pc.commands.max_age_ms === 5000 && !('enabled' in pc.commands),
+    `commands serialise with only the changed keys (${JSON.stringify(pc.commands)})`);
+  // Kind-specific params: slow_ack needs extra_ms, its duration is optional.
+  await page.click('#fault-add');
+  const row2 = page.locator('#fault-rows > li').nth(1);
+  await row2.locator('[data-flt="kind"]').selectOption('slow_ack');
+  await row2.locator('[data-flt="extra_ms"]').fill('');
+  await row2.locator('[data-flt="duration_ms"]').fill('');
+  await page.click('#start-btn');
+  await page.waitForTimeout(300);
+  const exErr = await row2.locator('[data-flt="extra_ms"] ~ .field-err').textContent();
+  check(/Enter ack delay/.test(exErr), `slow_ack requires extra_ms (${exErr.trim()})`);
+  await row2.locator('[data-flt="extra_ms"]').fill('500');
+  const pc2 = JSON.parse(await page.evaluate(() => buildProtoConfig()));
+  check(pc2.faults[1] && pc2.faults[1].extra_ms === 500 && !('duration_ms' in pc2.faults[1]), `optional duration is left out (${JSON.stringify(pc2.faults[1])})`);
+  const sum = await page.textContent('#start-summary');
+  check(/2 faults planned/.test(sum), `start summary flags the fault plan (${sum.trim().slice(0, 120)})`);
+  await audit(page, `configure (fault editor, ${label})`, 'fault-editor');
+  // Persistence across reload.
+  await page.waitForTimeout(400);
+  await page.reload();
+  await page.waitForSelector('#view-configure:not([hidden])');
+  await page.waitForTimeout(500);
+  const kept = await page.locator('#fault-rows > li').count();
+  const pc3 = JSON.parse(await page.evaluate(() => buildProtoConfig()) || '{}');
+  check(kept === 2 && JSON.stringify(pc3.faults) === JSON.stringify(pc2.faults), `fault plan survives a reload (${kept} rows)`);
+  // Server-side error mapped onto its row.
+  await page.evaluate(() => showIec104ConfigError('proto_config (faults): faults[1] (slow_ack): "extra_ms" must be 1..=600000, got 0'));
+  const srv = await page.locator('#fault-rows > li').nth(1).locator('[data-flt="extra_ms"] ~ .field-err').textContent();
+  check(/^Server: faults\[1\]/.test(srv), `server fault error lands on its row (${srv.trim().slice(0, 80)})`);
+  // Remove both rows; the plan is empty again.
+  await page.locator('#fault-rows [data-act="fault-remove"]').first().click();
+  await page.locator('#fault-rows [data-act="fault-remove"]').first().click();
+  const left = await page.locator('#fault-rows > li').count();
+  const pc4 = JSON.parse(await page.evaluate(() => buildProtoConfig()) || '{}');
+  check(left === 0 && !pc4.faults, `removing every fault empties the plan (${left} rows)`);
+  await page.fill('#cfg-fault-seed', '');
+  await page.selectOption('#cfg-cmd-return-info', 'none');
+  await page.fill('#cfg-cmd-max-age', '');
+  await page.click('label[for="role-master"]');
+  await page.waitForTimeout(400);
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+async function rerunFlow(browser) {
+  current = 'rerun';
+  console.log('\n== re-run, load into Configure, auto-analysis ==');
+  if (!flow.firstId) { notes.push('re-run flow skipped: no finished run from the run flows'); return; }
+  if (await activeRun()) { notes.push('re-run flow skipped: a run is active'); return; }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  await go(page, 'runs');
+  const id = flow.firstId;
+  const card = `#runs-list > li[data-key="${id}"]`;
+  await page.waitForSelector(card);
+  const st = await page.textContent(`${card} .run-analysis`);
+  const runRow = (await apiGet('/api/runs')).find(r => r.id === id);
+  if (runRow && runRow.auto_analysis) check(new RegExp(`Auto-analysis ${runRow.auto_analysis.state}`).test(st), `card shows the auto-analysis state (${st.trim().slice(0, 80)})`);
+  await page.click(`[data-fk="run-${id}-card-rerun"]`);
+  await page.waitForSelector('#dlg[open]');
+  const dlgText = await page.textContent('#dlg');
+  check(new RegExp(`Re-run #${id}`).test(dlgText) && /127\.0\.0\.1/.test(dlgText), `re-run asks for confirmation with the settings (${dlgText.trim().replace(/\s+/g, ' ').slice(0, 100)})`);
+  await page.click('#dlg-ok');
+  await page.waitForFunction(sel => /Re-run RUN·\d+ (failed|completed|stopped|partial)|refused/.test((document.querySelector(sel + ' .run-msg') || {}).textContent || ''), card, { timeout: 40000 }).catch(() => {});
+  const msg = await page.textContent(`${card} .run-msg`).catch(() => '');
+  const m = msg.match(/RUN·0*(\d+)/);
+  if (m) startedRuns.push(Number(m[1]));
+  if (/failed|refused/.test(msg)) {
+    check(/privileges|CAP_NET|protected|override/i.test(msg), `re-run failure is explained on the card (${msg.trim().slice(0, 160)})`);
+  } else {
+    check(/Re-run RUN·\d+/.test(msg), `re-run result shown on the card (${msg.trim().slice(0, 120)})`);
+    notes.push('re-run did not fail (privileged server?)');
+  }
+  if (m) {
+    const nr = (await apiGet('/api/runs')).find(r => r.id === Number(m[1]));
+    check(nr && nr.rerun_of === id, `new run records rerun_of (${nr && nr.rerun_of})`);
+    await page.waitForSelector(`#runs-list > li[data-key="${m[1]}"] .submeta a[href="#/runs/${id}"]`, { timeout: 10000 }).catch(() => {});
+    check(await page.isVisible(`#runs-list > li[data-key="${m[1]}"] .submeta a[href="#/runs/${id}"]`), 'new card links to the run it re-ran');
+  }
+  await page.screenshot({ path: path.join(OUT, 'flow-rerun.png'), fullPage: false });
+  // Load into Configure.
+  await page.click(`[data-fk="run-${id}-card-load"]`);
+  await page.waitForSelector('#view-configure:not([hidden])', { timeout: 10000 });
+  await page.waitForTimeout(500);
+  const ip = await page.inputValue('#cfg-target-ip');
+  const role = await page.evaluate(() => radio('role'));
+  const status = await page.textContent('#prof-status');
+  check(ip === '127.0.0.1' && role === 'master' && new RegExp(`run #${id}`).test(status), `Load into Configure fills the form (${ip}, ${role}; ${status.trim()})`);
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
+async function compareFlow(browser, pcapId) {
+  current = 'compare';
+  console.log('\n== compare ==');
+  if (!flow.slaveId) { notes.push('compare flow skipped: no slave run from the run flows'); return; }
+  if (await activeRun()) { notes.push('compare flow skipped: a run is active'); return; }
+  const A = flow.slaveId;
+  const runs = await apiGet('/api/runs');
+  if (!(runs.find(r => r.id === A) || {}).latest_analysis) await uploadAnalysis(A);
+  const B = await stoppedSlaveRun(pcapId);
+  if (!B) { check(false, 'could not create a second benchmark run'); return; }
+  let liveCapture = false;
+  if (CAPTURES_DIR) {
+    try { fs.copyFileSync(PCAP, path.join(CAPTURES_DIR, `run_${B}.pcap`)); liveCapture = true; } catch (e) { notes.push(`could not seed a capture: ${e.message}`); }
+  }
+  const ctx = await browser.newContext({ viewport: { width: 1440, height: 900 } });
+  const page = await ctx.newPage();
+  const errors = [];
+  trackConsole(page, errors);
+  const analyzePosts = [];
+  page.on('request', r => { if (/\/api\/runs\/\d+\/analyze$/.test(r.url()) && r.method() === 'POST') analyzePosts.push(r.url()); });
+
+  // "Compare with…" on B's card pre-selects a baseline and B.
+  await go(page, 'runs');
+  await page.click(`[data-fk="run-${B}-card-compare"]`);
+  await page.waitForSelector('#view-compare:not([hidden])');
+  const h1 = await page.evaluate(() => location.hash);
+  check(new RegExp(`^#/compare/\\d+/${B}$`).test(h1), `"Compare with…" opens the compare view with B preselected (${h1})`);
+
+  // Shared link with a threshold: analysis_missing for B.
+  await page.goto(`${BASE}/#/compare/${A}/${B}?score_drop=2`);
+  await page.waitForSelector('#view-compare:not([hidden])');
+  await page.waitForFunction(() => /has no stored analysis/.test(document.querySelector('#cmp-error').textContent), null, { timeout: 15000 }).catch(() => {});
+  const miss = await page.textContent('#cmp-error');
+  check(new RegExp(`Run #${B} \\(candidate B\\) has no stored analysis`).test(miss), `analysis_missing is explained (${miss.trim().slice(0, 90)})`);
+  check(await page.inputValue('#cmp-a') === String(A) && await page.inputValue('#cmp-b') === String(B), 'pickers follow the hash');
+  check(await page.inputValue('#cmp-th-score_drop') === '2', 'threshold from the hash fills its input');
+  await audit(page, 'compare (analysis missing)', 'compare-missing');
+  const btn = `[data-act="cmp-analyze"][data-id="${B}"]`;
+  if (liveCapture) {
+    check(await page.isVisible(btn), 'an "Analyze run" button is offered for a run with a capture');
+    await page.click(btn);
+    const busy = await page.textContent(btn).catch(() => '');
+    check(/Analysing/.test(busy) || analyzePosts.length > 0, `analyze button shows it is busy (${busy.trim()})`);
+    await page.waitForSelector('#cmp-tbody tr', { timeout: 180000 }).catch(() => {});
+    check(analyzePosts.length === 1 && await page.isVisible('.cmp-fleet'), `after POST analyze the comparison retries by itself (${analyzePosts.length} POST)`);
+  } else {
+    check(/no replay capture/.test(miss) && await page.isVisible(`#cmp-error a[href="#/analysis/${B}"]`), 'without a capture it points to Analysis to upload one');
+    // The Analyze button's error path, against the real server: pretend
+    // the run has a capture; the server then answers 409 capture_missing.
+    await page.route(`**/api/runs/${A}/compare/${B}**`, async route => {
+      const resp = await route.fetch();
+      const body = await resp.json();
+      if (body.code === 'analysis_missing') body.has_capture = true;
+      await route.fulfill({ response: resp, json: body });
+    });
+    await page.click('[data-act="cmp-retry"]');
+    await page.waitForSelector(btn, { timeout: 10000 });
+    await page.click(btn);
+    await page.waitForFunction(() => /Analysis of run #\d+ failed/.test(document.querySelector('#cmp-error').textContent), null, { timeout: 30000 }).catch(() => {});
+    const ae = await page.textContent('#cmp-error');
+    check(/no replay capture/.test(ae) && analyzePosts.length === 1, `POST analyze failure is explained (${ae.trim().slice(0, 120)})`);
+    await page.unroute(`**/api/runs/${A}/compare/${B}**`);
+    notes.push('compare: live analyze → retry path needs --captures-dir; used an uploaded analysis instead');
+    await uploadAnalysis(B);
+    await page.click('[data-act="cmp-retry"]');
+  }
+  await page.waitForSelector('#cmp-tbody tr', { timeout: 30000 }).catch(() => {});
+  const nrows = await page.locator('#cmp-tbody tr').count();
+  check(await page.isVisible('.cmp-fleet') && nrows > 0, `fleet summary and per-RTU table render (${nrows} rows)`);
+  const used = await page.textContent('.cmp-th-used').catch(() => '');
+  check(/score drop &gt; 2|score drop > 2/.test(used), `the threshold reached the server (${used.trim().slice(0, 60)})`);
+  const verdictBox = await page.textContent('.cmp-verdict');
+  check(/regression/i.test(verdictBox), `regressed / not regressed is stated (${verdictBox.trim()})`);
+  // Sort and filter.
+  await page.click('[data-act="cmp-sort"][data-key="rtu"]');
+  const sorted = await page.getAttribute('#cmp-thead th:first-child', 'aria-sort');
+  check(sorted === 'ascending', `RTU column sorts (${sorted})`);
+  const firstIp = (await page.textContent('#cmp-tbody tr:first-child th')).trim();
+  await page.fill('#cmp-q', firstIp);
+  const filtered = await page.locator('#cmp-tbody tr').count();
+  check(filtered >= 1 && filtered < Math.max(2, nrows), `filter narrows the RTU table (${filtered})`);
+  await page.fill('#cmp-q', 'no-such-rtu');
+  check(/No RTU matches/.test(await page.textContent('#cmp-tbody')), 'filter with no match says so');
+  await page.fill('#cmp-q', '');
+  // Changing a threshold updates the shareable hash.
+  await page.fill('#cmp-th-p99_increase_pct', '50');
+  await page.click('#cmp-btn');
+  await page.waitForTimeout(800);
+  const h2 = await page.evaluate(() => location.hash);
+  check(h2.includes(`/compare/${A}/${B}?`) && /score_drop=2/.test(h2) && /p99_increase_pct=50/.test(h2), `hash keeps runs and thresholds (${h2})`);
+  // Invalid threshold is caught before the request.
+  await page.fill('#cmp-th-score_drop', '-1');
+  await page.click('#cmp-btn');
+  const thErr = await page.textContent('#cmp-th-score_drop-err');
+  check(/0 or more/.test(thErr), `negative threshold rejected inline (${thErr.trim()})`);
+  await page.fill('#cmp-th-score_drop', '2');
+  await audit(page, 'compare (result)', 'compare-result');
+  await page.setViewportSize({ width: 390, height: 844 });
+  await page.waitForTimeout(500);
+  await audit(page, 'compare (result, 390px)', 'compare-result-390');
+  flow.cmpA = A;
+  flow.cmpB = B;
+  // The analysis picker shows the latest analysis of a run.
+  await page.setViewportSize({ width: 1440, height: 900 });
+  await go(page, `analysis/${B}`);
+  const optText = await page.textContent(`#an-run option[value="${B}"]`);
+  check(/analysed:/.test(optText), `analysis run picker shows latest_analysis (${optText.trim().slice(-40)})`);
+  check(!errors.length, `no console errors${errors.length ? ': ' + errors.slice(0, 3).join(' | ') : ''}`);
+  await ctx.close();
+}
+
 async function cleanup() {
+  for (const p of await apiGet('/api/profiles').catch(() => [])) {
+    if (p.name.startsWith(SMOKE_PROFILE)) await apiSend(`/api/profiles/${p.id}`, 'DELETE').catch(() => {});
+  }
   for (const id of startedRuns) {
     await apiSend(`/api/runs/${id}/stop`, 'POST').catch(() => {});
   }
@@ -457,7 +880,17 @@ async function cleanup() {
     const cr = await chromium.launch();
     pcapId = await engineWalk(cr, 'chromium-1440', { width: 1440, height: 900 }, true);
     await engineWalk(cr, 'chromium-390', { width: 390, height: 844 }, false);
-    if (pcapId) await runFlows(cr, pcapId);
+    await healthChecks(cr);
+    if (pcapId) {
+      await profileFlow(cr, pcapId);
+      await faultEditorFlow(cr, pcapId, { width: 1440, height: 900 }, '1440');
+      await faultEditorFlow(cr, pcapId, { width: 390, height: 844 }, '390');
+      await runFlows(cr, pcapId);
+      if (!NO_RUNS) {
+        await rerunFlow(cr);
+        await compareFlow(cr, pcapId);
+      }
+    }
     await cr.close();
     const wk = await webkit.launch();
     await engineWalk(wk, 'webkit-1440', { width: 1440, height: 900 }, false);

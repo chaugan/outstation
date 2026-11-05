@@ -8,6 +8,7 @@ function boot() {
   initRuns();
   initDiagram();
   initAnalysis();
+  initCompare();
   applyRoute(false);
   startRunEvents();
   loadStatus();
