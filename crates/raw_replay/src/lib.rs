@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, warn};
 
+pub mod bpf;
 pub mod capture;
 pub use capture::Capture;
 
