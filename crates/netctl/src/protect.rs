@@ -380,19 +380,23 @@ pub fn validate_alias_ip(ip: Ipv4Addr, prot: &Protection) -> Result<()> {
 
 /// Pure check for an address about to be put on one of our own bridge
 /// ports (master-mode session source IPs): the [`assess_alias_ip`]
-/// rules always apply, and an address already configured on a host
-/// interface outside our `pcr*` ports is refused unless `force`, since
-/// binding it to a replay port would steal it from that interface.
+/// rules always apply, and an address already configured on any
+/// interface other than `own_ifaces` (the calling run's own bridge and
+/// ports) is refused unless `force`, since binding it to a replay port
+/// would steal it from that interface. A foreign `pcr*` interface (e.g.
+/// another run's, or a crashed run's leftover) is treated like any other
+/// host interface: the `pcr` name prefix alone grants no exemption.
 pub fn assess_port_ip(
     ip: Ipv4Addr,
     local_addrs: &[(String, IpAddr)],
     facts: &AliasIpFacts,
     prot: &Protection,
+    own_ifaces: &[&str],
 ) -> Result<()> {
     assess_alias_ip(ip, facts, prot)?;
     let holders: Vec<&str> = local_addrs
         .iter()
-        .filter(|(iface, a)| *a == IpAddr::V4(ip) && !iface.starts_with(IFNAME_PREFIX))
+        .filter(|(iface, a)| *a == IpAddr::V4(ip) && !own_ifaces.contains(&iface.as_str()))
         .map(|(iface, _)| iface.as_str())
         .collect();
     if !holders.is_empty() {
@@ -410,12 +414,12 @@ pub fn assess_port_ip(
 }
 
 /// Live version of [`assess_port_ip`].
-pub fn validate_port_ip(ip: Ipv4Addr, prot: &Protection) -> Result<()> {
+pub fn validate_port_ip(ip: Ipv4Addr, prot: &Protection, own_ifaces: &[&str]) -> Result<()> {
     let facts = AliasIpFacts {
         gateways: default_gateways_v4().unwrap_or_default(),
     };
     let local = all_local_addrs()?;
-    assess_port_ip(ip, &local, &facts, prot)
+    assess_port_ip(ip, &local, &facts, prot, own_ifaces)
         .map_err(|e| anyhow::anyhow!("refusing source address {ip}: {e:#}"))
 }
 
@@ -518,21 +522,27 @@ mod tests {
         let local: Vec<(String, IpAddr)> = vec![
             ("eth0".into(), "192.168.1.10".parse().unwrap()),
             ("pcr1_b0".into(), "10.5.5.5".parse().unwrap()),
+            ("pcr2_b0".into(), "10.6.6.6".parse().unwrap()),
         ];
+        let own = ["pcr1_br", "pcr1_b0", "pcr1_b0i"];
         let p = Protection::default();
         // Captured client IP that is free: fine.
-        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 6), &local, &f, &p).is_ok());
-        // Already on one of our own ports (shared master_bind_ip): fine.
-        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 5), &local, &f, &p).is_ok());
+        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 6), &local, &f, &p, &own).is_ok());
+        // Already on one of this run's own ports (shared master_bind_ip): fine.
+        assert!(assess_port_ip(Ipv4Addr::new(10, 5, 5, 5), &local, &f, &p, &own).is_ok());
+        // On a *foreign* pcr* port (another run / leftover): refused, the
+        // name prefix alone is not ownership.
+        let e = assess_port_ip(Ipv4Addr::new(10, 6, 6, 6), &local, &f, &p, &own).unwrap_err();
+        assert!(format!("{e}").contains("pcr2_b0"), "{e}");
         // The host's management address: refused unless forced.
         let mgmt = Ipv4Addr::new(192, 168, 1, 10);
-        let e = assess_port_ip(mgmt, &local, &f, &p).unwrap_err();
+        let e = assess_port_ip(mgmt, &local, &f, &p, &own).unwrap_err();
         assert!(format!("{e}").contains("eth0"), "{e}");
-        assert!(assess_port_ip(mgmt, &local, &f, &Protection::new(vec![], true)).is_ok());
+        assert!(assess_port_ip(mgmt, &local, &f, &Protection::new(vec![], true), &own).is_ok());
         // Absolute refusals stay absolute even with force.
         let forced = Protection::new(vec![], true);
-        assert!(assess_port_ip(Ipv4Addr::new(192, 168, 1, 1), &local, &f, &forced).is_err());
-        assert!(assess_port_ip(Ipv4Addr::LOCALHOST, &local, &f, &forced).is_err());
+        assert!(assess_port_ip(Ipv4Addr::new(192, 168, 1, 1), &local, &f, &forced, &own).is_err());
+        assert!(assess_port_ip(Ipv4Addr::LOCALHOST, &local, &f, &forced, &own).is_err());
     }
 
     #[test]

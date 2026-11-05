@@ -170,8 +170,8 @@ impl Topology {
     /// anything is created: loopback/multicast/broadcast/reserved
     /// addresses, the host's default gateways and `prot`'s protected
     /// addresses are always refused, and an address already configured
-    /// on a host interface outside our `pcr*` ports is refused unless
-    /// `prot.force`.
+    /// on any interface other than this topology's own bridge and ports
+    /// is refused unless `prot.force`.
     pub fn add_port_with_ip(
         &mut self,
         id: impl Into<String>,
@@ -181,7 +181,12 @@ impl Topology {
     ) -> Result<String> {
         let bridge_side = id.into();
         if let Some(ip) = src_ip {
-            protect::validate_port_ip(ip, prot)?;
+            let own_inject: Vec<String> = self.taps.iter().map(|t| format!("{t}i")).collect();
+            let own: Vec<&str> = std::iter::once(self.bridge.as_str())
+                .chain(self.taps.iter().map(String::as_str))
+                .chain(own_inject.iter().map(String::as_str))
+                .collect();
+            protect::validate_port_ip(ip, prot, &own)?;
         }
         let inject_side = format!("{bridge_side}i");
         names::validate_owned_ifname(&bridge_side)?;
