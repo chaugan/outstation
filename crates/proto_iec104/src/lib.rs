@@ -65,6 +65,10 @@ impl ProtoReplayer for Iec104Replayer {
         Readiness::Ready
     }
 
+    fn validate_config(&self, proto_config: Option<&str>) -> anyhow::Result<()> {
+        asdu::validate_proto_config(proto_config)
+    }
+
     fn run(&self, cfg: ProtoRunCfg) -> ProtoReport {
         match cfg.role {
             Role::Master => session::run_session(cfg),

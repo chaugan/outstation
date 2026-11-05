@@ -466,6 +466,24 @@ async fn invalid_requests_never_create_runs() {
             },
             "invalid_request",
         ),
+        (
+            {
+                // Valid JSON, invalid IEC 104 config: unknown fault kind.
+                let mut r = bench_req("pcr_1");
+                r["proto_config"] = json!(r#"{"faults":[{"at":{"ms":10},"kind":"meltdown"}]}"#);
+                r
+            },
+            "invalid_proto_config",
+        ),
+        (
+            {
+                // t2 must be below t1.
+                let mut r = bench_req("pcr_1");
+                r["proto_config"] = json!(r#"{"session":{"t1":5,"t2":9}}"#);
+                r
+            },
+            "invalid_proto_config",
+        ),
         (bench_req("../../etc/passwd"), "invalid_id"),
         (bench_req("pcr_404"), "not_found"),
     ];

@@ -801,6 +801,13 @@ pub trait ProtoReplayer: Send + Sync {
     fn readiness(&self) -> Readiness;
     fn run(&self, cfg: ProtoRunCfg) -> ProtoReport;
 
+    /// Validate a protocol-specific `proto_config` JSON string up front,
+    /// so a bad config is rejected when the run is submitted instead of
+    /// surfacing later as a session error. Default: accept anything.
+    fn validate_config(&self, _proto_config: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Extract one timestamp per protocol-level message in the
     /// reassembled flow `payload`. Each timestamp is in nanoseconds,
     /// **relative to the first message** (so `out[0]` is always 0).

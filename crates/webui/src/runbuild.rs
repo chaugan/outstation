@@ -290,6 +290,24 @@ pub fn validate_settings(req: &RunRequest) -> Result<(), RequestError> {
                     ),
                 });
             }
+            // Protocol-specific config (IEC 104: rewrite map, cp56,
+            // session timers, commands, fault plan) is checked now, so
+            // a typo is a 400 on submit, not a failed session later.
+            let pc = req.proto_config.as_deref().filter(|s| !s.trim().is_empty());
+            rep.validate_config(pc).map_err(|e| {
+                let msg = format!("{e:#}");
+                RequestError {
+                    code: "invalid_proto_config",
+                    // Protocol errors already name the section, e.g.
+                    // "proto_config (faults): …", which the UI maps onto
+                    // the matching editor field.
+                    message: if msg.starts_with("proto_config") {
+                        msg
+                    } else {
+                        format!("proto_config: {msg}")
+                    },
+                }
+            })?;
         }
     }
     Ok(())
