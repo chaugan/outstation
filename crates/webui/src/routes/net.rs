@@ -129,6 +129,10 @@ pub(crate) struct NicJson {
     pub(crate) up: bool,
     pub(crate) loopback: bool,
     pub(crate) bridge: bool,
+    /// Already a port of some bridge (protected; the UI flags it).
+    pub(crate) bridge_port: bool,
+    /// Carries a default route (protected; the UI flags it).
+    pub(crate) default_route: bool,
 }
 
 pub(crate) async fn api_nics() -> Result<Json<Vec<NicJson>>, AppError> {
@@ -145,6 +149,8 @@ pub(crate) async fn api_nics() -> Result<Json<Vec<NicJson>>, AppError> {
             up: n.up,
             loopback: n.loopback,
             bridge: n.bridge,
+            bridge_port: n.bridge_port,
+            default_route: n.default_route,
         })
         .collect();
     Ok(Json(out))
