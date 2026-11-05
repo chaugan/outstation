@@ -20,6 +20,7 @@
       <a href="#/configure" data-view="configure">Configure</a>
       <a href="#/runs" data-view="runs">Runs <span class="nav-badge" id="nav-running" hidden></span></a>
       <a href="#/analysis" data-view="analysis">Analysis</a>
+      <a href="#/compare" data-view="compare">Compare</a>
     </nav>
     <div class="statusbar">
       <a class="active-run" id="active-run" href="#/runs" hidden></a>
@@ -511,6 +512,40 @@
     </div>
   </div>
   <div id="an-result"></div>
+</section>
+
+<!-- ================ compare ================ -->
+<section class="view" id="view-compare" data-view="compare" aria-labelledby="h-compare" hidden>
+  <div class="view-head">
+    <h2 id="h-compare" tabindex="-1">Compare runs</h2>
+    <span class="meta">baseline A against candidate B · the address bar keeps the selection, so it can be shared</span>
+  </div>
+  <form class="card" id="cmp-form" novalidate>
+    <div class="grid">
+      <div class="field span-2">
+        <label for="cmp-a">Baseline run (A)</label>
+        <select id="cmp-a" aria-describedby="cmp-a-err"></select>
+        <p class="field-err" id="cmp-a-err"></p>
+      </div>
+      <div class="field span-2">
+        <label for="cmp-b">Candidate run (B)</label>
+        <select id="cmp-b" aria-describedby="cmp-b-err"></select>
+        <p class="field-err" id="cmp-b-err"></p>
+      </div>
+    </div>
+    <p class="hint">Only stateful (benchmark) runs can be compared. Each run needs a stored analysis; the newest one is used.</p>
+    <details class="sub-collapsible" id="cmp-th">
+      <summary>Regression thresholds <span class="opt" id="cmp-th-sum">server defaults</span></summary>
+      <div class="grid" id="cmp-th-grid"></div>
+    </details>
+    <div class="start-actions">
+      <button type="submit" class="btn btn-primary" id="cmp-btn">Compare</button>
+      <button type="button" class="btn btn-secondary" data-act="cmp-swap">Swap A and B</button>
+      <span class="run-result" id="cmp-msg" role="status" aria-live="polite"></span>
+    </div>
+    <div class="run-error" id="cmp-error" role="alert"></div>
+  </form>
+  <div id="cmp-result"></div>
 </section>
 
 </main>

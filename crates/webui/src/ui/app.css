@@ -584,6 +584,39 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
 .fault-remove { justify-content: flex-end; align-self: end; }
 .fault-remove .btn { align-self: flex-start; }
 
+/* ---------- compare ---------- */
+.cmp-card { margin-top: 14px; }
+.cmp-sides { display: grid; grid-template-columns: minmax(0, 1fr) auto minmax(0, 1fr); gap: 10px 16px; align-items: stretch; }
+.cmp-side { border: 1px solid var(--rule); background: var(--surface-2); padding: 8px 12px; min-width: 0; }
+.cmp-side-label { font-size: var(--fs-xs); font-weight: 700; color: var(--ink-2); text-transform: uppercase; letter-spacing: 0.05em; }
+.cmp-side-run { font-family: var(--mono); font-size: var(--fs-md); font-weight: 600; display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.cmp-side .meta-line { margin: 2px 0 0; overflow-wrap: anywhere; }
+.cmp-arrow { align-self: center; color: var(--dim); font-size: var(--fs-lg); }
+.cmp-verdict { margin-top: 12px; }
+.cmp-h { margin: 18px 0 8px; }
+table.t th[scope="row"] { font-weight: 600; color: var(--ink); white-space: nowrap; border-bottom: 1px solid var(--rule-soft); }
+.cmp-fleet { max-width: 760px; }
+.dl-good { color: var(--ok); font-weight: 600; }
+.dl-bad { color: var(--err); font-weight: 600; }
+.dl-same { color: var(--dim); }
+.reg-tag { display: inline-block; font-size: var(--fs-xs); font-weight: 700; color: var(--err); border: 1px solid currentColor; padding: 0 5px; line-height: 16px; margin-left: 4px; white-space: nowrap; }
+.cmp-regs { margin: 0; padding-left: 22px; font-size: var(--fs-sm); }
+.cmp-regs li { margin: 2px 0; overflow-wrap: anywhere; }
+.reg-metric { font-family: var(--mono); font-size: var(--fs-xs); color: var(--err); font-weight: 700; margin-right: 4px; }
+.cmp-more > summary { cursor: pointer; color: var(--blue); font-size: var(--fs-sm); padding: 4px 0; }
+.cmp-toolbar { align-items: flex-end; }
+.cmp-toolbar .check { align-self: center; }
+.cmp-rtus td.reg { background: rgba(146, 38, 38, 0.12); }
+.cmp-rtus td.reg .ab { font-weight: 700; color: var(--err); }
+.cmp-rtus .ab, .cmp-rtus td.cmp-vd { white-space: nowrap; }
+table.t tr.row-problem th { background: var(--err-soft); }
+.cmp-regs .btn-text { min-height: 0; padding: 0 4px; }
+.cmp-only { margin-top: 10px; display: flex; flex-direction: column; gap: 6px; font-size: var(--fs-sm); }
+.cmp-only summary { cursor: pointer; }
+.cmp-ips { font-size: var(--fs-xs); margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 10px; }
+.cmp-th-used { margin-top: 12px; }
+.cmp-missing p + p { margin-top: 6px; }
+
 /* ---------- footer ---------- */
 .footer {
   max-width: 1200px; margin: 0 auto; padding: 16px 24px 32px; border-top: 1px solid var(--rule);
@@ -624,6 +657,8 @@ details.an-seq summary { cursor: pointer; font-size: var(--fs-xs); color: var(--
   .an-slave-head > :nth-child(3), .an-slave-head > :nth-child(5) { display: none; }
   .an-slave-sum > :nth-child(4), .an-slave-head > :nth-child(4) { display: none; }
   .an-slave-detail { padding: 8px 6px 12px; }
+  .cmp-sides { grid-template-columns: minmax(0, 1fr); }
+  .cmp-arrow { display: none; }
   .fault-grid { grid-template-columns: minmax(0, 1fr); }
   .statusbar { flex-wrap: wrap; }
   .an-tid-hist { grid-template-columns: minmax(0, 1fr); }
