@@ -268,7 +268,7 @@ fn reassembles_client_stream_with_retransmit() {
 }
 
 #[test]
-fn reassembly_detects_gap() {
+fn reassembly_records_gap_and_continues() {
     let client_mac: MacAddr = [0x02, 0, 0, 0, 0, 0x01];
     let server_mac: MacAddr = [0x02, 0, 0, 0, 0, 0x02];
     let c_ip = [10, 0, 0, 1];
@@ -302,8 +302,21 @@ fn reassembly_detects_gap() {
         ),
     ];
     let loaded = load_bytes(&make_pcap(&frames), PathBuf::from("gap.pcap")).unwrap();
-    let err = loaded.reassemble_client_payload(0).unwrap_err();
-    assert!(err.to_string().contains("gap"), "unexpected error: {err}");
+    // A hole no longer fails the direction: both sides are spliced and
+    // the hole is recorded.
+    let r = loaded.reassemble_client_payload(0).unwrap();
+    assert_eq!(&r.payload, b"AABB");
+    assert_eq!(
+        r.gaps,
+        vec![StreamGap {
+            offset: 2,
+            missing: 98
+        }]
+    );
+    assert!(!r.is_contiguous());
+    assert_eq!(r.missing_bytes(), 98);
+    let chunks: Vec<_> = r.contiguous_chunks().collect();
+    assert_eq!(chunks, vec![(0, &b"AA"[..]), (2, &b"BB"[..])]);
 }
 
 #[test]

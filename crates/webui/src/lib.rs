@@ -2396,7 +2396,10 @@ fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Viability {
     // the protocol name (e.g. taken from the upload metadata), look
     // it up via proto_registry::lookup(name) instead and dispatch.
     let replayer = proto_registry::lookup("iec104").expect("iec104 replayer always registered");
-    let proto = replayer.quick_viability(&view, file_size);
+    let mut proto = replayer.quick_viability(&view, file_size);
+    // Say why packets or flows may be missing (IPv6, unsupported link
+    // types, fragments, truncated file, reused 4-tuples).
+    proto.notes.extend(p.ingest_notes());
     viability_from_proto(proto)
 }
 

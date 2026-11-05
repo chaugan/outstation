@@ -580,7 +580,6 @@ outstation/
 │   ├── rewrite/                   in-place L2/L3/L4 header rewrite
 │   ├── raw_replay/                AF_PACKET sender with µs scheduling
 │   ├── sched/                     orchestrator: run() and run_benchmark()
-│   ├── tcp_session/               generic TCP client replayer
 │   ├── protoplay/                 ProtoReplayer trait + shared types
 │   ├── proto_iec104/              IEC 60870-5-104 windowed replayer
 │   ├── proto_modbus_tcp/          stub
