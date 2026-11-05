@@ -718,6 +718,9 @@ pub struct Iec104ProtoConfig {
     /// Slave-mode command echo.
     #[serde(default)]
     pub commands: CommandsConfig,
+    /// Post-run analysis thresholds (not used by the live session).
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
     /// Raw `faults` value; validated into [`Iec104ProtoConfig::fault_plan`].
     #[serde(default)]
     faults: Option<serde_json::Value>,
@@ -726,6 +729,58 @@ pub struct Iec104ProtoConfig {
     /// The validated fault plan (empty when `faults` is absent).
     #[serde(skip)]
     pub fault_plan: FaultPlan,
+}
+
+/// Thresholds the post-run fidelity analysis judges this run with.
+/// Lives in the run's `proto_config` so a run is re-analysed with the
+/// same thresholds it was configured with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisConfig {
+    /// Pacing drift (ms) above which an original-timing replay fails
+    /// its timing dimension; the effective threshold is the larger of
+    /// this and `timing_drift_fail_rel` × script span / speed.
+    #[serde(default = "default_drift_fail_ms")]
+    pub timing_drift_fail_ms: f64,
+    /// Relative part of the drift threshold (fraction of the script
+    /// span at the configured speed), `0..=1`.
+    #[serde(default = "default_drift_fail_rel")]
+    pub timing_drift_fail_rel: f64,
+}
+
+/// Default absolute pacing-drift fail threshold (ms).
+pub const DEFAULT_TIMING_DRIFT_FAIL_MS: f64 = 1_000.0;
+/// Default relative pacing-drift fail threshold.
+pub const DEFAULT_TIMING_DRIFT_FAIL_REL: f64 = 0.05;
+
+fn default_drift_fail_ms() -> f64 {
+    DEFAULT_TIMING_DRIFT_FAIL_MS
+}
+fn default_drift_fail_rel() -> f64 {
+    DEFAULT_TIMING_DRIFT_FAIL_REL
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            timing_drift_fail_ms: DEFAULT_TIMING_DRIFT_FAIL_MS,
+            timing_drift_fail_rel: DEFAULT_TIMING_DRIFT_FAIL_REL,
+        }
+    }
+}
+
+impl AnalysisConfig {
+    pub fn validate(&self) -> Result<()> {
+        let ms = self.timing_drift_fail_ms;
+        if !(ms.is_finite() && (1.0..=3_600_000.0).contains(&ms)) {
+            bail!("timing_drift_fail_ms must be 1..=3600000, got {ms}");
+        }
+        let rel = self.timing_drift_fail_rel;
+        if !(rel.is_finite() && (0.0..=1.0).contains(&rel)) {
+            bail!("timing_drift_fail_rel must be 0..=1, got {rel}");
+        }
+        Ok(())
+    }
 }
 
 /// IEC 60870-5-104 §5 link parameters plus session behaviour knobs.
@@ -927,6 +982,9 @@ impl Iec104ProtoConfig {
         cfg.session
             .validate()
             .map_err(|e| anyhow::anyhow!("proto_config (session): {e}"))?;
+        cfg.analysis
+            .validate()
+            .map_err(|e| anyhow::anyhow!("proto_config (analysis): {e}"))?;
         cfg.commands
             .validate()
             .map_err(|e| anyhow::anyhow!("proto_config (commands): {e}"))?;
@@ -962,6 +1020,29 @@ mod tests {
     /// N2: unknown or wrongly typed top-level keys are errors; every
     /// shape the web UI produces (buildProtoConfig in 30-configure.js,
     /// addIec104Editors in 35-iec104-config.js) still parses.
+    #[test]
+    fn analysis_thresholds_parse_and_validate() {
+        let c = Iec104ProtoConfig::parse(None).unwrap();
+        assert_eq!(c.analysis, AnalysisConfig::default());
+        let c = Iec104ProtoConfig::parse(Some(
+            r#"{"analysis":{"timing_drift_fail_ms":2500,"timing_drift_fail_rel":0.1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(c.analysis.timing_drift_fail_ms, 2500.0);
+        assert_eq!(c.analysis.timing_drift_fail_rel, 0.1);
+        for bad in [
+            r#"{"analysis":{"timing_drift_fail_ms":0}}"#,
+            r#"{"analysis":{"timing_drift_fail_rel":1.5}}"#,
+            r#"{"analysis":{"drift":1}}"#,
+        ] {
+            let e = validate_proto_config(Some(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains("analysis") || e.contains("unknown field"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
     #[test]
     fn proto_config_rejects_unknown_and_mistyped_top_level_keys() {
         let err = |s: &str| validate_proto_config(Some(s)).unwrap_err().to_string();

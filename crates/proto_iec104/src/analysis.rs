@@ -126,9 +126,9 @@ pub const SPEED_MATCH_TOLERANCE: f64 = 0.05;
 /// Timing fails (when the run was paced) if the worst cumulative drift
 /// exceeds this many ms *and* [`TIMING_DRIFT_FAIL_REL`] of the
 /// iteration's original span.
-pub const TIMING_DRIFT_FAIL_MS: f64 = 1_000.0;
+pub const TIMING_DRIFT_FAIL_MS: f64 = crate::asdu::DEFAULT_TIMING_DRIFT_FAIL_MS;
 /// Relative part of the timing drift threshold.
-pub const TIMING_DRIFT_FAIL_REL: f64 = 0.05;
+pub const TIMING_DRIFT_FAIL_REL: f64 = crate::asdu::DEFAULT_TIMING_DRIFT_FAIL_REL;
 /// Share-of-frames statistic: frames whose drift is within ±this.
 pub const DRIFT_WITHIN_MS: f64 = 100.0;
 
@@ -436,11 +436,11 @@ pub fn analyze_iec104_flow(
     ctx: &AnalyzeCtx,
 ) -> ProtoSlaveAnalysis {
     let mut notes: Vec<String> = Vec::new();
-    let cp56_cfg = match Iec104ProtoConfig::parse(ctx.proto_config.as_deref()) {
-        Ok(c) => c.cp56,
+    let (cp56_cfg, analysis_cfg) = match Iec104ProtoConfig::parse(ctx.proto_config.as_deref()) {
+        Ok(c) => (c.cp56, c.analysis),
         Err(e) => {
             notes.push(format!(
-                "{e}; analysed as if CP56 rewriting was off (the run itself would have refused this config)"
+                "{e}; analysed as if CP56 rewriting was off and with default thresholds (the run itself would have refused this config)"
             ));
             Default::default()
         }
@@ -646,6 +646,8 @@ pub fn analyze_iec104_flow(
         stopped_early: ctx.run.stopped_early || faults_on,
         // Faults stall the sender on purpose: timing is not judged.
         paced_speed: if faults_on { None } else { ctx.run.paced_speed },
+        drift_fail_ms: analysis_cfg.timing_drift_fail_ms,
+        drift_fail_rel: analysis_cfg.timing_drift_fail_rel,
     };
     if faults_on && ctx.run.paced_speed.is_some() {
         notes.push("faults were injected: pacing is measured but not judged".into());
@@ -1480,6 +1482,10 @@ struct CompareCfg {
     iterations_configured: u64,
     stopped_early: bool,
     paced_speed: Option<f64>,
+    /// Pacing-drift fail threshold, from `proto_config.analysis`
+    /// (defaults [`TIMING_DRIFT_FAIL_MS`] / [`TIMING_DRIFT_FAIL_REL`]).
+    drift_fail_ms: f64,
+    drift_fail_rel: f64,
 }
 
 struct CompareResult {
@@ -1946,7 +1952,9 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     );
     if let Some(s) = cfg.paced_speed.filter(|s| *s > 0.0) {
         timing.timing_judged = true;
-        let threshold = TIMING_DRIFT_FAIL_MS.max(TIMING_DRIFT_FAIL_REL * max_orig_span / s);
+        let threshold = cfg
+            .drift_fail_ms
+            .max(cfg.drift_fail_rel * max_orig_span / s);
         if timing.max_abs_drift_ms > threshold {
             timing.timing_failure = Some(format!(
                 "pacing drift reached {:.0} ms (threshold {:.0} ms at {s}× speed; replay ran {})",
@@ -4623,6 +4631,35 @@ mod tests {
         // The pacing samples pair by alignment: 9 samples, no phantom
         // drift from the dropped frame.
         assert_eq!(r.pacing_samples.len(), 9);
+
+        // F066: the drift threshold comes from proto_config.analysis.
+        // 1800 ms of drift passes a 5 s threshold.
+        let lenient = ctx_with(
+            RunFacts {
+                paced_speed: Some(1.0),
+                ..Default::default()
+            },
+            Some(r#"{"analysis":{"timing_drift_fail_ms":5000}}"#),
+        );
+        let r2 = analyze_iec104_flow(
+            Some(FlowSnapshot {
+                payload: &ep,
+                packet_offsets: &eo,
+            }),
+            Some(FlowSnapshot {
+                payload: &gp,
+                packet_offsets: &go,
+            }),
+            None,
+            Some(FlowSnapshot {
+                payload: &tp,
+                packet_offsets: &to,
+            }),
+            &lenient,
+        );
+        let t2 = &r2.protocol_specific["timing"];
+        assert_eq!(t2["timing_judged"], true);
+        assert!(t2["timing_failure"].is_null(), "{t2}");
     }
 
     #[test]
