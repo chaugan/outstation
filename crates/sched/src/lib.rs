@@ -857,6 +857,62 @@ impl Default for BenchmarkConfig {
     }
 }
 
+/// How well a reassembled flow side replays ([`protoplay::FlowQuality`]).
+pub(crate) fn replay_quality(r: &pcapload::ReassembledFlow) -> protoplay::FlowQuality {
+    let gaps: Vec<usize> = r.gaps.iter().map(|g| g.offset).collect();
+    protoplay::FlowQuality::new(r.payload.len(), &gaps, r.missing_bytes())
+}
+
+/// Keep the best of several candidate flows per IP: `candidates` are
+/// `(flow index, endpoint IP)`; each is reassembled and replaces the
+/// IP's current best only if `quality` ranks it strictly better (ties
+/// keep the earlier flow). Only the current best per IP is held.
+/// Returns `(flow index, ip, reassembly)` in the order the IPs first
+/// reassembled. A failed reassembly is logged and skipped.
+pub(crate) fn best_flow_per_ip<T>(
+    candidates: impl IntoIterator<Item = (usize, Ipv4Addr)>,
+    mut reassemble: impl FnMut(usize) -> Result<T>,
+    quality: impl Fn(&T) -> protoplay::FlowQuality,
+) -> Vec<(usize, Ipv4Addr, T)> {
+    let mut order: Vec<Ipv4Addr> = Vec::new();
+    let mut best: std::collections::HashMap<Ipv4Addr, (usize, protoplay::FlowQuality, T)> =
+        Default::default();
+    let mut flows_seen: std::collections::HashMap<Ipv4Addr, usize> = Default::default();
+    for (idx, ip) in candidates {
+        *flows_seen.entry(ip).or_default() += 1;
+        let t = match reassemble(idx) {
+            Ok(t) => t,
+            Err(e) => {
+                warn!(flow = idx, %ip, error = %e, "reassembly failed; trying the next flow");
+                continue;
+            }
+        };
+        let q = quality(&t);
+        match best.get(&ip) {
+            None => {
+                order.push(ip);
+                best.insert(ip, (idx, q, t));
+            }
+            Some((_, cur, _)) if q.better_than(cur) => {
+                best.insert(ip, (idx, q, t));
+            }
+            Some(_) => {}
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|ip| {
+            let (idx, q, t) = best.remove(&ip)?;
+            let n = flows_seen.get(&ip).copied().unwrap_or(1);
+            if n > 1 {
+                info!(%ip, flow = idx, flows = n, gaps = q.gaps, bytes = q.payload_bytes,
+                    "endpoint has several flows; replaying the most contiguous, largest");
+            }
+            Some((idx, ip, t))
+        })
+        .collect()
+}
+
 /// Resolve `iterations` into an actual loop count: 0 → unlimited
 /// (u64::MAX), N → N. Caller is expected to break on cancel.
 #[inline]

@@ -1044,6 +1044,109 @@ pub trait LoadedPcapView {
     fn flow_server_payload(&self, _flow_idx: usize) -> Vec<u8> {
         Vec::new()
     }
+    /// Reassemble one side of a flow once and hand it to `f` without
+    /// copying (P07). `f` is not called when that side carries no
+    /// payload. The default is built on
+    /// [`LoadedPcapView::flow_server_payload`] (server side only, no
+    /// gap information); real views override it.
+    fn with_flow_side(
+        &self,
+        flow_idx: usize,
+        side: FlowSide,
+        f: &mut dyn FnMut(&FlowSideView<'_>),
+    ) {
+        if side == FlowSide::Server {
+            let payload = self.flow_server_payload(flow_idx);
+            if !payload.is_empty() {
+                f(&FlowSideView {
+                    payload: &payload,
+                    gap_offsets: &[],
+                    missing_bytes: 0,
+                });
+            }
+        }
+    }
+    /// Packets in the capture (for the memory estimate); 0 = unknown.
+    fn packet_count(&self) -> u64 {
+        0
+    }
+}
+
+/// One side of a TCP flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSide {
+    /// Bytes the client sent (master role replays them).
+    Client,
+    /// Bytes the server sent (slave role replays them).
+    Server,
+}
+
+/// One reassembled side of a flow, see
+/// [`LoadedPcapView::with_flow_side`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlowSideView<'a> {
+    pub payload: &'a [u8],
+    /// Payload offsets of the capture gaps (TCP sequence holes), in
+    /// order; an offset of 0 is a lost first segment.
+    pub gap_offsets: &'a [usize],
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+/// How well one captured flow side lends itself to replay, to pick one
+/// flow per endpoint when an endpoint appears in several (reconnects,
+/// port reuse). The scheduler and the upload viability rank flows the
+/// same way (N18): the longest contiguous run of bytes first (the most
+/// that replays without a hole), then fewer gaps, then more bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlowQuality {
+    /// Longest stretch of payload without a capture gap inside it.
+    pub longest_chunk: usize,
+    /// Capture gaps, a lost first segment included.
+    pub gaps: usize,
+    pub payload_bytes: usize,
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+impl FlowQuality {
+    /// Quality of a side with `payload_len` bytes and capture gaps at
+    /// `gap_offsets` (sorted payload offsets).
+    pub fn new(payload_len: usize, gap_offsets: &[usize], missing_bytes: u64) -> Self {
+        let mut longest = 0usize;
+        let mut start = 0usize;
+        for &o in gap_offsets {
+            let o = o.min(payload_len);
+            longest = longest.max(o.saturating_sub(start));
+            start = start.max(o);
+        }
+        longest = longest.max(payload_len.saturating_sub(start));
+        Self {
+            longest_chunk: longest,
+            gaps: gap_offsets.len(),
+            payload_bytes: payload_len,
+            missing_bytes,
+        }
+    }
+
+    /// Quality of a reassembled side.
+    pub fn of(side: &FlowSideView<'_>) -> Self {
+        Self::new(side.payload.len(), side.gap_offsets, side.missing_bytes)
+    }
+
+    /// Strictly better replay candidate than `other` (ties keep the
+    /// flow seen first).
+    pub fn better_than(&self, other: &FlowQuality) -> bool {
+        (
+            self.longest_chunk,
+            std::cmp::Reverse(self.gaps),
+            self.payload_bytes,
+        ) > (
+            other.longest_chunk,
+            std::cmp::Reverse(other.gaps),
+            other.payload_bytes,
+        )
+    }
 }
 
 /// Minimal flow descriptor a viability impl needs.
@@ -1253,6 +1356,27 @@ pub fn stub_report(name: &str) -> ProtoReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_quality_prefers_the_longest_contiguous_run() {
+        let clean = FlowQuality::new(1000, &[], 0);
+        assert_eq!(clean.longest_chunk, 1000);
+        let gapped = FlowQuality::new(1200, &[300], 50);
+        assert_eq!(gapped.longest_chunk, 900);
+        assert_eq!(gapped.gaps, 1);
+        assert!(clean.better_than(&gapped));
+        assert!(!gapped.better_than(&clean));
+        // A lost first segment splits nothing but counts as a gap.
+        let lead = FlowQuality::new(1000, &[0], 6);
+        assert_eq!(lead.longest_chunk, 1000);
+        assert!(clean.better_than(&lead));
+        // A big flow with one small hole beats a short clean one.
+        let short = FlowQuality::new(100, &[], 0);
+        assert!(gapped.better_than(&short));
+        // Ties keep the first.
+        assert!(!clean.better_than(&clean));
+        assert_eq!(FlowQuality::new(10, &[3, 3, 8], 1).longest_chunk, 5);
+    }
 
     #[test]
     fn protocol_stats_merge_respects_caps() {

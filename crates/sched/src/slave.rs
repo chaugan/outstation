@@ -131,39 +131,24 @@ pub(crate) fn ensure_listen_alias(
     Ok(Some(lease))
 }
 
-/// Pick one flow per unique server (RTU) IP whose server port matches.
-/// An RTU is only marked as seen once its reassembly succeeded, so a
-/// later clean flow of the same RTU is used when an earlier one has a
-/// gap (P02).
+/// Pick the best flow ([`replay_quality`]) per unique server (RTU) IP
+/// whose server port matches, in the order the RTUs first reassembled.
+/// A flow that does not reassemble is skipped, so a later flow of the
+/// same RTU is used instead of dropping it (P02); among several, the
+/// most contiguous, largest one wins, not the first (N18).
 pub(crate) fn select_slave_flows<T>(
     flows: impl IntoIterator<Item = (usize, Option<(Ipv4Addr, u16)>)>,
     target_port: u16,
     selected: Option<&std::collections::HashSet<Ipv4Addr>>,
-    mut reassemble: impl FnMut(usize, Ipv4Addr) -> Result<T>,
+    reassemble: impl FnMut(usize) -> Result<T>,
+    quality: impl Fn(&T) -> protoplay::FlowQuality,
 ) -> Vec<(usize, Ipv4Addr, T)> {
-    let mut picks = Vec::new();
-    let mut seen: std::collections::HashSet<Ipv4Addr> = Default::default();
-    for (idx, server) in flows {
-        let Some((server_ip, server_port)) = server else {
-            continue;
-        };
-        if server_port != target_port || seen.contains(&server_ip) {
-            continue;
-        }
-        if selected.is_some_and(|s| !s.contains(&server_ip)) {
-            continue;
-        }
-        match reassemble(idx, server_ip) {
-            Ok(t) => {
-                seen.insert(server_ip);
-                picks.push((idx, server_ip, t));
-            }
-            Err(e) => {
-                warn!(flow = idx, error = %e, "slave: server reassembly failed, trying next flow");
-            }
-        }
-    }
-    picks
+    let candidates = flows.into_iter().filter_map(|(idx, server)| {
+        let (server_ip, server_port) = server?;
+        (server_port == target_port && selected.is_none_or(|s| s.contains(&server_ip)))
+            .then_some((idx, server_ip))
+    });
+    best_flow_per_ip(candidates, reassemble, quality)
 }
 
 /// Slave-mode benchmark: outstation binds a TcpListener per captured
@@ -252,8 +237,8 @@ struct SlavePick {
     frame_times_ns: Vec<u64>,
 }
 
-/// One flow per RTU ([`select_slave_flows`]), reassembled from the
-/// server side. Fails if none matches.
+/// The best flow per RTU ([`select_slave_flows`]), reassembled from
+/// the server side. Fails if none matches.
 fn select_slave_picks(
     pcap: &LoadedPcap,
     cfg: &BenchmarkConfig,
@@ -263,7 +248,8 @@ fn select_slave_picks(
         pcap.flows.iter().enumerate().map(|(i, f)| (i, f.server)),
         cfg.target_port,
         cfg.selected_endpoints.as_ref(),
-        |idx, _| pcap.reassemble_server_payload(idx),
+        |idx| pcap.reassemble_server_payload(idx),
+        replay_quality,
     )
     .into_iter()
     .map(|(flow_idx, server_ip, r)| SlavePick {

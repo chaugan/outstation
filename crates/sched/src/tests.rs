@@ -76,9 +76,9 @@ fn merge_keeps_first_error() {
 }
 
 #[test]
-fn slave_flow_selection_marks_seen_only_after_success() {
-    // P02: the first flow of 10.0.0.1 has a gap; the second is clean
-    // and must be used instead of dropping the RTU.
+fn slave_flow_selection_picks_the_best_flow_per_rtu() {
+    // P02: the first flow of 10.0.0.1 does not reassemble; N18: of its
+    // other flows the most contiguous, largest one wins, not the first.
     let ip1 = Ipv4Addr::new(10, 0, 0, 1);
     let ip2 = Ipv4Addr::new(10, 0, 0, 2);
     let flows = vec![
@@ -88,26 +88,68 @@ fn slave_flow_selection_marks_seen_only_after_success() {
         (3, Some((ip1, 2404))),
         (4, Some((ip2, 80))),
         (5, None),
+        (6, Some((ip1, 2404))),
     ];
-    let picks = select_slave_flows(flows.clone(), 2404, None, |idx, _| {
-        if idx == 0 {
-            bail!("gap")
-        } else {
-            Ok(idx)
+    // (payload length, gap offsets) per flow.
+    let shape = |idx: usize| -> (usize, Vec<usize>) {
+        match idx {
+            2 => (100, vec![]),
+            3 => (500, vec![]),
+            6 => (900, vec![100, 200]), // longest run 700
+            _ => (50, vec![]),
         }
-    });
+    };
+    let quality = |t: &(usize, Vec<usize>)| protoplay::FlowQuality::new(t.0, &t.1, 0);
+    let picks = select_slave_flows(
+        flows.clone(),
+        2404,
+        None,
+        |idx| {
+            if idx == 0 {
+                bail!("no payload")
+            } else {
+                Ok(shape(idx))
+            }
+        },
+        quality,
+    );
     let got: Vec<(usize, Ipv4Addr)> = picks.iter().map(|(i, ip, _)| (*i, *ip)).collect();
-    assert_eq!(got, vec![(1, ip2), (2, ip1)]);
+    assert_eq!(got, vec![(1, ip2), (6, ip1)]);
 
     // Endpoint filter is applied before reassembly is attempted.
-    let only: std::collections::HashSet<Ipv4Addr> = [ip1].into_iter().collect();
+    let only: std::collections::HashSet<Ipv4Addr> = [ip2].into_iter().collect();
     let mut tried = Vec::new();
-    let picks = select_slave_flows(flows, 2404, Some(&only), |idx, _| {
-        tried.push(idx);
-        Ok(())
-    });
+    let picks = select_slave_flows(
+        flows,
+        2404,
+        Some(&only),
+        |idx| {
+            tried.push(idx);
+            Ok(shape(idx))
+        },
+        quality,
+    );
     assert_eq!(picks.len(), 1);
-    assert_eq!(tried, vec![0]);
+    assert_eq!(tried, vec![1]);
+}
+
+/// N18: master selection ranks a reconnect's flows the same way, on
+/// real reassemblies: a later clean flow beats an earlier one with a
+/// capture gap.
+#[test]
+fn best_flow_per_ip_prefers_a_clean_later_flow() {
+    let ip = Ipv4Addr::new(10, 0, 0, 9);
+    let runs: Vec<(usize, Vec<usize>)> = vec![(400, vec![50]), (380, vec![]), (380, vec![])];
+    let got = best_flow_per_ip(
+        (0..3).map(|i| (i, ip)),
+        |i| Ok(runs[i].clone()),
+        |t: &(usize, Vec<usize>)| protoplay::FlowQuality::new(t.0, &t.1, 0),
+    );
+    assert_eq!(got.len(), 1);
+    assert_eq!(
+        got[0].0, 1,
+        "clean 380 beats 400 with a gap (run 350); ties keep the first"
+    );
 }
 
 #[test]

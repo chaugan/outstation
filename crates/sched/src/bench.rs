@@ -334,70 +334,67 @@ struct FlowPick {
 }
 
 /// TCP flows whose server port is the target port, reassembled from
-/// the client side, collapsed to one per client IP (the first flow that
-/// reassembled wins). Fails if none matches.
+/// the client side, reduced to the best flow per client IP
+/// ([`replay_quality`]: the same ranking for both roles and the upload
+/// viability, N18). Only the current best payload per IP is kept while
+/// walking the flows (P07). Fails if none matches.
 fn select_master_flows(
     pcap: &LoadedPcap,
     cfg: &BenchmarkConfig,
     replayer: &dyn protoplay::ProtoReplayer,
 ) -> Result<Vec<FlowPick>> {
-    let mut picks: Vec<FlowPick> = Vec::new();
-    for (idx, flow) in pcap.flows.iter().enumerate() {
-        let Some((_, server_port)) = flow.server else {
-            continue;
-        };
+    let candidates = pcap.flows.iter().enumerate().filter_map(|(idx, flow)| {
+        let (_, server_port) = flow.server?;
+        let (client_ip, _) = flow.client?;
         if server_port != cfg.target_port {
-            continue;
+            return None;
         }
-        let Some((client_ip, _)) = flow.client else {
-            continue;
-        };
-        if let Some(set) = &cfg.selected_endpoints {
-            if !set.contains(&client_ip) {
-                continue;
-            }
+        if cfg
+            .selected_endpoints
+            .as_ref()
+            .is_some_and(|set| !set.contains(&client_ip))
+        {
+            return None;
         }
-        let Some(src_info) = pcap.sources.get(&client_ip) else {
+        if !pcap.sources.contains_key(&client_ip) {
             warn!(%client_ip, "client ip has no MAC in sources table, skipping");
-            continue;
-        };
-        let first_pkt_rel_ns = flow
-            .packet_indices
-            .first()
-            .map(|i| pcap.packets[*i].rel_ts_ns)
-            .unwrap_or(0);
-        let flow_span_ns = flow
-            .packet_indices
-            .iter()
-            .map(|i| pcap.packets[*i].rel_ts_ns)
-            .max()
-            .unwrap_or(0)
-            .saturating_sub(first_pkt_rel_ns);
-        match pcap.reassemble_client_payload(idx) {
-            Ok(reassembled) => {
-                let frame_times_ns = replayer
-                    .extract_message_times_ns(&reassembled.payload, &reassembled.packet_offsets);
-                picks.push(FlowPick {
-                    flow_idx: idx,
-                    client_ip,
-                    client_mac: src_info.src_mac,
-                    first_pkt_rel_ns,
-                    flow_span_ns,
-                    capture_gaps: reassembled.gaps.iter().map(|g| g.offset).collect(),
-                    payload: reassembled.payload,
-                    frame_times_ns,
-                });
-            }
-            Err(e) => {
-                warn!(flow = idx, error = %e, "reassembly failed; skipping flow");
-            }
+            return None;
         }
-    }
-
-    // Collapse to one session per unique client IP: the first flow
-    // that reassembled successfully wins.
-    let mut seen_ips: std::collections::HashSet<Ipv4Addr> = Default::default();
-    picks.retain(|p| seen_ips.insert(p.client_ip));
+        Some((idx, client_ip))
+    });
+    let best = best_flow_per_ip(
+        candidates,
+        |idx| pcap.reassemble_client_payload(idx),
+        replay_quality,
+    );
+    let picks: Vec<FlowPick> = best
+        .into_iter()
+        .map(|(idx, client_ip, r)| {
+            let flow = &pcap.flows[idx];
+            let first_pkt_rel_ns = flow
+                .packet_indices
+                .first()
+                .map(|i| pcap.packets[*i].rel_ts_ns)
+                .unwrap_or(0);
+            let flow_span_ns = flow
+                .packet_indices
+                .iter()
+                .map(|i| pcap.packets[*i].rel_ts_ns)
+                .max()
+                .unwrap_or(0)
+                .saturating_sub(first_pkt_rel_ns);
+            FlowPick {
+                flow_idx: idx,
+                client_ip,
+                client_mac: pcap.sources[&client_ip].src_mac,
+                first_pkt_rel_ns,
+                flow_span_ns,
+                frame_times_ns: replayer.extract_message_times_ns(&r.payload, &r.packet_offsets),
+                capture_gaps: r.gaps.iter().map(|g| g.offset).collect(),
+                payload: r.payload,
+            }
+        })
+        .collect();
 
     if picks.is_empty() {
         bail!(
