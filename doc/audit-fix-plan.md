@@ -177,7 +177,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Annotate `fidelity_report_run2.md`.
   - Refs: F007, F068, F128, F129, F130, F133, F135, F138; product items #1, #6 and #10.
 - [x] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
-- [~] **T16b Bugs found by the smoke suite.**
+- [x] **T16b Bugs found by the smoke suite.**
   - B1: the raw mirror capture records each flooded frame once per run port (`mirror_port` mirrors ingress and egress on every port), and at top speed with many sources it drops some frames.
   - B2: `collect_capture` reads its counters before `stop()`, so `captured_packets` can be lower than the file.
   - O1: an unbounded master run with original pacing reconnects 8–12 times a second on short captures; an iteration should last the capture's span divided by speed.
@@ -320,3 +320,10 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Fixes: a 32 MiB SO_RCVBUF, the outgoing copy on `lo` dropped in BPF, the slave capture at RT priority, and the queue drained on stop. A new `captured_dropped` field is surfaced in reports, warnings and analysis notes.
   - Root cause 2: the test mistook a TCP retransmission for a double capture; it now compares frames byte-for-byte.
   - Under a load of about 30 on 12 cores: 30/30 runs, and 6/6 back-to-back rounds of all three privileged suites.
+- 2026-11-05: T16b merged. Workspace tests: 416 passed, 2 runs green.
+  - Exact-once captures: ingress-only port mirror plus a filtered NIC reader, kernel timestamps and checksum offload off on the inject ends.
+  - Bridge mcast_snooping off, plus `quiet_iface` (no IGMP or IPv6 chatter).
+  - Master iterations last at least span/speed, with an `iteration_gap_ms` gap and connect backoff.
+  - A startup auto-analysis backlog (newest 20).
+  - netns-smoke 10/10 on both runs; all privileged suites green.
+- 2026-11-05: Orchestrator added the `iteration_gap_ms` UI input and the `captured_dropped` docs, and made the ui-smoke compare flow auto-analysis aware. ui-smoke: 182/182 with auto-analysis, 204/204 without.
