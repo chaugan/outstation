@@ -176,7 +176,13 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Fix `doc/adding-a-protocol.md`.
   - Annotate `fidelity_report_run2.md`.
   - Refs: F007, F068, F128, F129, F130, F133, F135, F138; product items #1, #6 and #10.
-- [~] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
+- [x] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
+- [ ] **T16b Bugs found by the smoke suite.**
+  - B1: the raw mirror capture records each flooded frame once per run port (`mirror_port` mirrors ingress and egress on every port), and at top speed with many sources it drops some frames.
+  - B2: `collect_capture` reads its counters before `stop()`, so `captured_packets` can be lower than the file.
+  - O1: an unbounded master run with original pacing reconnects 8–12 times a second on short captures; an iteration should last the capture's span divided by speed.
+  - O2: inject ports send IGMPv3 reports onto the LAN with the RTU's MAC.
+  - O3: a run stopped by SIGTERM is never auto-analysed, neither at shutdown nor after a restart.
 - [ ] **T17 Final verification.** Run the full test, clippy and CI suite; live-UI Playwright pass (Chromium and WebKit, desktop and phone); a 200-RTU load run inside the netns, recording CPU, RSS, fds and msg/s; a re-audit of the diff against this plan. Every finding ID is accounted for (fixed, or won't-fix with a reason) in the table below.
 
 ---
@@ -304,3 +310,8 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - `adding-a-protocol.md` fixed; errata and caveats added to the reports.
   - The orchestrator reconciled the docs with T19, fixed the `cleanup --help` text and re-ran the link check (0 problems).
   - Left for T17 to measure: max throughput, CPU and memory per session, per-session setup time, and gateway mode with an egress NIC.
+- 2026-11-05: T16 merged.
+  - `scripts/netns-smoke.sh` drives the real `serve` over HTTP across 4 namespaces, covering 10 cases including SIGTERM, SIGKILL + `cleanup`, and restart persistence, with full host-state diffing in the namespace.
+  - Two runs: 9 PASS + 1 XFAIL each.
+  - Stale root scripts removed.
+  - Raw-capture bugs and behaviour issues logged as T16b.
