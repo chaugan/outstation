@@ -56,10 +56,12 @@ use crate::commands::{self, CommandsConfig, ReturnInfo, COT_RETREM};
 /// (`{"gi_ci_synthesis": false}`). Absent = on.
 pub const SYNTHESIS_KEY: &str = "gi_ci_synthesis";
 
-/// Whether the slave synthesizes GI/CI responses for this run, from
-/// the IEC 104 `proto_config`. Default on; only an explicit
-/// `"gi_ci_synthesis": false` turns it off. Malformed JSON counts as
-/// the default (the run itself validates the config).
+/// Whether the slave synthesized GI/CI responses for a run, from the
+/// IEC 104 `proto_config`. Default on; only an explicit
+/// `"gi_ci_synthesis": false` turns it off. Lenient for the analyzer,
+/// which may read stored configs: malformed JSON or a non-boolean
+/// counts as the default. A run never gets that far:
+/// [`crate::asdu::Iec104ProtoConfig::parse`] rejects a non-boolean.
 pub fn synthesis_enabled(proto_config: Option<&str>) -> bool {
     let Some(s) = proto_config.map(str::trim).filter(|s| !s.is_empty()) else {
         return true;

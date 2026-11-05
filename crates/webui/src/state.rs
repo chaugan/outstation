@@ -47,6 +47,9 @@ pub fn alias_state_path_in(state_dir: &Path) -> PathBuf {
     state_dir.join("state-aliases.txt")
 }
 
+/// Default for [`ServeConfig::runs_in_memory`].
+pub const DEFAULT_RUNS_IN_MEMORY: usize = 500;
+
 const GIB: u64 = 1024 * 1024 * 1024;
 const MIB: u64 = 1024 * 1024;
 
@@ -73,8 +76,24 @@ pub struct ServeConfig {
     pub capture_max_total_bytes: u64,
     /// Maximum number of capture files kept.
     pub capture_max_count: usize,
+    /// Per-run capture size cap in bytes; a capture that reaches it
+    /// stops recording and the run says `capture_truncated` (F055,
+    /// F072). 0 = no cap. `--capture-run-max-mb` or
+    /// `OUTSTATION_CAPTURE_RUN_MAX_MB`; default 4096 MiB.
+    pub capture_run_max_bytes: u64,
+    /// Finished runs kept in memory; older ones are served from the
+    /// database on demand (F054). `--runs-in-memory` or
+    /// `OUTSTATION_RUNS_IN_MEMORY`; default 500.
+    pub runs_in_memory: usize,
+    /// Total size quota of the pcap library in bytes; 0 = no quota
+    /// (F051). `--library-max-mb` or `OUTSTATION_LIBRARY_MAX_MB`.
+    pub library_max_bytes: u64,
     /// Concurrent heavy requests (analysis, uploads, gap histograms).
     pub heavy_concurrency: usize,
+    /// CP56Time2a drift tolerance (ms) for automatic and on-demand
+    /// analyses (F066). `--cp56-tolerance-ms` or
+    /// `OUTSTATION_CP56_TOLERANCE_MS`; default 50.
+    pub cp56_tolerance_ms: f64,
     /// Analyse every finished benchmark run's own capture automatically
     /// and store the result (T08). `serve --no-auto-analyze` or
     /// `OUTSTATION_AUTO_ANALYZE=0` turns it off.
@@ -122,7 +141,21 @@ impl ServeConfig {
             capture_max_count: env_u64("OUTSTATION_CAPTURE_MAX_COUNT")
                 .map(|v| v as usize)
                 .unwrap_or(200),
+            runs_in_memory: env_u64("OUTSTATION_RUNS_IN_MEMORY")
+                .map(|v| (v as usize).max(1))
+                .unwrap_or(DEFAULT_RUNS_IN_MEMORY),
+            capture_run_max_bytes: env_u64("OUTSTATION_CAPTURE_RUN_MAX_MB")
+                .map(|v| v * MIB)
+                .unwrap_or(4 * GIB),
+            library_max_bytes: env_u64("OUTSTATION_LIBRARY_MAX_MB")
+                .map(|v| v * MIB)
+                .unwrap_or(0),
             heavy_concurrency: 2,
+            cp56_tolerance_ms: std::env::var("OUTSTATION_CP56_TOLERANCE_MS")
+                .ok()
+                .and_then(|v| v.trim().parse::<f64>().ok())
+                .and_then(|v| crate::analysis::check_cp56_tolerance(v).ok())
+                .unwrap_or(crate::analysis::DEFAULT_CP56_TOLERANCE_MS),
             auto_analyze: std::env::var("OUTSTATION_AUTO_ANALYZE")
                 .ok()
                 .and_then(|v| env_flag(&v))
@@ -190,6 +223,8 @@ pub struct AppState {
     /// captured when the state is opened inside one.
     pub(crate) rt: Option<tokio::runtime::Handle>,
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
+    /// Library quota reservations of uploads in progress (F051).
+    pub(crate) library_quota: Arc<Mutex<crate::routes::library::QuotaBook>>,
 }
 
 impl AppState {
@@ -234,12 +269,52 @@ impl AppState {
             started: std::time::Instant::now(),
             rt: tokio::runtime::Handle::try_current().ok(),
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            library_quota: Arc::new(Mutex::new(Default::default())),
             cfg: Arc::new(cfg),
         })
     }
 
     pub(crate) fn get_run(&self, id: u64) -> Option<RunEntry> {
         self.runs.lock_safe().get(&id).cloned()
+    }
+
+    /// A run from memory, or else from the database (F054). The second
+    /// value is false for a database copy: changes to it are not kept.
+    pub(crate) fn get_run_any(&self, id: u64) -> Option<(RunEntry, bool)> {
+        if let Some(e) = self.get_run(id) {
+            return Some((e, true));
+        }
+        let rs = self.load_stored_run(id)?;
+        Some((Arc::new(Mutex::new(rs)), false))
+    }
+
+    /// Decode a run that is not in memory from the database, with its
+    /// newest analysis.
+    pub(crate) fn load_stored_run(&self, id: u64) -> Option<RunState> {
+        let stored = match self.db.load_one(id) {
+            Ok(s) => s?,
+            Err(e) => {
+                tracing::warn!(id, error = %e, "could not read run from the database");
+                return None;
+            }
+        };
+        self.load_stored_run_from(&stored)
+    }
+
+    /// [`Self::load_stored_run`] for a row already read.
+    pub(crate) fn load_stored_run_from(&self, stored: &crate::db::StoredRun) -> Option<RunState> {
+        let id = stored.id;
+        let mut rs = crate::persist::stored_to_runstate(
+            stored,
+            &self.cfg.library_dir,
+            &self.cfg.captures_dir(),
+        )
+        .map_err(|e| tracing::warn!(id, error = %e, "skipping unreadable run"))
+        .ok()?;
+        if let Ok(list) = self.db.analyses_for_run(id) {
+            rs.latest_analysis = list.first().map(Into::into);
+        }
+        Some(rs)
     }
 
     pub(crate) fn all_runs(&self) -> Vec<RunEntry> {

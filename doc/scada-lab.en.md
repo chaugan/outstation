@@ -47,7 +47,7 @@ There are two replay modes:
 | Mode | What happens | Use |
 |---|---|---|
 | **Stateful session** (benchmark) | Real TCP sessions running the IEC 104 link layer: STARTDT, k/w windows, acknowledgements, t1/t2/t3, TESTFR. Latency is measured. | Testing SCADA masters, RTUs and front ends |
-| **Raw L2 replay** | Every captured frame is injected as it was, from its original source addresses, with only the destination rewritten. No TCP state. | IDS, loggers, wire-tap analysis |
+| **Raw L2 replay** | Every captured frame is injected as it was, from its original source addresses, with only the destination rewritten. VLAN tags (802.1Q, also stacked) are removed from IPv4 frames, so they go out untagged even on a trunk port; there is no option to keep them. Tagged non-IP frames (GOOSE, SV) keep their tags. No TCP state. | IDS, loggers, wire-tap analysis |
 
 This guide is about stateful sessions.
 
@@ -153,7 +153,7 @@ When the run ends it is analysed automatically from outstation's own capture of 
 
 outstation plays the master. Each captured master (each distinct client IP talking to the target port) becomes one session that connects to the **target IP** and replays that master's side of the conversation: STARTDT, interrogations, commands, clock sync, acknowledgements.
 
-**One session per captured master.** A capture of one SCADA master polling 200 RTUs gives **one** session: the master's first conversation in the capture that reassembles cleanly. To test a particular RTU, use a capture of that RTU's link (filter the pcap first if needed). Captures with several masters, such as a front end serving multiple control centres, give one session per master; the picker (*Masters to replay*) selects among them.
+**One session per captured master.** A capture of one SCADA master polling 200 RTUs gives **one** session: the master's first conversation in the capture that carries master payload. Segments missing from the capture do not disqualify it: reassembly joins the bytes on either side of each hole, the session restarts framing after it and drops any frame that straddles it, and the session's details report this as **Capture gaps** (gaps, bytes skipped, frames dropped). To test a particular RTU, use a capture of that RTU's link (filter the pcap first if needed). Captures with several masters, such as a front end serving multiple control centres, give one session per master; the picker (*Masters to replay*) selects among them.
 
 ### 6.1 Network
 
@@ -245,7 +245,7 @@ Open `http://<eth1-address>:8080`. The header shows the server's health; a warni
 
 The run card shows the status (`completed`, `partial` when some sessions failed, `stopped`, `failed`), messages sent and received, and the capture download. **Details** adds:
 
-- **Ack latency** min/p50/p90/p99/max: time from sending an I-frame to the peer's acknowledgement, across all sessions, with a histogram.
+- **Ack latency** min/p50/p90/p99/max: time from sending an I-frame to the peer's acknowledgement, across all sessions, with a histogram. In scenario A this mostly reflects the master's own `w` and `t2`: it acknowledges after `w` I-frames or `t2` after the first unacknowledged one, so sparse telemetry gives latencies near the master's `t2`. It is not a network round-trip time ([details](iec104-config.md#session-report-fields)).
 - **Per session**: sent and received messages, latency percentiles, messages per second, **window stalls** (how often the session waited because the peer had not acknowledged k frames; a high number means the peer is slow to acknowledge), **unacked at end**, and the session's error, if any.
 - The **gap histogram** compares inter-frame gaps in the source with the replay.
 
@@ -253,7 +253,7 @@ The run card shows the status (`completed`, `partial` when some sessions failed,
 
 Every finished stateful run with a capture is analysed automatically. **Analysis** lists the stored analyses of a run; you can also upload a capture taken on the target side with Wireshark or tcpdump.
 
-- **Fleet verdict**: `all_correct`, `partial`, `failed`, `inconclusive`, or `run_failed` when the run itself failed or sent nothing.
+- **Fleet verdict**: `all_correct`, `stopped_clean` (the run was stopped; what it sent before the stop was clean), `partial`, `failed`, `inconclusive`, or `run_failed` when the run itself failed or sent nothing.
 - **Per RTU**: score (frames delivered intact, as a percentage), verdict and reason. `good_delivery` passes; `degraded` means the content was right but time tags, the GI/CI audit or timing failed; `partial_delivery` means frames were missing, extra, changed or reordered; `never_connected` means the master never connected to that RTU.
 - **Verdict dimensions** per RTU: content, time tags, GI/CI, timing, handshake, and faults when injected.
 - **GI/CI audit**: for every interrogation the master sent, whether ActCon came within 15 s, every data frame had the right group COT, ActTerm followed, and the data matched the RTU's point values.

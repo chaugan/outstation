@@ -205,6 +205,16 @@ pub struct RunReportJson {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// Non-fatal problems the run reported: capture failures, guard
+    /// restore or teardown errors (N15). Empty in old rows.
+    pub warnings: Vec<String>,
+    /// Whether the run's capture worked (true when none was asked
+    /// for). `None` in rows that predate the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
+    /// The capture stopped at the per-run byte cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,6 +263,9 @@ impl From<&RunReport> for RunReportJson {
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
             captured_dropped: r.captured_dropped,
+            warnings: with_truncation_warning(&r.warnings, r.capture_truncated),
+            capture_ok: Some(r.capture_ok),
+            capture_truncated: Some(r.capture_truncated),
         }
     }
 }
@@ -373,6 +386,16 @@ pub struct BenchmarkReportJson {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// Non-fatal problems the run reported: capture failures, guard
+    /// restore or teardown errors (N15). Empty in old rows.
+    pub warnings: Vec<String>,
+    /// Whether the run's capture worked (true when none was asked
+    /// for). `None` in rows that predate the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
+    /// The capture stopped at the per-run byte cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -387,6 +410,9 @@ pub struct SessionReportJson {
     pub bytes_written: u64,
     pub bytes_read: u64,
     pub elapsed_ms: u64,
+    /// Time the session spent replaying, without idle serving after
+    /// the script (N4); its throughput is over this time.
+    pub active_ms: u64,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
     pub latency_p90_us: u64,
@@ -627,6 +653,7 @@ impl From<&SessionReport> for SessionReportJson {
             bytes_written: pr.bytes_written,
             bytes_read: pr.bytes_read,
             elapsed_ms: pr.elapsed_ms,
+            active_ms: pr.active_ms(),
             latency_min_us: pr.latency_min_us,
             latency_p50_us: pr.latency_p50_us,
             latency_p90_us: pr.latency_p90_us,
@@ -719,8 +746,29 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
             captured_dropped: r.captured_dropped,
+            warnings: with_truncation_warning(&r.warnings, r.capture_truncated),
+            capture_ok: Some(r.capture_ok),
+            capture_truncated: Some(r.capture_truncated),
         }
     }
+}
+
+/// The run's warnings, plus one for a capture cut at its byte cap if
+/// the scheduler did not already say so.
+fn with_truncation_warning(w: &[String], truncated: bool) -> Vec<String> {
+    let mut v = w.to_vec();
+    if truncated
+        && !v
+            .iter()
+            .any(|x| x.contains("truncat") || x.contains("size cap"))
+    {
+        v.push(
+            "the capture reached its per-run size cap and is truncated; analysis reports frames \
+             after that point as missing"
+                .into(),
+        );
+    }
+    v
 }
 
 pub(crate) fn default_proto_name() -> String {
@@ -742,6 +790,10 @@ pub struct RunReportSummary {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// The run's warnings (N15).
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
 }
 
 /// Benchmark report without per-session rows or histograms.
@@ -760,6 +812,10 @@ pub struct BenchmarkSummary {
     pub captured_bytes: u64,
     /// Frames the capture lost to a full kernel queue (T18b).
     pub captured_dropped: u64,
+    /// The run's warnings (N15).
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
     pub sessions: usize,
     /// Sessions that ended with an error (cancelled ones excluded).
     pub sessions_failed: usize,
@@ -793,8 +849,13 @@ pub struct RunSummary {
     pub sent: u64,
     pub bytes_progress: u64,
     pub throughput_history: Vec<u64>,
-    /// Live per-source progress; only filled while the run is running.
+    /// Always empty in the list (F103): live rows come from the run's
+    /// WebSocket and `GET /api/runs/:id`. Kept for compatibility.
     pub per_source_progress: Vec<SourceProgressJson>,
+    /// Session count by state (`pending`, `listening`, `active`,
+    /// `failed`, …); a pending session that was cancelled counts as
+    /// `cancelled`.
+    pub source_states: std::collections::BTreeMap<String, usize>,
     /// Number of per-source progress rows (sessions/sources).
     pub sources: usize,
     /// Rows whose final state was "failed".
@@ -815,7 +876,6 @@ pub struct RunSummary {
 
 impl RunState {
     pub(crate) fn summary(&self) -> RunSummary {
-        let running = matches!(self.status, RunStatus::Running);
         RunSummary {
             id: self.id,
             status: self.status,
@@ -838,10 +898,18 @@ impl RunState {
             sent: self.sent,
             bytes_progress: self.bytes_progress,
             throughput_history: self.throughput_history.clone(),
-            per_source_progress: if running {
-                self.per_source_progress.clone()
-            } else {
-                Vec::new()
+            per_source_progress: Vec::new(),
+            source_states: {
+                let mut m = std::collections::BTreeMap::new();
+                for p in &self.per_source_progress {
+                    let s = if p.state == "pending" && p.cancelled {
+                        "cancelled"
+                    } else {
+                        p.state.as_str()
+                    };
+                    *m.entry(s.to_string()).or_default() += 1;
+                }
+                m
             },
             sources: self.per_source_progress.len(),
             sources_failed: self
@@ -863,6 +931,8 @@ impl RunState {
                 captured_packets: r.captured_packets,
                 captured_bytes: r.captured_bytes,
                 captured_dropped: r.captured_dropped,
+                warnings: r.warnings.clone(),
+                capture_ok: r.capture_ok,
             }),
             benchmark: self.benchmark.as_ref().map(|b| BenchmarkSummary {
                 total_messages_sent: b.total_messages_sent,
@@ -877,6 +947,8 @@ impl RunState {
                 captured_packets: b.captured_packets,
                 captured_bytes: b.captured_bytes,
                 captured_dropped: b.captured_dropped,
+                warnings: b.warnings.clone(),
+                capture_ok: b.capture_ok,
                 sessions: b.per_session.len(),
                 sessions_failed: b.sessions_failed(),
                 sessions_cancelled: b.sessions_cancelled(),

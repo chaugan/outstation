@@ -56,13 +56,15 @@ pub(crate) fn is_regular_file_inside(p: &Path, dir: &Path) -> bool {
 }
 
 /// Evict the oldest `run_*.pcap` files until the directory holds at
-/// most `max_count` files and `max_bytes` bytes. `keep` (the active
-/// run's capture) is never evicted. Returns the evicted paths.
+/// most `max_count` files and `max_bytes` bytes. Files in `keep` (the
+/// active run's capture, the run that just finished and runs whose
+/// analysis is still pending) are never evicted. Returns the evicted
+/// paths.
 pub(crate) fn enforce_retention(
     captures_dir: &Path,
     max_bytes: u64,
     max_count: usize,
-    keep: Option<&Path>,
+    keep: &[PathBuf],
 ) -> Vec<PathBuf> {
     let Ok(rd) = std::fs::read_dir(captures_dir) else {
         return Vec::new();
@@ -88,7 +90,7 @@ pub(crate) fn enforce_retention(
         if total <= max_bytes && count <= max_count {
             break;
         }
-        if keep == Some(p.as_path()) {
+        if keep.iter().any(|k| k == &p) {
             continue;
         }
         match std::fs::remove_file(&p) {
@@ -126,7 +128,7 @@ mod tests {
             f.set_modified(t).unwrap();
         }
         let keep = capture_path(d.path(), 1);
-        let ev = enforce_retention(d.path(), 250, 100, Some(&keep));
+        let ev = enforce_retention(d.path(), 250, 100, std::slice::from_ref(&keep));
         assert_eq!(
             ev,
             vec![capture_path(d.path(), 2), capture_path(d.path(), 3)]

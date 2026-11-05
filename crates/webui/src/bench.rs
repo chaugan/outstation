@@ -30,7 +30,7 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use tracing::{info, warn};
 
-use crate::analysis::{self, AnalysisMode, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, AnalysisMode};
 use crate::dto::*;
 use crate::error::panic_message;
 use crate::runbuild::{self, RunMode};
@@ -346,6 +346,9 @@ pub struct BenchReport {
     /// Analysis summary (same shape as `GET /api/analyses/:id`).
     pub analysis: Option<serde_json::Value>,
     pub analysis_error: Option<String>,
+    /// The run's own warnings (capture failures, guard restore or
+    /// teardown errors) (N15).
+    pub warnings: Vec<String>,
     pub metrics: BenchMetrics,
     pub assertions: Vec<AssertionResult>,
     /// True when every assertion passed (and there was no run error).
@@ -376,6 +379,7 @@ impl BenchReport {
             latency: None,
             analysis: None,
             analysis_error: None,
+            warnings: Vec::new(),
             metrics: BenchMetrics::default(),
             assertions: Vec::new(),
             passed: false,
@@ -442,6 +446,8 @@ pub struct BenchOptions {
     pub capture: Option<PathBuf>,
     /// Analyse in `correct` mode (target is the device in the pcap).
     pub correct_mode: bool,
+    /// CP56Time2a drift tolerance (ms) for the analysis (F066).
+    pub cp56_tolerance_ms: f64,
 }
 
 /// Load a profile file into a validated benchmark request. A missing
@@ -502,6 +508,11 @@ pub fn run(opts: &BenchOptions) -> BenchReport {
 }
 
 fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
+    // Never run next to a server (or another bench) on the same state
+    // directory: their host cleanup would tear down each other's run
+    // (N7).
+    let _lock = crate::statelock::StateLock::acquire(&opts.state_dir, "bench")
+        .context("refusing to run a benchmark on a state directory in use")?;
     let text = std::fs::read_to_string(&opts.profile)
         .with_context(|| format!("read profile {}", opts.profile.display()))?;
     let req = load_profile(&text)?;
@@ -644,14 +655,25 @@ fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
     }
     rep.run = Some(rs.summary());
 
-    // Analyse the run's own mirror capture.
-    let summary = if capture.is_file() {
+    // Analyse the run's own mirror capture, unless it failed (N15).
+    let unavailable = if capture.is_file() {
+        crate::analysis_run::capture_problem(&rs, &capture)
+    } else {
+        None
+    };
+    if let Some(b) = &rs.benchmark {
+        rep.warnings = b.warnings.clone();
+    }
+    let summary = if let Some(why) = &unavailable {
+        rep.analysis_error = Some(format!("capture unavailable: {why}"));
+        None
+    } else if capture.is_file() {
         let mode = if opts.correct_mode {
             AnalysisMode::Correct
         } else {
             AnalysisMode::Generic
         };
-        match crate::analysis_run::analyze_run(&rs, &capture, mode, DEFAULT_CP56_TOLERANCE_MS) {
+        match crate::analysis_run::analyze_run(&rs, &capture, mode, opts.cp56_tolerance_ms) {
             Ok(r) => Some(r.split().0),
             Err(e) => {
                 rep.analysis_error = Some(format!("{e:#}"));
@@ -668,6 +690,9 @@ fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
 
     if let Some(sig) = signal {
         bail!("interrupted by {sig}; run {}", status.as_str());
+    }
+    if let Some(why) = unavailable {
+        bail!("capture unavailable, the run cannot be judged: {why}");
     }
     if status == RunStatus::Failed {
         bail!(
@@ -716,6 +741,9 @@ pub fn summary_text(r: &BenchReport) -> String {
         }
         _ => {}
     }
+    for w in &r.warnings {
+        let _ = writeln!(s, "warning: {w}");
+    }
     for a in &r.assertions {
         let _ = writeln!(s, "  {}", a.message);
     }
@@ -734,6 +762,7 @@ pub fn summary_text(r: &BenchReport) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analysis::DEFAULT_CP56_TOLERANCE_MS;
 
     fn a(s: &str) -> Assertion {
         s.parse().unwrap()
@@ -816,6 +845,7 @@ mod tests {
             state_dir: "/s".into(),
             capture: None,
             correct_mode: false,
+            cp56_tolerance_ms: DEFAULT_CP56_TOLERANCE_MS,
         });
         r.assertions = asserts;
         r.error = error.map(str::to_string);

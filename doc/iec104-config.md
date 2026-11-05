@@ -19,6 +19,7 @@ The code is the reference. The relevant files are [`asdu.rs`](../crates/proto_ie
 - [`gi_ci_synthesis`: live GI and CI answers](#gi_ci_synthesis-live-gi-and-ci-answers)
 - [`commands`: command echo](#commands-command-echo)
 - [`faults` and `fault_seed`: fault injection](#faults-and-fault_seed-fault-injection)
+- [`analysis`: fidelity thresholds](#analysis-fidelity-thresholds)
 - [Session report fields](#session-report-fields)
 - [Analysis report](#analysis-report)
 
@@ -36,7 +37,8 @@ The code is the reference. The relevant files are [`asdu.rs`](../crates/proto_ie
   "gi_ci_synthesis": true,
   "commands": {"enabled": true, "return_info": "none", "max_age_ms": 10000, "unknown_ioa": "negative"},
   "fault_seed": 42,
-  "faults": [{"at": {"ms": 5000}, "kind": "withhold_acks", "duration_ms": 20000}]
+  "faults": [{"at": {"ms": 5000}, "kind": "withhold_acks", "duration_ms": 20000}],
+  "analysis": {"timing_drift_fail_ms": 1000, "timing_drift_fail_rel": 0.05}
 }
 ```
 
@@ -48,7 +50,7 @@ In a run request it is embedded as a string:
 {"mode": "benchmark", "role": "slave", "proto_config": "{\"session\":{\"t3\":30},\"commands\":{\"return_info\":\"retrem\"}}", …}
 ```
 
-**Validation.** `POST /api/run` checks only that `proto_config` is valid JSON. The IEC 104 rules below are applied when the sessions start. A bad value (out of range, a typo inside `cp56`, `session` or `commands`, an unknown fault kind) fails every session with a `proto_config (…)` error, and the run ends `failed`. Unknown keys at the top level are ignored. The UI's IEC 104 form builds `cp56`, `session` and `gi_ci_synthesis` for you; `commands` and `faults` are entered as JSON.
+**Validation.** `POST /api/run` (and re-run, profiles and `bench`) validates the whole IEC 104 config when the run is submitted. A bad value (out of range, a wrong type, a typo inside any section, an unknown top-level key, an unknown fault kind) is refused with 400 `invalid_proto_config` and a message naming the section, e.g. `proto_config (faults): faults[2] (delay): …`. No run is created. The UI's IEC 104 form builds `cp56`, `session`, `gi_ci_synthesis`, `commands` and `faults` for you and shows such errors on the matching field.
 
 | Key | Roles | Default |
 |---|---|---|
@@ -58,6 +60,7 @@ In a run request it is embedded as a string:
 | `gi_ci_synthesis` | slave | `true` |
 | `commands` | slave | enabled |
 | `faults`, `fault_seed` | both | none |
+| `analysis` | both (post-run analysis only) | drift fail at max(1000 ms, 5 % of span / speed) |
 
 ## Rewrite map
 
@@ -94,7 +97,7 @@ Unknown keys and other zones are errors. With rewriting on, the analyzer accepts
 | `t3` | 20 | > 0, ≤ 86400 s | After t3 without receiving anything we send TESTFR act |
 | `idle_serve_secs` | 30 | ≥ 0 | Slave role: keep serving the master (GI/CI, commands, TESTFR, acks) this long after the script ends, unless the master closes first or the run is stopped |
 
-Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3).
+Timers are seconds and may be fractional. `t2 >= t1` is an error. A `w` above two thirds of `k` is allowed but logged as a warning (IEC 60870-5-104 §5.5 recommends w ≤ 2k/3). `w` and `t2` here govern how fast *we* acknowledge; the latency we measure depends on the *peer's* `w` and `t2` ([Session report fields](#session-report-fields)).
 
 **t0 default.** When `t0` is absent the run's connect timeout is used, which is **5 s**, not the IEC default of 30 s. Set `t0` explicitly for slow targets. In slave role t0 is not used: an armed listener waits up to 600 s for the master to connect, then up to 60 s for STARTDT act. Both limits are fixed.
 
@@ -206,6 +209,17 @@ Ranges: `duration_ms` 1..86400000; `pct` greater than 0, up to 100; `count` 1..1
 
 The analyzer does not count deliberate faults as replay infidelity: duplicates are removed from the delivered side, dropped frames are excused, a session the peer ended in reaction is judged like a stopped run, and timing is not judged. The `faults` verdict dimension summarises what the capture shows.
 
+## `analysis`: fidelity thresholds
+
+Thresholds the post-run analysis judges this run with. They are stored with the run, so a re-analysis uses the same values. The live session ignores them.
+
+| Key | Default | Range | Meaning |
+|---|---|---|---|
+| `timing_drift_fail_ms` | 1000 | 1..=3600000 | Absolute part of the pacing-drift threshold |
+| `timing_drift_fail_rel` | 0.05 | 0..=1 | Relative part: a fraction of the script span divided by the speed factor |
+
+An original-timing replay fails its `timing` dimension when the largest pacing drift exceeds max(`timing_drift_fail_ms`, `timing_drift_fail_rel` × span / speed). Timing is not judged for as-fast-as-possible runs, runs with injected faults, or runs whose pacing speed is unknown. The CP56 time-tag tolerance is a separate, analysis-time setting (`cp56_tolerance_ms`: serve flag, upload field or `bench` flag).
+
 ## Session report fields
 
 Each session of a benchmark run (`benchmark.per_session[]` in `GET /api/runs/:id`, `sessions[]` in a `bench` report) carries a `protocol` object:
@@ -224,6 +238,8 @@ Each session of a benchmark run (`benchmark.per_session[]` in `GET /api/runs/:id
 The engine also records, per session, per-command-type round trips (`commands[]`: `{type_id, commands, act_con, negative, act_term, deact_con, unanswered, actcon_us[], actterm_us[]}`), `negative_confirmations[]`, `faults_injected[]` (`{at_ms, kind, detail, frames_affected}`) and `fault_reaction` (`{peer_closed, peer_reset, peer_stopdt, protocol_errors[], first_reaction_ms, summary}`). All four appear in each session's `protocol` object in `GET /api/runs/:id` and in the `bench` JSON report; the analyzer's `faults` section additionally judges the fault side from the capture.
 
 Latency (`latency_*_us`) is the time from sending an I-frame to the peer acknowledging it (the S-frame or I-frame N(R) that covers it, timestamped on receipt). It is not a command round trip.
+
+**Ack latency is bounded by the peer's w and t2, not the network.** The peer acknowledges on its own schedule: after it has received `w` I-frames, or `t2` after the first unacknowledged one, whichever comes first (the `w` and `t2` that matter are the peer's, not the ones in `session` above). In slave role the live master sends few or no I-frames of its own, so it acknowledges with S-frames by that rule: with sparse telemetry the latency approaches the master's t2 (often 10 s), with dense telemetry it is the time `w` frames take to go out. Read slave-role latency as the master's acknowledgement policy, and compare runs only against the same master settings. In master role an RTU that sends data carries N(R) in its own I-frames and so usually acknowledges sooner.
 
 ## Analysis report
 
@@ -245,7 +261,8 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 
 | Fleet verdict | When |
 |---|---|
-| `all_correct` | Every judged endpoint passed |
+| `all_correct` | Every judged endpoint passed, and the run was not stopped |
+| `stopped_clean` | The run was stopped before it finished, and everything it sent before the stop was clean. `run_warning` says it was stopped. A stopped run is never `all_correct` |
 | `partial` | Some passed, some failed |
 | `failed` | Every judged endpoint failed with score 0 |
 | `inconclusive` | Nothing failed, but some endpoints could not be verified |
@@ -261,7 +278,7 @@ Top level of the report: `run_id`, `run_status`, `run_warning`, `mode` (`generic
 |---|---|---|
 | `good_delivery` | pass | Everything passes (generic mode) |
 | `identical` | pass | Everything passes, including the target's script (correct mode) |
-| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean |
+| `stopped_clean` | pass | The run was stopped, and every frame sent before that was clean. An endpoint whose own session failed is never excused by the stop: its missing frames count as a failure |
 | `no_iframes_expected` | pass | The source carries no I-frames and none were delivered |
 | `degraded` | fail | Content is fine, but time tags, the GI/CI audit or timing failed |
 | `partial_delivery` | fail | Modified, missing, extra or reordered frames, or time tags changed with CP56 rewriting off |
@@ -289,7 +306,7 @@ The expected side leaves out what the slave answers live (captured interrogation
 | `content` | No modified, missing, extra or reordered frames, and no changed time tags with rewriting off |
 | `time_tags` | No CP56 stamp outside the drift tolerance |
 | `gi_ci` | Every live interrogation exchange is compliant (see below) |
-| `timing` | The largest pacing drift stayed within max(1000 ms, 5 % of the captured span divided by the speed factor); `null` when the run was not paced at original timing |
+| `timing` | The largest pacing drift stayed within max(`analysis.timing_drift_fail_ms`, `analysis.timing_drift_fail_rel` × span / speed), by default max(1000 ms, 5 %); `null` when the run was not paced at original timing |
 | `handshake` | STARTDT completed |
 | `target` | Correct mode only: the target's script matches; otherwise `null` |
 | `faults` | Not pass/fail: a summary of the injected faults and the peer's reaction, or `null` |

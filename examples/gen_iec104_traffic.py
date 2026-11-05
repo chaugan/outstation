@@ -679,8 +679,9 @@ def main(argv=None):
                          "embedded (old behaviour). Default is ON, which "
                          "emits TB-series types (30/31/34/35/36/37, and "
                          "58 + 103 for commands) — required if you want "
-                         "to exercise outstation's --fresh-timestamps "
-                         "rewrite feature.")
+                         "to exercise outstation's fresh-timestamps "
+                         "rewrite (the \"Fresh timestamps\" checkbox, "
+                         "i.e. IEC 104 config cp56.rewrite_to_now).")
     ap.add_argument("--no-master-commands", dest="master_commands",
                     action="store_false", default=True,
                     help="suppress master-side C_SC commands during the "

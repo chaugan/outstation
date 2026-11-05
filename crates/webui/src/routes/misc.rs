@@ -198,7 +198,12 @@ pub(crate) async fn api_inspect(
         .pcap_id
         .ok_or_else(|| AppError::BadRequest("pcap_id is required").code("invalid_request"))?;
     let path = library_pcap_path(&state.library_dir, &id)?;
-    let p = crate::routes::runs::load_blocking(path).await?;
+    let p = crate::routes::runs::load_heavy(
+        &state,
+        path,
+        Some(crate::routes::runs::INSPECT_PERMIT_WAIT),
+    )
+    .await?;
     let sources: Vec<InspectSource> = p
         .sources
         .iter()

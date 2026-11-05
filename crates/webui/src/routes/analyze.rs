@@ -20,14 +20,14 @@ use serde::{Deserialize, Serialize};
 
 use std::sync::atomic::Ordering;
 
-use crate::analysis::{self, AnalysisMode, DEFAULT_CP56_TOLERANCE_MS};
+use crate::analysis::{self, AnalysisMode};
 use crate::analysis_run::{analyze_run, note_analysis, store_blocking};
 use crate::db::StoredAnalysis;
 use crate::dto::*;
 use crate::error::{ApiPath, ApiQuery, AppError, LockExt};
 use crate::metrics::AnalysisSource;
 use crate::routes::library::{
-    check_free_space, declared_length, multipart_error, stream_field_to_file,
+    check_free_space, declared_length, multipart_error, stream_field_to_file, UploadLimits,
 };
 use crate::routes::runs::busy;
 use crate::state::*;
@@ -41,8 +41,14 @@ pub(crate) struct AnalyzeQuery {
 /// Analysis report plus how the run was chosen and any warnings.
 #[derive(Serialize)]
 pub(crate) struct AnalyzeResponse {
+    /// The stored summary; endpoint details are fetched lazily from
+    /// `GET /api/analyses/:id/endpoints/:endpoint` (F067).
     #[serde(flatten)]
-    report: analysis::AnalysisReport,
+    summary: analysis::AnalysisSummary,
+    /// Only when the analysis could not be stored (no `analysis_id`):
+    /// then there is nowhere to fetch the details from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    details_by_ip: Option<std::collections::BTreeMap<String, analysis::SlaveDetail>>,
     /// `"explicit"` when the caller named the run, `"latest"` when the
     /// newest finished benchmark run was picked.
     run_selection: &'static str,
@@ -85,7 +91,7 @@ pub(crate) async fn api_analyze(
     let mut size: u64 = 0;
     let mut mode: AnalysisMode = AnalysisMode::Generic;
     let mut field_run_id: Option<u64> = None;
-    let mut cp56_tolerance_ms: f64 = DEFAULT_CP56_TOLERANCE_MS;
+    let mut cp56_tolerance_ms: f64 = state.cfg.cp56_tolerance_ms;
     while let Some(mut field) = mp.next_field().await.map_err(multipart_error)? {
         let name = field.name().map(|s| s.to_string()).unwrap_or_default();
         match name.as_str() {
@@ -94,7 +100,8 @@ pub(crate) async fn api_analyze(
                     .reopen()
                     .map_err(|e| AppError::Internal(format!("open temp file: {e}")))?;
                 let mut f = tokio::fs::File::from_std(std_file);
-                size = stream_field_to_file(&mut field, &mut f, state.cfg.max_upload_bytes).await?;
+                let mut limits = UploadLimits::new(&state);
+                size = stream_field_to_file(&mut field, &mut f, &mut limits).await?;
                 got_file = true;
             }
             "mode" => {
@@ -129,10 +136,8 @@ pub(crate) async fn api_analyze(
                 let v: f64 = s.trim().parse().map_err(|_| {
                     AppError::BadRequest(format!("cp56_tolerance_ms {s:?} is not a number"))
                 })?;
-                if !(v.is_finite() && v >= 0.0) {
-                    return Err(AppError::BadRequest("cp56_tolerance_ms must be >= 0"));
-                }
-                cp56_tolerance_ms = v;
+                cp56_tolerance_ms =
+                    analysis::check_cp56_tolerance(v).map_err(AppError::BadRequest)?;
             }
             _ => {}
         }
@@ -157,8 +162,8 @@ pub(crate) async fn api_analyze(
     let mut warnings = Vec::new();
     let (rs, selection) = match run_id {
         Some(id) => {
-            let e = state
-                .get_run(id)
+            let (e, _) = state
+                .get_run_any(id)
                 .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
             let rs = e.lock_safe().clone();
             (rs, "explicit")
@@ -215,8 +220,10 @@ pub(crate) async fn api_analyze(
     // `tmp` drops here (and on every early return above), removing the
     // uploaded capture.
     drop(tmp);
+    let (summary, details) = report.split();
     Ok(Json(AnalyzeResponse {
-        report,
+        summary,
+        details_by_ip: analysis_id.is_none().then_some(details),
         run_selection: selection,
         warnings,
         analysis_id,
@@ -315,13 +322,26 @@ pub(crate) struct RunAnalyzeResp {
 /// capture now and store it (source `on_demand`). Mutating, so it sits
 /// behind the same-origin guard and the heavy-work limit (429 `busy`).
 /// 409 `capture_missing` when the run has no capture on disk.
+#[derive(Deserialize, Default)]
+pub(crate) struct RunAnalyzeQuery {
+    /// CP56Time2a drift tolerance for this analysis; default the
+    /// server's `--cp56-tolerance-ms` (F066).
+    #[serde(default)]
+    cp56_tolerance_ms: Option<f64>,
+}
+
 pub(crate) async fn api_run_analyze(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<u64>,
+    ApiQuery(q): ApiQuery<RunAnalyzeQuery>,
 ) -> Result<Json<RunAnalyzeResp>, AppError> {
+    let tol =
+        analysis::check_cp56_tolerance(q.cp56_tolerance_ms.unwrap_or(state.cfg.cp56_tolerance_ms))
+            .map_err(AppError::BadRequest)?;
     let rs = state
-        .get_run(id)
+        .get_run_any(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?
+        .0
         .lock_safe()
         .clone();
     crate::analysis_run::check_analyzable(&rs)?;
@@ -332,13 +352,19 @@ pub(crate) async fn api_run_analyze(
                 format!("run {id} has no capture to analyse (never written or evicted)"),
             )
         })?;
+    if let Some(why) = crate::analysis_run::capture_problem(&rs, &capture) {
+        return Err(AppError::Conflict(
+            "capture_unavailable",
+            format!("capture unavailable: {why}"),
+        ));
+    }
     let _permit = state
         .heavy
         .clone()
         .try_acquire_owned()
         .map_err(|_| busy())?;
     let (a, _) =
-        crate::analysis_run::analyze_and_store(&state, rs, capture, AnalysisSource::OnDemand)
+        crate::analysis_run::analyze_and_store(&state, rs, capture, AnalysisSource::OnDemand, tol)
             .await?;
     Ok(Json(RunAnalyzeResp {
         analysis_id: a.id,
@@ -348,4 +374,78 @@ pub(crate) async fn api_run_analyze(
         source: a.source,
         created_at: a.created_at,
     }))
+}
+
+/// `GET /api/analyses/:id/report.html`: the stored analysis as one
+/// self-contained, printable HTML page (F131). `?download=1` serves it
+/// as an attachment.
+pub(crate) async fn api_analysis_report_html(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<u64>,
+    ApiQuery(q): ApiQuery<ReportQuery>,
+) -> Result<axum::response::Response, AppError> {
+    use axum::http::{header, HeaderValue};
+    use axum::response::IntoResponse;
+    let st = state.clone();
+    let html = tokio::task::spawn_blocking(move || -> Result<(String, u64), AppError> {
+        let row = st
+            .db
+            .analysis_row(id)
+            .map_err(|e| AppError::Internal(format!("read analysis: {e:#}")))?
+            .ok_or_else(|| AppError::NotFound(format!("analysis {id} not found")))?;
+        let summary: serde_json::Value = st
+            .db
+            .analysis_summary(id)
+            .map_err(|e| AppError::Internal(format!("read analysis: {e:#}")))?
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or(serde_json::Value::Null);
+        let details: Vec<(String, serde_json::Value)> = st
+            .db
+            .analysis_details_all(id)
+            .map_err(|e| AppError::Internal(format!("read analysis details: {e:#}")))?
+            .into_iter()
+            .filter_map(|(ep, j)| Some((ep, serde_json::from_str(&j).ok()?)))
+            .collect();
+        let run = st
+            .get_run_any(row.run_id)
+            .map(|(e, _)| e.lock_safe().clone());
+        Ok((
+            crate::report_html::render(&row, &summary, &details, run.as_ref()),
+            row.run_id,
+        ))
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("report task: {e}")))??;
+    let (html, run_id) = html;
+    let mut resp = html.into_response();
+    let h = resp.headers_mut();
+    h.insert(
+        header::CONTENT_TYPE,
+        HeaderValue::from_static("text/html; charset=utf-8"),
+    );
+    // Self-contained by construction; the policy makes sure nothing in
+    // it can load or run anything.
+    h.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static("default-src 'none'; style-src 'unsafe-inline'"),
+    );
+    h.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    if matches!(q.download.as_deref(), Some("1" | "true" | "yes")) {
+        let name = format!("outstation_run{run_id}_analysis{id}.html");
+        h.insert(
+            header::CONTENT_DISPOSITION,
+            HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+                .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
+        );
+    }
+    Ok(resp)
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ReportQuery {
+    #[serde(default)]
+    download: Option<String>,
 }

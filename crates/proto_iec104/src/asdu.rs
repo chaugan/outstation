@@ -690,9 +690,26 @@ pub fn load_rewrite_map(proto_config: Option<&str>) -> Result<RewriteMap> {
 /// ```
 ///
 /// `commands` is described in [`crate::commands`], `faults` and
-/// `fault_seed` in [`crate::faults`].
+/// `fault_seed` in [`crate::faults`], `gi_ci_synthesis` in
+/// [`crate::interrogation`]. An unknown top-level key (a typo) or a
+/// wrongly typed one is an error (N2).
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Iec104ProtoConfig {
+    /// Rewrite-map sections, only type-checked here; parsed by
+    /// [`load_rewrite_map`].
+    #[serde(default)]
+    #[allow(dead_code)]
+    common_address: Option<HashMap<String, u16>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    cot: Option<HashMap<String, u8>>,
+    #[serde(default)]
+    #[allow(dead_code)]
+    ioa: Option<HashMap<String, u32>>,
+    /// Slave GI/CI response synthesis; `None` = on. Must be a boolean.
+    #[serde(default)]
+    pub gi_ci_synthesis: Option<bool>,
     #[serde(default)]
     pub cp56: Cp56Config,
     /// APCI link parameters and live-session behaviour.
@@ -701,6 +718,9 @@ pub struct Iec104ProtoConfig {
     /// Slave-mode command echo.
     #[serde(default)]
     pub commands: CommandsConfig,
+    /// Post-run analysis thresholds (not used by the live session).
+    #[serde(default)]
+    pub analysis: AnalysisConfig,
     /// Raw `faults` value; validated into [`Iec104ProtoConfig::fault_plan`].
     #[serde(default)]
     faults: Option<serde_json::Value>,
@@ -709,6 +729,58 @@ pub struct Iec104ProtoConfig {
     /// The validated fault plan (empty when `faults` is absent).
     #[serde(skip)]
     pub fault_plan: FaultPlan,
+}
+
+/// Thresholds the post-run fidelity analysis judges this run with.
+/// Lives in the run's `proto_config` so a run is re-analysed with the
+/// same thresholds it was configured with.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AnalysisConfig {
+    /// Pacing drift (ms) above which an original-timing replay fails
+    /// its timing dimension; the effective threshold is the larger of
+    /// this and `timing_drift_fail_rel` × script span / speed.
+    #[serde(default = "default_drift_fail_ms")]
+    pub timing_drift_fail_ms: f64,
+    /// Relative part of the drift threshold (fraction of the script
+    /// span at the configured speed), `0..=1`.
+    #[serde(default = "default_drift_fail_rel")]
+    pub timing_drift_fail_rel: f64,
+}
+
+/// Default absolute pacing-drift fail threshold (ms).
+pub const DEFAULT_TIMING_DRIFT_FAIL_MS: f64 = 1_000.0;
+/// Default relative pacing-drift fail threshold.
+pub const DEFAULT_TIMING_DRIFT_FAIL_REL: f64 = 0.05;
+
+fn default_drift_fail_ms() -> f64 {
+    DEFAULT_TIMING_DRIFT_FAIL_MS
+}
+fn default_drift_fail_rel() -> f64 {
+    DEFAULT_TIMING_DRIFT_FAIL_REL
+}
+
+impl Default for AnalysisConfig {
+    fn default() -> Self {
+        Self {
+            timing_drift_fail_ms: DEFAULT_TIMING_DRIFT_FAIL_MS,
+            timing_drift_fail_rel: DEFAULT_TIMING_DRIFT_FAIL_REL,
+        }
+    }
+}
+
+impl AnalysisConfig {
+    pub fn validate(&self) -> Result<()> {
+        let ms = self.timing_drift_fail_ms;
+        if !(ms.is_finite() && (1.0..=3_600_000.0).contains(&ms)) {
+            bail!("timing_drift_fail_ms must be 1..=3600000, got {ms}");
+        }
+        let rel = self.timing_drift_fail_rel;
+        if !(rel.is_finite() && (0.0..=1.0).contains(&rel)) {
+            bail!("timing_drift_fail_rel must be 0..=1, got {rel}");
+        }
+        Ok(())
+    }
 }
 
 /// IEC 60870-5-104 §5 link parameters plus session behaviour knobs.
@@ -723,8 +795,9 @@ pub struct SessionConfig {
     /// Acknowledge (S-frame) at the latest after receiving w I-frames.
     #[serde(default = "default_w")]
     pub w: u16,
-    /// Connection-establishment timeout (master mode TCP connect).
-    /// When absent the run's `connect_timeout` is used.
+    /// Connection-establishment timeout (master mode TCP connect), at
+    /// most [`MAX_T0_SECS`]. When absent the run's `connect_timeout` is
+    /// used.
     #[serde(default)]
     pub t0: Option<f64>,
     /// Timeout for the peer to acknowledge a sent I-frame or to
@@ -769,6 +842,8 @@ fn default_t3() -> f64 {
 
 /// IEC default t0 in seconds.
 pub const DEFAULT_T0_SECS: f64 = 30.0;
+/// Upper bound of t0 (IEC 60870-5-104 §9.6: 1..255 s).
+pub const MAX_T0_SECS: f64 = 255.0;
 /// Largest sequence-number distance; k and w must stay below it.
 const MAX_WINDOW: u16 = 32767;
 
@@ -807,6 +882,11 @@ impl SessionConfig {
                 if !v.is_finite() || v <= 0.0 || v > 86_400.0 {
                     bail!("session.{name} must be > 0 and <= 86400 seconds, got {v}");
                 }
+            }
+        }
+        if let Some(t0) = self.t0 {
+            if t0 > MAX_T0_SECS {
+                bail!("session.t0 must be <= {MAX_T0_SECS} seconds, got {t0}");
             }
         }
         if let Some(v) = self.idle_serve_secs {
@@ -879,8 +959,9 @@ impl Iec104ProtoConfig {
     /// (no rewrite, local zone).
     ///
     /// Malformed input is an error, never a silent default: invalid
-    /// JSON, a wrongly typed field (`"rewrite_to_now": "true"`), an
-    /// unknown key inside `cp56` (a typo), or a zone other than
+    /// JSON, a wrongly typed field (`"rewrite_to_now": "true"`,
+    /// `"gi_ci_synthesis": "false"`), an unknown key at the top level
+    /// or inside `cp56` / `session` (a typo), or a zone other than
     /// `"utc"` / `"local"`.
     pub fn parse(proto_config: Option<&str>) -> Result<Self> {
         let Some(s) = proto_config else {
@@ -901,6 +982,9 @@ impl Iec104ProtoConfig {
         cfg.session
             .validate()
             .map_err(|e| anyhow::anyhow!("proto_config (session): {e}"))?;
+        cfg.analysis
+            .validate()
+            .map_err(|e| anyhow::anyhow!("proto_config (analysis): {e}"))?;
         cfg.commands
             .validate()
             .map_err(|e| anyhow::anyhow!("proto_config (commands): {e}"))?;
@@ -932,6 +1016,73 @@ pub fn rewrite_or_skip(asdu: &mut [u8], map: &RewriteMap) -> Result<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// N2: unknown or wrongly typed top-level keys are errors; every
+    /// shape the web UI produces (buildProtoConfig in 30-configure.js,
+    /// addIec104Editors in 35-iec104-config.js) still parses.
+    #[test]
+    fn analysis_thresholds_parse_and_validate() {
+        let c = Iec104ProtoConfig::parse(None).unwrap();
+        assert_eq!(c.analysis, AnalysisConfig::default());
+        let c = Iec104ProtoConfig::parse(Some(
+            r#"{"analysis":{"timing_drift_fail_ms":2500,"timing_drift_fail_rel":0.1}}"#,
+        ))
+        .unwrap();
+        assert_eq!(c.analysis.timing_drift_fail_ms, 2500.0);
+        assert_eq!(c.analysis.timing_drift_fail_rel, 0.1);
+        for bad in [
+            r#"{"analysis":{"timing_drift_fail_ms":0}}"#,
+            r#"{"analysis":{"timing_drift_fail_rel":1.5}}"#,
+            r#"{"analysis":{"drift":1}}"#,
+        ] {
+            let e = validate_proto_config(Some(bad)).unwrap_err().to_string();
+            assert!(
+                e.contains("analysis") || e.contains("unknown field"),
+                "{bad}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn proto_config_rejects_unknown_and_mistyped_top_level_keys() {
+        let err = |s: &str| validate_proto_config(Some(s)).unwrap_err().to_string();
+        let e = err(r#"{"gi_ci_synthesis":"false"}"#);
+        assert!(e.contains("invalid type") && e.contains("boolean"), "{e}");
+        let e = err(r#"{"gi_ci_synthesys":false}"#);
+        assert!(e.contains("unknown field `gi_ci_synthesys`"), "{e}");
+        let e = err(r#"{"cot":{"3":"x"}}"#);
+        assert!(e.contains("invalid type"), "{e}");
+        let e = err(r#"{"sesion":{"k":12}}"#);
+        assert!(e.contains("unknown field `sesion`"), "{e}");
+
+        for ok in [
+            r#"{"gi_ci_synthesis":false}"#,
+            r#"{"gi_ci_synthesis":true}"#,
+            r#"{"common_address":{"1":7},"cot":{"3":20},"ioa":{"100":200}}"#,
+            r#"{"cp56":{"rewrite_to_now":true,"zone":"utc"}}"#,
+            r#"{"cp56":{"rewrite_cp56_to_now":true,"cp56_zone":"local"}}"#,
+            r#"{"session":{"k":12,"w":8,"t0":30,"t1":15,"t2":10,"t3":20,"idle_serve_secs":5}}"#,
+            r#"{"commands":{"enabled":true,"return_info":"none","max_age_ms":10000,"unknown_ioa":"negative"}}"#,
+            r#"{"faults":[{"at":{"ms":5000},"kind":"rst"}],"fault_seed":42}"#,
+            r#"{"common_address":{"1":2},"cp56":{"rewrite_to_now":true,"zone":"local"},
+                "session":{"k":12,"idle_serve_secs":30},"gi_ci_synthesis":false,
+                "commands":{"enabled":false},
+                "faults":[{"at":{"frame":3},"kind":"drop_iframes","pct":10,"duration_ms":2000}],
+                "fault_seed":7}"#,
+        ] {
+            assert!(
+                validate_proto_config(Some(ok)).is_ok(),
+                "{ok}: {:?}",
+                validate_proto_config(Some(ok))
+            );
+        }
+        let pc = Iec104ProtoConfig::parse(Some(r#"{"gi_ci_synthesis":false}"#)).unwrap();
+        assert_eq!(pc.gi_ci_synthesis, Some(false));
+        assert_eq!(
+            Iec104ProtoConfig::parse(None).unwrap().gi_ci_synthesis,
+            None
+        );
+    }
 
     #[test]
     fn rewrite_empty_map_is_noop() {

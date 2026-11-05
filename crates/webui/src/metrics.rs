@@ -44,9 +44,13 @@ impl AnalysisSource {
     }
 }
 
-/// Totals of runs that were deleted while this process ran.
+/// Totals of runs that were deleted while this process ran, or that
+/// are only in the database (not kept in memory, F054).
 #[derive(Debug, Default)]
 pub(crate) struct Folded {
+    /// Runs in the database but not in memory, by status index
+    /// (running, completed, partial, stopped, failed).
+    by_status: [u64; 5],
     frames: u64,
     bytes: u64,
     duration_sum_secs: u64,
@@ -61,6 +65,8 @@ pub(crate) struct Metrics {
     pub(crate) uploads_ok: AtomicU64,
     pub(crate) uploads_failed: AtomicU64,
     pub(crate) analyses_running: AtomicU64,
+    /// Open live-progress WebSockets (N23).
+    pub(crate) live_sockets: AtomicU64,
     /// `[source][ok=0 / error=1]`, this process only.
     analyses: [[AtomicU64; 2]; 3],
     /// Taken by the scrape and by run deletion (before any run lock).
@@ -152,6 +158,30 @@ pub(crate) fn fold_deleted(f: &mut Folded, rs: &RunState) {
     }
 }
 
+fn status_idx(s: RunStatus) -> usize {
+    match s {
+        RunStatus::Running => 0,
+        RunStatus::Completed => 1,
+        RunStatus::Partial => 2,
+        RunStatus::Stopped => 3,
+        RunStatus::Failed => 4,
+    }
+}
+
+/// Fold a run that leaves memory but stays in the database (F054): its
+/// totals as for a deleted run, and it still counts by status.
+pub(crate) fn fold_evicted(f: &mut Folded, rs: &RunState) {
+    fold_deleted(f, rs);
+    f.by_status[status_idx(rs.status)] += 1;
+}
+
+/// A run that was only in the database is deleted: it no longer counts
+/// by status (its totals stay, like any deleted run's).
+pub(crate) fn unfold_deleted_evicted(f: &mut Folded, status: RunStatus) {
+    let i = status_idx(status);
+    f.by_status[i] = f.by_status[i].saturating_sub(1);
+}
+
 /// Escape a Prometheus label value.
 pub(crate) fn esc(v: &str) -> String {
     let mut o = String::with_capacity(v.len());
@@ -239,7 +269,7 @@ pub(crate) fn render(state: &AppState, health: &Health) -> String {
 
     // -- runs (history-derived; under the fold lock) -------------------
     let folded = m.folded.lock_safe();
-    let mut by_status = [0u64; 5];
+    let mut by_status = folded.by_status;
     let mut frames = folded.frames;
     let mut bytes = folded.bytes;
     let mut dur_sum = folded.duration_sum_secs;
@@ -252,14 +282,7 @@ pub(crate) fn render(state: &AppState, health: &Health) -> String {
     let now = crate::events::now_secs();
     for e in state.all_runs() {
         let rs = e.lock_safe();
-        let si = match rs.status {
-            RunStatus::Running => 0,
-            RunStatus::Completed => 1,
-            RunStatus::Partial => 2,
-            RunStatus::Stopped => 3,
-            RunStatus::Failed => 4,
-        };
-        by_status[si] += 1;
+        by_status[status_idx(rs.status)] += 1;
         let t = run_totals(&rs);
         frames += t.frames;
         bytes += t.bytes;
@@ -478,6 +501,12 @@ pub(crate) fn render(state: &AppState, health: &Health) -> String {
         "gauge",
         "Analyses in progress.",
         m.analyses_running.load(Ordering::Relaxed) as f64,
+    );
+    o.one(
+        "outstation_live_websockets",
+        "gauge",
+        "Open live-progress WebSocket streams.",
+        m.live_sockets.load(Ordering::Relaxed) as f64,
     );
     if let Ok(counts) = state.db.analysis_counts() {
         o.head(

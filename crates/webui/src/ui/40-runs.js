@@ -13,22 +13,48 @@
 
 const poll = { timer: null, inflight: false, again: false, failures: 0 };
 
+// Server-side pages of /api/runs (F054): the poll refreshes the newest
+// page; older pages are fetched on demand and kept (finished runs do
+// not change).
+// `?runs_page=N` in the page URL overrides the page size (tests).
+const RUNS_PAGE = (() => {
+  const n = Number(new URLSearchParams(location.search).get('runs_page'));
+  return Number.isInteger(n) && n > 0 && n <= 1000 ? n : 100;
+})();
+const olderRuns = { loaded: false, more: false, busy: false };
+
+// The running run's sessions come from its live WebSocket frames
+// (F103/F105) while that stream is fresh; the list then only needs
+// slow polling for summaries.
+function liveFrameFor(id) {
+  const f = typeof diag !== 'undefined' ? diag.latest : null;
+  if (!f || f.run_id !== id || !diag.ws || diag.ws.readyState !== 1) return null;
+  return Date.now() - (diag.latestAt || 0) < 3000 ? f : null;
+}
+
 async function pollRuns() {
   if (poll.inflight) { poll.again = true; return; }
   poll.inflight = true;
   clearTimeout(poll.timer);
   let delay = 4000;
   try {
-    const res = await api('/api/runs', 'GET', null, { timeout: 10000 });
+    const res = await api(`/api/runs?limit=${RUNS_PAGE}`, 'GET', null, { timeout: 10000 });
     if (res.ok && Array.isArray(res.data)) {
-      S.runs = res.data;
+      const fresh = res.data;
+      const minFresh = fresh.length ? fresh[fresh.length - 1].id : Infinity;
+      const hasMore = !!(res.headers && res.headers.get('x-has-more') === 'true');
+      // Runs that slid off the first page stay listed once older pages
+      // were loaded; before that, "Load older runs" covers them.
+      const kept = olderRuns.loaded ? S.runs.filter(r => r.id < minFresh) : [];
+      if (!olderRuns.loaded) olderRuns.more = hasMore;
+      S.runs = fresh.concat(kept);
       S.runsLoaded = true;
       poll.failures = 0;
       await refreshExpandedDetails();
       setPollHealth(true);
       emit('runs', S.runs);
-      const running = S.runs.some(r => r.status === 'running');
-      delay = document.hidden ? 10000 : (running ? 1000 : 4000);
+      const running = S.runs.find(r => r.status === 'running');
+      delay = document.hidden ? 10000 : (running ? (liveFrameFor(running.id) ? 4000 : 1000) : 4000);
     } else {
       poll.failures++;
       delay = Math.min(15000, 1000 * 2 ** Math.min(4, poll.failures - 1));
@@ -43,6 +69,36 @@ async function pollRuns() {
     poll.timer = setTimeout(pollRuns, poll.again ? 50 : delay);
     poll.again = false;
   }
+}
+
+async function loadOlderRuns() {
+  if (olderRuns.busy) return;
+  olderRuns.busy = true;
+  renderRuns();
+  const before = S.runs.length ? Math.min(...S.runs.map(r => r.id)) : '';
+  const res = await api(`/api/runs?limit=${RUNS_PAGE}&before=${before}`, 'GET', null, { timeout: 20000 });
+  olderRuns.busy = false;
+  if (!res.ok || !Array.isArray(res.data)) { notify(`Could not load older runs: ${res.error || 'bad reply'}`); renderRuns(); return; }
+  const have = new Set(S.runs.map(r => r.id));
+  S.runs = S.runs.concat(res.data.filter(r => !have.has(r.id)));
+  olderRuns.loaded = true;
+  olderRuns.more = !!(res.headers && res.headers.get('x-has-more') === 'true');
+  announce(`${res.data.length} older runs loaded`);
+  emit('runs', S.runs);
+}
+
+// A live frame of the running run: refresh its card at most once a
+// second without waiting for the (thinned) list poll.
+let _liveCardAt = 0;
+function onLiveFrame(frame) {
+  const r = S.runs.find(x => x.id === frame.run_id);
+  if (!r || r.status !== 'running') return;
+  r.sent = frame.sent;
+  r.planned = frame.planned;
+  if (frame.status && frame.status !== 'running') { pollRunsSoon(); return; }
+  if (S.view !== 'runs' || Date.now() - _liveCardAt < 1000) return;
+  _liveCardAt = Date.now();
+  renderRuns();
 }
 
 function pollRunsSoon() {
@@ -73,7 +129,11 @@ function ui(id) {
 
 async function refreshExpandedDetails() {
   if (S.view !== 'runs') return;
-  for (const id of runUi.expanded) {
+  // The running run's rows: from the live stream when it is fresh,
+  // else from its detail (the list carries counts only).
+  const want = new Set(runUi.expanded);
+  for (const r of S.runs) if (r.status === 'running' && !liveFrameFor(r.id)) want.add(r.id);
+  for (const id of want) {
     const r = S.runs.find(x => x.id === id);
     if (!r) { runUi.expanded.delete(id); continue; }
     const cached = S.runDetail.get(id);
@@ -98,6 +158,10 @@ function stateCounts(rows) {
   return c;
 }
 function sessionRowsFor(r) {
+  if (r.status === 'running') {
+    const f = liveFrameFor(r.id);
+    if (f) return f.per_session || [];
+  }
   if (r.per_source_progress && r.per_source_progress.length) return r.per_source_progress;
   const d = S.runDetail.get(r.id);
   return (d && d.per_source_progress) || [];
@@ -107,11 +171,12 @@ function stateBarHtml(r) {
   const rows = sessionRowsFor(r);
   const n = rows.length || r.sources || 0;
   if (!n) return '';
-  if (!rows.length) {
+  const counts = r.source_states && Object.keys(r.source_states).length ? r.source_states : null;
+  if (!rows.length && !counts) {
     const failed = r.sources_failed || 0;
     return `<p class="state-line"><b>${plural(n, 'session')}</b>${failed ? ` · <span class="s-failed-text">${failed} failed</span>` : ' · none failed'}</p>`;
   }
-  const c = stateCounts(rows);
+  const c = rows.length ? stateCounts(rows) : counts;
   let bar = '<div class="state-bar" aria-hidden="true">';
   let legend = '';
   for (const s of STATE_ORDER) {
@@ -172,8 +237,12 @@ function renderRuns() {
   runUi.page = Math.min(runUi.page, pages - 1);
   const shown = list.slice(runUi.page * RUNS_PER_PAGE, (runUi.page + 1) * RUNS_PER_PAGE);
   reconcile(el('runs-list'), shown, r => r.id, renderRunCard, { tag: 'li', className: 'run' });
-  setHTML(el('runs-pager'), pagerHtml('runs-page', runUi.page, pages, list.length, 'runs'));
-  if (all.length && !list.length) setHTML(el('runs-pager'), '<p class="empty">No run matches the filter.</p>');
+  let pager = pagerHtml('runs-page', runUi.page, pages, list.length, 'runs');
+  if (all.length && !list.length) pager = '<p class="empty">No run matches the filter.</p>';
+  if (olderRuns.more && runUi.page >= pages - 1) {
+    pager += `<p class="older-runs"><button type="button" class="btn btn-secondary" data-act="runs-older" data-fk="runs-older"${olderRuns.busy ? ' disabled' : ''}>${olderRuns.busy ? 'Loading older runs…' : 'Load older runs'}</button></p>`;
+  }
+  setHTML(el('runs-pager'), pager);
 }
 
 function pagerHtml(act, page, pages, total, what, extra = '') {
@@ -184,15 +253,16 @@ function pagerHtml(act, page, pages, total, what, extra = '') {
     `<button type="button" class="btn btn-secondary" data-act="${act}" data-page="${page + 1}" ${extra}${page >= pages - 1 ? ' disabled' : ''} data-fk="${act}-next${extra ? '-' + extra.replace(/\D/g, '') : ''}">Next</button></nav>`;
 }
 
-const RUN_PARTS = ['head', 'err', 'progress', 'states', 'spark', 'analysis', 'actions', 'msg', 'sessions', 'detail'];
+const RUN_PARTS = ['head', 'err', 'warn', 'progress', 'states', 'spark', 'analysis', 'actions', 'msg', 'sessions', 'detail'];
 
 // Latest stored analysis and the auto-analysis state of a run.
 const AUTO_TEXT = { queued: 'Auto-analysis queued', running: 'Auto-analysis running…', done: 'Auto-analysis done', failed: 'Auto-analysis failed', skipped: 'Auto-analysis skipped' };
 function analysisLink(runId, a) {
   const v = String(a.verdict || 'unknown');
   const score = a.score != null ? Number(a.score) : (a.score_pct != null ? Number(a.score_pct) : null);
+  // Coloured by the verdict, never by the score (N14).
   return `<a class="an-link" href="#/analysis/${esc(runId)}/${esc(a.id)}">${verdictHtml(v)}` +
-    `${score != null && isFinite(score) ? ` <b class="${scoreCls(score)}">${score.toFixed(1)}%</b>` : ''}` +
+    `${score != null && isFinite(score) ? ` <b class="${verdictCls(v)}">${score.toFixed(1)}%</b>` : ''}` +
     ` <span class="an-link-id">analysis #${esc(a.id)}${a.source ? ', ' + esc(String(a.source).replace(/_/g, '-')) : ''}</span></a>`;
 }
 function analysisStateHtml(r) {
@@ -224,6 +294,11 @@ function renderRunCard(li, r, isNew) {
     ? `<p class="err-line"><span class="err-label">Error:</span> ${esc(r.error.length > 220 ? r.error.slice(0, 220) + '…' : r.error)}</p>` +
       (hint ? `<p class="hint-strong err-hint">${esc(hint)}</p>` : '') : '');
 
+  // Run warnings (N15): capture failures, guard restore errors.
+  const warns = ((r.benchmark && r.benchmark.warnings) || (r.report && r.report.warnings) || []);
+  setHTML(part('warn'), warns.length
+    ? `<div class="warn-box run-warnings"><b>${warns.length === 1 ? 'Warning' : `${warns.length} warnings`}:</b><ul>${warns.slice(0, 5).map(w => `<li>${esc(w)}</li>`).join('')}${warns.length > 5 ? `<li>… ${warns.length - 5} more in the details</li>` : ''}</ul></div>` : '');
+
   const total = r.planned || (r.report ? r.report.total_packets : 0) || (r.benchmark ? r.benchmark.total_messages_sent : 0);
   const cur = r.status === 'running' ? r.sent : (r.report ? r.report.total_packets : (r.benchmark ? r.benchmark.total_messages_sent : r.sent));
   const p = total ? pct(cur, total) : (r.status === 'completed' ? 100 : 0);
@@ -242,9 +317,11 @@ function renderRunCard(li, r, isNew) {
   const acts = [];
   if (r.status === 'running') {
     acts.push(`<button type="button" class="btn btn-danger" data-act="run-stop" data-id="${r.id}" data-fk="run-${r.id}-stop">Stop</button>`);
-    const rows = r.per_source_progress || [];
-    const pending = rows.filter(x => x.state === 'pending' && !x.cancelled).length;
-    if (pending && rows.some(x => x.listen_port > 0)) {
+    const rows = sessionRowsFor(r);
+    const pending = rows.length
+      ? rows.filter(x => x.state === 'pending' && !x.cancelled).length
+      : ((r.source_states || {}).pending || 0);
+    if (pending && (r.role === 'slave' || rows.some(x => x.listen_port > 0))) {
       acts.push(`<button type="button" class="btn btn-secondary" data-act="run-start-all" data-id="${r.id}" data-fk="run-${r.id}-startall">Start all pending (${pending})</button>`);
     }
   }
@@ -424,6 +501,9 @@ function renderSessions(box, r) {
   box.querySelector('[data-sess="sort"]').value = u.sort;
 
   const slaveMode = rows.some(x => x.listen_port > 0);
+  const table = box.querySelector('table.sess-table');
+  table.classList.toggle('slave-rows', slaveMode);
+  table.classList.toggle('source-rows', !slaveMode);
   let list = rows.map((p, idx) => ({ p, idx, s: sessionState(p) }));
   if (u.state) list = list.filter(x => x.s === u.state);
   if (u.q) list = list.filter(x => `${x.p.src_ip || ''} ${x.p.src_mac || ''} ${x.p.listen_ip || ''}`.includes(u.q));
@@ -805,6 +885,7 @@ actions({
     if (res.ok) {
       runUi.expanded.delete(id);
       S.runDetail.delete(id);
+      S.runs = S.runs.filter(r => r.id !== id);
       announce(`Run ${id} deleted`);
     }
     pollRunsSoon();
@@ -834,6 +915,7 @@ actions({
     renderRuns();
   },
   'runs-page': b => { runUi.page = Number(b.dataset.page); renderRuns(); },
+  'runs-older': () => loadOlderRuns(),
   'gap-retry': b => { gapCache.delete(Number(b.dataset.id)); renderRuns(); },
   'run-rerun': b => rerunRun(Number(b.dataset.id)),
   'run-load': b => loadRunIntoConfigure(Number(b.dataset.id)),
@@ -913,8 +995,8 @@ function gapChart(uid, data) {
   svg += '</svg>';
   chartData.set(uid, { kind: 'gap', data });
   return '<figure class="chart-wrap"><figcaption class="legend">' +
-    '<span><span class="swatch" style="background:var(--ink);opacity:0.78"></span>original pcap</span>' +
-    '<span><span class="swatch" style="background:var(--accent)"></span>replayed capture</span></figcaption>' + svg + '</figure>';
+    '<span><span class="swatch sw-orig"></span>original pcap</span>' +
+    '<span><span class="swatch sw-accent"></span>replayed capture</span></figcaption>' + svg + '</figure>';
 }
 
 function latencyChart(uid, hist, p50, p99) {
@@ -962,9 +1044,9 @@ function latencyChart(uid, hist, p50, p99) {
   svg += '</svg>';
   chartData.set(uid, { kind: 'lat', buckets: counts, logMin, logMax, overflowIdx: n > binsMain ? binsMain : -1 });
   return '<figure class="chart-wrap"><figcaption class="legend">' +
-    '<span><span class="swatch" style="background:var(--blue)"></span>ack latency</span>' +
-    '<span><span class="swatch" style="background:var(--ok)"></span>p50</span>' +
-    '<span><span class="swatch" style="background:var(--accent)"></span>p99</span>' +
+    '<span><span class="swatch sw-blue"></span>ack latency</span>' +
+    '<span><span class="swatch sw-ok"></span>p50</span>' +
+    '<span><span class="swatch sw-accent"></span>p99</span>' +
     `<span class="muted">${hist.total.toLocaleString()} messages (weighted)</span></figcaption>${svg}</figure>`;
 }
 

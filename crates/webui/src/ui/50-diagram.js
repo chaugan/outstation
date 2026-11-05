@@ -23,7 +23,9 @@ const NODE_STYLE = {
   pending: { color: '#cfcfca', border: '#6a6a65', symbol: 'circle', label: 'pending' },
   cancelled: { color: '#ebebe6', border: '#6a6a65', symbol: 'roundRect', label: 'cancelled' },
   listening: { color: '#1f4a78', border: '#0e0e0c', symbol: 'diamond', label: 'listening' },
-  connected: { color: '#c15a2b', border: '#0e0e0c', symbol: 'circle', label: 'connected' },
+  // Connected (handshake not done yet) is a hollow ring, active a
+  // filled disc: they differ in shape, not only in shade (N25).
+  connected: { color: '#ffffff', border: '#c15a2b', borderWidth: 2.5, symbol: 'circle', label: 'connected' },
   active: { color: '#c15a2b', border: '#0e0e0c', symbol: 'circle', label: 'active' },
   completed: { color: '#5a7a3f', border: '#0e0e0c', symbol: 'rect', label: 'completed' },
   failed: { color: '#922626', border: '#0e0e0c', symbol: 'triangle', label: 'failed' },
@@ -91,8 +93,10 @@ function connectDiagram(runId) {
     let frame;
     try { frame = JSON.parse(evt.data); } catch (_) { return; }
     diag.latest = frame;
+    diag.latestAt = Date.now();
     if (frame.status && frame.status !== 'running') diag.finishedAt = Date.now();
     scheduleDiagramRender();
+    onLiveFrame(frame);
   };
   sock.onclose = () => {
     if (gen !== diag.gen) return;
@@ -171,7 +175,8 @@ function computeLayout(n, W, H) {
   const perim = (a, b) => Math.PI * (3 * (a + b) - Math.sqrt((3 * a + b) * (a + 3 * b)));
   let rings = [];
   for (let attempt = 0; attempt < 6; attempt++) {
-    const spacing = size * 1.45 + (labels ? 10 : 0);
+    // At least a node's width of air between neighbours (F109).
+    const spacing = size * 2.1 + (labels ? 10 : 0);
     rings = [];
     let cap = 0;
     for (let k = 1; k <= 10 && cap < n; k++) {
@@ -185,7 +190,7 @@ function computeLayout(n, W, H) {
       }
     }
     if (cap >= n) break;
-    size = Math.max(5, size * 0.8);
+    size = Math.max(6, size * 0.85);
   }
   const total = rings.reduce((a, r) => a + r.cap, 0);
   let left = n;
@@ -258,7 +263,7 @@ function renderDiagram(frame) {
       data.push({
         name: p.src_ip || `session ${i}`, state: st, sent: p.sent, received: p.received,
         value: L.pos[i], symbol: ns.symbol, symbolSize: st === 'failed' ? L.size * 1.25 : L.size,
-        itemStyle: { color: ns.color, borderColor: ns.border, borderWidth: 1 },
+        itemStyle: { color: ns.color, borderColor: ns.border, borderWidth: ns.borderWidth || 1 },
         label: { show: L.labels, position: 'right', color: '#0e0e0c', fontSize: 11, formatter: '{b}' },
       });
     });
@@ -338,13 +343,13 @@ function renderDiagramText(frame, sessions) {
 
 function shapeSvg(state) {
   const s = nodeStyle(state);
-  const f = `fill="${s.color}" stroke="${s.border}" stroke-width="1"`;
+  const f = `fill="${s.color}" stroke="${s.border}" stroke-width="${s.borderWidth ? 2 : 1}"`;
   switch (s.symbol) {
     case 'diamond': return `<path d="M6 0.5 L11.5 6 L6 11.5 L0.5 6 Z" ${f}/>`;
     case 'rect': return `<rect x="1" y="1" width="10" height="10" ${f}/>`;
     case 'roundRect': return `<rect x="1" y="1" width="10" height="10" rx="3" ${f}/>`;
     case 'triangle': return `<path d="M6 0.5 L11.5 11 L0.5 11 Z" ${f}/>`;
-    default: return `<circle cx="6" cy="6" r="5" ${f}/>`;
+    default: return `<circle cx="6" cy="6" r="${s.borderWidth ? 4.5 : 5}" ${f}/>`;
   }
 }
 

@@ -29,8 +29,8 @@
 //!
 //! # Report size and persistence
 //!
-//! [`AnalysisReport`] still carries `details_by_ip` for the current UI,
-//! but every per-endpoint detail is bounded by the protocol's caps
+//! [`AnalysisReport`] carries `details_by_ip` while it is built, but
+//! the API only ever returns the summary (F067): every per-endpoint detail is bounded by the protocol's caps
 //! (IEC 104: 200 mismatches, 2 000-entry sequences, strided samples).
 //! [`AnalysisReport::split`] separates it into a small serializable
 //! [`AnalysisSummary`] (verdicts, scores, fleet rollup, timelines) and
@@ -51,6 +51,19 @@ use serde::Serialize;
 /// Default tolerance for the CP56Time2a drift analyzer: 50 ms is
 /// generous for a LAN SCADA session but keeps noise out of the count.
 pub const DEFAULT_CP56_TOLERANCE_MS: f64 = 50.0;
+/// Largest accepted CP56Time2a drift tolerance (one hour).
+pub const MAX_CP56_TOLERANCE_MS: f64 = 3_600_000.0;
+
+/// Check a configured CP56Time2a drift tolerance (F066).
+pub fn check_cp56_tolerance(v: f64) -> Result<f64, String> {
+    if v.is_finite() && (0.0..=MAX_CP56_TOLERANCE_MS).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!(
+            "cp56_tolerance_ms must be a number in 0..={MAX_CP56_TOLERANCE_MS}, got {v}"
+        ))
+    }
+}
 
 /// Cap on points emitted in the fleet timelines. Aggregate stats stay
 /// accurate beyond this; only the scatter is trimmed.
@@ -149,6 +162,9 @@ pub struct RunInfo {
     /// Frames the run's own capture lost to a full kernel queue. Any
     /// loss makes "missing" frames in the verdict suspect.
     pub capture_dropped: u64,
+    /// The capture stopped at its per-run size cap: frames after that
+    /// point are missing from it, not from the wire.
+    pub capture_truncated: bool,
 }
 
 /// Everything [`analyze`] needs.
@@ -232,14 +248,58 @@ pub struct AnalysisSummary {
     pub fleet_drift_timeline: Option<FleetDriftTimeline>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fleet_pacing_timeline: Option<FleetPacingTimeline>,
+    /// Sum of every endpoint's `protocol_specific.gi_ci_audit` counters
+    /// (IEC 104), so the fleet audit panel needs no endpoint details.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fleet_gi_ci_audit: Option<serde_json::Map<String, serde_json::Value>>,
+}
+
+/// Sum the numeric fields of each detail's `protocol_specific.gi_ci_audit`.
+fn fleet_gi_ci_audit(
+    details: &BTreeMap<String, SlaveDetail>,
+) -> Option<serde_json::Map<String, serde_json::Value>> {
+    let mut sums: BTreeMap<String, f64> = BTreeMap::new();
+    let mut with_events = 0u64;
+    for d in details.values() {
+        let Some(a) = d
+            .protocol_specific
+            .get("gi_ci_audit")
+            .and_then(|a| a.as_object())
+        else {
+            continue;
+        };
+        let mut events = 0.0;
+        for (k, v) in a {
+            if let Some(n) = v.as_f64() {
+                *sums.entry(k.clone()).or_default() += n;
+                if k == "gi_total" || k == "ci_total" {
+                    events += n;
+                }
+            }
+        }
+        if events > 0.0 {
+            with_events += 1;
+        }
+    }
+    if sums.is_empty() {
+        return None;
+    }
+    let mut m: serde_json::Map<String, serde_json::Value> = sums
+        .into_iter()
+        .map(|(k, v)| (k, serde_json::json!(v)))
+        .collect();
+    m.insert("endpoints_with_events".into(), with_events.into());
+    Some(m)
 }
 
 impl AnalysisReport {
     /// Split into the persistable summary and the per-endpoint detail
     /// map (keyed like `SlaveSummary::slave_ip`).
     pub fn split(self) -> (AnalysisSummary, BTreeMap<String, SlaveDetail>) {
+        let fleet_gi_ci_audit = fleet_gi_ci_audit(&self.details_by_ip);
         (
             AnalysisSummary {
+                fleet_gi_ci_audit,
                 run_id: self.run_id,
                 run_status: self.run_status,
                 run_warning: self.run_warning,
@@ -566,16 +626,15 @@ fn analyze_loaded(
     }
 
     // Source endpoints and the reference flow the replayer used for
-    // each: the first flow in pcap order (sched picks the same one).
-    let mut reference: BTreeMap<Ipv4Addr, usize> = BTreeMap::new();
-    for (idx, f) in original.flows.iter().enumerate() {
-        if server_port(f) != Some(source_port) {
-            continue;
-        }
-        if let Some(ep) = endpoint_of(f, role) {
-            reference.entry(ep).or_insert(idx);
-        }
-    }
+    // each: the one sched picks (its best flow per endpoint, N18).
+    let reference: BTreeMap<Ipv4Addr, usize> = sched::replayed_flows(
+        original,
+        match role {
+            RoleHint::Master => protoplay::Role::Master,
+            RoleHint::Slave => protoplay::Role::Slave,
+        },
+        source_port,
+    );
 
     // Endpoints to judge.
     let run_known = !run.endpoints.is_empty();
@@ -753,6 +812,12 @@ fn analyze_loaded(
             .then_with(|| a.slave_ip.cmp(&b.slave_ip))
     });
 
+    if run.capture_truncated {
+        fleet_notes.insert(
+            0,
+            "WARNING: the capture hit its per-run size cap and is truncated; frames sent after that point are reported missing".to_string(),
+        );
+    }
     if run.capture_dropped > 0 {
         fleet_notes.insert(
             0,
@@ -863,6 +928,16 @@ fn apply_run_status(
             Some("the run being analysed is still running".to_string()),
             true,
         ),
+        // A stopped run is judged only up to the stop; it is never
+        // certified as a complete replay (N11).
+        (RunStatusHint::Stopped, _) => (
+            Some(
+                "the run being analysed was STOPPED before it finished; only what it sent \
+                 before the stop is judged"
+                    .to_string(),
+            ),
+            false,
+        ),
         // Session errors are judged per endpoint from the capture.
         (RunStatusHint::Partial, _) => (
             Some("some sessions of the run being analysed reported errors".to_string()),
@@ -880,6 +955,18 @@ fn apply_run_status(
     };
     notes.insert(0, format!("WARNING: {w}"));
     if !blocks {
+        // A clean but stopped run says so instead of `all_correct`.
+        let (verdict, reason) = if run.status == RunStatusHint::Stopped && verdict == "all_correct"
+        {
+            (
+                "stopped_clean",
+                format!(
+                    "stopped before the end; everything sent before the stop was clean ({reason})"
+                ),
+            )
+        } else {
+            (verdict, reason)
+        };
         return RunJudgement {
             verdict,
             reason,
@@ -949,14 +1036,20 @@ fn analyze_endpoint(
     }
     let (orig_pb, orig_tg) = pick_playback_target(role, orig_client.as_ref(), orig_server.as_ref());
 
-    let stopped = run.status == RunStatusHint::Stopped || sel.is_some_and(|s| s.cancelled);
+    // A stop excuses a truncated tail, but never on an endpoint whose
+    // own session failed: its missing frames are a failure, whatever
+    // happened to the run afterwards (N11).
+    let failed = sel.is_some_and(|s| s.state == "failed" && !s.cancelled);
+    let stopped =
+        !failed && (run.status == RunStatusHint::Stopped || sel.is_some_and(|s| s.cancelled));
     let (per_session_iters, expected_sessions) = match run.loop_within_session {
         Some(true) => (run.iterations, Some(1u64)),
         Some(false) => (1, (run.iterations > 0).then_some(run.iterations)),
         None => (0, None),
     };
     // An unbounded loop always ends on a stop.
-    let stopped = stopped || (run.loop_within_session.is_some() && run.iterations == 0);
+    let stopped =
+        !failed && (stopped || (run.loop_within_session.is_some() && run.iterations == 0));
 
     // Sessions that carried no payload at all (port probes, refused
     // connects) are listed but not judged.
@@ -1243,7 +1336,7 @@ fn weighted_decimate(sorted: &[(f64, f64, f64)], cap: usize) -> (Vec<[f64; 2]>, 
 /// handshakes, so we bin SYNs by 1-second windows and flag bins that
 /// contain at least 30 % of the expected endpoint count. Adjacent
 /// flagged bins coalesce into a single iteration start.
-fn detect_iteration_starts(
+pub(crate) fn detect_iteration_starts(
     captured: &LoadedPcap,
     target_port: u16,
     expected_slave_count: usize,
@@ -2197,5 +2290,135 @@ mod tests {
         let b = t.samples.iter().filter(|p| p[1] == 1.0).count() as f64;
         let frac = b / t.samples.len() as f64;
         assert!((0.4..0.6).contains(&frac), "B share {frac}");
+    }
+
+    // ---------------- N11 regressions (re-audit reaudit_* probes) ----------------
+
+    /// RTU .2 completed; RTU .3's session FAILED after 2 of 8 frames,
+    /// then the operator stopped the run. The stop must not excuse the
+    /// failed endpoint, and the fleet is never certified.
+    #[test]
+    fn reaudit_failed_session_in_stopped_run() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Stopped;
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert_ne!(s.verdict, "stopped_clean");
+        assert!(s.score_pct < 100.0, "{s:?}");
+        assert_eq!(slave(&r, 2).outcome, VerdictOutcome::Pass);
+        assert_eq!(r.verdict, "partial", "{}", r.verdict_reason);
+        assert_ne!(r.fleet.fully_correct, 2);
+        assert!(r.run_warning.as_deref().unwrap().contains("STOPPED"));
+        assert!(r.notes[0].starts_with("WARNING"), "{:?}", r.notes);
+    }
+
+    /// Same failure in an unbounded loop (which always ends on a stop).
+    #[test]
+    fn reaudit_failed_session_in_unbounded_loop() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Partial;
+        run.iterations = 0;
+        run.loop_within_session = Some(true);
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert!(s.score_pct < 100.0, "{s:?}");
+        assert_ne!(r.verdict, "all_correct");
+    }
+
+    /// A finished run whose session failed midway.
+    #[test]
+    fn reaudit_completed_run_session_failed_midway() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script());
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..2]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Partial;
+        run.endpoints[1].state = "failed".into();
+        run.endpoints[1].sent = 2;
+        let r = run_analysis(&source, &cap.load(), run);
+        let s = slave(&r, 3);
+        assert_eq!(s.outcome, VerdictOutcome::Fail, "{s:?}");
+        assert!(s.score_pct < 100.0);
+        assert_eq!(r.verdict, "partial");
+    }
+
+    /// A run stopped after one frame per RTU is clean up to the stop,
+    /// but is reported as stopped with a warning, never `all_correct`.
+    #[test]
+    fn stopped_run_is_never_all_correct() {
+        let source = source_pcap(&[2, 3]);
+        let mut cap = Cap::default();
+        rtu_session(&mut cap, rtu(2), 2404, 50000, 0, &script()[..1]);
+        rtu_session(&mut cap, rtu(3), 2404, 50001, 0, &script()[..1]);
+        let mut run = completed_run(&[2, 3]);
+        run.status = RunStatusHint::Stopped;
+        run.messages_sent = Some(2);
+        for e in &mut run.endpoints {
+            e.state = "cancelled".into();
+            e.cancelled = true;
+            e.sent = 1;
+        }
+        let r = run_analysis(&source, &cap.load(), run);
+        assert_eq!(slave(&r, 2).verdict, "stopped_clean");
+        assert_eq!(r.verdict, "stopped_clean", "{}", r.verdict_reason);
+        assert!(r.verdict_reason.contains("stopped"));
+        assert!(r.run_warning.as_deref().unwrap().contains("STOPPED"));
+        assert!(r.notes[0].contains("STOPPED"), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn cp56_tolerance_is_bounded() {
+        assert_eq!(check_cp56_tolerance(0.0), Ok(0.0));
+        assert_eq!(check_cp56_tolerance(250.0), Ok(250.0));
+        for bad in [-1.0, f64::NAN, f64::INFINITY, MAX_CP56_TOLERANCE_MS + 1.0] {
+            assert!(check_cp56_tolerance(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn fleet_gi_ci_audit_sums_endpoint_counters() {
+        let detail = |ps: serde_json::Value| SlaveDetail {
+            tcp_flow: None,
+            sessions: Vec::new(),
+            sessions_total: 0,
+            protocol_specific: ps,
+            verdict: "good_delivery",
+            verdict_reason: String::new(),
+            score_pct: 100.0,
+            notes: Vec::new(),
+            pacing_samples: Vec::new(),
+            pacing_weight: 1.0,
+        };
+        let mut d = BTreeMap::new();
+        d.insert(
+            "a".to_string(),
+            detail(serde_json::json!({"gi_ci_audit": {"gi_total": 2, "gi_compliant": 1, "gi_partial": 1, "events": []}})),
+        );
+        d.insert(
+            "b".to_string(),
+            detail(serde_json::json!({"gi_ci_audit": {"gi_total": 0, "ci_total": 0}})),
+        );
+        d.insert("c".to_string(), detail(serde_json::Value::Null));
+        let m = fleet_gi_ci_audit(&d).unwrap();
+        assert_eq!(m["gi_total"], 2.0);
+        assert_eq!(m["gi_partial"], 1.0);
+        assert_eq!(m["endpoints_with_events"], 1);
+        assert!(!m.contains_key("events"));
+        assert!(fleet_gi_ci_audit(&BTreeMap::new()).is_none());
     }
 }

@@ -126,9 +126,9 @@ pub const SPEED_MATCH_TOLERANCE: f64 = 0.05;
 /// Timing fails (when the run was paced) if the worst cumulative drift
 /// exceeds this many ms *and* [`TIMING_DRIFT_FAIL_REL`] of the
 /// iteration's original span.
-pub const TIMING_DRIFT_FAIL_MS: f64 = 1_000.0;
+pub const TIMING_DRIFT_FAIL_MS: f64 = crate::asdu::DEFAULT_TIMING_DRIFT_FAIL_MS;
 /// Relative part of the timing drift threshold.
-pub const TIMING_DRIFT_FAIL_REL: f64 = 0.05;
+pub const TIMING_DRIFT_FAIL_REL: f64 = crate::asdu::DEFAULT_TIMING_DRIFT_FAIL_REL;
 /// Share-of-frames statistic: frames whose drift is within ±this.
 pub const DRIFT_WITHIN_MS: f64 = 100.0;
 
@@ -213,6 +213,9 @@ pub struct PlaybackReport {
     pub iterations_truncated: bool,
     pub iterations_configured: u64,
     pub iterations_observed: usize,
+    /// Passes delivered beyond `iterations_configured` (when that is
+    /// known): every frame in them counts as extra (N12).
+    pub extra_passes: usize,
     pub iterations_complete: usize,
     pub iterations_clean: usize,
     pub stopped_tail: Option<TailReport>,
@@ -251,7 +254,8 @@ pub struct IterationReport {
     /// 1-based.
     pub iteration: usize,
     /// `clean`, `deviations`, `stopped_tail_clean`,
-    /// `stopped_tail_deviations` or `not_started`.
+    /// `stopped_tail_deviations`, `not_started` or `extra_pass` (a pass
+    /// beyond the configured iteration count; all of it is extra).
     pub status: &'static str,
     pub expected: usize,
     pub identical: usize,
@@ -432,11 +436,11 @@ pub fn analyze_iec104_flow(
     ctx: &AnalyzeCtx,
 ) -> ProtoSlaveAnalysis {
     let mut notes: Vec<String> = Vec::new();
-    let cp56_cfg = match Iec104ProtoConfig::parse(ctx.proto_config.as_deref()) {
-        Ok(c) => c.cp56,
+    let (cp56_cfg, analysis_cfg) = match Iec104ProtoConfig::parse(ctx.proto_config.as_deref()) {
+        Ok(c) => (c.cp56, c.analysis),
         Err(e) => {
             notes.push(format!(
-                "{e}; analysed as if CP56 rewriting was off (the run itself would have refused this config)"
+                "{e}; analysed as if CP56 rewriting was off and with default thresholds (the run itself would have refused this config)"
             ));
             Default::default()
         }
@@ -642,6 +646,8 @@ pub fn analyze_iec104_flow(
         stopped_early: ctx.run.stopped_early || faults_on,
         // Faults stall the sender on purpose: timing is not judged.
         paced_speed: if faults_on { None } else { ctx.run.paced_speed },
+        drift_fail_ms: analysis_cfg.timing_drift_fail_ms,
+        drift_fail_rel: analysis_cfg.timing_drift_fail_rel,
     };
     if faults_on && ctx.run.paced_speed.is_some() {
         notes.push("faults were injected: pacing is measured but not judged".into());
@@ -657,6 +663,12 @@ pub fn analyze_iec104_flow(
             "captured session contains {} passes of the {}-frame source script; each pass is judged separately",
             cmp.iterations_observed,
             expected_frames.len()
+        ));
+    }
+    if cmp.report.extra_passes > 0 {
+        notes.push(format!(
+            "{} pass(es) beyond the {} configured iteration(s) were delivered; their frames count as extra",
+            cmp.report.extra_passes, cmp_cfg.iterations_configured
         ));
     }
 
@@ -1470,6 +1482,10 @@ struct CompareCfg {
     iterations_configured: u64,
     stopped_early: bool,
     paced_speed: Option<f64>,
+    /// Pacing-drift fail threshold, from `proto_config.analysis`
+    /// (defaults [`TIMING_DRIFT_FAIL_MS`] / [`TIMING_DRIFT_FAIL_REL`]).
+    drift_fail_ms: f64,
+    drift_fail_rel: f64,
 }
 
 struct CompareResult {
@@ -1585,6 +1601,21 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     let observed = last_touched.map(|e| e / e_len + 1).unwrap_or(0);
     let last_e = last_touched.unwrap_or(0);
     let tail_excused = cfg.stopped_early || (cfg.iterations_configured == 0 && observed > 1);
+    // Passes past a known iteration count were never owed: everything
+    // delivered in them is extra, nothing in them is missing (N12).
+    let configured = cfg.iterations_configured as usize;
+    let beyond = |it: usize| configured > 0 && it >= configured;
+    let extra_diff = |d: usize, it: usize| IFrameDiff {
+        kind: "extra",
+        index: d,
+        iteration: it + 1,
+        expected_index: None,
+        delivered_index: Some(d),
+        expected_type_id: None,
+        actual_type_id: Some(del_tids[d]),
+        expected_asdu_hex: String::new(),
+        actual_asdu_hex: to_hex(del[d].asdu),
+    };
 
     let mut iters: Vec<IterationReport> = (0..observed.max(1))
         .map(|i| IterationReport {
@@ -1610,6 +1641,11 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
         let it = e / e_len;
         let class = classify_pair(src[pos].asdu, &del[d], cfg);
         pair_classes.push((e, d, class));
+        if beyond(it) {
+            iters[it].extra += 1;
+            push_mm(extra_diff(d, it));
+            continue;
+        }
         if src_tids[pos] == del_tids[d] {
             report.matched_type_ids += 1;
         }
@@ -1653,6 +1689,11 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     for &(e, d) in &es.reordered {
         let pos = e % e_len;
         let it = (e / e_len).min(iters.len() - 1);
+        if beyond(it) {
+            iters[it].extra += 1;
+            push_mm(extra_diff(d, it));
+            continue;
+        }
         iters[it].reordered += 1;
         push_mm(IFrameDiff {
             kind: "reordered",
@@ -1671,8 +1712,10 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     let mut missing_indices: Vec<usize> = Vec::new();
     for &e in &es.missing {
         let it = e / e_len;
-        if it >= iters.len() {
-            continue; // repeated copy never started (insert-inflated)
+        if it >= iters.len() || beyond(it) {
+            // Repeated copy never started (insert-inflated), or a pass
+            // that was not owed.
+            continue;
         }
         if e > last_e && tail_excused {
             iters[it].not_sent += 1;
@@ -1716,12 +1759,19 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
         });
     }
     // Iterations the run was configured for but never started.
-    let configured = cfg.iterations_configured as usize;
     let never_started = configured.saturating_sub(observed.max(1));
     let never_started_frames = never_started.saturating_mul(e_len);
 
     // --- Per-iteration status, totals ---
     for (i, ir) in iters.iter_mut().enumerate() {
+        if beyond(i) {
+            ir.expected = 0;
+            ir.score_pct = 0.0;
+            ir.status = "extra_pass";
+            report.extra_count += ir.extra;
+            report.extra_passes += 1;
+            continue;
+        }
         let is_last = i + 1 == observed.max(1);
         let in_scope = ir.expected - ir.not_sent;
         let good = ir.identical + ir.cp56_ok;
@@ -1902,7 +1952,9 @@ fn compare_playback(src: &[IFrame], del: &[IFrame], cfg: &CompareCfg) -> Compare
     );
     if let Some(s) = cfg.paced_speed.filter(|s| *s > 0.0) {
         timing.timing_judged = true;
-        let threshold = TIMING_DRIFT_FAIL_MS.max(TIMING_DRIFT_FAIL_REL * max_orig_span / s);
+        let threshold = cfg
+            .drift_fail_ms
+            .max(cfg.drift_fail_rel * max_orig_span / s);
         if timing.max_abs_drift_ms > threshold {
             timing.timing_failure = Some(format!(
                 "pacing drift reached {:.0} ms (threshold {:.0} ms at {s}× speed; replay ran {})",
@@ -4077,6 +4129,51 @@ mod tests {
     }
 
     #[test]
+    fn passes_beyond_the_configured_count_are_extra() {
+        // N12 (probe C3): 3 clean passes delivered, 2 configured.
+        let exp = script10();
+        let mut got = exp.clone();
+        got.extend(exp.clone());
+        got.extend(exp.clone());
+        let c = ctx_with(
+            RunFacts {
+                iterations_per_session: 2,
+                ..Default::default()
+            },
+            None,
+        );
+        let o = run_with(&exp, &got, &c);
+        assert_ne!(o.r.verdict, "good_delivery", "{}", o.r.verdict_reason);
+        assert_ne!(o.r.outcome, VerdictOutcome::Pass);
+        assert_eq!(o.n("extra_count"), 10);
+        assert_eq!(o.n("extra_passes"), 1);
+        assert_eq!(o.n("missing_count"), 0);
+        assert_eq!(o.n("expected_iframes"), 20);
+        assert_eq!(o.n("iterations_clean"), 2);
+        let iters = o.pb("iterations").as_array().unwrap();
+        assert_eq!(iters.len(), 3);
+        assert_eq!(iters[2]["status"], "extra_pass");
+        assert_eq!(iters[2]["extra"], 10);
+        assert!(o
+            .r
+            .notes
+            .iter()
+            .any(|n| n.contains("beyond the 2 configured")));
+        // A partial extra pass is flagged too, and owes nothing.
+        let mut got = exp.clone();
+        got.extend(exp.clone());
+        got.extend(exp[..4].to_vec());
+        let o = run_with(&exp, &got, &c);
+        assert_eq!(o.n("extra_count"), 4);
+        assert_eq!(o.n("missing_count"), 0);
+        assert_eq!(o.n("not_sent_count"), 0);
+        // Unknown count (0): repeated passes are judged, not extra.
+        let o = run(&exp, &[exp.clone(), exp.clone(), exp.clone()].concat());
+        assert_eq!(o.n("extra_passes"), 0);
+        assert_eq!(o.r.verdict, "good_delivery");
+    }
+
+    #[test]
     fn configured_iterations_that_never_started_are_missing() {
         let exp = script10();
         let c = ctx_with(
@@ -4534,6 +4631,35 @@ mod tests {
         // The pacing samples pair by alignment: 9 samples, no phantom
         // drift from the dropped frame.
         assert_eq!(r.pacing_samples.len(), 9);
+
+        // F066: the drift threshold comes from proto_config.analysis.
+        // 1800 ms of drift passes a 5 s threshold.
+        let lenient = ctx_with(
+            RunFacts {
+                paced_speed: Some(1.0),
+                ..Default::default()
+            },
+            Some(r#"{"analysis":{"timing_drift_fail_ms":5000}}"#),
+        );
+        let r2 = analyze_iec104_flow(
+            Some(FlowSnapshot {
+                payload: &ep,
+                packet_offsets: &eo,
+            }),
+            Some(FlowSnapshot {
+                payload: &gp,
+                packet_offsets: &go,
+            }),
+            None,
+            Some(FlowSnapshot {
+                payload: &tp,
+                packet_offsets: &to,
+            }),
+            &lenient,
+        );
+        let t2 = &r2.protocol_specific["timing"];
+        assert_eq!(t2["timing_judged"], true);
+        assert!(t2["timing_failure"].is_null(), "{t2}");
     }
 
     #[test]

@@ -66,8 +66,17 @@ pub struct MessageProgress {
     /// Total messages the replayer plans to send for this session.
     /// Filled in by the replayer once it has parsed the pcap payload.
     pub planned: Arc<AtomicU64>,
-    /// Client messages sent on the wire so far.
+    /// Client messages sent on the wire in the current iteration.
     pub sent: Arc<AtomicU64>,
+    /// Sum of `sent` over finished iterations; see
+    /// [`MessageProgress::fold_iteration`].
+    pub sent_done_iters: Arc<AtomicU64>,
+    /// Sum of `bytes_written` over finished iterations.
+    pub bytes_done_iters: Arc<AtomicU64>,
+    /// Sequence counter guarding the fold of the per-iteration counters
+    /// into the `*_done_iters` totals (odd while a fold is under way),
+    /// so readers of a total never see it dip. See [`fold_counters`].
+    pub fold_seq: Arc<AtomicU64>,
     /// Server messages received so far.
     pub received: Arc<AtomicU64>,
     pub bytes_written: Arc<AtomicU64>,
@@ -113,6 +122,68 @@ impl MessageProgress {
     #[inline]
     pub fn is_cancelled(&self) -> bool {
         self.cancel.load(Ordering::Relaxed) || self.run_cancel.load(Ordering::Relaxed)
+    }
+
+    /// Start a new iteration: move `sent` and `bytes_written` into the
+    /// `*_done_iters` totals and restart them at zero. The totals
+    /// ([`MessageProgress::sent_total`]) never dip while this runs.
+    /// Call it only from the thread that sends.
+    pub fn fold_iteration(&self) {
+        fold_counters(
+            &self.fold_seq,
+            &[
+                (&self.sent, &self.sent_done_iters),
+                (&self.bytes_written, &self.bytes_done_iters),
+            ],
+        );
+    }
+
+    /// Messages sent over all iterations, monotonic.
+    pub fn sent_total(&self) -> u64 {
+        read_folded(&self.fold_seq, &self.sent, &self.sent_done_iters)
+    }
+}
+
+/// Move every `current` counter into its `done` total and zero it, as
+/// one step for readers using [`read_folded`] with the same `seq` (a
+/// seqlock: `seq` is odd while the fold runs). A reader of
+/// `done + current` therefore never sees the amount in neither (a dip)
+/// nor in both (a spike). Only one thread may fold a given `seq`, and
+/// nobody else may write the `current` counters during the fold (both
+/// hold when the sending thread folds its own counters).
+pub fn fold_counters(seq: &AtomicU64, pairs: &[(&AtomicU64, &AtomicU64)]) {
+    let s = seq.load(Ordering::Relaxed);
+    seq.store(s.wrapping_add(1), Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    for (current, done) in pairs {
+        let v = current.swap(0, Ordering::Relaxed);
+        done.fetch_add(v, Ordering::Relaxed);
+    }
+    seq.store(s.wrapping_add(2), Ordering::Release);
+}
+
+/// `done + current`, consistent with respect to [`fold_counters`] on
+/// the same `seq`: monotonic as long as the counters only grow between
+/// folds.
+pub fn read_folded(seq: &AtomicU64, current: &AtomicU64, done: &AtomicU64) -> u64 {
+    let mut spins = 0u32;
+    loop {
+        let s1 = seq.load(Ordering::Acquire);
+        if s1 & 1 == 0 {
+            let v = done
+                .load(Ordering::Relaxed)
+                .saturating_add(current.load(Ordering::Relaxed));
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s1 {
+                return v;
+            }
+        }
+        spins += 1;
+        if spins % 64 == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
     }
 }
 
@@ -390,6 +461,8 @@ pub struct ProtoReport {
     pub connected: bool,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    /// Wall-clock length of the session (all iterations when merged),
+    /// idle-serve included. See [`ProtoReport::active_ms`].
     pub elapsed_ms: u64,
     pub messages_sent: u64,
     pub messages_received: u64,
@@ -413,7 +486,8 @@ pub struct ProtoReport {
     pub latency_p99_us: u64,
     pub latency_max_us: u64,
     pub latency_mean_us: u64,
-    /// Client messages per second sustained over the active session.
+    /// Client messages per second over the session's active time
+    /// ([`ProtoReport::active_ms`]), idle-serve excluded.
     pub throughput_msgs_per_sec: f64,
     /// Number of times the send loop blocked waiting for the server
     /// to free the flow-control window.
@@ -686,15 +760,26 @@ impl ProtocolStats {
 }
 
 impl ProtoReport {
+    /// Active time of the session in milliseconds: `elapsed_ms` (the
+    /// total, wall clock) minus the time spent idle-serving the peer
+    /// after the script ([`ProtocolStats::idle_serve_ms`]). Both add up
+    /// when reports are merged, so this stays the sum of the active
+    /// times (N4).
+    pub fn active_ms(&self) -> u64 {
+        self.elapsed_ms.saturating_sub(self.protocol.idle_serve_ms)
+    }
+
     /// Compute latency percentile fields and throughput from the raw
-    /// `latency_samples_us` and the session's active send window.
-    /// Call this once at the end of a session, after all samples have
-    /// been recorded and `elapsed_ms` and `messages_sent` are set.
+    /// `latency_samples_us` and the session's active time
+    /// ([`ProtoReport::active_ms`]). Call this once at the end of a
+    /// session, after all samples have been recorded and `elapsed_ms`,
+    /// `protocol.idle_serve_ms` and `messages_sent` are set.
     pub fn finalize_latency(&mut self) {
         // Throughput does not depend on the latency samples; a session
         // that never saw an ACK still sent messages.
-        self.throughput_msgs_per_sec = if self.elapsed_ms > 0 {
-            (self.messages_sent as f64) * 1000.0 / (self.elapsed_ms as f64)
+        let active_ms = self.active_ms();
+        self.throughput_msgs_per_sec = if active_ms > 0 {
+            (self.messages_sent as f64) * 1000.0 / (active_ms as f64)
         } else {
             0.0
         };
@@ -959,6 +1044,109 @@ pub trait LoadedPcapView {
     fn flow_server_payload(&self, _flow_idx: usize) -> Vec<u8> {
         Vec::new()
     }
+    /// Reassemble one side of a flow once and hand it to `f` without
+    /// copying (P07). `f` is not called when that side carries no
+    /// payload. The default is built on
+    /// [`LoadedPcapView::flow_server_payload`] (server side only, no
+    /// gap information); real views override it.
+    fn with_flow_side(
+        &self,
+        flow_idx: usize,
+        side: FlowSide,
+        f: &mut dyn FnMut(&FlowSideView<'_>),
+    ) {
+        if side == FlowSide::Server {
+            let payload = self.flow_server_payload(flow_idx);
+            if !payload.is_empty() {
+                f(&FlowSideView {
+                    payload: &payload,
+                    gap_offsets: &[],
+                    missing_bytes: 0,
+                });
+            }
+        }
+    }
+    /// Packets in the capture (for the memory estimate); 0 = unknown.
+    fn packet_count(&self) -> u64 {
+        0
+    }
+}
+
+/// One side of a TCP flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSide {
+    /// Bytes the client sent (master role replays them).
+    Client,
+    /// Bytes the server sent (slave role replays them).
+    Server,
+}
+
+/// One reassembled side of a flow, see
+/// [`LoadedPcapView::with_flow_side`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlowSideView<'a> {
+    pub payload: &'a [u8],
+    /// Payload offsets of the capture gaps (TCP sequence holes), in
+    /// order; an offset of 0 is a lost first segment.
+    pub gap_offsets: &'a [usize],
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+/// How well one captured flow side lends itself to replay, to pick one
+/// flow per endpoint when an endpoint appears in several (reconnects,
+/// port reuse). The scheduler and the upload viability rank flows the
+/// same way (N18): the longest contiguous run of bytes first (the most
+/// that replays without a hole), then fewer gaps, then more bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlowQuality {
+    /// Longest stretch of payload without a capture gap inside it.
+    pub longest_chunk: usize,
+    /// Capture gaps, a lost first segment included.
+    pub gaps: usize,
+    pub payload_bytes: usize,
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+impl FlowQuality {
+    /// Quality of a side with `payload_len` bytes and capture gaps at
+    /// `gap_offsets` (sorted payload offsets).
+    pub fn new(payload_len: usize, gap_offsets: &[usize], missing_bytes: u64) -> Self {
+        let mut longest = 0usize;
+        let mut start = 0usize;
+        for &o in gap_offsets {
+            let o = o.min(payload_len);
+            longest = longest.max(o.saturating_sub(start));
+            start = start.max(o);
+        }
+        longest = longest.max(payload_len.saturating_sub(start));
+        Self {
+            longest_chunk: longest,
+            gaps: gap_offsets.len(),
+            payload_bytes: payload_len,
+            missing_bytes,
+        }
+    }
+
+    /// Quality of a reassembled side.
+    pub fn of(side: &FlowSideView<'_>) -> Self {
+        Self::new(side.payload.len(), side.gap_offsets, side.missing_bytes)
+    }
+
+    /// Strictly better replay candidate than `other` (ties keep the
+    /// flow seen first).
+    pub fn better_than(&self, other: &FlowQuality) -> bool {
+        (
+            self.longest_chunk,
+            std::cmp::Reverse(self.gaps),
+            self.payload_bytes,
+        ) > (
+            other.longest_chunk,
+            std::cmp::Reverse(other.gaps),
+            other.payload_bytes,
+        )
+    }
 }
 
 /// Minimal flow descriptor a viability impl needs.
@@ -1168,6 +1356,27 @@ pub fn stub_report(name: &str) -> ProtoReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn flow_quality_prefers_the_longest_contiguous_run() {
+        let clean = FlowQuality::new(1000, &[], 0);
+        assert_eq!(clean.longest_chunk, 1000);
+        let gapped = FlowQuality::new(1200, &[300], 50);
+        assert_eq!(gapped.longest_chunk, 900);
+        assert_eq!(gapped.gaps, 1);
+        assert!(clean.better_than(&gapped));
+        assert!(!gapped.better_than(&clean));
+        // A lost first segment splits nothing but counts as a gap.
+        let lead = FlowQuality::new(1000, &[0], 6);
+        assert_eq!(lead.longest_chunk, 1000);
+        assert!(clean.better_than(&lead));
+        // A big flow with one small hole beats a short clean one.
+        let short = FlowQuality::new(100, &[], 0);
+        assert!(gapped.better_than(&short));
+        // Ties keep the first.
+        assert!(!clean.better_than(&clean));
+        assert_eq!(FlowQuality::new(10, &[3, 3, 8], 1).longest_chunk, 5);
+    }
 
     #[test]
     fn protocol_stats_merge_respects_caps() {

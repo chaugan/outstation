@@ -36,6 +36,9 @@ enum Behaviour {
     /// Like `Sessions`, and writes the IEC 104 fixture as the run's
     /// mirror capture (so it can be analysed).
     SessionsWithCapture(&'static [Option<&'static str>]),
+    /// One clean session, but the capture failed: a header-only file
+    /// and a capture warning (N15).
+    FailedCapture,
 }
 
 /// The 200-RTU IEC 104 fixture.
@@ -44,13 +47,15 @@ fn fixture() -> PathBuf {
 }
 
 /// Host-safety fields of the last job handed to the executor:
-/// (run_id, protected_addrs, force, bridge_name, tap_prefix).
+/// (run_id, protected_addrs, force, bridge_name, tap_prefix,
+/// capture_max_bytes).
 type SeenCfg = (
     u64,
     Vec<std::net::IpAddr>,
     bool,
     Option<String>,
     Option<String>,
+    Option<u64>,
 );
 
 struct Fake {
@@ -67,9 +72,32 @@ impl Fake {
                 while !ctx.is_cancelled() {
                     std::thread::sleep(Duration::from_millis(5));
                 }
-                Ok(BenchmarkReport::default())
+                Ok(BenchmarkReport {
+                    capture_ok: true,
+                    ..Default::default()
+                })
             }
             Behaviour::Panic => panic!("boom in sched"),
+            Behaviour::FailedCapture => Ok(BenchmarkReport {
+                per_session: vec![SessionReport {
+                    src_ip: Ipv4Addr::new(10, 0, 0, 1),
+                    src_mac: [0; 6],
+                    tap: String::new(),
+                    flow_idx: 0,
+                    started_at_ns: 0,
+                    proto_report: protoplay::ProtoReport {
+                        messages_sent: 10,
+                        ..Default::default()
+                    },
+                    cancelled: false,
+                }],
+                total_messages_sent: 10,
+                warnings: vec![
+                    "capture failed to start: socket(AF_PACKET): Operation not permitted".into(),
+                ],
+                capture_ok: false,
+                ..Default::default()
+            }),
             Behaviour::Sessions(s) | Behaviour::SessionsWithCapture(s) => Ok(BenchmarkReport {
                 per_session: s
                     .iter()
@@ -90,6 +118,7 @@ impl Fake {
                     })
                     .collect(),
                 total_messages_sent: 10 * s.len() as u64,
+                capture_ok: true,
                 ..Default::default()
             }),
         }
@@ -104,6 +133,7 @@ impl RunExecutor for Fake {
             c.force_protected_nic,
             c.bridge_name.clone(),
             c.tap_prefix.clone(),
+            c.capture_max_bytes,
         ));
         self.bench(&ctx).map(|_| RunReport::default())
     }
@@ -120,9 +150,14 @@ impl RunExecutor for Fake {
             c.force_protected_nic,
             c.bridge_name.clone(),
             c.tap_prefix.clone(),
+            c.capture_max_bytes,
         ));
         if let (Behaviour::SessionsWithCapture(_), Some(cap)) = (self.behaviour, &c.capture_path) {
             std::fs::copy(fixture(), cap).unwrap();
+        }
+        if let (Behaviour::FailedCapture, Some(cap)) = (self.behaviour, &c.capture_path) {
+            // A classic pcap global header and nothing else.
+            std::fs::write(cap, tiny_pcap(0)).unwrap();
         }
         self.bench(&ctx)
     }
@@ -188,7 +223,11 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         min_free_bytes: 0,
         capture_max_total_bytes: u64::MAX,
         capture_max_count: 1000,
+        library_max_bytes: 0,
+        capture_run_max_bytes: 0,
+        runs_in_memory: crate::state::DEFAULT_RUNS_IN_MEMORY,
         heavy_concurrency: 2,
+        cp56_tolerance_ms: crate::analysis::DEFAULT_CP56_TOLERANCE_MS,
         auto_analyze: true,
     }
 }
@@ -1059,7 +1098,10 @@ async fn analyze_temp_file_removed_on_error_and_success() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{detail}");
-    assert_eq!(detail["verdict"], v["details_by_ip"][&endpoint]["verdict"]);
+    assert_eq!(detail["verdict"], v["slaves"][0]["verdict"]);
+    // F067: the reply itself is the summary, without endpoint details.
+    assert!(v.get("details_by_ip").is_none(), "{v}");
+    assert_eq!(v["fleet"], summary["fleet"]);
     let (s, _) = h
         .call(
             Method::GET,
@@ -1155,7 +1197,11 @@ async fn event_stream_starts_with_hello() {
 
 #[tokio::test]
 async fn run_protects_ui_address_and_derives_names_from_run_id() {
-    let h = harness(Behaviour::BlockUntilCancel);
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| c.capture_run_max_bytes = 5 * 1024 * 1024,
+    );
     h.add_pcap("pcr_1");
     // Request-supplied bridge/tap names are ignored; `force` is threaded.
     let mut req = bench_req("pcr_1");
@@ -1173,7 +1219,12 @@ async fn run_protects_ui_address_and_derives_names_from_run_id() {
         assert!(std::time::Instant::now() < deadline, "executor never ran");
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     };
-    let (run_id, protected, force, bridge, tap) = seen;
+    let (run_id, protected, force, bridge, tap, cap_max) = seen;
+    assert_eq!(
+        cap_max,
+        Some(5 * 1024 * 1024),
+        "per-run capture cap reaches sched"
+    );
     assert_eq!(run_id, id, "sched gets the allocated run id");
     // MockConnectInfo's local address is 10.0.0.1: the address the UI
     // was reached on must be protected.
@@ -1581,9 +1632,25 @@ async fn compare_runs() {
     let (s, _, _) = h.send(req).await;
     assert_eq!(s, StatusCode::FORBIDDEN);
     assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
+    // F066: the drift tolerance is an option; a bad one is a 400.
+    for bad in ["-1", "NaN", "1e12", "x"] {
+        let (s, v) = h
+            .call(
+                Method::POST,
+                &format!("/api/runs/{a}/analyze?cp56_tolerance_ms={bad}"),
+                None,
+            )
+            .await;
+        assert_eq!(s, StatusCode::BAD_REQUEST, "{bad}: {v}");
+    }
+    assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
     for id in [a, b] {
         let (s, v) = h
-            .call(Method::POST, &format!("/api/runs/{id}/analyze"), None)
+            .call(
+                Method::POST,
+                &format!("/api/runs/{id}/analyze?cp56_tolerance_ms=250"),
+                None,
+            )
             .await;
         assert_eq!(s, StatusCode::OK, "{v}");
         assert_eq!(v["run_id"], id);
@@ -1942,4 +2009,432 @@ async fn next_run_starts_as_soon_as_previous_is_terminal() {
             tokio::task::yield_now().await;
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// N6: a run is never visible without a registered worker.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stop_during_launch_never_abandons_a_live_worker() {
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    for want in 1..=30u64 {
+        // A watcher that stops the run the instant it becomes visible,
+        // the way a racing STOP click would.
+        let st = h.state.clone();
+        let watcher = std::thread::spawn(move || loop {
+            if let Some(e) = st.get_run(want) {
+                let alive = st.worker_alive(want);
+                crate::runs::cancel_run(&e.lock_safe());
+                return alive;
+            }
+            std::hint::spin_loop();
+        });
+        let (s, v) = h
+            .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert!(
+            watcher.join().unwrap(),
+            "run {want} was visible before its worker was registered"
+        );
+        let (s, v) = h
+            .call(Method::POST, &format!("/api/runs/{want}/stop"), None)
+            .await;
+        assert!(s.is_success(), "{v}");
+        let r = h.wait_status(want, "stopped").await;
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("no live worker"),
+            "run {want} was abandoned while its worker ran: {r}"
+        );
+        // The worker itself finalised it and is gone.
+        for _ in 0..200 {
+            if !h.state.worker_alive(want) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(!h.state.worker_alive(want));
+    }
+}
+
+/// N13: retention never evicts a run's own capture before its
+/// auto-analysis ran, even when that one capture exceeds the cap.
+#[tokio::test]
+async fn retention_spares_the_capture_awaiting_analysis() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::SessionsWithCapture(&[None]),
+        |c| c.capture_max_total_bytes = 1,
+    );
+    add_fixture(&h, "pcr_1");
+    let first = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(first).await;
+    assert_eq!(v["auto_analysis"]["state"], "done", "{v}");
+    // The next finished run evicts the older, analysed capture but
+    // keeps its own until it is analysed.
+    let second = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(second).await;
+    assert_eq!(v["auto_analysis"]["state"], "done", "{v}");
+    let files = h.files_in("state/captures");
+    assert!(!files.contains(&format!("run_{first}.pcap")), "{files:?}");
+}
+
+// ---------------------------------------------------------------------------
+// N23: the live WebSocket stream ends when the client closes it.
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn live_stream_ends_on_client_close() {
+    use futures_util::{SinkExt, StreamExt};
+    use tokio_tungstenite::tungstenite::Message;
+    let h = harness(Behaviour::BlockUntilCancel);
+    h.add_pcap("pcr_1");
+    let (s, v) = h
+        .call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let app = crate::router(h.state.clone());
+    tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<crate::security::ConnAddrs>(),
+        )
+        .await
+        .unwrap();
+    });
+    let gauge = || {
+        h.state
+            .metrics
+            .live_sockets
+            .load(std::sync::atomic::Ordering::Relaxed)
+    };
+    for round in 0..3 {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let mut req = format!("ws://{addr}/api/runs/1/live")
+            .into_client_request()
+            .unwrap();
+        req.headers_mut()
+            .insert("origin", format!("http://{addr}").parse().unwrap());
+        let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+        let first = ws.next().await.unwrap().unwrap();
+        assert!(matches!(first, Message::Text(_)), "{first:?}");
+        assert_eq!(gauge(), 1, "round {round}");
+        // Close, but keep the TCP connection open: the server must
+        // notice the Close itself rather than wait for a failed send.
+        ws.send(Message::Close(None)).await.unwrap();
+        let mut gone = false;
+        for _ in 0..100 {
+            if gauge() == 0 {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "round {round}: server still streaming after Close");
+        drop(ws);
+    }
+    h.call(Method::POST, "/api/runs/1/stop", None).await;
+    h.wait_status(1, "stopped").await;
+}
+
+/// F053: pcap loads for inspect and run start wait for a heavy-work
+/// permit like analyses and uploads do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pcap_loads_wait_for_a_heavy_permit() {
+    let h = Arc::new(harness(Behaviour::Sessions(&[None])));
+    h.add_pcap("pcr_1");
+    let permits = h.state.heavy.clone().acquire_many_owned(2).await.unwrap();
+    let h2 = h.clone();
+    let inspect = tokio::spawn(async move {
+        h2.call(
+            Method::POST,
+            "/api/inspect",
+            Some(json!({"pcap_id": "pcr_1"})),
+        )
+        .await
+    });
+    let h3 = h.clone();
+    let run = tokio::spawn(async move {
+        h3.call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!inspect.is_finished(), "inspect loaded without a permit");
+    assert!(!run.is_finished(), "run start loaded without a permit");
+    assert!(h.state.get_run(1).is_none());
+    drop(permits);
+    let (s, v) = inspect.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = run.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    h.wait_status(1, "completed").await;
+}
+
+/// F051: uploads without a usable Content-Length are held to the
+/// free-disk reserve and the library quota while they stream.
+#[tokio::test]
+async fn uploads_respect_disk_reserve_and_library_quota() {
+    let dir = tempfile::tempdir().unwrap();
+    let free = crate::sysinfo::free_bytes(dir.path()).unwrap();
+    // Leave ~200 KiB of budget above the reserve.
+    let h = harness_cfg(dir, Behaviour::BlockUntilCancel, |c| {
+        c.max_upload_bytes = 8 * 1024 * 1024;
+        c.min_free_bytes = free.saturating_sub(200 * 1024);
+    });
+    let mut big = tiny_pcap(1);
+    big.resize(4 * 1024 * 1024, 0);
+    for uri in ["/api/pcaps", "/api/analyze"] {
+        let (s, v) = h
+            .multipart(uri, &[("file", Some("big.pcap"), big.clone())])
+            .await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (StatusCode::INSUFFICIENT_STORAGE, Some("disk_full")),
+            "{uri}: {v}"
+        );
+    }
+    assert!(h.files_in("state/library").is_empty());
+    assert!(h.files_in("state/tmp").is_empty());
+
+    // Library quota: 64 KiB.
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| {
+            c.max_upload_bytes = 1024 * 1024;
+            c.library_max_bytes = 64 * 1024;
+        },
+    );
+    let mut mid = tiny_pcap(1);
+    mid.resize(40 * 1024, 0);
+    let (s, v) = h
+        .multipart("/api/pcaps", &[("file", Some("a.pcap"), mid.clone())])
+        .await;
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = h
+        .multipart("/api/pcaps", &[("file", Some("b.pcap"), mid.clone())])
+        .await;
+    assert_eq!(
+        (s, v["code"].as_str()),
+        (StatusCode::INSUFFICIENT_STORAGE, Some("quota_exceeded")),
+        "{v}"
+    );
+    assert!(!h
+        .files_in("state/library")
+        .iter()
+        .any(|f| f.ends_with(".pcap.part")
+            || (f.starts_with(".pcr_") && f.ends_with(".part") && !f.contains(".json"))));
+
+    // Two concurrent uploads that only fit one at a time: exactly one
+    // is refused and the library stays within its quota.
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| {
+            c.max_upload_bytes = 1024 * 1024;
+            c.library_max_bytes = 64 * 1024;
+        },
+    );
+    for round in 0..5 {
+        for f in h.files_in("state/library") {
+            let _ = std::fs::remove_file(h.state.library_dir.join(f));
+        }
+        let pa = [("file", Some("a.pcap"), mid.clone())];
+        let pb = [("file", Some("b.pcap"), mid.clone())];
+        let ((s1, v1), (s2, v2)) = tokio::join!(
+            h.multipart("/api/pcaps", &pa),
+            h.multipart("/api/pcaps", &pb),
+        );
+        let ok = [s1, s2].iter().filter(|s| **s == StatusCode::OK).count();
+        assert_eq!(ok, 1, "round {round}: {s1} {v1} / {s2} {v2}");
+        let refused = if s1 == StatusCode::OK { &v2 } else { &v1 };
+        assert_eq!(refused["code"], "quota_exceeded", "{refused}");
+        assert!(crate::routes::library::library_bytes(&h.state.library_dir) <= 64 * 1024);
+        assert_eq!(h.state.library_quota.lock_safe().reserved_bytes(), 0);
+    }
+}
+
+/// N15: the run's warnings reach the run JSON and summary, and a run
+/// whose capture failed is not analysed into a false `no_delivery`.
+#[tokio::test]
+async fn failed_capture_skips_analysis_with_the_reason() {
+    let h = harness(Behaviour::FailedCapture);
+    add_fixture(&h, "pcr_1");
+    let id = h.run_to(slave_req("pcr_1"), "completed").await;
+    let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+    assert_eq!(v["auto_analysis"]["state"], "skipped", "{v}");
+    let why = v["auto_analysis"]["error"].as_str().unwrap();
+    assert!(why.starts_with("capture unavailable"), "{why}");
+    assert!(why.contains("Operation not permitted"), "{why}");
+    assert!(v["benchmark"]["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("capture failed to start"));
+    let (_, list) = h.call(Method::GET, "/api/runs", None).await;
+    assert_eq!(list[0]["benchmark"]["warnings"], v["benchmark"]["warnings"]);
+    let (s, e) = h
+        .call(Method::POST, &format!("/api/runs/{id}/analyze"), None)
+        .await;
+    assert_eq!(
+        (s, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("capture_unavailable")),
+        "{e}"
+    );
+    assert!(e["error"].as_str().unwrap().contains("capture unavailable"));
+    assert!(h.state.db.analyses_for_run(id).unwrap().is_empty());
+    // The warnings survive a restart.
+    let st = AppState::open(h.state.cfg.as_ref().clone()).unwrap();
+    crate::restore(&st).unwrap();
+    let rs = st.get_run(id).unwrap().lock_safe().clone();
+    assert_eq!(rs.benchmark.unwrap().warnings.len(), 1);
+}
+
+/// F054: only the newest runs stay in memory; /api/runs pages through
+/// memory and then the database, and old runs are still served.
+#[tokio::test]
+async fn runs_are_paged_and_old_ones_come_from_the_db() {
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::Sessions(&[None]),
+        |c| c.runs_in_memory = 3,
+    );
+    h.add_pcap("pcr_1");
+    for _ in 0..6 {
+        h.run_to(bench_req("pcr_1"), "completed").await;
+    }
+    assert_eq!(
+        h.state.all_runs().len(),
+        3,
+        "only the newest stay in memory"
+    );
+    async fn page(h: &H, q: &str) -> (Vec<u64>, Option<String>) {
+        let req = Request::builder()
+            .uri(format!("/api/runs{q}"))
+            .header("host", HOST)
+            .body(Body::empty())
+            .unwrap();
+        let (s, headers, body) = h.send(req).await;
+        assert_eq!(s, StatusCode::OK);
+        let v: Value = serde_json::from_slice(&body).unwrap();
+        let ids = v
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_u64().unwrap())
+            .collect();
+        let next = headers
+            .get("x-next-before")
+            .map(|v| v.to_str().unwrap().to_string());
+        (ids, next)
+    }
+    assert_eq!(page(&h, "").await, (vec![6, 5, 4, 3, 2, 1], None));
+    assert_eq!(page(&h, "?limit=2").await, (vec![6, 5], Some("5".into())));
+    assert_eq!(
+        page(&h, "?limit=2&before=5").await,
+        (vec![4, 3], Some("3".into()))
+    );
+    assert_eq!(page(&h, "?limit=2&before=3").await, (vec![2, 1], None));
+    assert_eq!(
+        page(&h, "?status=completed&limit=4").await.0,
+        vec![6, 5, 4, 3]
+    );
+    assert_eq!(page(&h, "?status=failed").await.0, Vec::<u64>::new());
+    // A run that is only in the database: detail, rerun request, delete.
+    let (s, v) = h.call(Method::GET, "/api/runs/1", None).await;
+    assert_eq!(
+        (s, v["status"].as_str()),
+        (StatusCode::OK, Some("completed"))
+    );
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"completed\"}"], 6.0);
+    let (s, _) = h.call(Method::DELETE, "/api/runs/1", None).await;
+    assert_eq!(s, StatusCode::NO_CONTENT);
+    let (s, _) = h.call(Method::GET, "/api/runs/1", None).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+    let (m, _) = h.metrics().await;
+    assert_eq!(m["outstation_runs{status=\"completed\"}"], 5.0);
+    assert_eq!(page(&h, "").await.0, vec![6, 5, 4, 3, 2]);
+    // After a restart only the newest three are loaded into memory.
+    let st = AppState::open(h.state.cfg.as_ref().clone()).unwrap();
+    crate::restore(&st).unwrap();
+    let mut ids: Vec<u64> = st.all_runs().iter().map(|e| e.lock_safe().id).collect();
+    ids.sort_unstable();
+    assert_eq!(ids, vec![4, 5, 6]);
+    assert!(st.get_run_any(2).is_some());
+}
+
+/// F131: a stored analysis exports as one self-contained HTML page.
+#[tokio::test]
+async fn analysis_exports_as_self_contained_html() {
+    let h = harness(Behaviour::SessionsWithCapture(&[None]));
+    add_fixture(&h, "pcr_1");
+    let id = h.run_to(slave_req("pcr_1"), "completed").await;
+    let v = h.wait_analysis(id).await;
+    let aid = v["latest_analysis"]["id"].as_u64().unwrap();
+    let get = |q: String| {
+        Request::builder()
+            .uri(q)
+            .header("host", HOST)
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (s, headers, body) = h
+        .send(get(format!("/api/analyses/{aid}/report.html")))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert_eq!(headers["content-type"], "text/html; charset=utf-8");
+    assert!(headers["content-security-policy"]
+        .to_str()
+        .unwrap()
+        .starts_with("default-src 'none'"));
+    assert!(headers.get("content-disposition").is_none());
+    let html = String::from_utf8(body).unwrap();
+    assert!(
+        html.contains(&format!("Analysis #{aid} of run #{id}")),
+        "{html}"
+    );
+    let verdict = v["latest_analysis"]["verdict"].as_str().unwrap();
+    assert!(html.contains(verdict));
+    assert!(html.contains("<h2>Endpoints"));
+    assert!(html.contains("class=\"ep\""), "endpoint details included");
+    assert!(!html.contains("<script") && !html.contains("src="));
+    let (s, headers, _) = h
+        .send(get(format!("/api/analyses/{aid}/report.html?download=1")))
+        .await;
+    assert_eq!(s, StatusCode::OK);
+    assert!(headers["content-disposition"]
+        .to_str()
+        .unwrap()
+        .starts_with("attachment"));
+    let (s, _, _) = h.send(get("/api/analyses/999/report.html".into())).await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
+}
+
+/// A re-run whose stored proto_config no longer parses (strict keys)
+/// is a clear 400, not a failed run.
+#[tokio::test]
+async fn rerun_of_a_stale_config_is_a_clear_400() {
+    let h = harness(Behaviour::Sessions(&[None]));
+    h.add_pcap("pcr_1");
+    let id = h.run_to(bench_req("pcr_1"), "completed").await;
+    {
+        let e = h.state.get_run(id).unwrap();
+        let mut rs = e.lock_safe();
+        let req = rs.request.as_mut().unwrap();
+        req["proto_config"] = json!(r#"{"no_such_section": {"x": 1}}"#);
+    }
+    let (s, v) = h
+        .call(Method::POST, &format!("/api/runs/{id}/rerun"), None)
+        .await;
+    assert_eq!(s, StatusCode::BAD_REQUEST, "{v}");
+    assert_eq!(v["code"], "invalid_proto_config", "{v}");
+    let msg = v["error"].as_str().unwrap();
+    assert!(
+        msg.contains(&format!("run {id} are no longer accepted")),
+        "{msg}"
+    );
+    assert!(msg.contains("no_such_section"), "{msg}");
+    assert_eq!(h.state.all_runs().len(), 1, "no run was started");
 }

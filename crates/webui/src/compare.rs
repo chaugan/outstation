@@ -296,7 +296,7 @@ fn outcome_rank(o: &str) -> u8 {
 pub(crate) fn fleet_verdict_rank(v: &str) -> u8 {
     match v {
         "all_correct" => 3,
-        "inconclusive" => 2,
+        "inconclusive" | "stopped_clean" => 2,
         "partial" => 1,
         "failed" | "run_failed" | "no_delivery" | "no_session" => 0,
         _ => 2,

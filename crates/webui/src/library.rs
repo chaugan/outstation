@@ -43,6 +43,9 @@ pub(crate) struct LibraryEntry {
     /// deserialize with `viability: None` thanks to serde(default).
     #[serde(default)]
     pub(crate) viability: Option<Viability>,
+    /// Why the background parse failed, as pcapload reported it (P08).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) load_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -267,6 +270,52 @@ pub(crate) struct QuickInspect {
     pub(crate) pcap_end_unix_ms: Option<u64>,
     pub(crate) mac_collisions: u64,
     pub(crate) viability: Option<Viability>,
+    /// The load error when the pcap could not be parsed.
+    pub(crate) load_error: Option<String>,
+}
+
+/// The sidecar that replaces the pending one once the background parse
+/// of `path` is done: full metadata, or a `not_recommended` stub that
+/// carries the real load error (P08).
+pub(crate) fn finished_entry(pending: &LibraryEntry, path: &StdPath) -> LibraryEntry {
+    let qi = quick_inspect(path);
+    if qi.packets == 0 {
+        let why = qi
+            .load_error
+            .clone()
+            .unwrap_or_else(|| "the file holds no packets".into());
+        tracing::warn!(id = %pending.id, error = %why, "background parse of an upload failed");
+        return LibraryEntry {
+            name: format!("{} (parse failed)", pending.name),
+            viability: Some(Viability {
+                client_payload_bytes: 0,
+                server_payload_bytes: 0,
+                sessions_master_mode: 0,
+                sessions_slave_mode: 0,
+                estimated_peak_mb: 0,
+                verdict: "not_recommended".into(),
+                verdict_reason: format!("could not be parsed: {why}"),
+                notes: vec![],
+                slave_rtus: vec![],
+                master_clients: vec![],
+            }),
+            load_error: Some(why),
+            ..pending.clone()
+        };
+    }
+    LibraryEntry {
+        packets: qi.packets,
+        ip_sources: qi.ip_sources,
+        non_ip_sources: qi.non_ip_sources,
+        tcp_flows: qi.tcp_flows,
+        duration_ms: qi.duration_ms,
+        pcap_start_unix_ms: qi.pcap_start_unix_ms,
+        pcap_end_unix_ms: qi.pcap_end_unix_ms,
+        mac_collisions: qi.mac_collisions,
+        viability: qi.viability,
+        load_error: None,
+        ..pending.clone()
+    }
 }
 
 pub(crate) fn quick_inspect(path: &StdPath) -> QuickInspect {
@@ -284,9 +333,10 @@ pub(crate) fn quick_inspect(path: &StdPath) -> QuickInspect {
                 pcap_end_unix_ms: (p.last_ts_ns > 0).then_some(p.last_ts_ns / 1_000_000),
                 mac_collisions,
                 viability: Some(viability),
+                load_error: None,
             }
         }
-        Err(_) => QuickInspect {
+        Err(e) => QuickInspect {
             packets: 0,
             ip_sources: 0,
             non_ip_sources: 0,
@@ -296,6 +346,7 @@ pub(crate) fn quick_inspect(path: &StdPath) -> QuickInspect {
             pcap_end_unix_ms: None,
             mac_collisions: 0,
             viability: None,
+            load_error: Some(format!("{e:#}")),
         },
     }
 }
@@ -348,6 +399,28 @@ impl<'a> protoplay::LoadedPcapView for LoadedPcapAdapter<'a> {
             .map(|rf| rf.payload.to_vec())
             .unwrap_or_default()
     }
+    fn with_flow_side(
+        &self,
+        flow_idx: usize,
+        side: protoplay::FlowSide,
+        f: &mut dyn FnMut(&protoplay::FlowSideView<'_>),
+    ) {
+        let dir = match side {
+            protoplay::FlowSide::Client => pcapload::StreamDir::ClientToServer,
+            protoplay::FlowSide::Server => pcapload::StreamDir::ServerToClient,
+        };
+        if let Ok(rf) = self.inner.reassemble(flow_idx, dir) {
+            let gaps: Vec<usize> = rf.gaps.iter().map(|g| g.offset).collect();
+            f(&protoplay::FlowSideView {
+                payload: &rf.payload,
+                gap_offsets: &gaps,
+                missing_bytes: rf.missing_bytes(),
+            });
+        }
+    }
+    fn packet_count(&self) -> u64 {
+        self.inner.packets.len() as u64
+    }
 }
 
 /// Convert a generic [`protoplay::ProtoViability`] into the
@@ -380,4 +453,48 @@ pub(crate) fn compute_viability(p: &pcapload::LoadedPcap, path: &StdPath) -> Via
     // types, fragments, truncated file, reused 4-tuples) (T01, P03/P08).
     proto.notes.extend(p.ingest_notes());
     viability_from_proto(proto)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pending(id: &str) -> LibraryEntry {
+        LibraryEntry {
+            id: id.into(),
+            name: "x.pcap".into(),
+            uploaded_at_ms: 1,
+            size_bytes: 4,
+            packets: 0,
+            ip_sources: 0,
+            non_ip_sources: 0,
+            tcp_flows: 0,
+            duration_ms: 0.0,
+            pcap_start_unix_ms: None,
+            pcap_end_unix_ms: None,
+            mac_collisions: 0,
+            viability: None,
+            load_error: None,
+        }
+    }
+
+    #[test]
+    fn parse_failure_keeps_the_real_error() {
+        let d = tempfile::tempdir().unwrap();
+        // Passes the magic check, but the global header is cut short.
+        let p = d.path().join("pcr_1.pcap");
+        std::fs::write(&p, [0xd4, 0xc3, 0xb2, 0xa1, 2, 0]).unwrap();
+        pcapload::validate(&p).unwrap();
+        let e = finished_entry(&pending("pcr_1"), &p);
+        let err = e.load_error.clone().expect("load error stored");
+        assert!(!err.is_empty());
+        let v = e.viability.as_ref().unwrap();
+        assert_eq!(v.verdict, "not_recommended");
+        assert!(v.verdict_reason.contains(&err), "{}", v.verdict_reason);
+        assert!(e.name.ends_with("(parse failed)"));
+        // The sidecar round-trips it.
+        save_library_entry(d.path(), &e).unwrap();
+        let back = load_library_entry(d.path(), "pcr_1").unwrap();
+        assert_eq!(back.load_error.as_deref(), Some(err.as_str()));
+    }
 }

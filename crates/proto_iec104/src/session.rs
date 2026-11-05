@@ -143,8 +143,11 @@ pub(crate) fn extract_script(cfg: &ProtoRunCfg, side_label: &str) -> Script {
     bounds.extend_from_slice(&cuts);
     bounds.push(stream.len());
 
+    // A gap at offset 0 (the first segment after the handshake was
+    // lost) cuts nothing but is a gap all the same (N19).
+    let leading_gap = cfg.capture_gaps.contains(&0) && !stream.is_empty();
     let mut script = Script {
-        gaps: cuts.len() as u64,
+        gaps: cuts.len() as u64 + u64::from(leading_gap),
         ..Script::default()
     };
     let mut matched = 0usize;
@@ -228,13 +231,12 @@ fn link_options(
     }
 }
 
-/// Final figures: elapsed time, and latency/throughput over the active
-/// part of the session (idle-serve time excluded).
+/// Final figures: total elapsed time, and latency/throughput over the
+/// active part of the session ([`ProtoReport::active_ms`]: idle-serve
+/// time excluded).
 fn finish(mut report: ProtoReport, t_start: Instant) -> ProtoReport {
-    let total = t_start.elapsed().as_millis() as u64;
-    report.elapsed_ms = total.saturating_sub(report.protocol.idle_serve_ms);
+    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
     report.finalize_latency();
-    report.elapsed_ms = total;
     report
 }
 
@@ -308,8 +310,12 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         .t0
         .map(Duration::from_secs_f64)
         .unwrap_or(cfg.connect_timeout);
-    if let Err(e) = sock.connect_timeout(&tgt.into(), connect_timeout) {
-        report.error = Some(format!("connect({tgt}): {e}"));
+    if let Err(e) = connect_cancellable(&sock, &tgt.into(), connect_timeout, &progress) {
+        report.error = Some(if e.kind() == std::io::ErrorKind::Interrupted {
+            format!("cancelled while connecting to {tgt}")
+        } else {
+            format!("connect({tgt}): {e}")
+        });
         report.elapsed_ms = t_start.elapsed().as_millis() as u64;
         return report;
     }
@@ -336,6 +342,62 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         report.error = error;
     }
     finish(report, t_start)
+}
+
+/// Poll interval of a pending master connect, see [`connect_cancellable`].
+const CONNECT_SLICE: Duration = Duration::from_millis(100);
+
+/// Connect `sock` to `tgt` within `timeout`, checking the cancel flags
+/// every [`CONNECT_SLICE`] (a blocking `connect_timeout(t0)` could not
+/// be stopped, F028). A cancel returns `ErrorKind::Interrupted`. The
+/// socket is left in blocking mode.
+fn connect_cancellable(
+    sock: &Socket,
+    tgt: &socket2::SockAddr,
+    timeout: Duration,
+    progress: &Option<MessageProgress>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    sock.set_nonblocking(true)?;
+    match sock.connect(tgt) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+            let deadline = Instant::now() + timeout;
+            loop {
+                if progress_cancelled(progress) {
+                    return Err(Error::new(ErrorKind::Interrupted, "cancelled"));
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(ErrorKind::TimedOut, "connection timed out"));
+                }
+                let mut pfd = libc::pollfd {
+                    fd: sock.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let slice_ms = left.min(CONNECT_SLICE).as_millis().max(1) as libc::c_int;
+                // SAFETY: one valid pollfd.
+                let rc = unsafe { libc::poll(&mut pfd, 1, slice_ms) };
+                if rc < 0 {
+                    let err = Error::last_os_error();
+                    if err.kind() == ErrorKind::Interrupted {
+                        continue;
+                    }
+                    return Err(err);
+                }
+                if rc > 0 {
+                    if let Some(err) = sock.take_error()? {
+                        return Err(err);
+                    }
+                    break;
+                }
+            }
+        }
+        Err(e) => return Err(e),
+    }
+    sock.set_nonblocking(false)
 }
 
 /// STARTDT, script, drain, STOPDT. Returns the session error, if any.
@@ -369,9 +431,19 @@ fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<S
     //    so every in-flight I-frame gets a latency sample.
     match link.drain_pending() {
         Ok(()) => {}
-        // Server hung up after the script; unacked_at_end tells the
-        // story, and there is nobody left to STOPDT.
-        Err(LinkEnd::PeerClosed) => return None,
+        // Server hung up after the script, with everything
+        // acknowledged: there is nobody left to STOPDT.
+        Err(LinkEnd::PeerClosed) if link.unacked_sent() == 0 => return None,
+        // Hung up on unacknowledged frames: as much a failure as the
+        // t1 expiry it would be if the peer had stayed open (N1).
+        Err(e @ LinkEnd::PeerClosed) => {
+            let msg = format!(
+                "{} with {} I-frame(s) unacknowledged after the last I-frame",
+                e.describe(),
+                link.unacked_sent()
+            );
+            return fail(link, &e, msg);
+        }
         Err(e) => {
             let msg = format!("{} after the last I-frame", e.describe());
             return fail(link, &e, msg);
@@ -420,7 +492,8 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // replays the captured bursts verbatim and answers nothing live.
     // Command echo (`commands.enabled`, default on) answers the
     // master's control-direction commands from the same inventory.
-    let synthesize = crate::interrogation::synthesis_enabled(cfg.proto_config.as_deref());
+    // Validated by `load_config`: a boolean or absent (= on).
+    let synthesize = pc.gi_ci_synthesis.unwrap_or(true);
     let echo_commands = pc.commands.enabled;
     let responder = (synthesize || echo_commands).then(|| {
         let mut inventory = Inventory::default();
@@ -606,12 +679,12 @@ fn drive_slave(
                 .store(if unlimited { 0 } else { loops }, Ordering::Relaxed);
         });
         for loop_idx in 0..loops {
-            // Per-iteration UI counters restart; cumulative totals stay
-            // in the report.
+            // Per-iteration UI counters restart; they are folded into
+            // the progress totals (which never dip) and the cumulative
+            // figures stay in the report.
             bump(progress, |p| {
                 p.iter_current.store(loop_idx + 1, Ordering::Relaxed);
-                p.sent.store(0, Ordering::Relaxed);
-                p.bytes_written.store(0, Ordering::Relaxed);
+                p.fold_iteration();
             });
             if loop_idx > 0 {
                 info!(loop_idx, "slave: starting next within-session iteration");
@@ -677,3 +750,7 @@ mod command_tests;
 #[cfg(test)]
 #[path = "fault_tests.rs"]
 mod fault_tests;
+
+#[cfg(test)]
+#[path = "robustness_tests.rs"]
+mod robustness_tests;

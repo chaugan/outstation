@@ -10,7 +10,8 @@
 const an = { file: null, report: null, analysisId: null, details: new Map(), filter: '', verdict: '' };
 
 const VERDICT_CLASS = {
-  all_correct: 'ok', identical: 'ok', structurally_identical: 'ok', good_delivery: 'ok', stopped_clean: 'ok',
+  // stopped_clean is clean only up to a stop: never shown as a plain pass.
+  all_correct: 'ok', identical: 'ok', structurally_identical: 'ok', good_delivery: 'ok', stopped_clean: 'warn',
   partial: 'warn', partial_delivery: 'warn', degraded: 'warn', subset_script: 'warn', divergent_script: 'warn',
   stopped_before_delivery: 'warn', inconclusive: 'warn', unpaired: 'warn',
   failed: 'bad', run_failed: 'bad', never_connected: 'bad', no_delivery: 'bad', handshake_incomplete: 'bad',
@@ -18,7 +19,14 @@ const VERDICT_CLASS = {
   not_attempted: 'muted', no_reference: 'muted', target_silent: 'muted', unknown: 'muted',
 };
 const verdictHtml = v => `<span class="verdict vd-${VERDICT_CLASS[v] || 'muted'}">${esc(String(v || 'unknown').replace(/_/g, ' '))}</span>`;
-const scoreCls = s => (s >= 99.999 ? 'ok' : s <= 0 ? 'bad' : 'warn');
+// Colour follows the verdict or outcome, never the score: a degraded or
+// failing endpoint can score 100 on content and must not look green (N14).
+const verdictCls = v => VERDICT_CLASS[v] || 'muted';
+function outcomeCls(outcome, verdict) {
+  if (outcome === 'pass') return verdict === 'stopped_clean' ? 'warn' : 'ok';
+  if (outcome === 'fail') return verdictCls(verdict) === 'ok' ? 'bad' : (verdictCls(verdict) === 'muted' ? 'bad' : verdictCls(verdict));
+  return 'muted';
+}
 function slaveSlug(ip) { return String(ip).replace(/[^A-Za-z0-9]/g, '-'); }
 
 // ---------------------------------------------------------------------------
@@ -162,6 +170,7 @@ async function analyzeOwnCapture(runId) {
 // Why POST /api/runs/:id/analyze was refused, in operator terms.
 function analyzeErrorHint(code) {
   return {
+    capture_unavailable: 'The run\'s capture failed (see the run\'s warnings), so analysing it would report frames as missing that were sent. Upload a capture taken on the target side instead.',
     capture_missing: 'The run has no replay capture (slave-mode runs, and runs that failed before sending, have none). Upload a capture taken on the target side instead.',
     run_running: 'The run is still running; analyse it once it has finished.',
     not_benchmark: 'Only stateful (benchmark) runs can be analysed.',
@@ -225,13 +234,19 @@ function renderAnalysis() {
   const run = S.runs.find(x => x.id === r.run_id);
   let h = '<div class="card an-card">';
   h += `<h3 class="card-title">Result for ${runNum(r.run_id)}</h3>`;
+  if (an.analysisId != null) {
+    // Self-contained, printable HTML export of the stored analysis (F131).
+    const rep = `/api/analyses/${encodeURIComponent(an.analysisId)}/report.html`;
+    h += `<p class="btn-row an-export"><a class="btn btn-secondary" id="an-report-html" href="${rep}?download=1" download>Download HTML report</a>` +
+      `<a class="btn btn-text" href="${rep}" target="_blank" rel="noopener">Open printable report</a></p>`;
+  }
   h += `<p class="meta-line">Compared against ${runNum(r.run_id)} (${esc(run ? libraryName(run.pcap_id, run.pcap) : basename(r.original_pcap))}, ${esc(r.role)} role${run && run.target_port ? ', port ' + esc(run.target_port) : ''}, ${esc(r.mode)} mode)` +
     `${r.run_selection ? ` · run chosen ${r.run_selection === 'explicit' ? 'explicitly' : 'as the latest finished run'}` : ''}` +
     `${r.run_status ? ` · run status <span class="status s-${esc(r.run_status)}">${esc(r.run_status)}</span>` : ''}</p>`;
   if (r.run_warning) h += `<div class="err-box" role="alert"><b>Run warning:</b> ${esc(r.run_warning)}</div>`;
   const warns = (r.warnings || []).filter(w => !(r.run_warning && String(w).includes(r.run_warning)));
   if (warns.length) h += '<div class="warn-box"><ul>' + warns.map(w => `<li>${esc(w)}</li>`).join('') + '</ul></div>';
-  h += `<div class="an-summary">${verdictHtml(r.verdict)}<span class="an-score ${scoreCls(r.score_pct)}">${Number(r.score_pct).toFixed(1)}%</span>`;
+  h += `<div class="an-summary">${verdictHtml(r.verdict)}<span class="an-score ${verdictCls(r.verdict)}">${Number(r.score_pct).toFixed(1)}%</span>`;
   if (f.frame_weighted_score_pct != null) h += `<span class="hint">frame-weighted ${Number(f.frame_weighted_score_pct).toFixed(1)}%</span>`;
   h += `<p class="reason">${esc(r.verdict_reason)}</p></div>`;
   const bucket = (n, label, cls) => `<li class="an-bucket ${cls}"><b>${fmtInt(n || 0)}</b> ${label}</li>`;
@@ -250,7 +265,7 @@ function renderAnalysis() {
     h += '</p>';
   }
   const pr = (window.PROTOCOL_RENDERERS || {})[r.protocol];
-  if (pr && typeof pr.renderFleetExtras === 'function' && an.details.size) h += pr.renderFleetExtras(r);
+  if (pr && typeof pr.renderFleetExtras === 'function' && (an.details.size || r.fleet_gi_ci_audit)) h += pr.renderFleetExtras(r);
   h += fleetChartBlock(r.fleet_pacing_timeline, 'fleet-pacing', 'Fleet pacing drift', 'Each dot is one I-frame, plotted at how many ms later the replay sent it than the original pace. Orange: mean per time bucket (flat near zero = pacing held). Dashed: p95 and p05.', 'X: seconds since capture start · Y: pacing drift in ms, positive = late');
   h += fleetChartBlock(r.fleet_drift_timeline, 'fleet-drift', 'Fleet CP56 drift', 'Each dot is one CP56 sample. Orange: mean per time bucket (flat = constant offset, slope = cumulative drift). Dashed: p95 and p05.', 'X: seconds since capture start · Y: signed drift in ms');
   h += '<dl class="kv">';
@@ -277,8 +292,14 @@ function fleetChartBlock(tl, key, heading, legend, axes) {
   const iters = (tl.iteration_starts_ms || []).length;
   const note = (iters > 1 ? ` · ${iters} loop iterations marked` : '') +
     (tl.decimated ? ` · decimated from ${fmtInt(tl.total_samples)} samples` : ` · ${fmtInt(tl.total_samples)} samples`);
-  return `<figure class="an-figure"><figcaption><h4>${esc(heading)}</h4><p class="hint">${esc(legend)}${esc(note)}</p><p class="hint">${esc(axes)}</p></figcaption>` +
-    `<div id="an-${key}-chart" class="an-chart" role="img" aria-label="${esc(heading)} chart"></div><div id="an-${key}-stats" class="an-chart-stats"></div></figure>`;
+  // Key numbers for assistive tech (F126): the chart itself is a canvas.
+  const ys = tl.samples.map(s => Number(s[1])).filter(Number.isFinite).sort((a, b) => a - b);
+  const q = f => ys.length ? ys[Math.min(ys.length - 1, Math.floor(f * ys.length))] : 0;
+  const maxAbs = ys.length ? Math.max(Math.abs(ys[0]), Math.abs(ys[ys.length - 1])) : 0;
+  const label = `${heading}: ${fmtInt(tl.total_samples || ys.length)} samples, median ${q(0.5).toFixed(1)} ms, ` +
+    `5th to 95th percentile ${q(0.05).toFixed(1)} to ${q(0.95).toFixed(1)} ms, largest ${maxAbs.toFixed(1)} ms.`;
+  return `<figure class="an-figure"><figcaption id="an-${key}-cap"><h4>${esc(heading)}</h4><p class="hint">${esc(legend)}${esc(note)}</p><p class="hint" id="an-${key}-axes">${esc(axes)}</p></figcaption>` +
+    `<div id="an-${key}-chart" class="an-chart" role="img" aria-label="${esc(label)}" aria-describedby="an-${key}-cap"></div><div id="an-${key}-stats" class="an-chart-stats"></div></figure>`;
 }
 
 function endpointTableShell(r) {
@@ -312,7 +333,7 @@ function renderEndpointRows() {
       `<span>${fmtInt(s.packets)}<span class="sr-only"> packets</span></span>` +
       `<span class="${deliv}">${fmtInt(s.delivered_iframes)}/${fmtInt(s.expected_iframes)}<span class="sr-only"> delivered</span></span>` +
       `<span class="${hs[0]}"><span aria-hidden="true">${hs[1]}</span><span class="sr-only">handshake ${hs[2]}</span></span>` +
-      `<span class="${scoreCls(s.score_pct)}"><b>${Number(s.score_pct).toFixed(1)}%</b></span>` +
+      `<span class="${outcomeCls(s.outcome, s.verdict)}"><b>${Number(s.score_pct).toFixed(1)}%</b><span class="sr-only"> (${esc(s.outcome || 'unknown')})</span></span>` +
       `<span>${verdictHtml(s.verdict)}</span></summary><div class="an-slave-detail"></div></details>`;
   }
   if (!rows.length) h = '<p class="empty">No endpoint matches.</p>';
@@ -479,18 +500,15 @@ function initFleetTimelineChart(tl, key) {
     const meanY = nearestY(meanLine, t);
     const p05Y  = nearestY(p05Line,  t);
     const p95Y  = nearestY(p95Line,  t);
-    const swatch = (color) => `<span style="display:inline-block;width:10px;height:10px;background:${color};margin-right:6px;border-radius:2px;vertical-align:middle"></span>`;
-    const dash = (color) => `<span style="display:inline-block;width:14px;height:0;border-top:1.5px dashed ${color};margin-right:4px;vertical-align:middle"></span>`;
-    const solid = (color) => `<span style="display:inline-block;width:14px;height:0;border-top:2.5px solid ${color};margin-right:4px;vertical-align:middle"></span>`;
-    let html = `<div style="font-family:var(--mono);font-size:12px;line-height:1.55">`;
-    html += `<div style="font-weight:700;margin-bottom:4px">t = ${Number(t).toFixed(2)} s</div>`;
+    let html = '<div class="tt">';
+    html += `<div class="tt-head">t = ${Number(t).toFixed(2)} s</div>`;
     if (scatterEntry && scatterEntry.value) {
       const y = scatterEntry.value[1];
-      html += `<div>${swatch('#4a90e2')}sample: ${Number(y).toFixed(2)} ms</div>`;
+      html += `<div><span class="tt-sw tt-sample"></span>sample: ${Number(y).toFixed(2)} ms</div>`;
     }
-    if (meanY !== null) html += `<div>${solid('#d8741a')}mean: <b>${meanY.toFixed(2)} ms</b></div>`;
-    if (p95Y !== null)  html += `<div>${dash('#3c8a4a')}p95 (upper):&nbsp; ${p95Y.toFixed(2)} ms</div>`;
-    if (p05Y !== null)  html += `<div>${dash('#a4453c')}p05 (lower):&nbsp; ${p05Y.toFixed(2)} ms</div>`;
+    if (meanY !== null) html += `<div><span class="tt-line tt-mean"></span>mean: <b>${meanY.toFixed(2)} ms</b></div>`;
+    if (p95Y !== null)  html += `<div><span class="tt-line tt-dash tt-p95"></span>p95 (upper):&nbsp; ${p95Y.toFixed(2)} ms</div>`;
+    if (p05Y !== null)  html += `<div><span class="tt-line tt-dash tt-p05"></span>p05 (lower):&nbsp; ${p05Y.toFixed(2)} ms</div>`;
     html += `</div>`;
     return html;
   };

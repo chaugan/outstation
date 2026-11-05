@@ -83,8 +83,9 @@ struct Loaded {
 /// A finished benchmark run, or the error that rules it out.
 fn comparable_run(state: &AppState, id: u64) -> Result<RunState, AppError> {
     let rs = state
-        .get_run(id)
+        .get_run_any(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?
+        .0
         .lock_safe()
         .clone();
     if rs.mode != "benchmark" {

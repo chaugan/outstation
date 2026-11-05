@@ -66,6 +66,8 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 400 | `invalid_id` | Not a library pcap id |
 | 400 | `raw_path_rejected` | A raw filesystem path (`pcap`, `path`) instead of a library id |
 | 400 | `protocol_not_ready` | A benchmark with a stub protocol |
+| 400 | `invalid_target_ip` | Raw replay or master role with an unspecified, loopback, multicast or broadcast `target_ip` (a slave's `0.0.0.0` means any master and is accepted) |
+| 400 | `invalid_proto_config` | `proto_config` fails the protocol's validation (also a re-run whose stored settings no longer validate; the message names the run) |
 | 400 | `pcap_unreadable`, `not_a_pcap` | The pcap does not load, or the upload is not a pcap |
 | 400 | `not_benchmark` | Analysis or compare on a raw-replay run |
 | 403 | `host_missing`, `host_not_allowed`, `cross_origin`, `origin_required` | [Host and Origin rule](#the-host-and-origin-rule) |
@@ -79,13 +81,16 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 409 | `request_missing` | Re-run of a run recorded before run requests were stored |
 | 409 | `profile_exists` | A profile with that name exists |
 | 409 | `capture_missing` | `POST /api/runs/:id/analyze` and the run has no capture |
+| 409 | `capture_unavailable` | `POST /api/runs/:id/analyze` and the run's capture failed (see the run's `warnings`) |
 | 409 | `analysis_missing` | Compare and a run has no stored analysis. Extra fields: `run_id`, `has_capture` |
 | 413 | `too_large` | Upload above the size cap |
-| 429 | `busy` | Too many heavy requests at once (analysis, upload, gap histogram); retry |
+| 429 | `busy` | Too many heavy requests at once (analysis, upload, gap histogram; inspect and run start wait up to 10 s and 30 s for a slot first); retry |
 | 500 | `internal` | Server error, including a caught handler panic |
 | 503 | `shutting_down` | The server is stopping |
 | 503 | `db_unavailable` | The run could not be recorded in the database |
-| 507 | `disk_full` | Free space in the state directory would drop below the reserve |
+| 503 | `arping_unavailable` | `POST /api/arp` or `/api/verify-ip` and `arping` cannot be run (install iputils-arping) |
+| 507 | `disk_full` | Free space in the state directory would drop below the reserve (checked before and while an upload streams) |
+| 507 | `quota_exceeded` | A library upload would exceed `--library-max-mb` (uploads in progress count) |
 | 507 | `write_failed` | Writing the upload failed |
 
 Multipart uploads that break off can also return `upload_aborted` with the status the multipart reader reported.
@@ -219,14 +224,16 @@ curl -H "Origin: $B" -H 'Content-Type: application/json' "$B/api/run" -d '{
 
 The request is validated completely before a run id is allocated. A rejected request leaves nothing behind.
 
-### `GET /api/runs[?status=S]`
+### `GET /api/runs[?status=S][&limit=N][&before=ID]`
 
-Slim summaries, newest first. `S` is one of `running`, `completed`, `partial`, `stopped`, `failed`; any other value is 400. Each row:
+Slim summaries, newest first, one page at a time. `S` is one of `running`, `completed`, `partial`, `stopped`, `failed`; any other value is 400. `limit` is the page size (default 100, at most 1000); `before` returns only runs with a smaller id. When older runs exist, the response carries the headers `X-Next-Before: <id>` (pass it as `before` for the next page) and `X-Has-More: true`. The newest runs come from memory (`--runs-in-memory`, default 500 finished runs); older pages, and `GET /api/runs/:id` of an older run, are read from the database. Each row:
 
 - identity and request echo: `id, status, started_at, finished_at, started_by, pcap, pcap_id, target_ip, target_mac, speed, top_speed, realtime, error, mode, role, target_port, proto`;
-- progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s), `per_source_progress` (only while running);
+- progress: `planned, sent, bytes_progress, throughput_history` (messages or frames per second, last 120 s);
 - counts: `sources, sources_failed, sources_cancelled, has_capture`;
 - `report` (raw runs): `{total_packets, total_bytes, total_errors, capture_path, captured_packets, captured_bytes, captured_dropped}`;
+- `report` and `benchmark` both also carry `warnings[]` (non-fatal problems: capture failures, a truncated capture, guard restore or teardown errors) and `capture_ok` (false when a requested capture failed or holds no frame although frames were sent; absent in rows that predate it); the detail also has `capture_truncated`;
+- `source_states`: session count by state (`pending`, `listening`, `active`, `failed`, …). `per_source_progress` is always empty in the list: live rows come from `GET /api/runs/:id` and the run's WebSocket;
 - `benchmark` (benchmark runs): `{total_messages_sent, total_messages_received, aggregate_latency_{min,p50,p90,p99,max}_us, aggregate_throughput_msgs_per_sec, capture_path, captured_packets, captured_bytes, captured_dropped, sessions, sessions_failed, sessions_cancelled, protocol_violations}`. `captured_dropped` counts frames the kernel dropped from the capture socket (it should be 0; non-zero adds a run warning and an analysis note that "missing" frames may be capture loss);
 - `rerun_of`, `latest_analysis` (`{id, verdict, score, source, created_at}` or `null`), `auto_analysis` (`{state, error, analysis_id}` or `null`; `state` is `queued`, `running`, `done`, `failed` or `skipped`).
 
@@ -262,11 +269,12 @@ Progress stream, one JSON text frame every 200 ms until the run ends (one final 
 ```json
 {"run_id":3,"status":"running","mode":"benchmark","role":"slave","planned":1200,"sent":480,"bytes":51234,
  "pps_sent":12,"pps_recv":3,
- "per_session":[{"src_ip":"192.168.10.2","state":"active","planned":88,"sent":40,"received":9,"unacked":2,
+ "per_session":[{"src_ip":"192.168.10.2","src_mac":"02:00:00:00:00:02","listen_ip":"192.168.10.2","cancelled":false,
+                 "state":"active","planned":88,"sent":40,"received":9,"unacked":2,
                  "listen_port":2404,"pps_sent":1,"pps_recv":1,"iter_current":1,"iter_total":1}]}
 ```
 
-Rates are messages per second over a 1.5 s window.
+Rates are messages per second over a 1.5 s window. A failed session also has `error`. The stream ends at once when the client sends a Close frame or the connection drops. The web UI feeds the running run's card from this stream and polls `GET /api/runs` only every 4 s while it is fresh.
 
 ### `GET /api/runs/:id/download`
 
@@ -319,9 +327,9 @@ Analysis compares a capture of a benchmark run against the run's source pcap. Th
 
 Every finished benchmark run with a capture is analysed automatically unless the server runs with `--no-auto-analyze`; see `auto_analysis` on the run. A run that finished while the server was shutting down (SIGTERM), or was cut off by a crash, is analysed after the next start: the newest 20 finished benchmark runs with a capture and no analysis are queued, older ones get `auto_analysis` `skipped` and can be analysed on demand. Analyses are stored. Each has a `source`: `auto`, `manual` (upload) or `on_demand`.
 
-### `POST /api/runs/:id/analyze`
+### `POST /api/runs/:id/analyze[?cp56_tolerance_ms=N]`
 
-Analyse the run's own capture now and store the result. Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
+Analyse the run's own capture now and store the result. `cp56_tolerance_ms` (0 to 3 600 000) sets the CP56Time2a drift tolerance for this analysis; the default is the server's `--cp56-tolerance-ms` (50 unless configured). Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 409 `capture_unavailable` (the run's capture failed or holds no frames although the run sent some; the message says why), 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
 
 ### `POST /api/analyze[?run_id=N]` (multipart)
 
@@ -332,9 +340,9 @@ Analyse a capture you took yourself (for example with Wireshark on the target si
 | `file` | The captured pcap (required) |
 | `mode` | `generic` (default) or `correct`: also compare the target's replies byte for byte, when the target is the device recorded in the pcap |
 | `run_id` | The run to compare against; may also be given in the query string (both must agree) |
-| `cp56_tolerance_ms` | CP56Time2a drift tolerance, default 50 |
+| `cp56_tolerance_ms` | CP56Time2a drift tolerance in ms (0 to 3 600 000); default the server's `--cp56-tolerance-ms` |
 
-Without `run_id` the newest finished benchmark run is used, and a warning says so. The response is the full analysis report plus `run_selection` (`explicit` or `latest`), `warnings[]` and `analysis_id`.
+Without `run_id` the newest finished benchmark run is used, and a warning says so. The response is the stored analysis summary (the same shape as `GET /api/analyses/:id`, without per-endpoint detail) plus `run_selection` (`explicit` or `latest`), `warnings[]` and `analysis_id`. Fetch an endpoint's detail with `GET /api/analyses/:id/endpoints/:endpoint`. Only when the analysis could not be stored (`analysis_id` is null, and `warnings` says why) does the reply include `details_by_ip`. The summary's `fleet_gi_ci_audit` sums the endpoints' IEC 104 GI/CI audit counters.
 
 ```sh
 curl -H "Origin: $B" -F file=@target-side.pcap -F mode=generic "$B/api/analyze?run_id=7"
@@ -347,6 +355,7 @@ curl -H "Origin: $B" -F file=@target-side.pcap -F mode=generic "$B/api/analyze?r
 | `GET /api/runs/:id/analyses` | `[{id, run_id, created_at, verdict, score_pct, source}]`, newest first |
 | `GET /api/analyses/:id` | The stored summary: the report without per-endpoint detail |
 | `GET /api/analyses/:id/endpoints/:endpoint` | One endpoint's stored detail; `:endpoint` is the endpoint IP as listed in `slaves[].slave_ip` |
+| `GET /api/analyses/:id/report.html[?download=1]` | The analysis as one self-contained HTML page (inline CSS, no scripts or external assets, print-friendly): verdict, warnings, run facts, fleet counts, every endpoint and its detail. `download=1` sends it as an attachment |
 
 ## Compare
 
@@ -383,8 +392,8 @@ curl -s "$B/api/runs/12/compare/15?p99_increase_pct=10" | jq '.regressed, .regre
 | Route | Body | Result |
 |---|---|---|
 | `GET /api/nics` | | `[{name, mac, ipv4[], up, loopback, bridge, bridge_port, default_route}]`. `bridge_port` and `default_route` NICs are protected |
-| `POST /api/arp` | `{ip, iface?}` | `{ip, iface, mac, error}` via `arping` (default iface: the default-route NIC) |
-| `POST /api/verify-ip` | `{ip, iface?}` | `{ip, iface, in_use, locally_assigned, mac, error}`: whether an address is already taken, via the host's own addresses and `arping -D` |
+| `POST /api/arp` | `{ip, iface?}` | `{ip, iface, mac, error}` via `arping` (default iface: the default-route NIC); `error` only says there was no reply. 503 `arping_unavailable` when `arping` cannot be run |
+| `POST /api/verify-ip` | `{ip, iface?}` | `{ip, iface, in_use, locally_assigned, mac, error}`: whether an address is already taken, via the host's own addresses and `arping -D`. 503 `arping_unavailable` when `arping` cannot be run |
 
 `arping` comes from `iputils-arping`. Without it these routes return `error` instead of failing.
 
