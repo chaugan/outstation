@@ -116,7 +116,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Paginated or lazy per-RTU detail, with the report persisted to the DB.
   - Run-status check: refuse or warn when the run failed or sent nothing.
   - Table-driven verdict and rollup tests. Adopt the T02 frame iterator.
-- [ ] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
+- [~] **T07 Frontend fixes and SPA split** (`webui/src/index.html` → `webui/src/ui/*.{css,js}` spliced by `build.rs`, `proto_iec104/static/iec104_ui.js`). Refs: F088 (frontend), F095, F096, F097, F098, F099, F100 (rename half), F102, F103, F104, F105, F106, F107, F109, F110, F111, F112, F113, F114, F115, F116, F117, F118, F119, F120, F121, F122, F123, F124, F125, F126.
   - Split the SPA into modules.
   - Block START on invalid JSON; pre-flight validation with inline errors.
   - Fix the stuck ANALYZING panel.
@@ -145,7 +145,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
 - [ ] **T11 Responder command echo.** C_SC/C_DC/C_RC/C_SE/C_BO → ActCon/ActTerm plus optional return information; C_CS clock sync; C_RD read. Add command→ActCon/ActTerm timing metrics. Refs: F009 (metric), F139; product item #7.
 - [ ] **T12 Fault injection (FaultPlan).** In `proto_config`: withhold acks, drop or duplicate N%, corrupt N(S), TESTFR silence, RST at time T, delay. Refs: F139; product item #8.
 - [ ] **T13 Health and metrics.** Prometheus `/metrics` (runs, sessions, frames, latency histograms, guard state) and a degraded-health banner in the UI. Product item #9.
-- [ ] **T14 UI restructure.** Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
+- [~] **T14 UI restructure** (folded into T07, so the frontend is reworked only once). Library / Configure / Runs / Analysis / Compare views with navigation. IEC 104 role and pacing settings move out from behind the benchmark checkbox. Refs: F127.
 
 ## Wave 4: docs, privileged validation, final audit
 
@@ -204,3 +204,4 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Graceful shutdown, which calls `netctl::cleanup_all`.
   - The local request address goes into `protected_addrs`.
   - Partly fixed: F055/F149 (no per-run capture size cap yet; tracked in T04c) and F133 (docs part moved to T15).
+- 2026-11-05: T07 started, with T14 folded in, in `/opt/code/outstation-wt/frontend`. T06 finished its first pass and is now adapting to T04's split and to T05's GI-burst stripping.
