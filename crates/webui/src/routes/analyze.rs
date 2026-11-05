@@ -343,6 +343,12 @@ pub(crate) async fn api_run_analyze(
                 format!("run {id} has no capture to analyse (never written or evicted)"),
             )
         })?;
+    if let Some(why) = crate::analysis_run::capture_problem(&rs, &capture) {
+        return Err(AppError::Conflict(
+            "capture_unavailable",
+            format!("capture unavailable: {why}"),
+        ));
+    }
     let _permit = state
         .heavy
         .clone()

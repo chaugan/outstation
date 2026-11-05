@@ -36,6 +36,9 @@ enum Behaviour {
     /// Like `Sessions`, and writes the IEC 104 fixture as the run's
     /// mirror capture (so it can be analysed).
     SessionsWithCapture(&'static [Option<&'static str>]),
+    /// One clean session, but the capture failed: a header-only file
+    /// and a capture warning (N15).
+    FailedCapture,
 }
 
 /// The 200-RTU IEC 104 fixture.
@@ -70,6 +73,25 @@ impl Fake {
                 Ok(BenchmarkReport::default())
             }
             Behaviour::Panic => panic!("boom in sched"),
+            Behaviour::FailedCapture => Ok(BenchmarkReport {
+                per_session: vec![SessionReport {
+                    src_ip: Ipv4Addr::new(10, 0, 0, 1),
+                    src_mac: [0; 6],
+                    tap: String::new(),
+                    flow_idx: 0,
+                    started_at_ns: 0,
+                    proto_report: protoplay::ProtoReport {
+                        messages_sent: 10,
+                        ..Default::default()
+                    },
+                    cancelled: false,
+                }],
+                total_messages_sent: 10,
+                warnings: vec![
+                    "capture failed to start: socket(AF_PACKET): Operation not permitted".into(),
+                ],
+                ..Default::default()
+            }),
             Behaviour::Sessions(s) | Behaviour::SessionsWithCapture(s) => Ok(BenchmarkReport {
                 per_session: s
                     .iter()
@@ -123,6 +145,10 @@ impl RunExecutor for Fake {
         ));
         if let (Behaviour::SessionsWithCapture(_), Some(cap)) = (self.behaviour, &c.capture_path) {
             std::fs::copy(fixture(), cap).unwrap();
+        }
+        if let (Behaviour::FailedCapture, Some(cap)) = (self.behaviour, &c.capture_path) {
+            // A classic pcap global header and nothing else.
+            std::fs::write(cap, tiny_pcap(0)).unwrap();
         }
         self.bench(&ctx)
     }
@@ -2205,4 +2231,39 @@ async fn uploads_respect_disk_reserve_and_library_quota() {
         assert!(crate::routes::library::library_bytes(&h.state.library_dir) <= 64 * 1024);
         assert_eq!(h.state.library_quota.lock_safe().reserved_bytes(), 0);
     }
+}
+
+/// N15: the run's warnings reach the run JSON and summary, and a run
+/// whose capture failed is not analysed into a false `no_delivery`.
+#[tokio::test]
+async fn failed_capture_skips_analysis_with_the_reason() {
+    let h = harness(Behaviour::FailedCapture);
+    add_fixture(&h, "pcr_1");
+    let id = h.run_to(slave_req("pcr_1"), "completed").await;
+    let (_, v) = h.call(Method::GET, &format!("/api/runs/{id}"), None).await;
+    assert_eq!(v["auto_analysis"]["state"], "skipped", "{v}");
+    let why = v["auto_analysis"]["error"].as_str().unwrap();
+    assert!(why.starts_with("capture unavailable"), "{why}");
+    assert!(why.contains("Operation not permitted"), "{why}");
+    assert!(v["benchmark"]["warnings"][0]
+        .as_str()
+        .unwrap()
+        .contains("capture failed to start"));
+    let (_, list) = h.call(Method::GET, "/api/runs", None).await;
+    assert_eq!(list[0]["benchmark"]["warnings"], v["benchmark"]["warnings"]);
+    let (s, e) = h
+        .call(Method::POST, &format!("/api/runs/{id}/analyze"), None)
+        .await;
+    assert_eq!(
+        (s, e["code"].as_str()),
+        (StatusCode::CONFLICT, Some("capture_unavailable")),
+        "{e}"
+    );
+    assert!(e["error"].as_str().unwrap().contains("capture unavailable"));
+    assert!(h.state.db.analyses_for_run(id).unwrap().is_empty());
+    // The warnings survive a restart.
+    let st = AppState::open(h.state.cfg.as_ref().clone()).unwrap();
+    crate::restore(&st).unwrap();
+    let rs = st.get_run(id).unwrap().lock_safe().clone();
+    assert_eq!(rs.benchmark.unwrap().warnings.len(), 1);
 }

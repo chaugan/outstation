@@ -162,6 +162,9 @@ pub struct RunInfo {
     /// Frames the run's own capture lost to a full kernel queue. Any
     /// loss makes "missing" frames in the verdict suspect.
     pub capture_dropped: u64,
+    /// The capture stopped at its per-run size cap: frames after that
+    /// point are missing from it, not from the wire.
+    pub capture_truncated: bool,
 }
 
 /// Everything [`analyze`] needs.
@@ -766,6 +769,12 @@ fn analyze_loaded(
             .then_with(|| a.slave_ip.cmp(&b.slave_ip))
     });
 
+    if run.capture_truncated {
+        fleet_notes.insert(
+            0,
+            "WARNING: the capture hit its per-run size cap and is truncated; frames sent after that point are reported missing".to_string(),
+        );
+    }
     if run.capture_dropped > 0 {
         fleet_notes.insert(
             0,

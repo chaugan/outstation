@@ -346,6 +346,9 @@ pub struct BenchReport {
     /// Analysis summary (same shape as `GET /api/analyses/:id`).
     pub analysis: Option<serde_json::Value>,
     pub analysis_error: Option<String>,
+    /// The run's own warnings (capture failures, guard restore or
+    /// teardown errors) (N15).
+    pub warnings: Vec<String>,
     pub metrics: BenchMetrics,
     pub assertions: Vec<AssertionResult>,
     /// True when every assertion passed (and there was no run error).
@@ -376,6 +379,7 @@ impl BenchReport {
             latency: None,
             analysis: None,
             analysis_error: None,
+            warnings: Vec::new(),
             metrics: BenchMetrics::default(),
             assertions: Vec::new(),
             passed: false,
@@ -651,8 +655,19 @@ fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
     }
     rep.run = Some(rs.summary());
 
-    // Analyse the run's own mirror capture.
-    let summary = if capture.is_file() {
+    // Analyse the run's own mirror capture, unless it failed (N15).
+    let unavailable = if capture.is_file() {
+        crate::analysis_run::capture_problem(&rs, &capture)
+    } else {
+        None
+    };
+    if let Some(b) = &rs.benchmark {
+        rep.warnings = b.warnings.clone();
+    }
+    let summary = if let Some(why) = &unavailable {
+        rep.analysis_error = Some(format!("capture unavailable: {why}"));
+        None
+    } else if capture.is_file() {
         let mode = if opts.correct_mode {
             AnalysisMode::Correct
         } else {
@@ -675,6 +690,9 @@ fn run_inner(opts: &BenchOptions, rep: &mut BenchReport) -> Result<()> {
 
     if let Some(sig) = signal {
         bail!("interrupted by {sig}; run {}", status.as_str());
+    }
+    if let Some(why) = unavailable {
+        bail!("capture unavailable, the run cannot be judged: {why}");
     }
     if status == RunStatus::Failed {
         bail!(
@@ -722,6 +740,9 @@ pub fn summary_text(r: &BenchReport) -> String {
             let _ = writeln!(s, "analysis: unavailable: {e}");
         }
         _ => {}
+    }
+    for w in &r.warnings {
+        let _ = writeln!(s, "warning: {w}");
     }
     for a in &r.assertions {
         let _ = writeln!(s, "  {}", a.message);

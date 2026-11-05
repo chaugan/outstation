@@ -205,6 +205,16 @@ pub struct RunReportJson {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// Non-fatal problems the run reported: capture failures, guard
+    /// restore or teardown errors (N15). Empty in old rows.
+    pub warnings: Vec<String>,
+    /// Whether the run's capture worked. `None` when the scheduler did
+    /// not say (old rows, or a scheduler without the field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
+    /// The capture stopped at the per-run byte cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -253,6 +263,13 @@ impl From<&RunReport> for RunReportJson {
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
             captured_dropped: r.captured_dropped,
+            warnings: r.warnings.clone(),
+            // Lane fx1 adds `capture_ok` / `capture_truncated` to the
+            // sched reports; map them here at merge:
+            // `capture_ok: Some(r.capture_ok)`,
+            // `capture_truncated: Some(r.capture_truncated)`.
+            capture_ok: None,
+            capture_truncated: None,
         }
     }
 }
@@ -373,6 +390,16 @@ pub struct BenchmarkReportJson {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// Non-fatal problems the run reported: capture failures, guard
+    /// restore or teardown errors (N15). Empty in old rows.
+    pub warnings: Vec<String>,
+    /// Whether the run's capture worked. `None` when the scheduler did
+    /// not say (old rows, or a scheduler without the field).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
+    /// The capture stopped at the per-run byte cap.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_truncated: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -719,6 +746,13 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
             captured_packets: r.captured_packets,
             captured_bytes: r.captured_bytes,
             captured_dropped: r.captured_dropped,
+            warnings: r.warnings.clone(),
+            // Lane fx1 adds `capture_ok` / `capture_truncated` to the
+            // sched reports; map them here at merge:
+            // `capture_ok: Some(r.capture_ok)`,
+            // `capture_truncated: Some(r.capture_truncated)`.
+            capture_ok: None,
+            capture_truncated: None,
         }
     }
 }
@@ -742,6 +776,10 @@ pub struct RunReportSummary {
     /// Frames the capture lost to a full kernel queue (T18b); 0 in old
     /// rows.
     pub captured_dropped: u64,
+    /// The run's warnings (N15).
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
 }
 
 /// Benchmark report without per-session rows or histograms.
@@ -760,6 +798,10 @@ pub struct BenchmarkSummary {
     pub captured_bytes: u64,
     /// Frames the capture lost to a full kernel queue (T18b).
     pub captured_dropped: u64,
+    /// The run's warnings (N15).
+    pub warnings: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub capture_ok: Option<bool>,
     pub sessions: usize,
     /// Sessions that ended with an error (cancelled ones excluded).
     pub sessions_failed: usize,
@@ -863,6 +905,8 @@ impl RunState {
                 captured_packets: r.captured_packets,
                 captured_bytes: r.captured_bytes,
                 captured_dropped: r.captured_dropped,
+                warnings: r.warnings.clone(),
+                capture_ok: r.capture_ok,
             }),
             benchmark: self.benchmark.as_ref().map(|b| BenchmarkSummary {
                 total_messages_sent: b.total_messages_sent,
@@ -877,6 +921,8 @@ impl RunState {
                 captured_packets: b.captured_packets,
                 captured_bytes: b.captured_bytes,
                 captured_dropped: b.captured_dropped,
+                warnings: b.warnings.clone(),
+                capture_ok: b.capture_ok,
                 sessions: b.per_session.len(),
                 sessions_failed: b.sessions_failed(),
                 sessions_cancelled: b.sessions_cancelled(),

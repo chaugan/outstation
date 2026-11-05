@@ -79,6 +79,7 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 409 | `request_missing` | Re-run of a run recorded before run requests were stored |
 | 409 | `profile_exists` | A profile with that name exists |
 | 409 | `capture_missing` | `POST /api/runs/:id/analyze` and the run has no capture |
+| 409 | `capture_unavailable` | `POST /api/runs/:id/analyze` and the run's capture failed (see the run's `warnings`) |
 | 409 | `analysis_missing` | Compare and a run has no stored analysis. Extra fields: `run_id`, `has_capture` |
 | 413 | `too_large` | Upload above the size cap |
 | 429 | `busy` | Too many heavy requests at once (analysis, upload, gap histogram); retry |
@@ -321,7 +322,7 @@ Every finished benchmark run with a capture is analysed automatically unless the
 
 ### `POST /api/runs/:id/analyze[?cp56_tolerance_ms=N]`
 
-Analyse the run's own capture now and store the result. `cp56_tolerance_ms` (0 to 3 600 000) sets the CP56Time2a drift tolerance for this analysis; the default is the server's `--cp56-tolerance-ms` (50 unless configured). Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
+Analyse the run's own capture now and store the result. `cp56_tolerance_ms` (0 to 3 600 000) sets the CP56Time2a drift tolerance for this analysis; the default is the server's `--cp56-tolerance-ms` (50 unless configured). Returns `{analysis_id, run_id, verdict, score_pct, source: "on_demand", created_at}`. Errors: 409 `run_running`, 409 `capture_missing`, 409 `capture_unavailable` (the run's capture failed or holds no frames although the run sent some; the message says why), 404 `source_pcap_missing`, 400 `not_benchmark`, 429 `busy`.
 
 ### `POST /api/analyze[?run_id=N]` (multipart)
 
