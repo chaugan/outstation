@@ -106,8 +106,33 @@ pub(crate) struct RunResp {
     id: u64,
 }
 
-/// Load a pcap on the blocking pool (F053, F087).
-pub(crate) async fn load_blocking(path: PathBuf) -> Result<pcapload::LoadedPcap, AppError> {
+/// How long a run start waits for a heavy-work permit before 429.
+pub(crate) const RUN_LOAD_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long `/api/inspect` waits for a heavy-work permit before 429.
+pub(crate) const INSPECT_PERMIT_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Load a pcap on the blocking pool under a heavy-work permit (F053,
+/// F087): parsing a large pcap costs as much memory and CPU as an
+/// analysis. `wait` is how long to wait for a permit; `None` gives 429
+/// `busy` at once.
+pub(crate) async fn load_heavy(
+    state: &AppState,
+    path: PathBuf,
+    wait: Option<std::time::Duration>,
+) -> Result<pcapload::LoadedPcap, AppError> {
+    let sem = state.heavy.clone();
+    let _permit = match wait {
+        None => sem.try_acquire_owned().map_err(|_| busy())?,
+        Some(d) => tokio::time::timeout(d, sem.acquire_owned())
+            .await
+            .map_err(|_| busy())?
+            .map_err(|_| busy())?,
+    };
+    load_blocking(path).await
+}
+
+/// Load a pcap on the blocking pool. Callers hold a heavy permit.
+async fn load_blocking(path: PathBuf) -> Result<pcapload::LoadedPcap, AppError> {
     tokio::task::spawn_blocking(move || load(&path))
         .await
         .map_err(|e| AppError::Internal(format!("pcap load task: {e}")))?
@@ -144,7 +169,7 @@ pub(crate) async fn start_run(
     }
     let pcap_id = req.pcap_id.clone().unwrap_or_default();
     let pcap_path = library_pcap_path(&state.library_dir, &pcap_id)?;
-    let pcap = Arc::new(load_blocking(pcap_path.clone()).await?);
+    let pcap = Arc::new(load_heavy(state, pcap_path.clone(), Some(RUN_LOAD_PERMIT_WAIT)).await?);
     // The address the operator reached this UI on must never be taken
     // over by a run (security review of T03/T04).
     let protected: Vec<std::net::IpAddr> = local_ip.into_iter().collect();

@@ -2071,3 +2071,36 @@ async fn live_stream_ends_on_client_close() {
     h.call(Method::POST, "/api/runs/1/stop", None).await;
     h.wait_status(1, "stopped").await;
 }
+
+/// F053: pcap loads for inspect and run start wait for a heavy-work
+/// permit like analyses and uploads do.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn pcap_loads_wait_for_a_heavy_permit() {
+    let h = Arc::new(harness(Behaviour::Sessions(&[None])));
+    h.add_pcap("pcr_1");
+    let permits = h.state.heavy.clone().acquire_many_owned(2).await.unwrap();
+    let h2 = h.clone();
+    let inspect = tokio::spawn(async move {
+        h2.call(
+            Method::POST,
+            "/api/inspect",
+            Some(json!({"pcap_id": "pcr_1"})),
+        )
+        .await
+    });
+    let h3 = h.clone();
+    let run = tokio::spawn(async move {
+        h3.call(Method::POST, "/api/run", Some(bench_req("pcr_1")))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!inspect.is_finished(), "inspect loaded without a permit");
+    assert!(!run.is_finished(), "run start loaded without a permit");
+    assert!(h.state.get_run(1).is_none());
+    drop(permits);
+    let (s, v) = inspect.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    let (s, v) = run.await.unwrap();
+    assert_eq!(s, StatusCode::OK, "{v}");
+    h.wait_status(1, "completed").await;
+}
