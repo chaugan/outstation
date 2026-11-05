@@ -7,310 +7,465 @@
 <!-- @@APP_CSS@@ -->
 </head>
 <body>
-<main>
+<a class="skip-link" href="#main">Skip to content</a>
 
-<header class="masthead">
-  <div class="logo">outstation</div>
-  <div class="v" id="version">—</div>
-  <div class="host"><span class="ok-dot"></span><span id="host-label">—</span></div>
+<header class="topbar">
+  <div class="topbar-inner">
+    <div class="brand">
+      <h1 class="logo">outstation</h1>
+      <span class="version" id="version">—</span>
+    </div>
+    <nav class="nav" aria-label="Views">
+      <a href="#/library" data-view="library">Library</a>
+      <a href="#/configure" data-view="configure">Configure</a>
+      <a href="#/runs" data-view="runs">Runs <span class="nav-badge" id="nav-running" hidden></span></a>
+      <a href="#/analysis" data-view="analysis">Analysis</a>
+    </nav>
+    <div class="statusbar">
+      <a class="active-run" id="active-run" href="#/runs" hidden></a>
+      <span class="conn" id="conn" data-state="connecting" role="status" aria-live="polite">
+        <span class="conn-dot" aria-hidden="true"></span><span id="conn-text">connecting…</span>
+      </span>
+    </div>
+  </div>
 </header>
-<div id="run-banner" role="status" aria-live="polite"><span id="run-banner-text"></span><button onclick="el('run-banner').classList.remove('on')">dismiss</button></div>
 
-<!-- ================ library ================ -->
-<section class="section">
-  <div class="section-head">
-    <h2>PCAP LIBRARY</h2>
-    <span class="meta" id="lib-meta">—</span>
+<div class="banners">
+  <div class="banner warn" id="degraded-banner" role="status" hidden>
+    <div class="banner-body"><strong>Server health:</strong> <span id="degraded-text"></span></div>
+    <button type="button" class="btn btn-text" data-act="dismiss-banner" data-target="degraded-banner">Dismiss</button>
   </div>
-  <div class="lib-grid">
-    <div>
-      <label for="lib-file" class="dropzone" id="dropzone">
-        <input type="file" id="lib-file" accept=".pcap,.pcapng,.cap" multiple>
-        <div class="title">DROP PCAP TO UPLOAD</div>
-        <div class="sub">or click to browse &middot; .pcap, .pcapng, .cap</div>
-        <div class="sub" id="upload-status" style="margin-top:10px;color:var(--accent);display:none"></div>
-      </label>
-    </div>
-    <div class="pcap-list" id="pcap-list">
-      <div class="lib-empty">no pcaps uploaded</div>
-    </div>
-  </div>
-</section>
-
-<!-- ================ run ================ -->
-<section class="section">
-  <div class="section-head">
-    <h2>RUN CONFIGURATION</h2>
-  </div>
-
-  <div class="panel"><div class="panel-body">
-    <div class="run-form">
-
-      <div class="field span-4">
-        <label>source pcap</label>
-        <div class="selected-box" id="selected-box">
-          <span class="empty" id="selected-label">no pcap selected &mdash; pick one from the library above</span>
-        </div>
-        <div class="raw-hatch" style="display:none">
-          <label>raw path</label>
-          <input id="raw-path" type="text" placeholder="/absolute/path/to/file.pcap" spellcheck="false">
-          <button onclick="inspectRaw()">inspect</button>
-        </div>
-      </div>
-
-      <div class="field">
-        <label>target ip</label>
-        <input id="run-target-ip" type="text" placeholder="10.0.0.50" spellcheck="false">
-      </div>
-      <div class="field">
-        <label>master bind ip <span class="opt">(master mode, optional)</span></label>
-        <input id="run-master-bind-ip" type="text" placeholder="(use captured master ip)" spellcheck="false" title="Override the source IP every master session binds from. Default uses each captured master's IP — set this when the captured master IP doesn't exist locally and you want all sessions to originate from a single local address (e.g. the host's primary IP, or a pre-aliased address).">
-      </div>
-      <div class="field">
-        <label>tcp_nodelay <span class="opt">(optional override)</span></label>
-        <select id="run-tcp-nodelay" title="Whether to set TCP_NODELAY on each session's socket. Default uses role-based: slave=on (matches real RTU event-driven behaviour), master=off (master traffic is sparser). Override here to A/B compare or when debugging packet timing. Note: NIC-level TSO/GSO/GRO can still coalesce segments below this layer; use ethtool -K to fully observe per-frame timing on the wire.">
-          <option value="">(default by role: slave=on, master=off)</option>
-          <option value="on">on  (no Nagle — every frame its own segment)</option>
-          <option value="off">off (Nagle on — coalesce small frames)</option>
-        </select>
-      </div>
-      <div class="field">
-        <label>target mac <span class="opt">(raw only)</span></label>
-        <div style="display:flex;gap:6px">
-          <input id="run-target-mac" type="text" placeholder="aa:bb:cc:dd:ee:ff" spellcheck="false" style="flex:1">
-          <button class="ghost-btn" onclick="arpProbe()" id="arp-btn" type="button" style="padding:6px 10px;font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em">ARP</button>
-        </div>
-        <div id="arp-status" class="muted" style="font-family:var(--mono);font-size:10px;margin-top:3px;min-height:12px"></div>
-      </div>
-      <div class="field">
-        <label>speed</label>
-        <input id="run-speed" type="number" step="0.1" value="1.0">
-      </div>
-      <div class="field">
-        <label>warmup (s)</label>
-        <input id="run-warmup" type="number" step="1" value="5">
-      </div>
-      <div class="field">
-        <label>iterations <span class="opt">(0 = unlimited)</span></label>
-        <input id="run-iterations" type="number" step="1" min="0" value="1">
-      </div>
-      <div class="field span-2" data-proto="iec104">
-        <label class="check-row" title="Slave-mode only. When on, the slave replays the captured script N times within ONE TCP session — no STOPDT between iterations. More spec-realistic (real RTUs hold their session open) and works around polling masters that don't auto-reconnect after a STOPDT.">
-          <input id="run-loop-within-session" type="checkbox">
-          loop iterations within one session <span class="opt">(slave-mode · no STOPDT between loops)</span>
-        </label>
-      </div>
-
-      <div class="field span-2">
-        <label>egress nic <span class="opt">(optional)</span></label>
-        <select id="run-nic"><option value="">(none — bridge stays isolated)</option></select>
-      </div>
-      <div class="field span-2">
-        <label>bridge name</label>
-        <input id="run-bridge" type="text" value="pcr_br0" spellcheck="false">
-      </div>
-
-      <div class="field span-4">
-        <label>flags</label>
-        <div class="checks">
-          <label><input id="run-top-speed" type="checkbox"> top speed</label>
-          <label><input id="run-realtime" type="checkbox"> realtime (sched_fifo)</label>
-          <label><input id="run-skip-non-ip" type="checkbox"> skip non-ip</label>
-          <label><input id="run-benchmark" type="checkbox" onchange="toggleBenchmarkControls()"> benchmark mode</label>
-        </div>
-      </div>
-
-      <div class="field span-4" data-proto="iec104">
-        <label>timestamps</label>
-        <div class="checks">
-          <label title="Rewrite every CP56Time2a inside outgoing ASDUs to the actual wall-clock send moment. SCADA sees fresh event timestamps; intra-pcap spacing preserved. IV flag preserved from source; SU flag follows the chosen timezone's DST state.">
-            <input id="run-fresh-timestamps" type="checkbox"> fresh timestamps &middot; rewrite CP56Time2a to wall-clock
-          </label>
-          <label title="Local time (default): server's calendar with SU bit following DST \u2014 matches most plant SCADA HMIs.">
-            <input type="radio" name="run-cp56-zone" value="local" checked> local time (SU follows DST)
-          </label>
-          <label title="UTC: server's UTC calendar, SU always 0 \u2014 matches ICCP-style links.">
-            <input type="radio" name="run-cp56-zone" value="utc"> UTC (SU=0)
-          </label>
-        </div>
-      </div>
-
-      <div class="bench-panel" id="bench-controls" style="display:none">
-        <div class="hd">BENCHMARK MODE &middot; STATEFUL SESSION REPLAY</div>
-        <div class="bench-grid">
-          <div class="field span-4">
-            <label>role &middot; which side the target is</label>
-            <div class="checks">
-              <label><input type="radio" name="run-role" value="master" checked onchange="toggleRoleControls()"> target is server &middot; tool connects out as master (client)</label>
-              <label><input type="radio" name="run-role" value="slave" onchange="toggleRoleControls()"> target is master &middot; tool listens as slave (server)</label>
-            </div>
-          </div>
-          <div class="field" id="bench-target-port-field">
-            <label>target port</label>
-            <input id="run-target-port" type="number" value="2404">
-          </div>
-          <div class="field" id="bench-listen-port-field" style="display:none">
-            <label>listen port base</label>
-            <input id="run-listen-port-base" type="number" value="2404">
-          </div>
-          <div class="field">
-            <label>protocol</label>
-            <select id="run-proto" onchange="applyProtoVisibility()">
-              <option value="iec104">iec104</option>
-              <option value="modbus_tcp" disabled>modbus_tcp (stub)</option>
-              <option value="dnp3_tcp" disabled>dnp3_tcp (stub)</option>
-              <option value="iec61850_mms" disabled>iec61850_mms (stub)</option>
-              <option value="iec60870_6_iccp" disabled>iec60870_6_iccp (stub)</option>
-            </select>
-          </div>
-          <div class="field span-2" id="bench-concurrency-field">
-            <label>concurrency</label>
-            <div class="checks">
-              <label><input type="radio" name="run-concurrency" value="all_at_once" checked> all at once</label>
-              <label><input type="radio" name="run-concurrency" value="staggered"> staggered to pcap timing</label>
-            </div>
-          </div>
-          <div class="field span-4">
-            <label>pacing &middot; how fast to emit each i-frame</label>
-            <div class="checks">
-              <label><input type="radio" name="run-pacing" value="fast" checked> as fast as possible <span class="opt">(benchmark — throughput test)</span></label>
-              <label><input type="radio" name="run-pacing" value="original"> original pcap timing <span class="opt">(soak test, realism · scaled by speed)</span></label>
-            </div>
-          </div>
-          <div class="field span-4" data-proto="iec104">
-            <label>asdu rewrite map <span class="opt">(optional json)</span></label>
-            <textarea id="run-proto-config" rows="4" placeholder='{"common_address":{"1":100},"cot":{},"ioa":{"1001":2001}}' spellcheck="false" style="font-family:var(--mono);font-size:11px;padding:8px 10px;background:var(--surface);color:var(--ink);border:1px solid var(--rule);outline:none;resize:vertical;width:100%"></textarea>
-          </div>
-
-          <div class="field span-4" style="border-top:1px solid var(--rule);padding-top:10px;margin-top:2px">
-            <label><input id="run-scada-gw-enable" type="checkbox" onchange="toggleScadaGwControls()"> act as scada gateway <span class="opt">(isolated virtual switch setup — see doc/scada-lab.md)</span></label>
-          </div>
-          <div class="field span-2" id="run-scada-gw-ip-field" style="display:none">
-            <label>scada-side gateway ip <span class="opt">(/32 alias on inner nic)</span></label>
-            <input id="run-scada-gw-ip" type="text" placeholder="10.0.0.1" spellcheck="false">
-          </div>
-          <div class="field span-2" id="run-scada-gw-iface-field" style="display:none">
-            <label>inner nic <span class="opt">(vnic facing scada)</span></label>
-            <select id="run-scada-gw-iface"><option value="">(select nic)</option></select>
-          </div>
-          <div class="field span-4" id="run-scada-upstream-field" style="display:none">
-            <label>upstream nat nic <span class="opt">(optional — masquerade scada's non-capture egress)</span></label>
-            <select id="run-scada-upstream"><option value="">(none — scada has no upstream)</option></select>
-          </div>
-        </div>
-        <div class="bench-note" id="bench-note-master">master mode &middot; one outbound tcp session per captured rtu &middot; pipelined to k=12 unacked i-frames &middot; latency measured send→ack</div>
-        <div class="bench-note" id="bench-note-slave" style="display:none">slave mode &middot; one listener per captured rtu on 0.0.0.0:(base + index) &middot; target master connects in &middot; server i-frames driven through the same windowed send loop</div>
-      </div>
-
-      <div class="actions-row">
-        <button class="primary" id="start-btn" onclick="startRun()">START RUN</button>
-        <span id="run-result" class="muted" style="font-family:var(--mono);font-size:11px"></span>
-      </div>
-    </div>
-  </div></div>
-
-  <div id="inspect-result"></div>
-</section>
-
-
-<!-- Fullscreen overlay for the live diagram. The diagram-card gets
-     portal'd into here on FULLSCREEN click, then portal'd back. -->
-<div id="diagram-overlay" class="diagram-overlay" style="display:none">
-  <div class="diagram-overlay-inner">
-    <button class="diagram-overlay-close" onclick="toggleDiagramFullscreen()">&times; CLOSE</button>
-    <div id="diagram-overlay-mount"></div>
+  <div class="banner info" id="run-banner" role="status" aria-live="polite" hidden>
+    <div class="banner-body" id="run-banner-text"></div>
+    <a class="btn btn-text" id="run-banner-link" href="#/runs">View run</a>
+    <button type="button" class="btn btn-text" data-act="dismiss-banner" data-target="run-banner">Dismiss</button>
   </div>
 </div>
 
+<main id="main" tabindex="-1">
+
+<!-- ================ library ================ -->
+<section class="view" id="view-library" data-view="library" aria-labelledby="h-library" hidden>
+  <div class="view-head">
+    <h2 id="h-library" tabindex="-1">Pcap library</h2>
+    <span class="meta" id="lib-meta">—</span>
+  </div>
+  <div class="lib-grid">
+    <div class="lib-upload">
+      <input type="file" id="lib-file" accept=".pcap,.pcapng,.cap" multiple hidden aria-label="Pcap files to upload">
+      <button type="button" class="dropzone" id="dropzone" data-file-input="lib-file" aria-describedby="dropzone-hint">
+        <span class="dz-title">Upload pcap</span>
+        <span class="dz-sub" id="dropzone-hint">Drop files here, or press to browse. Accepts .pcap, .pcapng, .cap</span>
+      </button>
+      <div class="upload-status" id="upload-status" role="status" aria-live="polite"></div>
+    </div>
+    <div class="lib-list-wrap">
+      <ul class="pcap-list" id="pcap-list" aria-label="Uploaded pcaps"></ul>
+      <p class="empty" id="lib-empty">No pcaps uploaded yet. Upload one to start.</p>
+    </div>
+  </div>
+  <div id="lib-detail" class="lib-detail"></div>
+</section>
+
+<!-- ================ configure ================ -->
+<section class="view" id="view-configure" data-view="configure" aria-labelledby="h-configure" hidden>
+  <div class="view-head">
+    <h2 id="h-configure" tabindex="-1">Configure run</h2>
+    <span class="meta">settings are remembered in this browser</span>
+  </div>
+
+  <form id="run-form" class="run-form" novalidate>
+    <fieldset class="seg" id="mode-seg">
+      <legend>Replay mode</legend>
+      <div class="seg-opts">
+        <input type="radio" name="mode" id="mode-benchmark" value="benchmark" checked>
+        <label for="mode-benchmark"><span class="seg-title">Stateful session</span><span class="seg-sub">IEC 104 master or slave, with acks and latency</span></label>
+        <input type="radio" name="mode" id="mode-raw" value="raw">
+        <label for="mode-raw"><span class="seg-title">Raw L2 replay</span><span class="seg-sub">every frame as captured, one TAP per source</span></label>
+      </div>
+    </fieldset>
+
+    <div class="card">
+      <h3 class="card-title">Source</h3>
+      <div class="grid">
+        <div class="field span-4">
+          <label for="cfg-pcap">Source pcap</label>
+          <select id="cfg-pcap" aria-describedby="cfg-pcap-err"></select>
+          <p class="field-err" id="cfg-pcap-err"></p>
+        </div>
+      </div>
+      <div id="cfg-pcap-summary" class="pcap-summary" role="status" aria-live="polite"></div>
+    </div>
+
+    <div class="card" data-mode="benchmark">
+      <h3 class="card-title">Session</h3>
+      <div class="grid">
+        <div class="field span-2">
+          <label for="cfg-proto">Protocol</label>
+          <select id="cfg-proto" aria-describedby="cfg-proto-err"></select>
+          <p class="field-err" id="cfg-proto-err"></p>
+        </div>
+        <fieldset class="seg seg-small span-4" id="role-seg">
+          <legend>Role: which side is the target?</legend>
+          <div class="seg-opts">
+            <input type="radio" name="role" id="role-master" value="master" checked>
+            <label for="role-master"><span class="seg-title">Target is a server</span><span class="seg-sub">we connect out as master (client)</span></label>
+            <input type="radio" name="role" id="role-slave" value="slave">
+            <label for="role-slave"><span class="seg-title">Target is a master</span><span class="seg-sub">we listen as slaves (one per RTU)</span></label>
+          </div>
+        </fieldset>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 class="card-title">Target</h3>
+      <div class="grid">
+        <div class="field">
+          <label for="cfg-target-ip" id="cfg-target-ip-label">Target IP</label>
+          <input id="cfg-target-ip" type="text" inputmode="decimal" placeholder="10.0.0.50" spellcheck="false" autocomplete="off" aria-describedby="cfg-target-ip-hint cfg-target-ip-err">
+          <p class="hint" id="cfg-target-ip-hint"></p>
+          <p class="field-err" id="cfg-target-ip-err"></p>
+        </div>
+        <div class="field" data-mode="benchmark" data-role="master">
+          <label for="cfg-target-port">Target port</label>
+          <input id="cfg-target-port" type="number" min="1" max="65535" value="2404" aria-describedby="cfg-target-port-err">
+          <p class="field-err" id="cfg-target-port-err"></p>
+        </div>
+        <div class="field" data-mode="benchmark" data-role="slave">
+          <label for="cfg-listen-port-base">Listen port base</label>
+          <input id="cfg-listen-port-base" type="number" min="1" max="65535" value="2404" aria-describedby="cfg-listen-port-base-hint cfg-listen-port-base-err">
+          <p class="hint" id="cfg-listen-port-base-hint">RTU n listens on base + n</p>
+          <p class="field-err" id="cfg-listen-port-base-err"></p>
+        </div>
+        <div class="field" data-mode="benchmark" data-role="master">
+          <label for="cfg-master-bind-ip">Master bind IP <span class="opt">optional</span></label>
+          <input id="cfg-master-bind-ip" type="text" inputmode="decimal" placeholder="captured master IP" spellcheck="false" autocomplete="off" aria-describedby="cfg-master-bind-ip-hint cfg-master-bind-ip-err">
+          <p class="hint" id="cfg-master-bind-ip-hint">Source IP for every master session. Empty: each captured master's own IP.</p>
+          <p class="field-err" id="cfg-master-bind-ip-err"></p>
+        </div>
+        <div class="field" data-mode="raw">
+          <label for="cfg-target-mac">Target MAC</label>
+          <div class="inline">
+            <input id="cfg-target-mac" type="text" placeholder="aa:bb:cc:dd:ee:ff" spellcheck="false" autocomplete="off" aria-describedby="arp-status cfg-target-mac-err">
+            <button type="button" class="btn btn-secondary" id="arp-btn" data-act="arp">ARP lookup</button>
+          </div>
+          <p class="hint" id="arp-status" role="status" aria-live="polite"></p>
+          <p class="field-err" id="cfg-target-mac-err"></p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 class="card-title">Network</h3>
+      <div class="grid">
+        <div class="field span-2">
+          <label for="cfg-nic">Egress NIC <span class="opt">optional</span></label>
+          <select id="cfg-nic" aria-describedby="cfg-nic-hint"></select>
+          <p class="hint" id="cfg-nic-hint">Empty: the replay bridge stays isolated on this host.</p>
+        </div>
+        <div class="field span-2" data-mode="benchmark" data-role="slave">
+          <label for="cfg-alias-iface">Alias NIC for RTU listen IPs</label>
+          <select id="cfg-alias-iface" aria-describedby="cfg-alias-iface-hint"></select>
+          <p class="hint" id="cfg-alias-iface-hint">Receives the RTU listen IPs that are not already local. Empty: the default-route NIC, which is protected, so the run is refused unless you override protection below.</p>
+        </div>
+        <div class="field span-2" data-mode="benchmark">
+          <label for="cfg-tcp-nodelay">TCP_NODELAY</label>
+          <select id="cfg-tcp-nodelay" aria-describedby="cfg-tcp-nodelay-hint">
+            <option value="">Default by role (slave on, master off)</option>
+            <option value="on">On: every frame its own segment</option>
+            <option value="off">Off: Nagle may coalesce small frames</option>
+          </select>
+          <p class="hint" id="cfg-tcp-nodelay-hint">NIC offloads (TSO/GSO/GRO) can still coalesce segments below this layer.</p>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h3 class="card-title">Pacing</h3>
+      <div class="grid">
+        <fieldset class="field span-4 radio-set" data-mode="benchmark">
+          <legend>How fast to send each I-frame</legend>
+          <label class="check"><input type="radio" name="pacing" value="fast" checked> As fast as possible <span class="opt">throughput benchmark</span></label>
+          <label class="check"><input type="radio" name="pacing" value="original"> Original pcap timing <span class="opt">soak test, scaled by speed</span></label>
+        </fieldset>
+        <fieldset class="field span-4 radio-set" data-mode="benchmark" data-role="master">
+          <legend>Session start</legend>
+          <label class="check"><input type="radio" name="concurrency" value="all_at_once" checked> All sessions at once</label>
+          <label class="check"><input type="radio" name="concurrency" value="staggered"> Staggered to pcap timing</label>
+        </fieldset>
+        <div class="field" id="speed-field">
+          <label for="cfg-speed">Speed factor</label>
+          <input id="cfg-speed" type="number" step="0.1" min="0.001" max="1000" value="1.0" aria-describedby="cfg-speed-hint cfg-speed-err">
+          <p class="hint" id="cfg-speed-hint">1.0 = captured pace</p>
+          <p class="field-err" id="cfg-speed-err"></p>
+        </div>
+        <div class="field">
+          <label for="cfg-iterations">Iterations</label>
+          <input id="cfg-iterations" type="number" step="1" min="0" value="1" aria-describedby="cfg-iterations-hint cfg-iterations-err">
+          <p class="hint" id="cfg-iterations-hint">0 = loop until stopped</p>
+          <p class="field-err" id="cfg-iterations-err"></p>
+        </div>
+        <div class="field">
+          <label for="cfg-warmup">Warmup (s)</label>
+          <input id="cfg-warmup" type="number" step="1" min="0" max="3600" value="5" aria-describedby="cfg-warmup-err">
+          <p class="field-err" id="cfg-warmup-err"></p>
+        </div>
+        <div class="field span-4 checks" data-mode="benchmark" data-role="slave">
+          <label class="check"><input id="cfg-loop-within-session" type="checkbox" aria-describedby="cfg-loop-hint"> Loop iterations within one TCP session</label>
+          <p class="hint" id="cfg-loop-hint">No STOPDT between loops, like a real RTU that keeps its session open.</p>
+        </div>
+        <div class="field span-4 checks" data-mode="raw">
+          <label class="check"><input id="cfg-top-speed" type="checkbox"> Top speed (ignore capture timing)</label>
+          <label class="check"><input id="cfg-realtime" type="checkbox"> Realtime scheduling (SCHED_FIFO)</label>
+          <label class="check"><input id="cfg-skip-non-ip" type="checkbox"> Skip non-IP frames</label>
+        </div>
+      </div>
+    </div>
+
+    <div class="card" data-mode="benchmark" data-proto="iec104">
+      <h3 class="card-title">IEC 104 options</h3>
+      <div class="grid">
+        <div class="field span-4 checks">
+          <label class="check"><input id="cfg-fresh-ts" type="checkbox" aria-describedby="cfg-fresh-ts-hint"> Fresh timestamps: rewrite CP56Time2a to the wall-clock send time</label>
+          <p class="hint" id="cfg-fresh-ts-hint">Spacing inside the pcap is kept; the IV flag is kept from the source.</p>
+        </div>
+        <fieldset class="field span-4 radio-set">
+          <legend>CP56Time2a time zone</legend>
+          <label class="check"><input type="radio" name="cp56-zone" value="local" checked> Local time, SU bit follows DST <span class="opt">most plant HMIs</span></label>
+          <label class="check"><input type="radio" name="cp56-zone" value="utc"> UTC, SU = 0 <span class="opt">ICCP-style links</span></label>
+        </fieldset>
+        <div class="field span-4">
+          <label for="cfg-proto-config">ASDU rewrite map <span class="opt">optional JSON</span></label>
+          <textarea id="cfg-proto-config" rows="4" spellcheck="false" placeholder='{"common_address":{"1":100},"cot":{},"ioa":{"1001":2001}}' aria-describedby="cfg-proto-config-hint cfg-proto-config-err"></textarea>
+          <p class="hint" id="cfg-proto-config-hint">A JSON object. Keys such as common_address, cot and ioa map captured values to new ones.</p>
+          <p class="field-err" id="cfg-proto-config-err"></p>
+        </div>
+      </div>
+      <details class="sub-collapsible" id="link-params">
+        <summary>IEC 104 link parameters <span class="opt">advanced; empty fields use the defaults</span></summary>
+        <div class="grid">
+          <div class="field">
+            <label for="cfg-k">k (max unacked sent)</label>
+            <input id="cfg-k" type="number" min="1" max="32767" step="1" placeholder="12" aria-describedby="cfg-k-err">
+            <p class="field-err" id="cfg-k-err"></p>
+          </div>
+          <div class="field">
+            <label for="cfg-w">w (ack after received)</label>
+            <input id="cfg-w" type="number" min="1" max="32767" step="1" placeholder="8" aria-describedby="cfg-w-hint cfg-w-err">
+            <p class="hint" id="cfg-w-hint">The standard recommends w ≤ 2k/3.</p>
+            <p class="field-err" id="cfg-w-err"></p>
+          </div>
+          <div class="field">
+            <label for="cfg-t0">t0 connect (s)</label>
+            <input id="cfg-t0" type="number" min="0" step="any" placeholder="30" aria-describedby="cfg-t0-err">
+            <p class="field-err" id="cfg-t0-err"></p>
+          </div>
+          <div class="field">
+            <label for="cfg-t1">t1 ack timeout (s)</label>
+            <input id="cfg-t1" type="number" min="0" step="any" placeholder="15" aria-describedby="cfg-t1-err">
+            <p class="field-err" id="cfg-t1-err"></p>
+          </div>
+          <div class="field">
+            <label for="cfg-t2">t2 ack delay (s)</label>
+            <input id="cfg-t2" type="number" min="0" step="any" placeholder="10" aria-describedby="cfg-t2-hint cfg-t2-err">
+            <p class="hint" id="cfg-t2-hint">Must be less than t1.</p>
+            <p class="field-err" id="cfg-t2-err"></p>
+          </div>
+          <div class="field">
+            <label for="cfg-t3">t3 idle test (s)</label>
+            <input id="cfg-t3" type="number" min="0" step="any" placeholder="20" aria-describedby="cfg-t3-err">
+            <p class="field-err" id="cfg-t3-err"></p>
+          </div>
+          <div class="field" data-role="slave">
+            <label for="cfg-idle-serve">Idle serve after script (s)</label>
+            <input id="cfg-idle-serve" type="number" min="0" step="any" placeholder="30" aria-describedby="cfg-idle-serve-hint cfg-idle-serve-err">
+            <p class="hint" id="cfg-idle-serve-hint">Keep answering GI/CI and TESTFR this long after the script ends.</p>
+            <p class="field-err" id="cfg-idle-serve-err"></p>
+          </div>
+          <div class="field span-4 checks">
+            <label class="check"><input id="cfg-gi-ci-synth" type="checkbox" checked aria-describedby="cfg-gi-ci-synth-hint"> Answer GI/CI live (synthesize interrogation responses)</label>
+            <p class="hint" id="cfg-gi-ci-synth-hint">Off: captured interrogation bursts are replayed as they were recorded.</p>
+          </div>
+        </div>
+      </details>
+    </div>
+
+    <details class="card collapsible" data-mode="benchmark" id="scada-gw-card">
+      <summary><h3 class="card-title">SCADA gateway <span class="opt">optional, isolated lab switch setups</span></h3></summary>
+      <div class="grid">
+        <div class="field span-4 checks">
+          <label class="check"><input id="cfg-scada-gw" type="checkbox"> Act as the SCADA side's gateway (see doc/scada-lab.md)</label>
+        </div>
+        <div class="field span-2">
+          <label for="cfg-scada-gw-ip">SCADA-side gateway IP</label>
+          <input id="cfg-scada-gw-ip" type="text" inputmode="decimal" placeholder="10.0.0.1" spellcheck="false" autocomplete="off" aria-describedby="cfg-scada-gw-ip-err">
+          <p class="field-err" id="cfg-scada-gw-ip-err"></p>
+        </div>
+        <div class="field span-2">
+          <label for="cfg-scada-gw-iface">Inner NIC facing SCADA</label>
+          <select id="cfg-scada-gw-iface" aria-describedby="cfg-scada-gw-iface-err"></select>
+          <p class="field-err" id="cfg-scada-gw-iface-err"></p>
+        </div>
+        <div class="field span-4">
+          <label for="cfg-scada-upstream">Upstream NAT NIC <span class="opt">optional</span></label>
+          <select id="cfg-scada-upstream"></select>
+        </div>
+      </div>
+    </details>
+
+    <div class="card" data-mode="benchmark" id="rtu-card">
+      <h3 class="card-title" id="rtu-title">RTUs to simulate</h3>
+      <div id="rtu-picker"></div>
+    </div>
+
+    <div class="card safety">
+      <h3 class="card-title">Safety</h3>
+      <div class="field checks">
+        <label class="check"><input id="cfg-force" type="checkbox" aria-describedby="cfg-force-hint"> Override NIC and address protection</label>
+        <p class="hint" id="cfg-force-hint">Allows the default-route NIC, the address this page is served on, bridge ports and addresses held by other interfaces. Loopback, gateway and multicast are always refused. You will be asked to confirm. Never remembered.</p>
+      </div>
+    </div>
+
+    <div class="start-bar">
+      <p class="start-summary" id="start-summary"></p>
+      <p class="caps-warn" id="caps-warn" hidden></p>
+      <div class="start-actions">
+        <button type="submit" class="btn btn-primary" id="start-btn">Start run</button>
+        <span class="run-result" id="run-result" role="status" aria-live="polite"></span>
+      </div>
+      <div class="run-error" id="run-error" role="alert"></div>
+    </div>
+  </form>
+</section>
+
 <!-- ================ runs ================ -->
-<section class="section">
-  <div class="section-head">
-    <h2>RUNS</h2>
+<section class="view" id="view-runs" data-view="runs" aria-labelledby="h-runs" hidden>
+  <div class="view-head">
+    <h2 id="h-runs" tabindex="-1">Runs</h2>
     <span class="meta" id="runs-meta">—</span>
   </div>
 
-  <!-- Live diagram: stable sibling of #runs-list. Never moved in the
-       DOM (which means refreshRuns()'s innerHTML rewrite of #runs-list
-       leaves it alone), just shown/hidden based on whether a run is
-       currently running. Sits visually between the section header
-       and the list of runs. -->
-  <div id="diagram-section" class="diagram-section" style="display:none">
-    <div class="diagram-head">
-      <h3>LIVE TRAFFIC</h3>
-      <span class="meta" id="diagram-meta">—</span>
-      <button id="diagram-fs-btn" type="button" onclick="toggleDiagramFullscreen()">FULLSCREEN</button>
-    </div>
-    <div id="diagram-card" class="diagram-card">
+  <section class="diagram-section" id="diagram-section" aria-labelledby="diagram-title" hidden>
+    <div class="diagram-card" id="diagram-card">
+      <div class="diagram-head">
+        <h3 id="diagram-title">Live traffic</h3>
+        <span class="meta" id="diagram-meta">—</span>
+        <button type="button" class="btn btn-secondary" id="diagram-fs-btn" data-act="diagram-fullscreen" aria-pressed="false">Full screen</button>
+      </div>
       <div class="diagram-stats" id="diagram-stats"></div>
       <div class="diagram-progress">
-        <div class="diagram-progress-track"><div class="diagram-progress-fill" id="diagram-pfill"></div></div>
+        <div class="track" aria-hidden="true"><div class="fill" id="diagram-pfill"></div></div>
         <div class="diagram-progress-label" id="diagram-plabel">—</div>
       </div>
+      <ul class="legend" id="diagram-legend" aria-label="Session states"></ul>
       <div class="diagram-canvas-wrap">
-        <div id="diagram-canvas"></div>
+        <div id="diagram-canvas" role="img" aria-label="Live traffic diagram"></div>
       </div>
+      <details class="diagram-table" id="diagram-table-wrap">
+        <summary>Session table (text view of the diagram)</summary>
+        <div class="table-scroll"><table class="t" id="diagram-table">
+          <thead><tr><th scope="col">RTU</th><th scope="col">State</th><th scope="col" class="num">Sent</th><th scope="col" class="num">Received</th><th scope="col" class="num">Up msg/s</th><th scope="col" class="num">Down msg/s</th></tr></thead>
+          <tbody></tbody>
+        </table></div>
+      </details>
+    </div>
+  </section>
+
+  <div class="runs-toolbar" id="runs-toolbar">
+    <div class="field">
+      <label for="runs-filter">Filter runs</label>
+      <input id="runs-filter" type="search" placeholder="id, pcap or target" spellcheck="false" autocomplete="off">
+    </div>
+    <div class="field">
+      <label for="runs-status">Status</label>
+      <select id="runs-status">
+        <option value="">All</option>
+        <option value="running">Running</option>
+        <option value="completed">Completed</option>
+        <option value="partial">Partial</option>
+        <option value="stopped">Stopped</option>
+        <option value="failed">Failed</option>
+      </select>
     </div>
   </div>
-
-  <div id="runs-list"><div class="lib-empty">no runs recorded</div></div>
+  <ol class="runs-list" id="runs-list" aria-label="Runs, newest first"></ol>
+  <p class="empty" id="runs-empty">No runs recorded yet.</p>
+  <div class="pager" id="runs-pager"></div>
 </section>
 
 <!-- ================ analysis ================ -->
-<section class="section">
-  <div class="section-head">
-    <h2>ANALYSIS</h2>
-    <span class="meta">compare a captured pcap against the most recent run</span>
+<section class="view" id="view-analysis" data-view="analysis" aria-labelledby="h-analysis" hidden>
+  <div class="view-head">
+    <h2 id="h-analysis" tabindex="-1">Analysis</h2>
+    <span class="meta">compare a capture from the target side against a run</span>
   </div>
-  <div class="panel"><div class="panel-body">
+  <div class="card">
     <div class="an-grid">
-      <div>
-        <label for="an-file" class="dropzone" id="an-dropzone">
-          <input type="file" id="an-file" accept=".pcap,.pcapng,.cap">
-          <div class="title">DROP CAPTURED PCAP</div>
-          <div class="sub">wireshark output from the target side</div>
-          <div class="sub" id="an-upload-status" style="margin-top:10px;color:var(--accent);display:none"></div>
-        </label>
+      <div class="an-inputs">
+        <div class="field">
+          <label for="an-run">Run to compare against</label>
+          <select id="an-run" aria-describedby="an-run-info"></select>
+          <div class="hint" id="an-run-info" role="status" aria-live="polite"></div>
+        </div>
+        <input type="file" id="an-file" accept=".pcap,.pcapng,.cap" hidden aria-label="Captured pcap to analyse">
+        <button type="button" class="dropzone" id="an-dropzone" data-file-input="an-file" aria-describedby="an-dropzone-hint">
+          <span class="dz-title">Captured pcap</span>
+          <span class="dz-sub" id="an-dropzone-hint">Wireshark capture taken on the target side. Drop it here, or press to browse.</span>
+        </button>
+        <div class="upload-status" id="an-file-status" role="status" aria-live="polite"></div>
       </div>
-      <div>
-        <label>target correctness mode</label>
-        <div class="checks" style="flex-direction:column;gap:10px;align-items:flex-start">
-          <label><input type="radio" name="an-mode" value="generic" checked> <b>generic</b> &middot; target is different software &middot; only check that we delivered the expected frames and the handshake held up</label>
-          <label><input type="radio" name="an-mode" value="correct"> <b>correct</b> &middot; target is the same rtu/scada as the pcap &middot; target's replies should match the original byte-for-byte</label>
+      <div class="an-options">
+        <fieldset class="radio-set">
+          <legend>Target correctness mode</legend>
+          <label class="check"><input type="radio" name="an-mode" value="generic" checked> <span><b>Generic</b>: the target is different software. Checks that the expected frames were delivered and the handshake held.</span></label>
+          <label class="check"><input type="radio" name="an-mode" value="correct"> <span><b>Correct</b>: the target is the same RTU or SCADA as in the pcap. Its replies must match the original byte for byte.</span></label>
+        </fieldset>
+        <div class="field">
+          <label for="an-cp56-tol">CP56 drift tolerance (ms)</label>
+          <input id="an-cp56-tol" type="number" min="0" step="10" value="50" aria-describedby="an-cp56-tol-hint an-cp56-tol-err">
+          <p class="hint" id="an-cp56-tol-hint">Largest accepted |stamp − wire| difference. 50 ms suits a capture on the same host; use 200 ms across hosts or VMs. Used only when the run had fresh timestamps.</p>
+          <p class="field-err" id="an-cp56-tol-err"></p>
         </div>
-        <div style="margin-top:14px">
-          <label style="font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);display:block;margin-bottom:4px">CP56 drift tolerance (ms)</label>
-          <input id="an-cp56-tol" type="number" min="0" step="10" value="50" style="width:90px" title="Max acceptable |stamp \u2212 wire| difference. 50 ms is tight (intra-host); 200 ms is realistic when capture and replayer are different machines or VMs. Only used when the run had fresh-timestamps enabled.">
-          <span class="muted" style="font-family:var(--mono);font-size:11px;margin-left:8px">default 50 &middot; raise to 200 for cross-host capture</span>
+        <div class="start-actions">
+          <button type="button" class="btn btn-primary" id="an-run-btn" data-act="analyze" disabled>Analyze</button>
+          <button type="button" class="btn btn-secondary" id="an-download-json" data-act="analysis-download" hidden>Download JSON</button>
+          <span class="run-result" id="an-msg" role="status" aria-live="polite"></span>
         </div>
-        <div style="display:flex;gap:10px;align-items:center;margin-top:16px;flex-wrap:wrap">
-          <button class="primary" id="an-run-btn" onclick="runAnalysis()" disabled>ANALYZE</button>
-          <a id="an-download-json" style="display:none;font-family:var(--sans);font-size:10px;font-weight:600;text-transform:uppercase;letter-spacing:0.08em;color:var(--dim);text-decoration:none">DOWNLOAD JSON</a>
-          <span id="an-msg" class="muted" style="font-family:var(--mono);font-size:11px"></span>
-        </div>
+        <div class="run-error" id="an-error" role="alert"></div>
       </div>
     </div>
-    <div id="an-result"></div>
-  </div></div>
-</section>
-
-<!-- ================ protocols ================ -->
-<section class="section">
-  <div class="section-head">
-    <h2>REGISTERED PROTOCOLS</h2>
   </div>
-  <div class="protocols" id="protocols-list">&mdash;</div>
+  <div id="an-result"></div>
 </section>
-
-<footer>
-  <span><span class="k">ENGINE</span> <span class="v">af_packet</span></span>
-  <span><span class="k">TOPOLOGY</span> <span class="v">veth-per-source</span></span>
-  <span><span class="k">PROTOS</span> <span class="v">iec104 · raw</span></span>
-  <span><span class="k">UI</span> <span class="v" id="foot-version">—</span></span>
-</footer>
 
 </main>
 
-<div class="tooltip" id="tooltip"></div>
+<footer class="footer">
+  <span><span class="k">Engine</span> <span class="v">af_packet</span></span>
+  <span><span class="k">Topology</span> <span class="v">veth per source</span></span>
+  <span><span class="k">Protocols</span> <span class="v" id="foot-protocols">—</span></span>
+  <span><span class="k">UI</span> <span class="v" id="foot-version">—</span></span>
+</footer>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<div class="sr-only" id="sr-status" role="status" aria-live="polite"></div>
+<div class="tooltip" id="tooltip" role="tooltip"></div>
+
+<dialog id="dlg" aria-labelledby="dlg-title" aria-describedby="dlg-body">
+  <form method="dialog" id="dlg-form">
+    <h2 id="dlg-title"></h2>
+    <div id="dlg-body"></div>
+    <div class="field" id="dlg-input-wrap" hidden>
+      <label for="dlg-input" id="dlg-input-label">Value</label>
+      <input id="dlg-input" type="text" spellcheck="false" autocomplete="off" aria-describedby="dlg-input-err">
+      <p class="field-err" id="dlg-input-err"></p>
+    </div>
+    <div class="dlg-actions">
+      <button type="button" class="btn btn-secondary" id="dlg-cancel">Cancel</button>
+      <button type="submit" class="btn btn-primary" id="dlg-ok" value="ok">OK</button>
+    </div>
+  </form>
+</dialog>
 
 <script src="/echarts.min.js"></script>
 <!-- @@APP_JS@@ -->

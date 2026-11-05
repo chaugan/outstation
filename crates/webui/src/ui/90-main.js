@@ -1,25 +1,21 @@
-// 90-main.js — polling and boot
-// Spliced into the served page by crates/webui/build.rs (classic script,
-// shared global scope with the other ui/*.js files, loaded in file-name order).
+// 90-main.js — boot: wire every view, apply the route, then start the
+// runs poller, the run-event stream and the periodic status refresh.
+'use strict';
 
-// =========================================================================
-//  polling
-// =========================================================================
-let pollTimer = null;
-function schedulePoll() {
-  if (pollTimer) clearTimeout(pollTimer);
-  const anyRunning = document.querySelectorAll('.run.running').length > 0;
-  const delay = anyRunning ? 800 : 3000;
-  pollTimer = setTimeout(async () => {
-    await refreshRuns();
-    schedulePoll();
-  }, delay);
+function boot() {
+  initLibrary();
+  initConfigure();
+  initRuns();
+  initDiagram();
+  initAnalysis();
+  applyRoute(false);
+  startRunEvents();
+  loadStatus();
+  loadProtocols();
+  loadNics();
+  refreshLibrary();
+  pollRuns();
+  setInterval(loadStatus, 30000);
 }
 
-loadStatus();
-startRunEvents();
-loadProtocols();
-loadNics();
-refreshLibrary();
-refreshRuns().then(schedulePoll);
-applyProtoVisibility();
+boot();
