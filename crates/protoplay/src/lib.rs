@@ -431,6 +431,9 @@ pub struct ProtoReport {
 pub const PROTOCOL_ERRORS_CAP: usize = 64;
 /// Cap on [`ProtocolStats::synthesized_send_indices`] entries.
 pub const SYNTHESIZED_INDICES_CAP: usize = 100_000;
+/// Cap on [`ProtocolStats::command_response_us`] samples (the first
+/// ones are kept).
+pub const COMMAND_RESPONSE_SAMPLES_CAP: usize = 10_000;
 
 /// One protocol violation or protocol-level failure seen on a session.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -472,6 +475,7 @@ pub struct ProtocolStats {
     /// Application-level response time in microseconds: from receiving
     /// a command the replayer answers itself (IEC 104 slave: GI/CI
     /// activation) to sending the first response frame (ActCon).
+    /// Capped at [`COMMAND_RESPONSE_SAMPLES_CAP`].
     pub command_response_us: Vec<u64>,
     /// Captured frames removed from the replay script because the
     /// replayer synthesizes their equivalent live (IEC 104 slave:
@@ -513,7 +517,9 @@ impl ProtocolStats {
                 .take(room)
                 .map(|i| i + send_offset),
         );
-        self.command_response_us.extend(other.command_response_us);
+        let room = COMMAND_RESPONSE_SAMPLES_CAP.saturating_sub(self.command_response_us.len());
+        self.command_response_us
+            .extend(other.command_response_us.into_iter().take(room));
         // Script-level figures are identical for every connection of
         // the same slot, so keep one copy rather than summing.
         self.stripped_capture_frames = self
@@ -1004,6 +1010,32 @@ pub fn stub_report(name: &str) -> ProtoReport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protocol_stats_merge_respects_caps() {
+        let mut a = ProtocolStats {
+            command_response_us: vec![1; COMMAND_RESPONSE_SAMPLES_CAP - 1],
+            synthesized_send_indices: vec![0, 1],
+            protocol_errors: vec![ProtocolError::default(); PROTOCOL_ERRORS_CAP],
+            protocol_violations: PROTOCOL_ERRORS_CAP as u64,
+            ..Default::default()
+        };
+        let b = ProtocolStats {
+            command_response_us: vec![2; 10],
+            synthesized_send_indices: vec![0, 3],
+            protocol_errors: vec![ProtocolError::default(); 3],
+            protocol_violations: 3,
+            stripped_capture_frames: 4,
+            ..Default::default()
+        };
+        a.merge(b.clone(), 10);
+        assert_eq!(a.command_response_us.len(), COMMAND_RESPONSE_SAMPLES_CAP);
+        assert_eq!(a.synthesized_send_indices, vec![0, 1, 10, 13]);
+        assert_eq!(a.protocol_errors.len(), PROTOCOL_ERRORS_CAP);
+        assert_eq!(a.protocol_violations, PROTOCOL_ERRORS_CAP as u64 + 3);
+        a.merge(b, 20);
+        assert_eq!(a.stripped_capture_frames, 4);
+    }
 
     #[test]
     fn finalize_latency_basic() {

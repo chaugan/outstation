@@ -29,7 +29,7 @@
 //! peer sees FIN even though the reader thread holds a duplicate fd)
 //! and joins the reader thread.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,7 +40,8 @@ use std::time::Duration;
 
 use protoplay::{
     progress_cancelled, LatencyReservoir, MessageProgress, ProtoReport, ProtocolError, Role,
-    LATENCY_RESERVOIR_CAP, PROTOCOL_ERRORS_CAP, SYNTHESIZED_INDICES_CAP,
+    COMMAND_RESPONSE_SAMPLES_CAP, LATENCY_RESERVOIR_CAP, PROTOCOL_ERRORS_CAP,
+    SYNTHESIZED_INDICES_CAP,
 };
 use tracing::{debug, warn};
 
@@ -162,12 +163,38 @@ struct PendingIFrame {
     send_ns: u64,
 }
 
+/// At most this many interrogations (distinct (type, CA) requests) are
+/// answered at once; further activations get a negative ActCon.
+pub(crate) const MAX_OUTSTANDING_INTERROGATIONS: usize = 8;
+/// Hard cap on queued synthesized ASDUs. An activation that arrives
+/// with the queue this full is dropped (and recorded), so a peer that
+/// floods GI/CI while never acknowledging cannot grow memory.
+pub(crate) const RESPONSE_QUEUE_CAP: usize = 4096;
+
 /// One synthesized ASDU waiting to be sent.
 struct Queued {
     asdu: Vec<u8>,
     /// Receive time of the command this ASDU answers; set on the first
     /// ASDU of a response so the command-to-response time is measured.
     cmd_recv_ns: Option<u64>,
+    /// (type, request CA) of the interrogation this frame belongs to,
+    /// for a full (positive) response; `None` for a rejection.
+    key: Option<(u8, u16)>,
+}
+
+/// What [`Responder::on_command`] did with an ASDU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandOutcome {
+    /// Not a GI/CI activation.
+    NotACommand,
+    /// Full response queued (it may itself be a negative ActCon, e.g.
+    /// for an unknown CA or an unsupported qualifier).
+    Answered,
+    /// The same interrogation is still being answered, or too many
+    /// are: a negative ActCon is queued instead of another response.
+    Rejected,
+    /// Response queue full: nothing queued.
+    Dropped,
 }
 
 /// Slave-mode GI/CI answering: the point inventory and the queue of
@@ -175,6 +202,8 @@ struct Queued {
 pub(crate) struct Responder {
     inventory: Inventory,
     queue: VecDeque<Queued>,
+    /// Queued-but-unsent frame count per outstanding interrogation.
+    outstanding: HashMap<(u8, u16), usize>,
 }
 
 impl Responder {
@@ -182,29 +211,50 @@ impl Responder {
         Self {
             inventory,
             queue: VecDeque::new(),
+            outstanding: HashMap::new(),
         }
     }
 
     /// If `asdu` is a GI (`C_IC_NA_1`, type 100) or CI (`C_CI_NA_1`,
     /// type 101) activation, queue the spec-correct response (ActCon →
-    /// data → ActTerm, built by [`crate::responder`]).
-    fn on_command(&mut self, asdu: &[u8], recv_ns: u64) {
+    /// data → ActTerm, built by [`crate::responder`]). A request for an
+    /// interrogation that is still being answered, or one beyond
+    /// [`MAX_OUTSTANDING_INTERROGATIONS`], is answered with a negative
+    /// ActCon; with [`RESPONSE_QUEUE_CAP`] frames queued it is dropped.
+    fn on_command(&mut self, asdu: &[u8], recv_ns: u64) -> CommandOutcome {
         if asdu.len() < DUI_LEN + IOA_LEN + 1 {
-            return;
+            return CommandOutcome::NotACommand;
         }
         let type_id = asdu[0];
         if !matches!(type_id, 100 | 101) {
-            return;
+            return CommandOutcome::NotACommand;
         }
         if asdu[2] & 0x3f != 6 {
             // Activation only; ActCon/ActTerm never come from a master.
-            return;
+            return CommandOutcome::NotACommand;
+        }
+        if self.queue.len() >= RESPONSE_QUEUE_CAP {
+            return CommandOutcome::Dropped;
         }
         let echo = RequestEcho {
             ca: common_address(asdu),
             oa: asdu[3],
             test: asdu[2] & 0x80 != 0,
         };
+        let key = (type_id, echo.ca);
+        if self.outstanding.contains_key(&key)
+            || self.outstanding.len() >= MAX_OUTSTANDING_INTERROGATIONS
+        {
+            // Mirror of the request: COT 7 with P/N = 1, T echoed.
+            let mut neg = asdu.to_vec();
+            neg[2] = (asdu[2] & 0x80) | 0x40 | 7;
+            self.queue.push_back(Queued {
+                asdu: neg,
+                cmd_recv_ns: Some(recv_ns),
+                key: None,
+            });
+            return CommandOutcome::Rejected;
+        }
         let qualifier = asdu[DUI_LEN + IOA_LEN]; // QOI (100) or QCC (101)
         let response = if type_id == 100 {
             respond_gi(&self.inventory, echo, qualifier)
@@ -219,12 +269,31 @@ impl Responder {
                 "interrogation rejected with negative ActCon"
             );
         }
-        for (i, asdu) in response.into_asdus().into_iter().enumerate() {
+        let asdus = response.into_asdus();
+        if !asdus.is_empty() {
+            self.outstanding.insert(key, asdus.len());
+        }
+        for (i, asdu) in asdus.into_iter().enumerate() {
             self.queue.push_back(Queued {
                 asdu,
                 cmd_recv_ns: (i == 0).then_some(recv_ns),
+                key: Some(key),
             });
         }
+        CommandOutcome::Answered
+    }
+
+    fn pop(&mut self) -> Option<Queued> {
+        let q = self.queue.pop_front()?;
+        if let Some(key) = q.key {
+            if let Some(n) = self.outstanding.get_mut(&key) {
+                *n -= 1;
+                if *n == 0 {
+                    self.outstanding.remove(&key);
+                }
+            }
+        }
+        Some(q)
     }
 }
 
@@ -586,9 +655,20 @@ impl Link {
                 self.vr = (self.vr + 1) & SEQ_MASK;
                 self.unacked_rx += 1;
                 self.oldest_unacked_rx_ns.get_or_insert(recv_ns);
-                if self.role == Role::Slave {
+                // GI/CI are only answered in the started state: a master
+                // may not send them otherwise, and queueing them would
+                // let it build an unbounded backlog while we cannot send.
+                if self.role == Role::Slave && self.transfer == Transfer::Started {
                     if let Some(r) = &mut self.responder {
-                        r.on_command(&asdu, recv_ns);
+                        if r.on_command(&asdu, recv_ns) == CommandOutcome::Dropped {
+                            self.violation(
+                                "interrogation_flood",
+                                format!(
+                                    "GI/CI activation dropped: {RESPONSE_QUEUE_CAP} response frames already queued"
+                                ),
+                                false,
+                            );
+                        }
                     }
                 }
                 if self.unacked_rx >= self.params.w {
@@ -802,12 +882,15 @@ impl Link {
     /// Send queued synthesized responses while the window allows.
     fn drain_responses(&mut self) -> Result<(), LinkEnd> {
         while self.can_send() {
-            let Some(q) = self.responder.as_mut().and_then(|r| r.queue.pop_front()) else {
+            let Some(q) = self.responder.as_mut().and_then(Responder::pop) else {
                 break;
             };
             if let Some(t) = q.cmd_recv_ns {
                 let us = now_ns().saturating_sub(t) / 1_000;
-                self.report.protocol.command_response_us.push(us);
+                let v = &mut self.report.protocol.command_response_us;
+                if v.len() < COMMAND_RESPONSE_SAMPLES_CAP {
+                    v.push(us);
+                }
             }
             self.send_i(q.asdu, true)?;
         }
@@ -893,5 +976,83 @@ fn apdu_name(apdu: &Apdu) -> &'static str {
         Apdu::I { .. } => "I-frame",
         Apdu::S { .. } => "S-frame",
         Apdu::U { code } => u_name(*code),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn gi(ca: u16) -> Vec<u8> {
+        vec![100, 1, 6, 0, ca as u8, (ca >> 8) as u8, 0, 0, 0, 20]
+    }
+
+    fn responder(cas: u16) -> Responder {
+        let mut inv = Inventory::default();
+        for ca in 1..=cas {
+            inv.ingest_asdu(&[1, 1, 3, 0, ca as u8, (ca >> 8) as u8, 1, 0, 0, 1]);
+        }
+        Responder::new(inv)
+    }
+
+    fn drain(r: &mut Responder) -> Vec<Vec<u8>> {
+        std::iter::from_fn(|| r.pop().map(|q| q.asdu)).collect()
+    }
+
+    #[test]
+    fn duplicate_interrogation_gets_negative_actcon() {
+        let mut r = responder(1);
+        assert_eq!(r.on_command(&gi(1), 1), CommandOutcome::Answered);
+        assert_eq!(r.queue.len(), 3);
+        assert_eq!(r.on_command(&gi(1), 2), CommandOutcome::Rejected);
+        assert_eq!(r.on_command(&gi(1), 3), CommandOutcome::Rejected);
+        let out = drain(&mut r);
+        assert_eq!(out.len(), 5);
+        // Positive ActCon, data, ActTerm, then two negative ActCons.
+        assert_eq!(out[0][2], 7);
+        assert_eq!(out[2][2], 10);
+        assert_eq!(out[3][2], 0x40 | 7);
+        assert_eq!(out[4][2], 0x40 | 7);
+        assert!(r.outstanding.is_empty());
+        // Once sent, the same interrogation is answered in full again.
+        assert_eq!(r.on_command(&gi(1), 4), CommandOutcome::Answered);
+        assert_eq!(r.queue.len(), 3);
+    }
+
+    #[test]
+    fn outstanding_interrogations_are_capped() {
+        let cas = MAX_OUTSTANDING_INTERROGATIONS as u16 + 1;
+        let mut r = responder(cas);
+        for ca in 1..cas {
+            assert_eq!(r.on_command(&gi(ca), 0), CommandOutcome::Answered);
+        }
+        let full = r.queue.len();
+        assert_eq!(r.on_command(&gi(cas), 0), CommandOutcome::Rejected);
+        assert_eq!(r.queue.len(), full + 1);
+        // A CI is a different interrogation, but the global cap applies.
+        let ci = [101, 1, 6, 0, 1, 0, 0, 0, 0, 5];
+        assert_eq!(r.on_command(&ci, 0), CommandOutcome::Rejected);
+        // Non-commands are ignored.
+        assert_eq!(
+            r.on_command(&[1, 1, 3, 0, 1, 0, 1, 0, 0, 1], 0),
+            CommandOutcome::NotACommand
+        );
+        assert_eq!(
+            r.on_command(&[100, 1, 7, 0, 1, 0, 0, 0, 0, 20], 0),
+            CommandOutcome::NotACommand
+        );
+    }
+
+    #[test]
+    fn response_queue_is_bounded() {
+        let mut r = responder(1);
+        let mut dropped = 0;
+        for i in 0..RESPONSE_QUEUE_CAP + 50 {
+            if r.on_command(&gi(1), i as u64) == CommandOutcome::Dropped {
+                dropped += 1;
+            }
+        }
+        assert_eq!(r.queue.len(), RESPONSE_QUEUE_CAP);
+        assert!(dropped >= 50);
     }
 }

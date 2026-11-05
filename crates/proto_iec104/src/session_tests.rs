@@ -750,3 +750,74 @@ fn resync_skips_leading_partial_frame_bytes() {
     assert_eq!(s.skipped_bytes, 7);
     let _ = MS;
 }
+
+/// Security: GI/CI activations are only answered in the started state,
+/// and a repeated GI while one is being answered gets a negative ActCon
+/// instead of a second full response.
+#[test]
+fn slave_answers_gi_only_when_started_and_rejects_duplicates() {
+    let (run, port) = slave(
+        blob(&[sp_asdu(1, 1)]),
+        r#"{"session":{"k":1,"w":1,"t1":3,"t2":0.5,"t3":30}}"#,
+    );
+    let mut p = Peer::connect(port);
+    // Before STARTDT: ignored (acknowledged, never answered).
+    p.send_i(gi_act());
+    master_handshake(&mut p);
+    let a = p.recv_until(ms(1000), is_i).expect("script frame");
+    assert_eq!(asdu_of(&a).unwrap(), &sp_asdu(1, 1)[..]);
+    // Window (k=1) full: GI #1 queues a full response, #2 and #3 are
+    // rejected while it is outstanding.
+    p.send_i(gi_act());
+    p.send_i(gi_act());
+    p.send_i(gi_act());
+    std::thread::sleep(ms(100));
+    let mut out = Vec::new();
+    while out.len() < 5 {
+        p.ack();
+        let a = p.recv_until(ms(1000), is_i).expect("response frame");
+        out.push(asdu_of(&a).unwrap().to_vec());
+    }
+    p.ack();
+    assert!(p.recv_until(ms(300), is_i).is_none(), "extra I-frame");
+    drop(p);
+    let (rep, _, _) = run.join_within(ms(2000));
+    assert!(rep.error.is_none(), "{:?}", rep.error);
+    let cots: Vec<u8> = out.iter().map(|a| a[2]).collect();
+    assert_eq!(cots, vec![7, 20, 10, 0x47, 0x47]);
+    assert_eq!(rep.protocol.synthesized_frames, 5);
+    assert_eq!(rep.protocol.command_response_us.len(), 3);
+    assert_eq!(rep.messages_received, 4);
+}
+
+/// `{"gi_ci_synthesis": false}`: captured bursts are replayed verbatim
+/// and live GI/CI is not answered.
+#[test]
+fn slave_synthesis_off_replays_captured_bursts() {
+    let captured = vec![
+        sp_asdu(1, 1),
+        vec![100, 1, 7, 0, 1, 0, 0, 0, 0, 20],
+        vec![1, 1, 20, 0, 1, 0, 2, 0, 0, 1],
+        vec![100, 1, 10, 0, 1, 0, 0, 0, 0, 20],
+    ];
+    let (run, port) = slave(
+        blob(&captured),
+        r#"{"gi_ci_synthesis":false,"session":{"t1":3,"t2":0.5,"idle_serve_secs":0.3}}"#,
+    );
+    let mut p = Peer::connect(port);
+    master_handshake(&mut p);
+    let mut got = Vec::new();
+    while got.len() < 4 {
+        let a = p.recv_until(ms(1000), is_i).expect("captured frame");
+        got.push(asdu_of(&a).unwrap().to_vec());
+    }
+    p.ack();
+    p.send_i(gi_act());
+    assert!(p.recv_until(ms(250), is_i).is_none(), "GI answered");
+    assert!(p.sees_fin(ms(2000)));
+    let (rep, _, _) = run.join_within(ms(2000));
+    assert!(rep.error.is_none(), "{:?}", rep.error);
+    assert_eq!(got, captured);
+    assert_eq!(rep.protocol.stripped_capture_frames, 0);
+    assert_eq!(rep.protocol.synthesized_frames, 0);
+}
