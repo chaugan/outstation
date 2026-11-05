@@ -1,164 +1,201 @@
-# outstation — bruksanvisning for SCADA-ingeniører
+# outstation: veiledning for SCADA-ingeniører
 
-*Hvordan kjøre realistisk replay av IEC 60870-5-104-trafikk mot en SCADA-server i et virtuelt testlab, uten å røre SCADA-en.*
+*Slik tester du en SCADA-master, en RTU eller en frontend med avspilt IEC 60870-5-104-trafikk i et virtuelt lab, uten å endre noe i systemet som testes.*
+
+Denne norske versjonen følger den engelske, [scada-lab.en.md](scada-lab.en.md), som er referansen.
 
 ---
 
 ## Innhold
 
-1. [Kort om verktøyet](#1-kort-om-verktøyet)
-2. [Hva det gjør i praksis](#2-hva-det-gjør-i-praksis)
-3. [Nettverksutfordringen — hvorfor replay er vanskelig](#3-nettverksutfordringen)
-4. [Anbefalt oppsett i VMware / Proxmox / virtuelt miljø](#4-anbefalt-oppsett)
-5. [Steg for steg: sette opp labben](#5-steg-for-steg)
-6. [Steg for steg: kjøre en replay](#6-kjøre-en-replay)
-7. [Forstå resultatene](#7-forstå-resultatene)
-8. [Feilsøking](#8-feilsøking)
-9. [Begreper og kortliste](#9-begreper)
+1. [Hva verktøyet gjør](#1-hva-verktøyet-gjør)
+2. [Velg scenario](#2-velg-scenario)
+3. [Lab-topologi](#3-lab-topologi)
+4. [Gateway-modus: når SCADA-masteren står på et annet subnett](#4-gateway-modus-når-scada-masteren-står-på-et-annet-subnett)
+5. [Scenario A: test av en SCADA-master](#5-scenario-a-test-av-en-scada-master)
+6. [Scenario B: test av en RTU eller en server](#6-scenario-b-test-av-en-rtu-eller-en-server)
+7. [Oppsett av labben steg for steg](#7-oppsett-av-labben-steg-for-steg)
+8. [Slik leser du resultatene](#8-slik-leser-du-resultatene)
+9. [Repeterbare tester: profiler, ny kjøring, sammenligning, CI](#9-repeterbare-tester-profiler-ny-kjøring-sammenligning-ci)
+10. [Opprydding og sikkerhet](#10-opprydding-og-sikkerhet)
+11. [Feilsøking](#11-feilsøking)
+12. [Ordliste](#12-ordliste)
 
 ---
 
-## 1. Kort om verktøyet
+## 1. Hva verktøyet gjør
 
-**outstation** er et verktøy for å spille av fanget nettverkstrafikk — typisk IEC 60870-5-104 fra reelle RTU-er — mot et testmål, på en slik måte at du kan:
+**outstation** tar et opptak (pcap eller pcapng) av ekte IEC 60870-5-104-trafikk og spiller den ene siden av det live mot systemet du vil teste:
 
-- **Benchmarke** en SCADA-server ved å slippe løs et realistisk antall RTU-sesjoner mot den samtidig, og måle latens, gjennomstrømning og om noen meldinger mistes.
-- **Regresjonsteste** en SCADA-oppgradering ved å spille av den samme trafikken før og etter, og sammenligne responsen.
-- **Simulere last** — for eksempel 200 RTU-er som sender 50 meldinger i sekundet hver — fra én enkelt Linux-VM.
-- **Fôre IDS-/logger-/historian-systemer** med realistisk trafikk uten å måtte ha de ekte RTU-ene tilkoblet.
+- **Det spiller RTU-ene** (slave-rolle): én lytter per RTU i opptaket, på RTU-ens egen IP og port 2404. SCADA-masteren din kobler seg til dem slik den gjør i produksjon. De avspilte RTU-ene sender den opptatte telemetrien, svarer på masterens generelle utspørringer og telleverdi-utspørringer (GI og CI), og bekrefter kommandoene den sender.
+- **Det spiller masteren** (master-rolle): én klientsesjon per master i opptaket, som kobler seg til RTU-en, gatewayen eller frontenden du tester, og sender den opptatte mastertrafikken (utspørringer, kommandoer, klokkesynkronisering).
 
-Verktøyet er styrt fullt ut fra et nettgrensesnitt i nettleseren (`http://<replay-vm>:8080`). Det er ingen kommandolinje-arbeidsflyt — du laster opp pcap-filer, konfigurerer en kjøring, trykker start, og ser på resultatene i samme grensesnitt.
+Under kjøringen måler verktøyet forsinkelsen per melding. Etterpå sammenligner det sitt eget opptak av kjøringen med kilde-pcap-en og gir hver RTU en dom (verdict) og en poengsum.
 
-### To kjøremoduser
+Bruk det til å:
 
-| Modus | Hva skjer | Bruksområde |
+- **lasttest** en SCADA-master med et realistisk antall RTU-sesjoner i opptakets tempo;
+- **regresjonsteste** en oppgradering ved å kjøre samme opptak før og etter og sammenligne kjøringene;
+- **sjekke hvordan en master håndterer utspørringer og kommandoer** mot avspilte RTU-er som svarer korrekt;
+- **se hvordan motparten takler feil**: tilbakeholdte kvitteringer, tapte rammer, sekvensfeil, stillhet, tilbakestilte forbindelser;
+- **mate IDS, loggere og historikere** med realistisk trafikk (rå avspilling).
+
+Du kan styre det fra nettleser-UI-et (`http://<outstation-vert>:8080`), fra skript via [HTTP-API-et](api.md), eller uten UI med `outstation bench`, som passer i CI (se [avsnitt 9](#9-repeterbare-tester-profiler-ny-kjøring-sammenligning-ci)).
+
+Det finnes to avspillingsmoduser:
+
+| Modus | Hva som skjer | Bruk |
 |---|---|---|
-| **Raw replay** | Pakkene fra pcap-filen blir skrevet rått ut på nettverket via AF_PACKET, med opprinnelsesadresser uendret, men med destinasjonen omskrevet til ditt mål. Ingen TCP-tilstand, ingen ack. | Fôre IDS-er, wire-tap-analyse, logger-regresjon. |
-| **Benchmark / stateful session replay** | Verktøyet åpner en reell TCP-sesjon per RTU i pcap-en, kjører en protokoll-bevisst replay (IEC 104), venter på ack-er, måler latens. | Lasttesting av SCADA-server, session-regresjon, respons-måling. |
+| **Tilstandsfull sesjon** (benchmark) | Ekte TCP-sesjoner som kjører IEC 104-linklaget: STARTDT, k/w-vinduer, kvitteringer, t1/t2/t3, TESTFR. Forsinkelsen måles. | Test av SCADA-mastere, RTU-er og frontender |
+| **Rå L2-avspilling** | Hver opptatte ramme sendes slik den var, fra de opprinnelige avsenderadressene; bare mottakeren skrives om. Ingen TCP-tilstand. | IDS, loggere, analyse av nettverkstrafikk |
 
-Denne veiledningen fokuserer på benchmark-modus mot en SCADA-server, siden det er her SCADA-ingeniøren typisk har bruk for verktøyet.
-
----
-
-## 2. Hva det gjør i praksis
-
-La oss si du har en pcap fanget fra produksjon, med trafikk fra 200 RTU-er som alle kommuniserer med en SCADA-master over IEC 60870-5-104. Pcap-en er på 3 GB og dekker en time.
-
-Du peker outstation på et SCADA-testsystem, velger "benchmark"-modus og trykker start. Det som skjer:
-
-1. **Pcap-analyse.** Verktøyet leser filen, identifiserer alle TCP-flows, grupperer pakkene per kilde-IP (per RTU), og plukker ut de meldingene som er relevante for IEC 104.
-2. **Sesjonsoppsett.** For hver RTU i pcap-en opprettes et TCP-socket som binder seg til den RTU-ens originale kilde-IP (via automatiske IP-aliaser på lokalt nettgrensesnitt), og kobler seg til SCADA-testserveren på port 2404.
-3. **IEC 104-handshake.** Hver sesjon sender `STARTDT act` og venter på `STARTDT con` fra SCADA. K-vinduet settes opp (standard `k=12`, `w=8`).
-4. **Meldingsstrøm.** Hver sesjon spiller av sine I-rammer mot SCADA med ønsket pacing (maksimal hastighet eller original pcap-timing), venter på S-rammer / ack-er, måler latens send→ack for hver enkelt melding.
-5. **Live rapportering.** I nettgrensesnittet ser du et live nettverksdiagram med animerte datapakker (ekte retning og hastighet), progress-barer per RTU, gjennomstrømning i pakker per sekund, og en latenstidshistogram som oppdateres underveis.
-6. **Avslutning.** Når alle sesjoner er ferdige, lagres rapporten i en SQLite-database, pakkene som ble sendt på wire lagres som en egen pcap (kan lastes ned for verifisering), og du ser aggregerte statistikker: p50/p90/p99-latens, meldinger sendt/mottatt, feil, per-sesjon-detaljer.
+Denne veiledningen handler om tilstandsfulle sesjoner.
 
 ---
 
-## 3. Nettverksutfordringen
+## 2. Velg scenario
 
-Dette er kanskje den viktigste delen å forstå.
+| Du tester | outstation spiller | Rolle i UI-et | Viktigste innstillinger |
+|---|---|---|---|
+| **A. En SCADA-master** (driftssentral, HMI-frontend som ringer opp RTU-er) | RTU-ene | *Target is a master* (slave-rolle) | Alias-NIC for RTU-adressene; gateway-modus hvis masteren når RTU-ene via standard gateway |
+| **B. En RTU, en protokollgateway eller en server som mastere kobler seg til** | masteren(e) | *Target is a server* (master-rolle) | Mål-IP og port; utgående NIC mot målet |
 
-### Problemet
-
-Pcap-en inneholder trafikk fra 200 RTU-er som er spredt over mange forskjellige subnett — for eksempel `192.168.10.0/24`, `172.16.5.0/24`, `10.50.0.0/16`, osv. Disse IP-ene er de *ekte* adressene til RTU-ene i produksjon.
-
-SCADA-testserveren har sannsynligvis en whitelist: den godtar bare tilkoblinger fra adresser den kjenner — som er de samme RTU-adressene fra produksjon.
-
-Så langt, alt vel: outstation sender pakker med de ekte kilde-IP-ene, SCADA godtar dem fordi de matcher whitelisten, og TCP-SYN-en kommer fram.
-
-**Men** — SCADA må svare tilbake på SYN-en. SCADA-ens kjerne slår opp i rutetabellen sin: *"Hvor skal jeg sende pakker til 192.168.10.42?"*. Hvis SCADA-en står på `10.0.0.0/24`, har den ingen direkte rute til `192.168.10.0/24`. Den sender svaret til sin default gateway. Default gateway har heller ingen rute dit. Svaret dør.
-
-TCP-handshaken fullføres aldri. Ingen IEC 104-sesjon opprettes. Benchmarken feiler før den har startet.
-
-### Hvorfor man ikke kan "bare konfigurere det på SCADA-en"
-
-Den åpenbare løsningen — *"bare legg inn statiske ruter på SCADA som peker RTU-subnettene tilbake til outstation"* — er ikke alltid akseptabelt:
-
-- SCADA-serveren kan være en produksjonslignende test som skal være "uten endring".
-- Du har ikke root-tilgang på SCADA.
-- Endringene må dokumenteres, godkjennes, og rulles tilbake — alt er overhead.
-- Testen skal være **non-invasive**: SCADA-en skal oppføre seg nøyaktig som i produksjon.
-
-Vi trenger en løsning der vi manipulerer **SCADAens nettverksmiljø**, ikke SCADA-en selv.
-
-### Løsningen: isolert virtuell switch
-
-Hvis både outstation og SCADA kjører som virtuelle maskiner — noe de gjør i dette oppsettet — kan vi sette dem begge på en **isolert virtuell switch** der outstation er den eneste naboen SCADA kan se på lag 2.
-
-Da skjer følgende, helt automatisk:
-
-1. SCADA prøver å sende en TCP SYN-ACK til `192.168.10.42`.
-2. Rutetabellen sier: "off-subnet, send til default gateway `10.0.0.1`".
-3. SCADA gjør en ARP: *"Hvem har `10.0.0.1`?"*.
-4. På en isolert switch er outstation den eneste som hører ARP-spørsmålet. Outstation har fått `10.0.0.1` lagt til som et lokalt /32-alias på sitt indre nettgrensesnitt, og svarer: *"Det er meg."*
-5. SCADA sender SYN-ACK-en til outstation sin MAC-adresse.
-6. Outstation tar imot pakken på kjernenivå, og fordi `192.168.10.42` også er et lokalt alias, ruter kjernen pakken opp til brukerrommet, der benchmark-sesjonen bundet til `192.168.10.42:0` venter på den. Handshaken fullføres.
-
-SCADA har **ikke blitt konfigurert om**. Den tror fortsatt den snakker med sin default gateway. Whitelisten stemmer fortsatt fordi vi ikke har rørt kilde-IP-en. Alt er som i produksjon — *bortsett fra* at det fysiske laget har blitt skjøvet til en isolert virtuell switch.
+I IEC 104 er den kontrollerte stasjonen (RTU-en) TCP-server og den kontrollerende stasjonen (masteren) TCP-klient. For å teste en master lytter altså outstation, og for å teste en RTU kobler outstation seg til.
 
 ---
 
-## 4. Anbefalt oppsett
+## 3. Lab-topologi
 
-### Topologi
+Kjør outstation på en egen Linux-VM med to nettverkskort:
 
 ```
-┌─────────────────────┐        ┌──────────────────────────┐
-│                     │        │                          │
-│    SCADA (VM)       │        │     outstation (VM)      │
-│                     │        │                          │
-│   eth0              │        │  eth0 (indre)            │
-│   10.0.0.50/24      ├────────┤  10.0.0.1/24   (*)       │
-│   gw: 10.0.0.1      │        │  + 192.168.10.0/24 alias │
-│                     │        │  + 172.16.5.0/24 alias   │
-│                     │        │  + ...                   │
-│                     │        │                          │
-└─────────────────────┘        │  eth1 (ytre)             │
-                               │  10.20.30.40/24          │
-          isolert vSwitch     │  gw: 10.20.30.1          │
-          "vswitch_test"      └───────────┬──────────────┘
-                                          │
-                                          │
-                                  ekte lab-nettverk
-                                  (internett, admin, NTP,
-                                   oppdateringer for SCADA)
+┌────────────────────────┐        ┌────────────────────────────┐
+│  System under test     │        │  outstation (VM)           │
+│  f.eks. SCADA-master   │        │                            │
+│                        │        │  eth0 (indre)              │
+│  eth0  10.0.0.50/24    ├────────┤  10.0.0.2/24               │
+│  gw    10.0.0.1        │        │  + RTU-adresser som /32-   │
+│                        │        │    alias under en kjøring  │
+└────────────────────────┘        │  + 10.0.0.1/32 i gateway-  │
+                                  │    modus, under kjøringen  │
+       isolert vSwitch            │                            │
+       "vswitch_test"             │  eth1 (ytre)               │
+                                  │  10.20.30.40/24            │
+                                  │  standard gw 10.20.30.1    │
+                                  └─────────────┬──────────────┘
+                                                │
+                                          labnettet
+                                     (admin, SSH, NTP, oppdateringer)
 ```
 
-(*) `10.0.0.1` er et eksempel — det skal være den samme IP-en som SCADA allerede har konfigurert som sin default gateway. Vi bruker det SCADA *allerede tror* er gatewayen, vi skaper ingen ny konfigurasjon på SCADA-siden.
+- **Isolert virtuell svitsj** (`vswitch_test`): en svitsj uten fysisk uplink. Bare systemet under test og outstations indre nettverkskort er koblet til den, så injisert trafikk kan ikke lekke ut i andre nett.
+- **eth0 (indre)**: vender mot systemet under test. Gi det en ledig adresse i testsystemets subnett (her `10.0.0.2/24`), uten gateway.
+- **eth1 (ytre)**: administrasjon og UI. Det har standardruten, så outstation beskytter det: kjøringer legger ikke alias-adresser på det og slaver det ikke inn i en bro, med mindre du overstyrer.
 
-### Komponenter
-
-- **SCADA-VM**: din eksisterende SCADA-testserver. Ingen endringer. Flyttes bare over på den nye isolerte switchen.
-- **outstation-VM**: en ren Ubuntu / Debian / RHEL-installasjon med `outstation`-binæren, to vNIC-er.
-- **Isolert virtuell switch** (kalt `vswitch_test` her): i VMware ESXi: "Port Group" uten uplink; i vSphere: "Private VLAN"; i Proxmox: en Linux Bridge uten fysisk interface; i VirtualBox: "Internal Network"; i libvirt/KVM: `<forward mode='none'/>`.
-
-### Hvorfor to vNIC-er på outstation?
-
-- **eth0 (indre)**: eneste kontakt med SCADA. Her legges alle RTU-aliaser og gateway-aliaset.
-- **eth1 (ytre)**: outstation-VM-en selv trenger tilgang til det ekte lab-nettet for admin/SSH/oppdateringer. I tillegg brukes eth1 som NAT-utgang slik at SCADA fortsatt kan hente NTP, oppdateringer osv. via outstation. Dette er valgfritt — hvis SCADA skal være helt isolert under testen, kan du droppe eth1.
+UI-et har ingen autentisering. Nå det via eth1 bare fra din egen arbeidsstasjon, eller bind det til loopback og bruk en SSH-tunnel ([drift](operations.md#the-systemd-unit)).
 
 ---
 
-## 5. Steg for steg: sette opp labben
+## 4. Gateway-modus: når SCADA-masteren står på et annet subnett
 
-Dette gjør du én gang per testlab. Etterpå er det kun pcap-opplasting og knappetrykk i nettgrensesnittet.
+Dette gjelder scenario A når RTU-adressene i opptaket ikke ligger i masterens eget subnett.
 
-### 5.1 Opprett den isolerte switchen
+**Problemet.** Masteren (si `10.0.0.50/24`, gateway `10.0.0.1`) ringer opp RTU `192.168.10.42:2404`. Adressen er utenfor subnettet, så masteren sender SYN-pakken til standard gateway: den spør med ARP etter `10.0.0.1`. På en isolert svitsj finnes det ingen ruter, og SYN-pakken havner ingen steder.
+
+**De vanlige løsningene endrer noe du kanskje ikke får lov til å røre:** en statisk rute på masteren, eller en rute på labruteren som peker RTU-subnettene mot outstation. Styrer du labruteren selv, er en slik rute helt grei, og da trengs ikke gateway-modus.
+
+**Gateway-modus** endrer bare masterens omgivelser. Så lenge kjøringen varer, legger outstation masterens standard gateway-IP (`10.0.0.1`) som `/32`-alias på sitt indre nettverkskort. På den isolerte svitsjen er outstation den eneste som svarer på masterens ARP etter gatewayen, så masteren sender all trafikk utenfor subnettet til outstation. Pakker til en RTU-adresse treffer det lokale RTU-aliaset og når lytteren til den avspilte RTU-en. Svarene går rett tilbake til `10.0.0.50`, som ligger på outstations direkte tilkoblede subnett.
+
+Masteren blir ikke konfigurert om: den snakker fortsatt med «gatewayen sin», og RTU-adressene er de samme som i produksjon.
+
+Valgfri **NAT oppstrøms**: oppgi det ytre nettverkskortet (`eth1`), så slår outstation også på IP-videresending og legger inn en merket MASQUERADE-regel der. Da når masteren fortsatt NTP, oppdateringer og lignende gjennom outstation under testen. La feltet stå tomt hvis masteren skal være helt isolert.
+
+Alt gateway-modus gjør, blir journalført og tilbakestilt når kjøringen slutter. Gateway-modus nekter å bruke outstation-vertens egen standard gateway som gateway-IP.
+
+---
+
+## 5. Scenario A: test av en SCADA-master
+
+outstation spiller RTU-ene i opptaket. Hver RTU får en lytter på sin opptatte IP og port 2404 (*listen port base*). Alle lytterne deler porten; bare IP-adressen skiller dem, så masteren kan bruke RTU-listen fra produksjon uendret.
+
+### 5.1 Sett opp kjøringen
+
+Under **Configure**:
+
+1. **Source pcap**: opptaket. Biblioteket viser hvor mange RTU-er det inneholder, og en vurdering av om det egner seg (`ok`, `caution`, `heavy`, `not recommended`) med et anslag over minnebruken.
+2. **Replay mode**: *Stateful session*. **Protocol**: `iec104`. **Role**: *Target is a master*.
+3. **Master IP** (valgfritt): SCADA-masterens adresse. Den brukes til å finne nettverkskortet masterens trafikk kommer inn på, slik at den også blir tatt opp.
+4. **Listen port base**: `2404`, med mindre masteren din bruker en annen port.
+5. **Alias NIC for RTU listen IPs**: `eth0`, det indre kortet. RTU-adresser som ikke allerede finnes på verten, legges der som `/32 noprefixroute`-alias mens lytteren kjører. Uten dette ville aliasene havnet på kortet med standardruten, som er beskyttet, og de sesjonene feiler.
+6. **Pacing**: *Original pcap timing* spiller av i opptakets takt (skalert med hastighetsfaktoren); *As fast as possible* tester gjennomstrømning.
+7. **Iterations**: hvor mange ganger skriptet spilles (`0` = til du stopper). Kryss av for *Loop iterations within one TCP session* for å oppføre deg som en RTU som holder sesjonen åpen; ellers blir hver runde en ny forbindelse.
+8. **IEC 104 options**:
+   - *Fresh timestamps* skriver om CP56Time2a-tidsmerkene til det øyeblikket hver ramme sendes, så masteren ser aktuelle hendelsestider. Velg lokal tid eller UTC.
+   - *Answer GI/CI live* (på som standard): de avspilte RTU-ene svarer selv på generelle utspørringer og telleverdi-utspørringer, ut fra punktverdiene i opptaket, og de opptatte utspørringssvarene tas ut av skriptet.
+   - *IEC 104 link parameters*: k, w, t0–t3 og *Idle serve after script* (hvor lenge RTU-ene fortsetter å svare etter at skriptet er ferdig, standard 30 s).
+   - Kommandoekko (på som standard) bekrefter masterens kommandoer slik en ekte RTU gjør. Tilbakemelding (return information) og feilinjeksjon legges i `proto_config`-JSON-en: se [IEC 104-referansen](iec104-config.md).
+9. **SCADA gateway** (ved behov, [avsnitt 4](#4-gateway-modus-når-scada-masteren-står-på-et-annet-subnett)): kryss av for *Act as the SCADA side's gateway*, skriv inn masterens gateway-IP (`10.0.0.1`), velg `eth0` som *Inner NIC facing SCADA*, og eventuelt `eth1` som *Upstream NAT NIC*.
+10. **RTUs to simulate**: velgeren viser alle RTU-ene i opptaket med antall meldinger og trafikkmengde. Begynn med én eller noen få RTU-er for å sjekke oppsettet, og kjør så hele flåten.
+
+### 5.2 Start og følg med
+
+1. Trykk **Start run**. Kjører noen andre allerede, får du en feilmelding som sier hvem som startet kjøringen og når; bare én kjøring kan være aktiv om gangen.
+2. Kjøringen dukker opp under **Runs**. Lytterne venter i `pending`. Nå kan du koble til et opptaksverktøy hvis du vil, eller endre en lytte-IP.
+3. Trykk **Start all pending** på kjøringskortet (eller start RTU-ene én og én i sesjonstabellen).
+4. La masteren koble seg til. Hver sesjon går `listening → connected → active → completed`. Det levende diagrammet og sesjonstabellen viser meldingsrater per RTU.
+5. Kjøringen slutter når alle sesjoner har spilt skriptet ferdig og ventetiden etterpå er ute, eller når du trykker **Stop**.
+
+Når kjøringen er ferdig, analyseres den automatisk ut fra outstations eget opptak av RTU-sesjonene ([avsnitt 8](#8-slik-leser-du-resultatene)).
+
+---
+
+## 6. Scenario B: test av en RTU eller en server
+
+outstation spiller masteren. Hver master i opptaket (hver klient-IP som snakker med målporten) blir én sesjon som kobler seg til **mål-IP-en** og spiller av masterens side av samtalen: STARTDT, utspørringer, kommandoer, klokkesynkronisering, kvitteringer.
+
+**Én sesjon per master i opptaket.** Et opptak av én SCADA-master som spør 200 RTU-er gir **én** sesjon: masterens første samtale i opptaket som lar seg sette sammen feilfritt. For å teste en bestemt RTU bruker du et opptak av den RTU-ens forbindelse (filtrer pcap-en først om nødvendig). Opptak med flere mastere, for eksempel en frontend som betjener flere driftssentraler, gir én sesjon per master; velgeren (*Masters to replay*) lar deg velge blant dem.
+
+### 6.1 Nettverk
+
+Hver sesjon får sin egen veth-port på en privat bro, med den opptatte masterens IP- og MAC-adresse, og binder socketen sin til den porten. Broen slaver inn det **utgående nettverkskortet** (`eth0`, det indre kortet), så sesjonene dukker opp på testsegmentet med de opptatte adressene.
+
+Målet må nå disse adressene på det segmentet: det spør med ARP, og hver port svarer for sin egen adresse. Det fungerer når:
+
+- master-adressene i opptaket ligger i målets subnett; eller
+- du setter **Master bind IP** til en ledig adresse i målets subnett, som alle sesjonene da bruker; eller
+- målets rute til master-subnettet peker direkte ut på testsegmentet.
+
+Kjøringens grensesnitt er isolert fra verten: ingen videresending, streng ARP, IPv6 av, og merkede brannmurregler som kaster alt som kommer inn på dem, unntatt målets svar til en sesjonsadresse.
+
+### 6.2 Sett opp og kjør
+
+1. **Replay mode**: *Stateful session*. **Role**: *Target is a server*.
+2. **Target IP** og **Target port** (`2404`): RTU-en eller serveren som testes.
+3. **Egress NIC**: `eth0`. Er kortet beskyttet (det har standardruten, eller adressen du nådde UI-et på), avvises kjøringen med mindre du overstyrer beskyttelsen under **Safety**. I den anbefalte topologien er det indre kortet ikke beskyttet.
+4. **Session start**: *All sessions at once*, eller *Staggered to pcap timing* for å starte hver master på sitt tidspunkt i opptaket.
+5. **Pacing**, **Iterations** og **IEC 104 options** som i scenario A. GI/CI-svar og kommandoekko gjelder bare slave-rollen; i master-rollen sendes de opptatte kommandoene, og tiden til målets bekreftelser måles.
+6. **Start run**. Sesjonene kobler seg til, spiller skriptet, sender gjenstående kvitteringer, sender STOPDT og lukker.
+
+Rå avspilling og master-rollen tar opp trafikken ved å speile kjøringens porter, og det krever `tc` på verten ([drift](operations.md#troubleshooting)).
+
+---
+
+## 7. Oppsett av labben steg for steg
+
+Dette gjør du én gang per lab.
+
+### 7.1 Lag den isolerte svitsjen
 
 **VMware vSphere / ESXi:**
 
-1. Gå til *Host → Networking → Virtual switches → Add standard virtual switch*.
-2. Kall den `vswitch_test`.
-3. **Ikke legg til noen physical uplink.** Denne switchen skal ikke være tilkoblet noen NIC.
-4. Gå til *Port groups → Add port group*, navngi den `pg_scada_test`, velg `vswitch_test` som uplink.
-5. VLAN-ID kan stå som 0.
+1. *Host → Networking → Virtual switches → Add standard virtual switch*, kall den `vswitch_test`.
+2. **Ikke koble til noen fysisk uplink.**
+3. *Port groups → Add port group*, kall den `pg_scada_test`, på `vswitch_test`, VLAN 0.
 
 **Proxmox VE:**
 
-1. *Datacenter → Node → Network → Create → Linux Bridge*, navngi den `vmbr_test`.
-2. La "Bridge ports" stå tom.
-3. Ikke gi den en IP.
+1. *Datacenter → Node → Network → Create → Linux Bridge*, kall den `vmbr_test`.
+2. La *Bridge ports* stå tomt, og gi den ingen IP.
 
 **libvirt / virt-manager:**
 
@@ -170,206 +207,154 @@ Dette gjør du én gang per testlab. Etterpå er det kun pcap-opplasting og knap
 </network>
 ```
 
-Last inn med `sudo virsh net-define isolated.xml && sudo virsh net-start isolated-test && sudo virsh net-autostart isolated-test`.
-
-### 5.2 Flytt SCADA-VM over på den nye switchen
-
-1. Slå av SCADA-VM-en, eller — om den støtter det — hot-swap vNIC-en.
-2. I VM-innstillingene: endre network adapter fra dagens switch til `pg_scada_test` / `vmbr_test` / `isolated-test`.
-3. Ikke endre noe inne i SCADA-gjesten. IP-adresse, netmask, default gateway, DNS — alt skal være uendret.
-4. Start SCADA-en igjen.
-
-Viktig: etter flyttingen vil SCADA-en miste all nettverkskontakt inntil outstation-VM-en også er koblet til den samme isolerte switchen. Dette er forventet.
-
-### 5.3 Opprett outstation-VM-en
-
-1. Opprett en ny VM med 4 vCPU, 8 GB RAM (for 200 RTU-er), 40 GB disk.
-2. Installer Ubuntu Server 22.04 LTS eller lignende.
-3. Legg til **to** vNIC-er:
-   - `eth0` → **`vswitch_test` / `pg_scada_test`** (indre — mot SCADA).
-   - `eth1` → din vanlige lab-switch (ytre — mot det ekte nettet).
-4. Sett en statisk IP på `eth0`. Bruk **samme IP som SCADA-en har som default gateway** — for eksempel `10.0.0.1/24`. Ikke sett gateway på denne.
-5. Sett en IP på `eth1` som passer det ekte lab-nettet, og sett default gateway på den.
-6. Installer outstation og systemd-tjenesten (følg `systemd/install.sh` i repoet).
-
-Du kan verifisere ved å pinge SCADA fra outstation: `ping 10.0.0.50`. Hvis det svarer, er det fysiske laget i orden.
-
-### 5.4 Åpne nettgrensesnittet
-
-Fra arbeidsstasjonen din, åpne `http://<outstation-eth1-ip>:8080` i nettleser. Du skal se oversikten med seksjoner for "Pcap Library", "Run Configuration", "Runs" og "Network Diagram".
-
----
-
-## 6. Kjøre en replay
-
-### 6.1 Last opp pcap-filen
-
-1. Gå til **Pcap Library**-seksjonen.
-2. Dra-og-slipp pcap-en eller pcapng-en din inn i opplastingsfeltet.
-3. Vent til analysen er ferdig — du ser antall pakker, RTU-er, TCP-flows, lengde og en "viability"-vurdering av om pcap-en egner seg for benchmark-modus.
-
-### 6.2 Konfigurer kjøringen
-
-I **Run Configuration**-seksjonen:
-
-1. **Velg pcap**: klikk på pcap-en du nettopp lastet opp.
-2. **Target IP**: SCADA-testserverens IP, f.eks. `10.0.0.50`.
-3. **Target port**: `2404` for IEC 104 (standard).
-4. **Egress NIC**: velg `eth0` (indre, mot SCADA). Dette er nettgrensesnittet der AF_PACKET-injeksjonen og TCP-sesjonene skal sendes ut.
-5. **Flags** → haken på **"benchmark mode"**.
-6. **Role**: "target is server · tool connects out as master" (dette er standard).
-7. **Protocol**: `iec104`.
-8. **Pacing**: velg "as fast as possible" for maksbelastning, eller "original pcap timing" for realisme.
-9. **Iterations**: antall ganger scriptet skal løpe. `1` for et enkelt pass, `0` for uendelig løkke.
-
-### 6.3 Aktiver SCADA-gateway-modus
-
-Dette er det nye, kritiske trinnet. Haken du har ventet på:
-
-1. Huk av **"act as scada gateway"** nederst i benchmark-panelet.
-2. **SCADA-side gateway IP**: den IP-en SCADA har som default gateway — i vårt eksempel `10.0.0.1`. Dette er IP-en outstation vil hekte på som /32-alias under kjøringen.
-3. **Inner NIC**: velg `eth0` (samme som egress NIC — det er den som peker mot SCADA).
-4. **Upstream NAT NIC** *(valgfritt)*: velg `eth1` hvis SCADA skal ha fortsatt tilgang til det ekte nettet (oppdateringer, NTP, admin) mens testen kjører. outstation vil da slå på IP-forwarding og legge til en MASQUERADE-regel for `eth1`. La være tom hvis SCADA skal være helt isolert under testen.
-
-### 6.4 Start
-
-Trykk **START RUN**. Det som skjer bak kulissene:
-
-1. outstation installerer `10.0.0.1/32` som alias på `eth0`.
-2. IP-forwarding slås på (hvis NAT er valgt).
-3. MASQUERADE-regelen settes inn i `iptables -t nat -A POSTROUTING -o eth1 -j MASQUERADE`.
-4. For hver RTU i pcap-en legges RTU-IP-en til som /32-alias på `eth0` via bestående auto-alias-mekanismen.
-5. pcr_br0-broen opprettes, veth-interfaces per kilde etableres.
-6. Sesjonene kobler seg til SCADA-en én etter én (eller samtidig, avhengig av concurrency-valg).
-7. SCADA svarer på ARP-spørsmål for `10.0.0.1` (via oss) og `192.168.10.42` (via oss direkte på lag 2 — selv om det ikke er nødvendig siden det går via default gateway).
-8. Sesjonene strømmer I-rammer, måler latens, logger til SQLite.
-
-Nettgrensesnittet viser live nettverksdiagram med animerte datastrømmer, progress-bar per RTU, og latens-sparkline.
-
-### 6.5 Når kjøringen er ferdig
-
-outstation rydder opp alt automatisk:
-
-- /32-aliaset på `eth0` fjernes.
-- IP-forwarding tilbakestilles til opprinnelig verdi.
-- MASQUERADE-regelen slettes.
-- Veth-interfacene og pcr_br0-broen rives.
-- Alle endringer er reversible.
-
-Hvis outstation-prosessen krasjer midt i en kjøring, blir aliasene og MASQUERADE-regelen liggende. Ved oppstart ser outstation etter dette i statusfilen `/var/lib/outstation/state-aliases.txt` og fjerner spor etter forrige kjøring automatisk. Du får en advarsel i loggen: *"reclaimed N orphaned ip alias(es) from a previous run"*.
-
----
-
-## 7. Forstå resultatene
-
-Når kjøringen er ferdig ser du en "Run card" i **RUNS**-seksjonen. Klikk **DETAILS** for å utvide.
-
-### Aggregerte tall
-
-- **Total messages sent / received**: skal matche antall I-rammer i pcap-en (sendt) og det SCADA-en responderte med (mottatt).
-- **Aggregate latency p50/p90/p99/max**: send→ack-tid målt per melding, aggregert over alle RTU-er. Dette er den viktigste tallet for SCADA-benchmarking.
-- **Aggregate throughput (msgs/sec)**: summen av alle sesjoners meldinger per sekund.
-
-### Per-sesjon-detaljer
-
-En rad per RTU, med:
-
-- **connected**: om TCP-handshaken faktisk kom gjennom (dette er din første sanitetssjekk).
-- **messages sent / received / bytes**
-- **latency p50/p90/p99/max**: per-sesjons latens.
-- **window stalls**: antall ganger sesjonen måtte vente på et `w`-ack fra SCADA fordi k-vinduet var fullt. Høyt tall her = SCADA henger etter på ack-sendingen.
-- **unacked at end**: meldinger som ble sendt men ikke fikk ack før sesjonen stengte. Bør være 0.
-- **error**: hvis sesjonen feilet, står feilmeldingen her.
-
-### Fanget pcap
-
-outstation lagrer alt som faktisk ble sendt på wire under kjøringen til `/tmp/outstation-captures/run_<id>.pcap`. Du kan laste denne ned via **DOWNLOAD CAPTURE**-knappen og åpne den i Wireshark for å verifisere at det som gikk ut matcher forventningen.
-
-### Timing-sammenligning
-
-Under **DETAILS** kan du også se en histogramsammenligning av inter-frame-gaps i original pcap vs det som faktisk ble sendt. Dette lar deg vurdere hvor nøyaktig pacing-en var. Typisk forskjell: millisekund-nivå på p99-halen, noe som er normalt for userspace-scheduling på Linux.
-
-### SQLite-persistens
-
-Alle kjøringer lagres i `/var/lib/outstation/runs.sqlite`. Etter en server-restart ligger alle historiske kjøringer der fortsatt, med rapporter og alt, og du kan slette dem individuelt via **DELETE**-knappen på hver run card.
-
----
-
-## 8. Feilsøking
-
-### SCADA får ikke kontakt med outstation
-
-Sjekk fra outstation-VM-en:
-
 ```sh
-ping 10.0.0.50                       # SCADA-ens IP
-ip addr show eth0                    # skal vise 10.0.0.1/24
-ip neigh | grep 10.0.0.50            # skal vise SCADA-ens MAC
+sudo virsh net-define isolated.xml && sudo virsh net-start isolated-test && sudo virsh net-autostart isolated-test
 ```
 
-Hvis pingen feiler, sjekk at begge VM-ene faktisk står på samme isolerte switch i hypervisoren.
+### 7.2 Flytt systemet under test over på svitsjen
 
-### TCP-sesjonen etableres ikke
+1. Slå av VM-en, eller bytt nettverkskort mens den kjører hvis hypervisoren støtter det.
+2. Endre nettverkskortet til `pg_scada_test` / `vmbr_test` / `isolated-test`.
+3. Endre ingenting inne i gjesten: adresse, nettmaske, gateway og DNS blir som før.
+4. Start den igjen. Den har ingen forbindelse før outstation også er koblet til; det er som forventet.
 
-I nettgrensesnittets per-sesjon-rad er `connected` fortsatt `false` etter 10 sekunder.
+### 7.3 Lag outstation-VM-en
 
-- **Verifiser at gateway-aliaset er installert**: `ip addr show eth0 | grep "10.0.0.1"`. Skal være der under kjøringen.
-- **Verifiser at RTU-IP-aliaset er installert**: `ip addr show eth0 | grep "192.168.10.42"` (eller hvilken RTU du tester).
-- **Sjekk at SCADA-en faktisk har `10.0.0.1` som default gateway**: `ip route` på SCADA — selv om vi ikke skal endre noe på SCADA, kan du fritt lese konfigurasjonen.
-- **Sjekk at kilde-IP-en matcher SCADA-ens whitelist**. Dette er den vanligste feilen: du bruker en pcap fra et annet miljø, og SCADA-testserveren godtar ikke de kilde-IP-ene.
+1. En Linux-VM (for eksempel Ubuntu Server LTS). Vurderingen av opptaket anslår hvor mye minne en kjøring trenger; kjøringen med 165 RTU-er i [reports/](../reports/README.md) brukte en VM med 12 vCPU og 12 GB.
+2. To nettverkskort: `eth0` på den isolerte svitsjen, `eth1` på labnettet.
+3. `eth0`: en ledig statisk adresse i testsystemets subnett, uten gateway. `eth1`: labadresse og standard gateway.
+4. Installer verktøyene tjenesten trenger: `iproute2`, `iptables`, `ethtool`, og `iputils-arping` for ARP-oppslaget i UI-et.
+5. Bygg og installer:
 
-### "TCP RST" fra outstations egen kjerne
+   ```sh
+   cargo build --release -p outstation
+   sudo ./systemd/install.sh
+   ```
 
-Hvis du i Wireshark (på outstation-siden) ser at outstation-kjernen svarer med RST på SYN-ACK-er fra SCADA, betyr det at RTU-IP-en ikke er lagt til som lokalt alias, og kjernen vet ikke at det er en "lokal" adresse. Dette skjer kun hvis den pre-emptive auto-alias-mekanismen har sviktet. Sjekk `/var/log/syslog` for feil fra `netctl::add_ip_alias`.
+6. Sjekk forbindelsen: `ping 10.0.0.50` fra outstation.
 
-### SCADA mister all internett-tilgang
+### 7.4 Åpne UI-et
 
-Du glemte å huke på "upstream NAT NIC". SCADA-en står isolert med kun outstation som nabo, og kommer seg ikke videre. Enten aktiver NAT-modus i neste kjøring, eller aksepter at SCADA er isolert under testen (ofte det beste uansett).
-
-### Kjøringen henger på warmup
-
-Benchmark-modus har et valgfritt warmup-intervall (standard 0 sekunder). Hvis du har satt en høy verdi, er det forventet at sesjonene ikke begynner å sende før warmup er ferdig. Warmup-tiden brukes for å la deg attache Wireshark / tcpdump på `eth0` før trafikken starter.
-
-### Outstation krasjer og lar aliasene stå igjen
-
-Start outstation på nytt: `sudo systemctl restart outstation` (eller manuell start av binæren). Den rydder opp automatisk ved oppstart og logger `reclaimed N orphaned ip alias(es)`.
-
-Hvis du vil rydde manuelt:
-
-```sh
-sudo cat /var/lib/outstation/state-aliases.txt
-sudo ip addr del 10.0.0.1/32 dev eth0
-sudo iptables -t nat -D POSTROUTING -o eth1 -j MASQUERADE
-sudo sysctl net.ipv4.ip_forward=0
-```
+Åpne `http://<eth1-adresse>:8080`. Toppen av siden viser serverens helsetilstand; en advarsel der (for eksempel manglende rettigheter eller lite diskplass) er forklart i [drift](operations.md#health-and-metrics).
 
 ---
 
-## 9. Begreper
+## 8. Slik leser du resultatene
 
-| Begrep | Forklaring |
+### 8.1 Kjøringen
+
+Kjøringskortet viser status (`completed`, `partial` når noen sesjoner feilet, `stopped`, `failed`), sendte og mottatte meldinger, og nedlasting av opptaket. **Details** viser i tillegg:
+
+- **Ack latency** min/p50/p90/p99/maks: tiden fra en I-ramme sendes til motparten kvitterer, over alle sesjoner, med histogram.
+- **Per sesjon**: sendte og mottatte meldinger, forsinkelsesprosentiler, meldinger per sekund, **window stalls** (hvor ofte sesjonen ventet fordi motparten ikke hadde kvittert for k rammer; et høyt tall betyr at motparten er treg med kvitteringene), **unacked at end**, og eventuell feilmelding.
+- **Gap-histogrammet** sammenligner avstanden mellom rammene i kilden og i avspillingen.
+
+### 8.2 Analysen
+
+Alle ferdige tilstandsfulle kjøringer med opptak analyseres automatisk. **Analysis** viser de lagrede analysene for en kjøring; du kan også laste opp et opptak tatt på målsiden med Wireshark eller tcpdump.
+
+- **Dom for hele flåten**: `all_correct`, `partial`, `failed`, `inconclusive`, eller `run_failed` når selve kjøringen feilet eller ikke sendte noe.
+- **Per RTU**: poengsum (andelen rammer levert uendret), dom og begrunnelse. `good_delivery` er godkjent; `degraded` betyr at innholdet var riktig, men tidsmerker, GI/CI-revisjonen eller timingen feilet; `partial_delivery` betyr at rammer manglet, kom i tillegg, var endret eller kom i feil rekkefølge; `never_connected` betyr at masteren aldri koblet seg til den RTU-en.
+- **Domsdimensjoner** per RTU: innhold, tidsmerker, GI/CI, timing, handshake, og feil når slike ble injisert.
+- **GI/CI-revisjon**: for hver utspørring masteren sendte, om ActCon kom innen 15 s, om alle datarammer hadde riktig gruppe-COT, om ActTerm fulgte, og om dataene stemte med RTU-ens punktverdier.
+- **Timing**: varighet i opptaket mot avspillingen, en hastighetsmerkelapp («matched» innenfor ±5 %) og taktavvik.
+- **CP56-avvik** (med ferske tidsmerker): hvert tidsmerke mot det faktiske sendetidspunktet.
+
+Den fullstendige listen over dommer står i [IEC 104-referansen](iec104-config.md#analysis-report).
+
+---
+
+## 9. Repeterbare tester: profiler, ny kjøring, sammenligning, CI
+
+- **Ny kjøring**: `POST /api/runs/<id>/rerun` starter en ny kjøring med nøyaktig den lagrede forespørselen fra en tidligere kjøring. Overstyring av beskyttelsen arves aldri.
+- **Profiler**: lagre en kjøringsforespørsel under et navn (`/api/profiles`) og bruk den igjen.
+- **Sammenligning**: `GET /api/runs/<a>/compare/<b>` gir forskjellene for hele flåten og per RTU i poengsum, leverte rammer, forsinkelse og gjennomstrømning, og flagger tilbakegang ut over terskler du velger. Bruk det før og etter en oppgradering av systemet under test.
+- **CI**: `outstation bench` kjører én benchmark fra en profil, analyserer den og sjekker påstander:
+
+  ```sh
+  sudo outstation bench --pcap fleet.pcap --profile master-test.json \
+      --assert 'score>=99' --assert 'p99_ms<=500' --report out.json
+  ```
+
+  Avslutningskode 0 betyr at alle påstandene holdt, 1 at en påstand feilet, 2 at kjøringen feilet.
+
+UI-et for ny kjøring, profiler og sammenligning er fortsatt under arbeid; API-et og `bench` fungerer nå. Se [API-referansen](api.md) for eksempler; skript må sende en `Origin`-header.
+
+---
+
+## 10. Opprydding og sikkerhet
+
+Hver endring en kjøring gjør på outstation-verten (broer og veth-par, IP-alias, gateway-aliaset, videresending, NAT- og brannmurregler, innstillinger på nettverkskort) skrives først til en journal og tilbakestilles når kjøringen slutter. Etter et krasj rydder tjenesten opp det som ble liggende igjen når den starter på nytt, og systemd-enheten kjører `outstation cleanup` hver gang tjenesten stopper. Du kan kjøre `sudo outstation cleanup` for hånd mens tjenesten er stoppet.
+
+Systemet under test endres aldri. outstation sender likevel trafikk med falske avsenderadresser, så hold testsegmentet isolert, og test bare systemer du har lov til å teste.
+
+---
+
+## 11. Feilsøking
+
+### Masteren når ikke RTU-ene (scenario A)
+
+På outstation, mens kjøringen pågår:
+
+```sh
+ip addr show eth0              # RTU-adresser som /32, og gateway-IP-en i gateway-modus
+ip neigh | grep 10.0.0.50      # masterens MAC-adresse
+sudo tcpdump -ni eth0 port 2404
+```
+
+- Ingen SYN-pakker i det hele tatt: masteren sender ikke til outstation. Sjekk at den står på den isolerte svitsjen, og i gateway-modus at gateway-IP-en er dens faktiske standard gateway (`ip route` på masteren; å lese den endrer ingenting).
+- SYN kommer, men ingen SYN-ACK: RTU-ens lytter er ikke oppe. Sjekk at den er startet (**Start all pending**), og se på sesjonens feilmelding. «needs a /32 alias on …» betyr at alias-kortet mangler eller er beskyttet.
+- Masteren avviser sesjonen: hvitelisten dens inneholder ikke RTU-adressene fra opptaket. Bruk et opptak fra samme miljø.
+
+### Målet svarer aldri (scenario B)
+
+- `tcpdump -ni eth0 port 2404` på outstation: går SYN-pakkene ut med master-adressen fra opptaket?
+- Svarer målet på ARP for den adressen? Ligger master-IP-en utenfor målets subnett, bruk **Master bind IP** ([avsnitt 6.1](#61-nettverk)).
+- «connect timeout»: øk `t0` under IEC 104-linkparameterne (standard 5 s her).
+
+### Sesjoner faller ut med `t1_timeout`
+
+Motparten kvitterte ikke innen t1 (15 s som standard). Den kan være overbelastet eller ha et mindre vindu; `protocol_errors` og `window_stalls` for sesjonen forteller mer. Juster k, w og tidsfristene til motpartens konfigurasjon.
+
+### Kjøringen avvises
+
+- 409 «run … is active»: noen andre har en aktiv kjøring.
+- Et nettverkskort er «protected»: du valgte kortet med standardruten eller det du nådde UI-et på. Velg det indre kortet, eller overstyr beskyttelsen hvis det er det du mener.
+
+### Masteren mister internett under testen
+
+Gateway-modus uten NAT oppstrøms isolerer den. Legg til `eth1` som NAT-kort oppstrøms, eller godta isolasjonen (ofte det beste valget).
+
+### outstation krasjet
+
+Start den på nytt (`sudo systemctl restart outstation`); oppstarten rydder opp etter den krasjede kjøringen. Tjenesteloggen viser hva som ble tilbakestilt.
+
+Mer i [drift](operations.md#troubleshooting).
+
+---
+
+## 12. Ordliste
+
+| Begrep | Betydning |
 |---|---|
-| **IEC 60870-5-104** | Standard for SCADA-kommunikasjon, TCP-basert, port 2404. Sender I-, S- og U-rammer; bruker et glidende k-vindu for flytkontroll. |
-| **I-frame** | "Information frame" — den faktiske nyttelasten med ASDU-data (målinger, kommandoer, hendelser). |
-| **S-frame** | "Supervisory frame" — ack-ramme som bekrefter mottak av N I-rammer. |
-| **U-frame** | "Unnumbered frame" — styrings-rammer (STARTDT, STOPDT, TESTFR). |
-| **k-vindu** | Maksimalt antall u-bekreftede I-rammer en sender kan ha ute. Standard k=12. |
-| **w-vindu** | Mottaker må sende S-frame ack senest etter w mottatte I-rammer. Standard w=8. |
-| **ASDU** | "Application Service Data Unit" — innholdet i en I-frame: type-ID, COT (cause of transmission), common address, IOA (information object address), verdier. |
-| **RTU** | "Remote Terminal Unit" — fjernstasjon som rapporterer til SCADA. I denne labben er hver RTU representert av én TCP-sesjon fra outstation. |
-| **SCADA master** | Systemet som samler inn data fra RTU-er. Når vi kjører benchmark i "master"-rolle, er outstation klienten og SCADA er serveren. |
-| **pcap / pcapng** | Pakkefangstformater. outstation støtter begge. |
-| **AF_PACKET** | Linux-mekanisme for å sende/motta rå Ethernet-rammer direkte, uten å gå via TCP/IP-stakken. Brukt av outstation for raw replay-modus. |
-| **MASQUERADE** | NAT-regel i iptables som rewriter kildeadressen til utgangs-NICens adresse. Brukt her for å gi SCADA upstream-tilgang. |
-| **Isolert vSwitch** | Virtuell switch som ikke er tilkoblet noen fysisk NIC. Kun VM-er som er koblet til samme switch kan snakke med hverandre. |
-| **/32-alias** | En IP-adresse lagt til på et nettgrensesnitt med subnet-maske 32, som betyr "bare denne enkle adressen, ingen subnet-rute". Brukt for å hekte gateway-IP-en og RTU-IP-ene på `eth0` uten å rote med rutetabellen. |
+| **IEC 60870-5-104** | SCADA-protokoll for fjernkontroll over TCP, port 2404. Overfører I-, S- og U-rammer med k/w-flytkontroll |
+| **Kontrollerende stasjon (master)** | SCADA-siden som samler inn data og sender kommandoer. I IEC 104 er den TCP-**klient** |
+| **Kontrollert stasjon (RTU, slave)** | Feltstasjonen som rapporterer data og utfører kommandoer. I IEC 104 er den TCP-**server** |
+| **Slave-rolle** | outstation spiller RTU-ene og lytter; systemet under test er en master (scenario A) |
+| **Master-rolle** | outstation spiller masteren og kobler seg til; systemet under test er en RTU eller en server (scenario B) |
+| **I-ramme** | Informasjonsramme med en ASDU (måleverdier, hendelser, kommandoer) |
+| **S-ramme** | Kvitteringsramme for mottatte I-rammer |
+| **U-ramme** | Kontrollramme: STARTDT, STOPDT, TESTFR |
+| **k / w** | Høyst k ukvitterte I-rammer underveis (standard 12); kvitter senest etter w mottatte (standard 8) |
+| **t1 / t2 / t3** | Tidsfrist for kvittering (15 s), seneste kvitteringsforsinkelse (10 s), stille tid før TESTFR (20 s) |
+| **ASDU** | Applikasjonsdataenhet: type-ID, årsak til overføring (COT), felles adresse (CA), objektadresse (IOA), verdier |
+| **GI / CI** | Generell utspørring (type 100) og telleverdi-utspørring (type 101): masteren ber om alle gjeldende verdier |
+| **CP56Time2a** | Tidsmerket på 7 oktetter i tidsmerkede ASDU-er |
+| **Isolert vSwitch** | En virtuell svitsj uten fysisk uplink |
+| **/32-alias** | En ekstra enkeltadresse på et nettverkskort, uten subnettrute |
+| **MASQUERADE** | NAT-regel som skriver om avsenderadressen til adressen på det utgående kortet |
 
 ---
 
-## Kontakt og ressurser
-
-- Prosjektets README: [`README.md`](../README.md) i rotmappen.
-- Protokollkode: `crates/proto_iec104/`.
-- SCADA-gateway-implementasjon: `crates/netctl/src/lib.rs` (søk etter `GatewayGuard`).
-
-God testing.
+- Oversikt over prosjektet: [README](../README.md)
+- [HTTP-API](api.md), [IEC 104-referanse](iec104-config.md), [Drift](operations.md)
