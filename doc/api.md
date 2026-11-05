@@ -66,6 +66,8 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 400 | `invalid_id` | Not a library pcap id |
 | 400 | `raw_path_rejected` | A raw filesystem path (`pcap`, `path`) instead of a library id |
 | 400 | `protocol_not_ready` | A benchmark with a stub protocol |
+| 400 | `invalid_target_ip` | Raw replay or master role with an unspecified, loopback, multicast or broadcast `target_ip` (a slave's `0.0.0.0` means any master and is accepted) |
+| 400 | `invalid_proto_config` | `proto_config` fails the protocol's validation (also a re-run whose stored settings no longer validate; the message names the run) |
 | 400 | `pcap_unreadable`, `not_a_pcap` | The pcap does not load, or the upload is not a pcap |
 | 400 | `not_benchmark` | Analysis or compare on a raw-replay run |
 | 403 | `host_missing`, `host_not_allowed`, `cross_origin`, `origin_required` | [Host and Origin rule](#the-host-and-origin-rule) |
@@ -82,11 +84,13 @@ Every error has the same JSON shape, sometimes with extra fields:
 | 409 | `capture_unavailable` | `POST /api/runs/:id/analyze` and the run's capture failed (see the run's `warnings`) |
 | 409 | `analysis_missing` | Compare and a run has no stored analysis. Extra fields: `run_id`, `has_capture` |
 | 413 | `too_large` | Upload above the size cap |
-| 429 | `busy` | Too many heavy requests at once (analysis, upload, gap histogram); retry |
+| 429 | `busy` | Too many heavy requests at once (analysis, upload, gap histogram; inspect and run start wait up to 10 s and 30 s for a slot first); retry |
 | 500 | `internal` | Server error, including a caught handler panic |
 | 503 | `shutting_down` | The server is stopping |
 | 503 | `db_unavailable` | The run could not be recorded in the database |
-| 507 | `disk_full` | Free space in the state directory would drop below the reserve |
+| 503 | `arping_unavailable` | `POST /api/arp` or `/api/verify-ip` and `arping` cannot be run (install iputils-arping) |
+| 507 | `disk_full` | Free space in the state directory would drop below the reserve (checked before and while an upload streams) |
+| 507 | `quota_exceeded` | A library upload would exceed `--library-max-mb` (uploads in progress count) |
 | 507 | `write_failed` | Writing the upload failed |
 
 Multipart uploads that break off can also return `upload_aborted` with the status the multipart reader reported.
@@ -388,8 +392,8 @@ curl -s "$B/api/runs/12/compare/15?p99_increase_pct=10" | jq '.regressed, .regre
 | Route | Body | Result |
 |---|---|---|
 | `GET /api/nics` | | `[{name, mac, ipv4[], up, loopback, bridge, bridge_port, default_route}]`. `bridge_port` and `default_route` NICs are protected |
-| `POST /api/arp` | `{ip, iface?}` | `{ip, iface, mac, error}` via `arping` (default iface: the default-route NIC) |
-| `POST /api/verify-ip` | `{ip, iface?}` | `{ip, iface, in_use, locally_assigned, mac, error}`: whether an address is already taken, via the host's own addresses and `arping -D` |
+| `POST /api/arp` | `{ip, iface?}` | `{ip, iface, mac, error}` via `arping` (default iface: the default-route NIC); `error` only says there was no reply. 503 `arping_unavailable` when `arping` cannot be run |
+| `POST /api/verify-ip` | `{ip, iface?}` | `{ip, iface, in_use, locally_assigned, mac, error}`: whether an address is already taken, via the host's own addresses and `arping -D`. 503 `arping_unavailable` when `arping` cannot be run |
 
 `arping` comes from `iputils-arping`. Without it these routes return `error` instead of failing.
 
