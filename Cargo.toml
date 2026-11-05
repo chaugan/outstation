@@ -7,7 +7,6 @@ members = [
     "crates/raw_replay",
     "crates/sched",
     "crates/outstation",
-    "crates/tcp_session",
     "crates/protoplay",
     "crates/proto_iec104",
     "crates/proto_modbus_tcp",
