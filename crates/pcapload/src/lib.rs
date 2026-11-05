@@ -876,32 +876,46 @@ impl IngestBuilder {
         let is_syn_ack = flags & TCP_SYN != 0 && flags & TCP_ACK != 0;
 
         let existing = self.flow_key_to_idx.get(&canon).copied();
-        let split = existing.is_some_and(|idx| {
+        let mut split = false;
+        // Flow the segment joins when it does not split: normally the
+        // current one on the 4-tuple, but a stale segment of an earlier
+        // connection (a retransmit captured after the reconnect's SYN)
+        // goes back to that connection instead of splitting the new
+        // one apart (N16).
+        let mut target = existing;
+        if let Some(idx) = existing {
             let f = &self.flows[idx];
             let t = &self.tracks[idx];
             if is_syn {
-                // A fresh SYN after the connection closed, or with a
-                // different ISN, is a new connection. A retransmitted
-                // SYN (same ISN) is not.
-                f.saw_fin
+                // A fresh SYN after the connection closed, with a
+                // different ISN, or after data has flowed (a reconnect
+                // reusing a fixed ISN without FIN/RST, N17) is a new
+                // connection. A retransmitted SYN (same ISN, before any
+                // data) is not.
+                split = f.saw_fin
                     || f.saw_rst
-                    || match f.client_isn {
-                        Some(isn) => isn != seg.seq,
-                        None => t.payload_seen,
+                    || t.payload_seen
+                    || f.client_isn.is_some_and(|isn| isn != seg.seq);
+            } else if flags & TCP_SYN == 0 {
+                let cur = self.seq_dist(idx, dir, seg.seq);
+                if cur != Some(0) {
+                    match self.closest_earlier_flow(idx, dir, seg.seq) {
+                        // Closer to where an earlier connection left
+                        // off than to the current one.
+                        Some((prev, d)) if cur.is_none_or(|c| d < c) => target = Some(prev),
+                        // Sequence number nowhere near where this
+                        // direction left off: a different connection
+                        // whose handshake was not captured.
+                        _ => {
+                            split =
+                                flags & TCP_RST == 0 && cur.is_some_and(|c| c > SEQ_JUMP_NEW_FLOW);
+                        }
                     }
-            } else if flags & (TCP_RST | TCP_SYN) == 0 {
-                // Sequence number nowhere near where this direction
-                // left off: a different connection whose handshake was
-                // not captured.
-                t.next_seq[dir].is_some_and(|next| {
-                    (seg.seq.wrapping_sub(next) as i32).unsigned_abs() > SEQ_JUMP_NEW_FLOW
-                })
-            } else {
-                false
+                }
             }
-        });
+        }
 
-        let flow_idx = match existing {
+        let flow_idx = match target {
             Some(idx) if !split => idx,
             _ => {
                 let idx = self.flows.len();
@@ -987,6 +1001,34 @@ impl IngestBuilder {
             track.payload_seen = true;
         }
         (flow_idx, dir)
+    }
+
+    /// Distance of `seq` from where direction `dir` of flow `idx` left
+    /// off; `None` if that direction has not been seen.
+    fn seq_dist(&self, idx: usize, dir: usize, seq: u32) -> Option<u32> {
+        self.tracks[idx].next_seq[dir].map(|next| (seq.wrapping_sub(next) as i32).unsigned_abs())
+    }
+
+    /// Among the earlier flows on the same 4-tuple (following
+    /// `previous_on_tuple`, a few steps back), the one whose direction
+    /// `dir` left off closest to `seq`, if within
+    /// [`SEQ_JUMP_NEW_FLOW`], with that distance.
+    fn closest_earlier_flow(&self, idx: usize, dir: usize, seq: u32) -> Option<(usize, u32)> {
+        let mut best: Option<(usize, u32)> = None;
+        let mut prev = self.flows[idx].previous_on_tuple;
+        for _ in 0..8 {
+            let Some(p) = prev else { break };
+            if let Some(d) = self
+                .seq_dist(p, dir, seq)
+                .filter(|d| *d <= SEQ_JUMP_NEW_FLOW)
+            {
+                if best.is_none_or(|(_, b)| d < b) {
+                    best = Some((p, d));
+                }
+            }
+            prev = self.flows[p].previous_on_tuple;
+        }
+        best
     }
 
     fn finish(self, path: PathBuf, link_type: u32) -> LoadedPcap {
