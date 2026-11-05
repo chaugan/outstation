@@ -721,7 +721,9 @@ pub fn effective_iterations(n: u64) -> u64 {
 
 /// Merge a per-iteration [`protoplay::ProtoReport`] into an accumulator.
 /// Counters add, latency samples extend, error short-circuits.
-pub fn merge_proto_report(acc: &mut protoplay::ProtoReport, new: protoplay::ProtoReport) {
+pub fn merge_proto_report(acc: &mut protoplay::ProtoReport, mut new: protoplay::ProtoReport) {
+    acc.protocol
+        .merge(std::mem::take(&mut new.protocol), acc.messages_sent);
     acc.connected = acc.connected || new.connected;
     acc.messages_sent = acc.messages_sent.saturating_add(new.messages_sent);
     acc.messages_received = acc.messages_received.saturating_add(new.messages_received);
@@ -829,6 +831,7 @@ pub fn run_benchmark(
         client_mac: MacAddr,
         first_pkt_rel_ns: u64,
         payload: Vec<u8>,
+        capture_gaps: Vec<usize>,
         frame_times_ns: Vec<u64>,
     }
 
@@ -866,6 +869,7 @@ pub fn run_benchmark(
                     client_ip,
                     client_mac: src_info.src_mac,
                     first_pkt_rel_ns,
+                    capture_gaps: reassembled.gaps.iter().map(|g| g.offset).collect(),
                     payload: reassembled.payload,
                     frame_times_ns,
                 });
@@ -1019,6 +1023,7 @@ pub fn run_benchmark(
         let flow_idx = pick.flow_idx;
         let first_pkt_rel_ns = pick.first_pkt_rel_ns;
         let payload = std::mem::take(&mut pick.payload);
+        let capture_gaps = std::mem::take(&mut pick.capture_gaps);
         let frame_times_ns = std::mem::take(&mut pick.frame_times_ns);
         let replayer = Arc::clone(&replayer);
         let cfg_cloned = cfg.clone();
@@ -1147,6 +1152,7 @@ pub fn run_benchmark(
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
                         loop_iterations: 1,
+                        capture_gaps: capture_gaps.clone(),
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();
@@ -1278,6 +1284,7 @@ fn run_benchmark_slave(
         server_ip: Ipv4Addr,
         server_mac: MacAddr,
         payload: Vec<u8>,
+        capture_gaps: Vec<usize>,
         frame_times_ns: Vec<u64>,
     }
     let mut picks: Vec<SlavePick> = Vec::new();
@@ -1313,6 +1320,7 @@ fn run_benchmark_slave(
                     flow_idx: idx,
                     server_ip,
                     server_mac,
+                    capture_gaps: r.gaps.iter().map(|g| g.offset).collect(),
                     payload: r.payload,
                     frame_times_ns,
                 });
@@ -1418,6 +1426,7 @@ fn run_benchmark_slave(
         // straight into the worker, no clone (saves ~payload bytes
         // per session at large RTU counts).
         let payload = pick.payload;
+        let capture_gaps = pick.capture_gaps;
         let frame_times_ns = pick.frame_times_ns;
         let replayer = Arc::clone(&replayer);
         let cfg_cloned = cfg.clone();
@@ -1633,6 +1642,7 @@ fn run_benchmark_slave(
                         pacing: cfg_cloned.pacing,
                         frame_times_ns: (*frame_times_arc).clone(),
                         loop_iterations: run_loop_iterations,
+                        capture_gaps: capture_gaps.clone(),
                     };
                     let iter_report = replayer.run(run_cfg);
                     let had_error = iter_report.error.is_some();

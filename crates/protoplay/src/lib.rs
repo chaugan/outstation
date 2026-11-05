@@ -190,6 +190,13 @@ pub struct ProtoRunCfg {
     /// looping within one session is more spec-realistic than the
     /// outer "fresh handshake per iteration" model.
     pub loop_iterations: u64,
+    /// Byte offsets into the concatenated `client_segments` stream at
+    /// which the capture lost bytes (TCP reassembly gaps, see
+    /// `pcapload::ReassembledFlow::gaps`). The bytes on either side of
+    /// each offset were spliced together, so a protocol framer must
+    /// restart at every offset instead of reading a frame across it.
+    /// Empty = the stream is contiguous.
+    pub capture_gaps: Vec<usize>,
     // Note: protocol-specific knobs (e.g. IEC 104 CP56Time2a rewrite
     // settings, ASDU rewrite map) live inside `proto_config` JSON.
     // The protocol replayer parses what it needs from there.
@@ -207,9 +214,16 @@ pub struct ProtoReport {
     pub error: Option<String>,
 
     // --- benchmark stats ---
-    /// Raw per-message latency samples in microseconds, one entry per
-    /// client message whose matching server acknowledgement was seen.
-    /// Kept so the web UI can render a histogram.
+    /// Raw per-message **ack latency** samples in microseconds: the
+    /// time from writing a data message to receiving the peer's
+    /// protocol-level acknowledgement of it (IEC 104: the N(R) in an
+    /// S- or I-frame). The receive side is timestamped in the reader
+    /// thread when the frame arrives, not when the session loop gets
+    /// round to it. Note that this includes the peer's ack-deferral
+    /// policy (IEC 104 w / t2), so it is not a pure responsiveness
+    /// measure. One entry per message whose acknowledgement was seen.
+    /// Kept so the web UI can render a histogram. The `latency_*_us`
+    /// fields below are percentiles of these samples.
     pub latency_samples_us: Vec<u64>,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
@@ -225,6 +239,111 @@ pub struct ProtoReport {
     /// Messages still in flight (sent, not yet acknowledged) when the
     /// session ended.
     pub unacked_at_end: u64,
+    /// Protocol-level conformance and session-behaviour detail
+    /// (violations, synthesized frames, stripped capture frames, idle
+    /// time). Protocols that do not track these leave it at default.
+    pub protocol: ProtocolStats,
+}
+
+/// Cap on [`ProtocolStats::protocol_errors`] entries kept per session.
+pub const PROTOCOL_ERRORS_CAP: usize = 64;
+/// Cap on [`ProtocolStats::synthesized_send_indices`] entries.
+pub const SYNTHESIZED_INDICES_CAP: usize = 100_000;
+
+/// One protocol violation or protocol-level failure seen on a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolError {
+    /// Milliseconds since the connection was established.
+    pub at_ms: u64,
+    /// Short machine-readable class, e.g. `"ns_mismatch"`,
+    /// `"nr_out_of_window"`, `"malformed_frame"`, `"t1_timeout"`,
+    /// `"unexpected_u_frame"`.
+    pub kind: String,
+    /// Human-readable detail (expected vs. received values).
+    pub detail: String,
+    /// True if the session closed the connection because of it.
+    pub fatal: bool,
+}
+
+/// Protocol-level session detail reported next to the generic
+/// counters in [`ProtoReport`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ProtocolStats {
+    /// Number of protocol violations by the peer (sequence-number
+    /// errors, malformed frames, unexpected control frames) plus
+    /// protocol timer expiries. Every one is counted even when
+    /// `protocol_errors` is capped.
+    pub protocol_violations: u64,
+    /// Detail for the first [`PROTOCOL_ERRORS_CAP`] violations.
+    pub protocol_errors: Vec<ProtocolError>,
+    /// Data messages the replayer generated itself (IEC 104 slave:
+    /// GI/CI responses) rather than replaying from the capture. They
+    /// are included in `messages_sent`.
+    pub synthesized_frames: u64,
+    /// 0-based index, among all data messages sent on this session
+    /// (`messages_sent` order), of each synthesized message, so the
+    /// analyzer can tell them apart from replayed ones. Capped at
+    /// [`SYNTHESIZED_INDICES_CAP`]. When reports from several
+    /// connections are merged, indices are offset by the earlier
+    /// sessions' `messages_sent`.
+    pub synthesized_send_indices: Vec<u64>,
+    /// Application-level response time in microseconds: from receiving
+    /// a command the replayer answers itself (IEC 104 slave: GI/CI
+    /// activation) to sending the first response frame (ActCon).
+    pub command_response_us: Vec<u64>,
+    /// Captured frames removed from the replay script because the
+    /// replayer synthesizes their equivalent live (IEC 104 slave:
+    /// captured GI/CI ActCon, Inrogen/Reqcogen data and ActTerm).
+    pub stripped_capture_frames: u64,
+    /// Number of capture gaps in the replayed stream.
+    pub capture_gaps: u64,
+    /// Bytes of the captured stream that did not frame (leading
+    /// partial frame, bytes around capture gaps, truncated tail).
+    pub script_skipped_bytes: u64,
+    /// Captured frames that straddled a capture gap and were dropped
+    /// instead of being sent corrupted.
+    pub script_dropped_frames: u64,
+    /// Time spent serving the peer after the captured script ended
+    /// (IEC 104 slave idle-serve phase), in milliseconds.
+    pub idle_serve_ms: u64,
+    /// Standalone acknowledgement frames sent (IEC 104 S-frames).
+    pub acks_sent: u64,
+    /// Keep-alive probes sent (IEC 104 TESTFR act after t3 idle).
+    pub keepalives_sent: u64,
+}
+
+impl ProtocolStats {
+    /// Fold `other` (a later connection of the same session slot) into
+    /// `self`. `send_offset` is the number of data messages already
+    /// accounted in `self`'s report, used to rebase
+    /// `synthesized_send_indices`.
+    pub fn merge(&mut self, other: ProtocolStats, send_offset: u64) {
+        self.protocol_violations += other.protocol_violations;
+        let room = PROTOCOL_ERRORS_CAP.saturating_sub(self.protocol_errors.len());
+        self.protocol_errors
+            .extend(other.protocol_errors.into_iter().take(room));
+        self.synthesized_frames += other.synthesized_frames;
+        let room = SYNTHESIZED_INDICES_CAP.saturating_sub(self.synthesized_send_indices.len());
+        self.synthesized_send_indices.extend(
+            other
+                .synthesized_send_indices
+                .into_iter()
+                .take(room)
+                .map(|i| i + send_offset),
+        );
+        self.command_response_us.extend(other.command_response_us);
+        // Script-level figures are identical for every connection of
+        // the same slot, so keep one copy rather than summing.
+        self.stripped_capture_frames = self
+            .stripped_capture_frames
+            .max(other.stripped_capture_frames);
+        self.capture_gaps = self.capture_gaps.max(other.capture_gaps);
+        self.script_skipped_bytes = self.script_skipped_bytes.max(other.script_skipped_bytes);
+        self.script_dropped_frames = self.script_dropped_frames.max(other.script_dropped_frames);
+        self.idle_serve_ms += other.idle_serve_ms;
+        self.acks_sent += other.acks_sent;
+        self.keepalives_sent += other.keepalives_sent;
+    }
 }
 
 impl ProtoReport {

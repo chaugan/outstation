@@ -27,9 +27,11 @@
 //! bytes skipped are reported on the yielded [`Frame`] (`skipped`) and
 //! in the iterator's running totals.
 //!
-//! The live-socket reader ([`crate::apdu::ApduReader`]) uses the same
-//! [`classify`] rules but cannot look ahead past the current frame, so
-//! it does not apply the boundary rule.
+//! The live-socket reader ([`crate::apdu::ApduReader::strict`]) uses
+//! the same [`classify`] rules. It cannot look ahead past the current
+//! frame, so it applies the boundary rule when the next frame arrives:
+//! anything but a 0x68 where a frame should start is a framing error,
+//! not something to skip.
 
 use crate::apdu::{
     Apdu, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT, U_STARTDT_CON, U_STOPDT_ACT,
