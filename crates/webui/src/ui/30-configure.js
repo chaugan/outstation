@@ -65,6 +65,10 @@ function loadForm() {
 // ---------------------------------------------------------------------------
 // Visibility of mode / role / protocol specific fields.
 
+// Gateway fields are sent (and validated) only in slave role.
+const gatewayAllowed = c => c.mode === 'benchmark' && c.role === 'slave';
+const gatewayOn = c => gatewayAllowed(c) && el('cfg-scada-gw').checked;
+
 function applyVisibility() {
   const c = cfg();
   for (const n of qsa('#run-form [data-mode], #run-form [data-role], #run-form [data-proto]')) {
@@ -87,6 +91,11 @@ function applyVisibility() {
     setText(hint, 'The SCADA master connects in to our listeners; this is informational.');
   }
   setText(el('rtu-title'), c.role === 'slave' ? 'RTUs to simulate' : 'Masters to replay');
+  // SCADA-gateway mode is slave-only (the server answers 400
+  // gateway_requires_slave): kept but disabled, with the reason.
+  const gwOff = !gatewayAllowed(c);
+  el('scada-gw-fields').disabled = gwOff;
+  el('scada-gw-note').hidden = !gwOff;
   renderPicker();
   renderStartSummary();
 }
@@ -422,7 +431,7 @@ function validators() {
       v['cfg-fault-seed'] = faultSeedError;
       v['fault-editor'] = faultEditorError;
     }
-    if (val('cfg-scada-gw')) {
+    if (gatewayOn(c)) {
       v['cfg-scada-gw-ip'] = () => { const ip = val('cfg-scada-gw-ip'); return !ip ? 'Enter the gateway IP, or turn off gateway mode.' : (isIPv4(ip) ? '' : `"${ip}" is not an IPv4 address.`); };
       v['cfg-scada-gw-iface'] = () => (val('cfg-scada-gw-iface') ? '' : 'Select the inner NIC, or turn off gateway mode.');
     }
@@ -519,7 +528,7 @@ function buildBody(force) {
       body.loop_within_session = el('cfg-loop-within-session').checked;
       body.alias_iface = val('cfg-alias-iface') || null;
     }
-    if (el('cfg-scada-gw').checked) {
+    if (gatewayOn(c)) {
       body.scada_gateway_ip = val('cfg-scada-gw-ip');
       body.scada_gateway_iface = val('cfg-scada-gw-iface');
       body.upstream_nat_iface = val('cfg-scada-upstream') || null;
@@ -662,7 +671,8 @@ function applyPreset(name) {
   applyVisibility();
   saveForm();
   const st = el('preset-status');
-  setText(st, `${pr.title}: ${pr.what}. Your capture, addresses, NICs, link parameters and fault plan are unchanged.`);
+  const gwNote = pr.role === 'master' && el('cfg-scada-gw').checked ? ' SCADA-gateway mode is not used: it works in slave role only.' : '';
+  setText(st, `${pr.title}: ${pr.what}. Your capture, addresses, NICs, link parameters and fault plan are unchanged.${gwNote}`);
   announce(`${pr.title} preset applied`);
 }
 

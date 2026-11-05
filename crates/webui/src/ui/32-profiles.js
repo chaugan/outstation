@@ -100,6 +100,10 @@ function applyRequestToForm(req) {
   setField('cfg-scada-gw-iface', req.scada_gateway_iface || '');
   setField('cfg-scada-upstream', req.upstream_nat_iface || '');
   if (gw) el('scada-gw-card').open = true;
+  const gwSet = gw || !!req.scada_gateway_iface || !!req.upstream_nat_iface;
+  if (gwSet && mode === 'benchmark' && role === 'master') {
+    notes.push('Its SCADA-gateway settings are kept but not sent: gateway mode works in slave role only.');
+  }
   applyProtoConfigToForm(req.proto_config);
   // The override is never loaded: it must be chosen again, every time.
   el('cfg-force').checked = false;
