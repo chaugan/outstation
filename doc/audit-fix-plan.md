@@ -166,7 +166,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Command and fault report sections (`commands[]`, `negative_confirmations`, `faults_injected`, `fault_reaction`, the analyzer's `faults` dimension), plus configuration editors for `commands` and `faults` under advanced IEC 104.
   - Health detail from `degraded_detail`, and a link to `/metrics`.
 
-- [~] **T18b Root-cause the flaky slave LAN e2e test.** It failed 1 in 11 runs, right after the bench suite.
+- [x] **T18b Root-cause the flaky slave LAN e2e test.** It failed 1 in 11 runs, right after the bench suite.
 
 ## Wave 4: docs, privileged validation, final audit
 
@@ -315,3 +315,8 @@ F000 T05 · F001 T05 · F002 T05 · F003 T05 · F004 T05 · F005 T05 · F006 T05
   - Two runs: 9 PASS + 1 XFAIL each.
   - Stale root scripts removed.
   - Raw-capture bugs and behaviour issues logged as T16b.
+- 2026-11-05: T18b merged. Workspace tests: 408 passed, 2 runs green.
+  - Root cause 1, a product bug: the capture socket buffer overflowed under CPU load, losing frames in master and slave captures alike.
+  - Fixes: a 32 MiB SO_RCVBUF, the outgoing copy on `lo` dropped in BPF, the slave capture at RT priority, and the queue drained on stop. A new `captured_dropped` field is surfaced in reports, warnings and analysis notes.
+  - Root cause 2: the test mistook a TCP retransmission for a double capture; it now compares frames byte-for-byte.
+  - Under a load of about 30 on 12 cores: 30/30 runs, and 6/6 back-to-back rounds of all three privileged suites.
