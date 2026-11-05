@@ -544,6 +544,7 @@
   .run.completed::before  { background: var(--ok); }
   .run.failed::before     { background: var(--err); }
   .run.stopped::before    { background: var(--warn); }
+  .run.partial::before    { background: var(--warn); }
   .run .head {
     display: flex;
     align-items: center;
@@ -579,6 +580,12 @@
   .run .head .status.completed { color: var(--ok); }
   .run .head .status.stopped { color: var(--warn); }
   .run .head .status.failed { color: var(--err); }
+  .run .head .status.partial { color: var(--warn); }
+  /* T04: minimal "someone else started/stopped a run" banner; T07 polishes. */
+  #run-banner { display:none; margin: 8px 0; padding: 6px 10px; border: 1px solid var(--warn);
+    color: var(--ink-2); font-family: var(--mono); font-size: 12px; }
+  #run-banner.on { display:flex; gap: 8px; align-items: center; }
+  #run-banner button { margin-left: auto; }
   .run .submeta {
     font-family: var(--mono);
     font-size: 10px;
@@ -1496,6 +1503,7 @@
   <div class="v" id="version">—</div>
   <div class="host"><span class="ok-dot"></span><span id="host-label">—</span></div>
 </header>
+<div id="run-banner" role="status" aria-live="polite"><span id="run-banner-text"></span><button onclick="el('run-banner').classList.remove('on')">dismiss</button></div>
 
 <!-- ================ library ================ -->
 <section class="section">
@@ -1532,7 +1540,7 @@
         <div class="selected-box" id="selected-box">
           <span class="empty" id="selected-label">no pcap selected &mdash; pick one from the library above</span>
         </div>
-        <div class="raw-hatch">
+        <div class="raw-hatch" style="display:none">
           <label>raw path</label>
           <input id="raw-path" type="text" placeholder="/absolute/path/to/file.pcap" spellcheck="false">
           <button onclick="inspectRaw()">inspect</button>
@@ -1835,8 +1843,11 @@ const fmtUtcShort = ms => {
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth()+1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}Z`;
 };
 
+// Per-tab id echoed by the server in run events, so the banner can
+// tell this tab's own actions from someone else's.
+const CLIENT_ID = 'tab-' + Math.random().toString(36).slice(2, 10);
 async function api(path, method='GET', body=null) {
-  const opts = { method, headers: {} };
+  const opts = { method, headers: { 'X-Client-Id': CLIENT_ID } };
   if (body) { opts.headers['Content-Type'] = 'application/json'; opts.body = JSON.stringify(body); }
   const r = await fetch(path, opts);
   const text = await r.text();
@@ -2040,7 +2051,13 @@ function collectSelectedRtus() {
 
 async function deletePcap(id) {
   if (!confirm('delete this pcap?')) return;
-  await api(`/api/pcaps/${id}`, 'DELETE');
+  let res = await api(`/api/pcaps/${id}`, 'DELETE');
+  if (res.status === 409 && res.data && res.data.code === 'pcap_in_use') {
+    const ids = (res.data.runs || []).map(r => '#' + r).join(', ');
+    if (!confirm(`Runs ${ids} use this pcap. Their gap histograms and analysis will stop working. Delete anyway?`)) return;
+    res = await api(`/api/pcaps/${id}?force=1`, 'DELETE');
+  }
+  if (!res.ok) alert(`Delete failed: ${(res.data && res.data.error) || res.status}`);
   if (selectedPcapId === id) selectedPcapId = null;
   updateSelectedLabel();
   refreshLibrary();
@@ -2312,8 +2329,8 @@ async function startRun() {
     const up = el('run-scada-upstream').value.trim();
     if (up) body.upstream_nat_iface = up;
   }
+  // The server accepts library ids only (raw paths are rejected).
   if (selectedPcapId) body.pcap_id = selectedPcapId;
-  else body.pcap = selectedRawPath;
   const sel = collectSelectedRtus();
   if (sel.length > 0) body.selected_rtus = sel;
 
@@ -2528,6 +2545,11 @@ async function refreshRuns() {
     return;
   }
   const runs = res.data || [];
+  // /api/runs is a slim summary; fetch the full record for the expanded run.
+  if (currentDetailId != null && runs.some(r => r.id === currentDetailId)) {
+    const d = await api(`/api/runs/${currentDetailId}`);
+    if (d.ok) runDetailCache[currentDetailId] = d.data;
+  }
   const running = runs.filter(r => r.status === 'running').length;
   meta.textContent = runs.length ? `${runs.length} total · ${running} running` : '—';
   if (!runs.length) {
@@ -2616,7 +2638,7 @@ async function refreshRuns() {
     if (r.status === 'running') {
       actions.push(`<button class="stop" onclick="stopRun(${r.id})">STOP</button>`);
     }
-    if ((r.report && r.report.capture_path) || (r.benchmark && r.benchmark.capture_path)) {
+    if (r.has_capture) {
       actions.push(`<a href="/api/runs/${r.id}/download" download>DOWNLOAD CAPTURE</a>`);
     }
     actions.push(`<button onclick="toggleDetail(${r.id})">${currentDetailId === r.id ? 'HIDE DETAILS' : 'DETAILS'}</button>`);
@@ -2626,7 +2648,7 @@ async function refreshRuns() {
     h += `<div class="actions-inline">${actions.join('')}</div>`;
 
     if (currentDetailId === r.id) {
-      h += renderDetail(r);
+      h += renderDetail(runDetailCache[r.id] || r);
     }
     h += `</div>`;
   }
@@ -2660,6 +2682,7 @@ function syncDiagramVisibility() {
   }
 }
 
+const runDetailCache = {};
 function toggleDetail(id) {
   currentDetailId = currentDetailId === id ? null : id;
   refreshRuns();
@@ -2686,7 +2709,7 @@ function renderDetail(r) {
   }
   if (r.benchmark) {
     const b = r.benchmark;
-    h += `<div class="k">sessions</div><div class="v">${b.per_session.length}</div>`;
+    h += `<div class="k">sessions</div><div class="v">${(b.per_session || []).length}</div>`;
     h += `<div class="k">messages</div><div class="v">${b.total_messages_sent} sent &middot; ${b.total_messages_received} recv</div>`;
     h += `<div class="k">throughput</div><div class="v">${fmt(b.aggregate_throughput_msgs_per_sec)} msg/s</div>`;
     h += `<div class="k">latency (µs)</div><div class="v">min ${b.aggregate_latency_min_us} &middot; p50 ${b.aggregate_latency_p50_us} &middot; p90 ${b.aggregate_latency_p90_us} &middot; p99 ${b.aggregate_latency_p99_us} &middot; max ${b.aggregate_latency_max_us}</div>`;
@@ -2737,11 +2760,11 @@ function renderDetail(r) {
     h += `</table>`;
 
     h += `<h3>latency distribution</h3>`;
-    h += latencyChart(`lat-agg-${r.id}`, r.benchmark.aggregate_latency_samples_us, r.benchmark.aggregate_latency_p50_us, r.benchmark.aggregate_latency_p99_us);
+    h += latencyChart(`lat-agg-${r.id}`, r.benchmark.aggregate_latency_histogram, r.benchmark.aggregate_latency_p50_us, r.benchmark.aggregate_latency_p99_us);
   }
 
   // gap histogram
-  if ((r.report && r.report.capture_path) || (r.benchmark && r.benchmark.capture_path)) {
+  if (r.has_capture) {
     h += `<h3>inter-packet gap distribution</h3>`;
     const cached = gapCache[r.id];
     if (cached && cached !== 'loading') {
@@ -2852,22 +2875,24 @@ function gapChart(uid, data) {
 }
 
 // latency histogram — samples µs → 20 log buckets
-function latencyChart(uid, samples, p50, p99) {
-  if (!samples || !samples.length) return '<div class="lib-empty">no samples</div>';
-  const n = 20;
+function latencyChart(uid, hist, p50, p99) {
+  // `hist` is the server's pre-binned, session-weighted histogram:
+  // {log10_min_us, log10_max_us, counts[], underflow, overflow, total}.
+  if (!hist || !hist.total) return '<div class="lib-empty">no samples</div>';
+  const counts = hist.counts.slice();
+  counts[0] += hist.underflow || 0;
+  const binsMain = counts.length;
+  if (hist.overflow) counts.push(hist.overflow);
+  const n = counts.length;
   const w = 680, h = 200;
   const padL = 44, padR = 20, padT = 16, padB = 34;
   const innerW = w - padL - padR;
   const innerH = h - padT - padB;
-  const logMin = 1;          // 10 µs
-  const logMax = 6;          // 1 s
-  const buckets = new Array(n).fill(0);
-  const bucketOf = v => {
-    if (v <= 0) return 0;
-    const l = Math.log10(v);
-    return Math.max(0, Math.min(n-1, Math.floor(((l - logMin) / (logMax - logMin)) * n)));
-  };
-  for (const v of samples) buckets[bucketOf(v)]++;
+  const logMin = hist.log10_min_us;
+  // Extend the axis by one bin width when there is an overflow bar.
+  const logMaxMain = hist.log10_max_us;
+  const logMax = logMaxMain + (n - binsMain) * (logMaxMain - logMin) / binsMain;
+  const buckets = counts;
   const max = Math.max(1, ...buckets);
   const bw = innerW / n;
 
@@ -2896,13 +2921,12 @@ function latencyChart(uid, samples, p50, p99) {
   svg += markerAt(p99, 'var(--accent)', 'p99');
 
   svg += `<line x1="${padL}" y1="${padT + innerH}" x2="${w-padR}" y2="${padT + innerH}" stroke="var(--ink)" stroke-width="1"/>`;
-  const xTicks = [
-    { frac: 0, label: '10 µs' },
-    { frac: 0.4, label: '1 ms' },
-    { frac: 0.6, label: '10 ms' },
-    { frac: 0.8, label: '100 ms' },
-    { frac: 1, label: '1 s' },
-  ];
+  const tickLabel = l => l < 3 ? `${Math.round(Math.pow(10, l))} µs` : (l < 6 ? `${Math.round(Math.pow(10, l - 3))} ms` : `${Math.round(Math.pow(10, l - 6))} s`);
+  const xTicks = [];
+  for (let l = Math.ceil(logMin); l <= logMaxMain; l++) {
+    xTicks.push({ frac: (l - logMin) / (logMax - logMin), label: tickLabel(l) });
+  }
+  if (n > binsMain) xTicks.push({ frac: 1, label: `>${tickLabel(logMaxMain)}` });
   for (const t of xTicks) {
     const x = padL + t.frac * innerW;
     svg += `<line x1="${x}" y1="${padT + innerH}" x2="${x}" y2="${padT + innerH + 4}" stroke="var(--dim)" stroke-width="1"/>`;
@@ -2911,14 +2935,14 @@ function latencyChart(uid, samples, p50, p99) {
   }
   svg += `</svg>`;
 
-  latencyDataByUid[uid] = { buckets, logMin, logMax };
+  latencyDataByUid[uid] = { buckets, logMin, logMax, overflowIdx: n > binsMain ? binsMain : -1 };
   return `
     <div class="chart-wrap">
       <div class="legend">
         <span><span class="swatch" style="background:var(--blue);opacity:0.85"></span>latency samples</span>
         <span><span class="swatch" style="background:var(--ok)"></span>p50</span>
         <span><span class="swatch" style="background:var(--accent)"></span>p99</span>
-        <span class="muted" style="margin-left:auto">${samples.length.toLocaleString()} samples</span>
+        <span class="muted" style="margin-left:auto">${hist.total.toLocaleString()} msgs (weighted)</span>
       </div>
       ${svg}
     </div>
@@ -2962,10 +2986,12 @@ document.addEventListener('mousemove', e => {
     html = `<b>${nsRange(lo, hi)}</b><br>original: ${d.original[idx]}<br>replay: ${d.captured[idx]}`;
   } else if (latencyDataByUid[uid]) {
     const d = latencyDataByUid[uid];
-    const n = 20;
+    const n = d.buckets.length;
     const lo = Math.pow(10, d.logMin + (idx / n) * (d.logMax - d.logMin));
     const hi = Math.pow(10, d.logMin + ((idx+1) / n) * (d.logMax - d.logMin));
-    html = `<b>${usRange(lo, hi)}</b><br>${d.buckets[idx]} samples`;
+    html = idx === d.overflowIdx
+      ? `<b>&ge; ${usRange(lo, lo).split(' – ')[0]}</b><br>${d.buckets[idx]} msgs`
+      : `<b>${usRange(lo, hi)}</b><br>${d.buckets[idx]} msgs`;
   }
   if (html) showTip(html, e.clientX + window.scrollX, e.clientY + window.scrollY);
 });
@@ -3993,9 +4019,9 @@ function renderDiagramStats(frame) {
 
 async function pickDiagramRun() {
   // Subscribe the live diagram to the most recent running run, if any.
-  const res = await api('/api/runs');
+  const res = await api('/api/runs?status=running');
   if (!res.ok) return null;
-  const running = (res.data || []).find(r => r.status === 'running');
+  const running = (res.data || [])[0];
   return running ? running.id : null;
 }
 
@@ -4185,7 +4211,28 @@ function schedulePoll() {
   }, delay);
 }
 
+// Run lifecycle events (SSE). Shows a banner when another client starts
+// or stops a run; T07 will polish this.
+function startRunEvents() {
+  if (!window.EventSource) return;
+  const es = new EventSource('/api/events');
+  const show = (ev) => {
+    let d; try { d = JSON.parse(ev.data); } catch { return; }
+    refreshRuns();
+    if (d.client_id && d.client_id === CLIENT_ID) return;
+    if (ev.type === 'run_finished') return;
+    const t = new Date(d.time * 1000).toLocaleTimeString();
+    const verb = ev.type === 'run_started' ? 'was started' : 'was stopped';
+    el('run-banner-text').textContent = `Run #${d.run_id} ${verb} by ${d.client_ip} at ${t}`;
+    el('run-banner').classList.add('on');
+  };
+  es.addEventListener('run_started', show);
+  es.addEventListener('run_stopped', show);
+  es.addEventListener('run_finished', show);
+}
+
 loadStatus();
+startRunEvents();
 loadProtocols();
 loadNics();
 refreshLibrary();

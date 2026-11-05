@@ -92,6 +92,8 @@ impl RoleHint {
 #[serde(rename_all = "snake_case")]
 pub enum RunStatusHint {
     Completed,
+    /// Finished, but some (not all) sessions reported an error.
+    Partial,
     /// Stopped by the user: a truncated final iteration is expected.
     Stopped,
     Failed,
@@ -203,9 +205,6 @@ pub struct AnalysisReport {
 /// to persist with the run and to send on every poll. Serialize it as
 /// JSON and store it as text; fetch details separately by endpoint
 /// key (`SlaveSummary::slave_ip`).
-// Not yet called outside tests: T04 persists the summary and serves
-// details lazily.
-#[cfg_attr(not(test), allow(dead_code))]
 #[derive(Serialize, Debug, Clone)]
 pub struct AnalysisSummary {
     pub run_id: u64,
@@ -233,7 +232,6 @@ pub struct AnalysisSummary {
 }
 
 impl AnalysisReport {
-    #[cfg_attr(not(test), allow(dead_code))]
     /// Split into the persistable summary and the per-endpoint detail
     /// map (keyed like `SlaveSummary::slave_ip`).
     pub fn split(self) -> (AnalysisSummary, BTreeMap<String, SlaveDetail>) {
@@ -800,22 +798,40 @@ fn apply_run_status(
     reason: String,
     notes: &mut Vec<String>,
 ) -> (&'static str, String, Option<String>) {
-    let warning = match (run.status, run.messages_sent) {
-        (RunStatusHint::Failed, _) => Some(format!(
-            "the run being analysed FAILED{}",
-            run.error
-                .as_ref()
-                .map(|e| format!(": {e}"))
-                .unwrap_or_default()
-        )),
-        (_, Some(0)) => Some("the run being analysed sent 0 messages".to_string()),
-        (RunStatusHint::Running, _) => Some("the run being analysed is still running".to_string()),
-        _ => None,
+    // (warning, whether it blocks certification)
+    let (warning, blocks) = match (run.status, run.messages_sent) {
+        (RunStatusHint::Failed, _) => (
+            Some(format!(
+                "the run being analysed FAILED{}",
+                run.error
+                    .as_ref()
+                    .map(|e| format!(": {e}"))
+                    .unwrap_or_default()
+            )),
+            true,
+        ),
+        (_, Some(0)) => (
+            Some("the run being analysed sent 0 messages".to_string()),
+            true,
+        ),
+        (RunStatusHint::Running, _) => (
+            Some("the run being analysed is still running".to_string()),
+            true,
+        ),
+        // Session errors are judged per endpoint from the capture.
+        (RunStatusHint::Partial, _) => (
+            Some("some sessions of the run being analysed reported errors".to_string()),
+            false,
+        ),
+        _ => (None, false),
     };
     let Some(w) = warning else {
         return (verdict, reason, None);
     };
     notes.insert(0, format!("WARNING: {w}"));
+    if !blocks {
+        return (verdict, reason, Some(w));
+    }
     if verdict == "all_correct" || verdict == "inconclusive" {
         (
             "run_failed",
@@ -1948,6 +1964,14 @@ mod tests {
             apply_run_status(&running, "all_correct", "x".into(), &mut notes).0,
             "run_failed"
         );
+        let partial = RunInfo {
+            status: RunStatusHint::Partial,
+            messages_sent: Some(10),
+            ..Default::default()
+        };
+        let (v, _, w) = apply_run_status(&partial, "all_correct", "x".into(), &mut notes);
+        assert_eq!(v, "all_correct");
+        assert!(w.is_some());
     }
 
     #[test]
