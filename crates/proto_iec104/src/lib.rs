@@ -20,7 +20,11 @@ pub mod analysis;
 pub mod apci;
 pub mod apdu;
 pub mod asdu;
+pub mod interrogation;
 pub mod inventory;
+mod link;
+#[cfg(test)]
+mod mockpeer;
 pub mod responder;
 pub mod session;
 

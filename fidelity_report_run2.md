@@ -1,5 +1,13 @@
 # outstation — playback fidelity report
 
+> **Errata (2026-11-05, audit finding F068).** Several statements below describe checks that outstation's post-run analyser does **not** perform. Read them as the author's observations, not as analyser output:
+>
+> - **§2 "No protocol errors, no out-of-window frames, no t1/t2/t3 timer violations were reported by the analyser."** The analyser has no k/w window check, no t2 or t3 check, no N(S)/N(R) continuity check and no STOPDT or session-close check. Its only timer constant is t1, used to judge GI/CI ActCon delay. "Nothing reported" here means "not checked".
+> - **§2 "Session close: clean FIN / RST after STOPDT"** and the bullet list of state-machine behaviour (STARTDT_CON reply, TESTFR_CON replies, S-frame window handling, clean teardown). The analyser checks only that the master sent STARTDT_ACT. None of the other items is verified.
+> - **§1 "indistinguishable" / §5 "full protocol correctness".** The score in this report counted type-ID matches, not frame content. Since T06 the score counts byte-identical frames (plus CP56-only differences within tolerance when timestamp rewriting is on), so this claim was not backed by the score at the time it was written.
+> - **§3 timing.** The analyser at the time paired frames by index and judged pacing as "matched" anywhere between 0.5x and 2x. The timing figures are raw measurements, not a pass/fail check.
+> - **Score.** This report predates the GI/CI synthesis filter (commit f9bee86). The source script carried C_IC_NA_1 frames, which that filter removed from the delivered side only (F012, F059), so under the analyser as it stood before T06 the same capture would most likely not have scored 100 %. The current analyser has not been re-run against this capture, so this report should be regenerated before it is cited.
+
 **Run ID:** 2
 **Pcap under test:** `synth_iec104_rtus200_lan10.pcap` (SHA-256 `61c897f8…96938d`, 200 synthetic RTUs)
 **RTU analysed:** `192.168.10.2:2404` (single flow out of 200, selected by the master during the captured session)

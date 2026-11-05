@@ -991,6 +991,38 @@ async fn analyze_temp_file_removed_on_error_and_success() {
     assert_eq!(v["run_selection"], "explicit");
     assert_eq!(v["warnings"], json!([]));
     assert!(h.files_in("state/tmp").is_empty());
+
+    // T06 / F067: the analysis is stored; summary and per-endpoint
+    // details are fetched separately.
+    let aid = v["analysis_id"].as_u64().expect("analysis_id");
+    let endpoint = v["slaves"][0]["slave_ip"].as_str().unwrap().to_string();
+    let (s, list) = h.call(Method::GET, "/api/runs/1/analyses", None).await;
+    assert_eq!(s, StatusCode::OK, "{list}");
+    assert_eq!(list[0]["id"], aid);
+    assert_eq!(list[0]["verdict"], v["verdict"]);
+    let (s, summary) = h
+        .call(Method::GET, &format!("/api/analyses/{aid}"), None)
+        .await;
+    assert_eq!(s, StatusCode::OK, "{summary}");
+    assert_eq!(summary["verdict"], v["verdict"]);
+    assert!(summary.get("details_by_ip").is_none());
+    let (s, detail) = h
+        .call(
+            Method::GET,
+            &format!("/api/analyses/{aid}/endpoints/{endpoint}"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::OK, "{detail}");
+    assert_eq!(detail["verdict"], v["details_by_ip"][&endpoint]["verdict"]);
+    let (s, _) = h
+        .call(
+            Method::GET,
+            &format!("/api/analyses/{aid}/endpoints/192.0.2.1"),
+            None,
+        )
+        .await;
+    assert_eq!(s, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
@@ -1016,7 +1048,10 @@ async fn analyze_warns_when_run_sent_nothing() {
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["run_selection"], "latest");
     let w = v["warnings"].to_string();
-    assert!(w.contains("failed"), "{w}");
+    assert!(w.to_lowercase().contains("failed"), "{w}");
+    // F093: a failed run can never be certified.
+    assert_ne!(v["verdict"], "all_correct", "{v}");
+    assert!(v["run_warning"].is_string(), "{v}");
     assert!(h.files_in("state/tmp").is_empty());
 }
 
