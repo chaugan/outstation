@@ -144,7 +144,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   4. Stale `listen_port_base + n − 1 ≤ 65535` check, although every slave shares one port on its own IP.
   5. Analysing a run that sent 0 messages gives a `partial` verdict rather than a clear failure or inconclusive result.
 
-- [ ] **T12b Fault and command caveats** (from the T11/T12 lane).
+- [~] **T12b Fault and command caveats** (from the T11/T12 lane).
   - With `return_info` on, captured COT 11/12 return-information frames are still replayed next to the live ones; strip them when echo plus return info is on.
   - GI after a command with return info can be judged non-compliant, because the analyzer's inventory comes from the capture. Track the command-updated values in the audit.
 
