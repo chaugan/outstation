@@ -88,15 +88,83 @@ pub(crate) struct UploadLimits {
     /// Bytes that may be written before free space in the state dir
     /// drops below the reserve, measured when the upload started.
     disk_budget: Option<u64>,
-    /// Bytes left under the library quota, for library uploads.
-    quota_left: Option<u64>,
+    /// This upload's share of the library quota, for library uploads.
+    quota: Option<QuotaReservation>,
     state_dir: PathBuf,
     min_free: u64,
 }
 
-/// Re-measure free space every this many bytes of an upload, so
-/// concurrent writers (a run capture) are noticed too.
+/// Re-measure free space (and re-scan the library for the quota) every
+/// this many bytes of an upload, so concurrent writers are noticed too.
 const FREE_RECHECK_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Library quota bookkeeping shared by all uploads (F051). `committed`
+/// is the size of the finished pcaps in the library (re-scanned at the
+/// start of each upload and every [`FREE_RECHECK_BYTES`]); `reserved`
+/// is what in-flight uploads have written so far. Every reservation
+/// is checked and taken under the one lock, so concurrent uploads can
+/// never together exceed the quota.
+#[derive(Debug, Default)]
+pub(crate) struct QuotaBook {
+    committed: u64,
+    reserved: u64,
+}
+
+impl QuotaBook {
+    /// Bytes reserved by uploads in progress.
+    #[cfg(test)]
+    pub(crate) fn reserved_bytes(&self) -> u64 {
+        self.reserved
+    }
+}
+
+/// One upload's reservation; released on drop (error, abort) unless
+/// [`QuotaReservation::commit`] moved it into `committed`.
+pub(crate) struct QuotaReservation {
+    book: std::sync::Arc<std::sync::Mutex<QuotaBook>>,
+    dir: PathBuf,
+    quota: u64,
+    held: u64,
+}
+
+impl QuotaReservation {
+    /// Grow the reservation by `n` bytes, or refuse. `rescan` refreshes
+    /// the committed size from the library directory first.
+    fn reserve(&mut self, n: u64, rescan: bool) -> Result<(), AppError> {
+        let mut b = self.book.lock_safe();
+        if rescan {
+            b.committed = library_bytes(&self.dir);
+        }
+        let used = b.committed.saturating_add(b.reserved);
+        if used.saturating_add(n) > self.quota {
+            return Err(quota_exceeded(used, self.quota));
+        }
+        b.reserved += n;
+        self.held += n;
+        Ok(())
+    }
+
+    /// The upload is complete: run `finish` (the rename into the
+    /// library) and move the reservation into `committed` atomically,
+    /// so no rescan sees the file twice or not at all.
+    fn commit<T>(mut self, finish: impl FnOnce() -> T) -> T {
+        let mut b = self.book.lock_safe();
+        let out = finish();
+        b.reserved = b.reserved.saturating_sub(self.held);
+        b.committed = b.committed.saturating_add(self.held);
+        self.held = 0;
+        out
+    }
+}
+
+impl Drop for QuotaReservation {
+    fn drop(&mut self) {
+        if self.held > 0 {
+            let mut b = self.book.lock_safe();
+            b.reserved = b.reserved.saturating_sub(self.held);
+        }
+    }
+}
 
 impl UploadLimits {
     pub(crate) fn new(state: &AppState) -> Self {
@@ -105,26 +173,37 @@ impl UploadLimits {
             max: state.cfg.max_upload_bytes,
             disk_budget: crate::sysinfo::free_bytes(&state.cfg.state_dir)
                 .map(|f| f.saturating_sub(min_free)),
-            quota_left: None,
+            quota: None,
             state_dir: state.cfg.state_dir.clone(),
             min_free,
         }
     }
 
-    /// Also hold the upload to the library quota.
-    pub(crate) fn with_library_quota(mut self, state: &AppState) -> Result<Self, AppError> {
+    /// Also hold the upload to the library quota. `declared` (the
+    /// Content-Length, 0 if unknown) is reserved up front, so an
+    /// upload that cannot fit is refused before any byte is written.
+    pub(crate) fn with_library_quota(
+        mut self,
+        state: &AppState,
+        declared: u64,
+    ) -> Result<Self, AppError> {
         let quota = state.cfg.library_max_bytes;
         if quota > 0 {
-            let used = library_bytes(&state.library_dir);
-            if used >= quota {
-                return Err(library_full(used, quota));
-            }
-            self.quota_left = Some(quota - used);
+            let mut r = QuotaReservation {
+                book: state.library_quota.clone(),
+                dir: state.library_dir.as_ref().clone(),
+                quota,
+                held: 0,
+            };
+            // The multipart framing makes Content-Length a little larger
+            // than the file; reserving it is conservative.
+            r.reserve(declared, true)?;
+            self.quota = Some(r);
         }
         Ok(self)
     }
 
-    fn check(&self, written: u64, recheck: bool) -> Result<(), AppError> {
+    fn check(&mut self, written: u64, recheck: bool) -> Result<(), AppError> {
         if written > self.max {
             return Err(AppError::new(
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -132,16 +211,13 @@ impl UploadLimits {
                 format!("upload exceeds the {}-byte limit", self.max),
             ));
         }
-        if let Some(left) = self.quota_left {
-            if written > left {
-                return Err(AppError::new(
-                    StatusCode::INSUFFICIENT_STORAGE,
-                    "library_full",
-                    format!(
-                        "upload exceeds the library quota ({left} bytes left); \
-                         delete pcaps from the library or raise --library-max-mb"
-                    ),
-                ));
+        if let Some(q) = self.quota.as_mut() {
+            // Reserve only beyond what is already held (the declared
+            // length may already cover it).
+            if written > q.held {
+                q.reserve(written - q.held, recheck)?;
+            } else if recheck {
+                q.reserve(0, true)?;
             }
         }
         let low = self.disk_budget.is_some_and(|b| written > b)
@@ -160,29 +236,36 @@ impl UploadLimits {
         }
         Ok(())
     }
+
+    /// Finish a library upload: run `finish` (the rename) and commit the
+    /// quota reservation with it.
+    pub(crate) fn commit<T>(&mut self, finish: impl FnOnce() -> T) -> T {
+        match self.quota.take() {
+            Some(q) => q.commit(finish),
+            None => finish(),
+        }
+    }
 }
 
-fn library_full(used: u64, quota: u64) -> AppError {
+/// 507 `quota_exceeded`: the library quota would be exceeded.
+fn quota_exceeded(used: u64, quota: u64) -> AppError {
     AppError::new(
         StatusCode::INSUFFICIENT_STORAGE,
-        "library_full",
+        "quota_exceeded",
         format!(
-            "the library holds {used} bytes of its {quota}-byte quota; delete pcaps \
-             or raise --library-max-mb"
+            "the library quota is {quota} bytes and {used} are used or reserved by \
+             uploads in progress; delete pcaps from the library or raise --library-max-mb"
         ),
     )
 }
 
-/// Total size of the library's pcaps and in-progress uploads.
+/// Total size of the finished pcaps in the library. Uploads in
+/// progress are counted through their quota reservations instead.
 pub(crate) fn library_bytes(dir: &StdPath) -> u64 {
     std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| {
-                    let n = e.file_name();
-                    let n = n.to_string_lossy();
-                    n.ends_with(".pcap") || n.ends_with(".part")
-                })
+                .filter(|e| e.file_name().to_string_lossy().ends_with(".pcap"))
                 .filter_map(|e| e.metadata().ok())
                 .filter(|m| m.is_file())
                 .map(|m| m.len())
@@ -198,7 +281,7 @@ pub(crate) fn library_bytes(dir: &StdPath) -> u64 {
 pub(crate) async fn stream_field_to_file(
     field: &mut axum::extract::multipart::Field<'_>,
     file: &mut tokio::fs::File,
-    limits: &UploadLimits,
+    limits: &mut UploadLimits,
 ) -> Result<u64, AppError> {
     use tokio::io::AsyncWriteExt;
     let mut written: u64 = 0;
@@ -246,16 +329,8 @@ async fn library_upload(
         .try_acquire_owned()
         .map_err(|_| crate::routes::runs::busy())?;
     check_free_space(state, declared_length(&headers))?;
-    let limits = UploadLimits::new(state).with_library_quota(state)?;
-    if let Some(left) = limits.quota_left {
-        let declared = declared_length(&headers);
-        if declared > left {
-            return Err(library_full(
-                state.cfg.library_max_bytes - left,
-                state.cfg.library_max_bytes,
-            ));
-        }
-    }
+    let mut limits =
+        UploadLimits::new(state).with_library_quota(state, declared_length(&headers))?;
     let dir: &StdPath = state.library_dir.as_ref();
     let mut field = mp
         .next_field()
@@ -291,7 +366,7 @@ async fn library_upload(
         .open(&tmp_path)
         .await
         .map_err(|e| AppError::Internal(format!("open tmp: {e}")))?;
-    stream_field_to_file(&mut field, &mut f, &limits).await?;
+    stream_field_to_file(&mut field, &mut f, &mut limits).await?;
     drop(f);
 
     // Fast validation: check the magic bytes only. Full parse runs in a
@@ -301,7 +376,8 @@ async fn library_upload(
         .await
         .map_err(|e| AppError::Internal(format!("validate task: {e}")))?
         .map_err(|e| AppError::BadRequest(format!("not a pcap: {e}")).code("not_a_pcap"))?;
-    std::fs::rename(&tmp_path, &final_path)
+    limits
+        .commit(|| std::fs::rename(&tmp_path, &final_path))
         .map_err(|e| AppError::Internal(format!("rename: {e}")))?;
     part.keep();
     let final_guard = PartGuard::new(final_path.clone());

@@ -2148,16 +2148,44 @@ async fn uploads_respect_disk_reserve_and_library_quota() {
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     let (s, v) = h
-        .multipart("/api/pcaps", &[("file", Some("b.pcap"), mid)])
+        .multipart("/api/pcaps", &[("file", Some("b.pcap"), mid.clone())])
         .await;
     assert_eq!(
         (s, v["code"].as_str()),
-        (StatusCode::INSUFFICIENT_STORAGE, Some("library_full")),
+        (StatusCode::INSUFFICIENT_STORAGE, Some("quota_exceeded")),
         "{v}"
     );
     assert!(!h
         .files_in("state/library")
         .iter()
         .any(|f| f.ends_with(".pcap.part")
-            || (f.starts_with('.') && f.ends_with(".part") && !f.contains(".json"))));
+            || (f.starts_with(".pcr_") && f.ends_with(".part") && !f.contains(".json"))));
+
+    // Two concurrent uploads that only fit one at a time: exactly one
+    // is refused and the library stays within its quota.
+    let h = harness_cfg(
+        tempfile::tempdir().unwrap(),
+        Behaviour::BlockUntilCancel,
+        |c| {
+            c.max_upload_bytes = 1024 * 1024;
+            c.library_max_bytes = 64 * 1024;
+        },
+    );
+    for round in 0..5 {
+        for f in h.files_in("state/library") {
+            let _ = std::fs::remove_file(h.state.library_dir.join(f));
+        }
+        let pa = [("file", Some("a.pcap"), mid.clone())];
+        let pb = [("file", Some("b.pcap"), mid.clone())];
+        let ((s1, v1), (s2, v2)) = tokio::join!(
+            h.multipart("/api/pcaps", &pa),
+            h.multipart("/api/pcaps", &pb),
+        );
+        let ok = [s1, s2].iter().filter(|s| **s == StatusCode::OK).count();
+        assert_eq!(ok, 1, "round {round}: {s1} {v1} / {s2} {v2}");
+        let refused = if s1 == StatusCode::OK { &v2 } else { &v1 };
+        assert_eq!(refused["code"], "quota_exceeded", "{refused}");
+        assert!(crate::routes::library::library_bytes(&h.state.library_dir) <= 64 * 1024);
+        assert_eq!(h.state.library_quota.lock_safe().reserved_bytes(), 0);
+    }
 }

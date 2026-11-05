@@ -94,8 +94,8 @@ pub(crate) async fn api_analyze(
                     .reopen()
                     .map_err(|e| AppError::Internal(format!("open temp file: {e}")))?;
                 let mut f = tokio::fs::File::from_std(std_file);
-                let limits = UploadLimits::new(&state);
-                size = stream_field_to_file(&mut field, &mut f, &limits).await?;
+                let mut limits = UploadLimits::new(&state);
+                size = stream_field_to_file(&mut field, &mut f, &mut limits).await?;
                 got_file = true;
             }
             "mode" => {

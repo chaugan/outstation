@@ -196,6 +196,8 @@ pub struct AppState {
     /// captured when the state is opened inside one.
     pub(crate) rt: Option<tokio::runtime::Handle>,
     pub(crate) metrics: Arc<crate::metrics::Metrics>,
+    /// Library quota reservations of uploads in progress (F051).
+    pub(crate) library_quota: Arc<Mutex<crate::routes::library::QuotaBook>>,
 }
 
 impl AppState {
@@ -240,6 +242,7 @@ impl AppState {
             started: std::time::Instant::now(),
             rt: tokio::runtime::Handle::try_current().ok(),
             metrics: Arc::new(crate::metrics::Metrics::default()),
+            library_quota: Arc::new(Mutex::new(Default::default())),
             cfg: Arc::new(cfg),
         })
     }
