@@ -85,7 +85,10 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - `api_run` fills `protected_addrs` for RunConfig and BenchmarkConfig with the request's local socket address (ConnectInfo / the bound listener address), from a security review.
   - Thread the `force` override through RunReq with a UI confirmation.
 
-- [ ] **T04c Leftovers from wave 1.**
+- [x] **T04c Leftovers from wave 1.** All done elsewhere:
+  - the per-run capture cap (fx1, `--capture-run-max-mb`);
+  - `alias_iface` and `force` with a confirmation in Configure (T07);
+  - the Origin rule documented in doc/api.md and used by the smoke scripts (T15/T16).
   - Per-run capture size cap while writing: a hook in sched/raw_replay capture (F055/F149 remainder). Until then, a low-disk watchdog stops the run.
   - The UI must expose `alias_iface` and `force` (with a confirmation dialog), or slave runs with non-local RTU IPs fail. Owned by T07.
   - curl/script clients now need an `Origin` header for POST/DELETE/PATCH; document this in the README and smoke scripts (T15, T16).
