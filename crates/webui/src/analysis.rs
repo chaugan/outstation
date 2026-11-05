@@ -1243,7 +1243,7 @@ fn weighted_decimate(sorted: &[(f64, f64, f64)], cap: usize) -> (Vec<[f64; 2]>, 
 /// handshakes, so we bin SYNs by 1-second windows and flag bins that
 /// contain at least 30 % of the expected endpoint count. Adjacent
 /// flagged bins coalesce into a single iteration start.
-fn detect_iteration_starts(
+pub(crate) fn detect_iteration_starts(
     captured: &LoadedPcap,
     target_port: u16,
     expected_slave_count: usize,
