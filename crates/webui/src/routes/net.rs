@@ -5,7 +5,7 @@ use std::net::Ipv4Addr;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::error::AppError;
+use crate::error::{ApiJson, AppError};
 use crate::netprobe::*;
 
 #[derive(Deserialize)]
@@ -37,18 +37,30 @@ pub(crate) struct VerifyIpResp {
 ///   2. `arping -D` — duplicate-address detection probe on the
 ///      relevant interface. Responds? Someone else owns it.
 pub(crate) async fn api_verify_ip(
-    Json(req): Json<VerifyIpReq>,
+    ApiJson(req): ApiJson<VerifyIpReq>,
 ) -> Result<Json<VerifyIpResp>, AppError> {
+    if let Some(i) = req.iface.as_deref().filter(|s| !s.is_empty()) {
+        crate::routes::runs::validate_ifname("iface", i, 15)?;
+    }
+    // arping/ip are blocking subprocesses (2 s worst case): keep them
+    // off the async workers (F053).
+    tokio::task::spawn_blocking(move || verify_ip_blocking(req))
+        .await
+        .map_err(|e| AppError::Internal(format!("verify task: {e}")))?
+        .map(Json)
+}
+
+fn verify_ip_blocking(req: VerifyIpReq) -> Result<VerifyIpResp, AppError> {
     // 0.0.0.0 is the "any" sentinel — always valid, skip probing.
     if req.ip.trim() == "0.0.0.0" {
-        return Ok(Json(VerifyIpResp {
+        return Ok(VerifyIpResp {
             ip: "0.0.0.0".into(),
             iface: "any".into(),
             in_use: false,
             locally_assigned: true,
             mac: None,
             error: None,
-        }));
+        });
     }
     let ip: Ipv4Addr = req
         .ip
@@ -62,14 +74,14 @@ pub(crate) async fn api_verify_ip(
 
     // Check host's own addresses first.
     if let Some(local_iface) = find_local_ip_iface(&ip) {
-        return Ok(Json(VerifyIpResp {
+        return Ok(VerifyIpResp {
             ip: ip.to_string(),
             iface: local_iface,
             in_use: true,
             locally_assigned: true,
             mac: Some("local host".into()),
             error: None,
-        }));
+        });
     }
 
     // arping -D -c 2 -w 2 -I <iface> <ip>
@@ -79,7 +91,7 @@ pub(crate) async fn api_verify_ip(
     let out = match out {
         Ok(o) => o,
         Err(e) => {
-            return Ok(Json(VerifyIpResp {
+            return Ok(VerifyIpResp {
                 ip: ip.to_string(),
                 iface,
                 in_use: false,
@@ -88,7 +100,7 @@ pub(crate) async fn api_verify_ip(
                 error: Some(format!(
                     "arping not available: {e}. apt install iputils-arping"
                 )),
-            }));
+            });
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -99,14 +111,14 @@ pub(crate) async fn api_verify_ip(
     let in_use =
         !out.status.success() || stdout.contains("reply from") || stdout.contains("Unicast reply");
     let mac = extract_mac(&stdout).or_else(|| extract_mac(&stderr));
-    Ok(Json(VerifyIpResp {
+    Ok(VerifyIpResp {
         ip: ip.to_string(),
         iface,
         in_use,
         locally_assigned: false,
         mac,
         error: None,
-    }))
+    })
 }
 
 #[derive(Serialize)]
@@ -120,7 +132,10 @@ pub(crate) struct NicJson {
 }
 
 pub(crate) async fn api_nics() -> Result<Json<Vec<NicJson>>, AppError> {
-    let nics = netctl::list_nics().map_err(|e| AppError::Internal(format!("list nics: {e}")))?;
+    let nics = tokio::task::spawn_blocking(netctl::list_nics)
+        .await
+        .map_err(|e| AppError::Internal(format!("nics task: {e}")))?
+        .map_err(|e| AppError::Internal(format!("list nics: {e}")))?;
     let out = nics
         .into_iter()
         .map(|n| NicJson {
@@ -153,7 +168,17 @@ pub(crate) struct ArpResp {
 /// Send an ARP request via `arping` and return the responding MAC.
 /// Used by the UI's "ARP" button next to the target_mac field so the
 /// user doesn't have to type it.
-pub(crate) async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, AppError> {
+pub(crate) async fn api_arp(ApiJson(req): ApiJson<ArpReq>) -> Result<Json<ArpResp>, AppError> {
+    if let Some(i) = req.iface.as_deref().filter(|s| !s.is_empty()) {
+        crate::routes::runs::validate_ifname("iface", i, 15)?;
+    }
+    tokio::task::spawn_blocking(move || arp_blocking(req))
+        .await
+        .map_err(|e| AppError::Internal(format!("arp task: {e}")))?
+        .map(Json)
+}
+
+fn arp_blocking(req: ArpReq) -> Result<ArpResp, AppError> {
     let ip: Ipv4Addr = req
         .ip
         .parse()
@@ -171,12 +196,12 @@ pub(crate) async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, Ap
                 .find(|n| n.name == local_iface)
                 .and_then(|n| n.mac.map(netctl::format_mac))
         });
-        return Ok(Json(ArpResp {
+        return Ok(ArpResp {
             ip: ip.to_string(),
             iface: local_iface,
             mac,
             error: None,
-        }));
+        });
     }
 
     let out = std::process::Command::new("arping")
@@ -185,14 +210,14 @@ pub(crate) async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, Ap
     let out = match out {
         Ok(o) => o,
         Err(e) => {
-            return Ok(Json(ArpResp {
+            return Ok(ArpResp {
                 ip: ip.to_string(),
                 iface,
                 mac: None,
                 error: Some(format!(
                     "arping not available: {e}. apt install iputils-arping"
                 )),
-            }));
+            });
         }
     };
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -202,17 +227,17 @@ pub(crate) async fn api_arp(Json(req): Json<ArpReq>) -> Result<Json<ArpResp>, Ap
         let msg = format!(
             "no ARP reply within 2 s (is the host live and on the same L2 segment as {iface}?)"
         );
-        return Ok(Json(ArpResp {
+        return Ok(ArpResp {
             ip: ip.to_string(),
             iface,
             mac: None,
             error: Some(msg),
-        }));
+        });
     }
-    Ok(Json(ArpResp {
+    Ok(ArpResp {
         ip: ip.to_string(),
         iface,
         mac,
         error: None,
-    }))
+    })
 }

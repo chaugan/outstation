@@ -1,4 +1,8 @@
 //! Serializable run state and report DTOs.
+//!
+//! Persisted report structs (`RunReportJson`, `BenchmarkReportJson`,
+//! `SessionReportJson`, `SourceProgressJson`) are `#[serde(default)]`
+//! so adding a field never makes older history unreadable (F090).
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -11,7 +15,15 @@ pub struct RunState {
     pub id: u64,
     pub status: RunStatus,
     pub started_at: u64,
+    /// Unix seconds when the run reached a terminal status.
+    pub finished_at: Option<u64>,
+    /// Peer address of the client that started the run.
+    pub started_by: Option<String>,
+    /// Absolute path of the source pcap (server-side only; requests
+    /// reference pcaps by library id).
     pub pcap: PathBuf,
+    /// Library id of the source pcap.
+    pub pcap_id: Option<String>,
     pub target_ip: Ipv4Addr,
     pub target_mac: String,
     pub speed: f64,
@@ -22,39 +34,34 @@ pub struct RunState {
     pub benchmark: Option<BenchmarkReportJson>,
     pub mode: &'static str,
     /// Benchmark role: "master" or "slave", "" for raw.
-    #[serde(default)]
     pub role: &'static str,
     /// Benchmark target port, 0 for raw.
-    #[serde(default)]
     pub target_port: u16,
     /// Name of the protocol replayer used for this run (matches
-    /// [`protoplay::ProtoReplayer::name`]). Surfaced so the analyser
-    /// can look up the right replayer via [`proto_registry::lookup`].
-    #[serde(default = "default_proto_name")]
+    /// [`protoplay::ProtoReplayer::name`]).
     pub proto: String,
     /// Free-form per-protocol JSON config the run was started with.
-    /// Persisted so the post-run analyser can read protocol-specific
-    /// settings (e.g. IEC 104 CP56 rewrite + zone).
-    #[serde(default)]
     pub proto_config: Option<String>,
-    /// Total frames planned for this run (snapshot from ctx.planned).
+    /// Total frames planned for this run.
     pub planned: u64,
-    /// Frames sent so far (snapshot from ctx.sent).
+    /// Frames (raw) or messages (benchmark) sent so far.
     pub sent: u64,
-    /// Wire bytes sent so far (snapshot from ctx.bytes).
+    /// Wire bytes sent so far.
     pub bytes_progress: u64,
     /// Per-source live progress snapshot.
     pub per_source_progress: Vec<SourceProgressJson>,
-    /// Rolling throughput samples in packets per second — one entry
-    /// per server-side poll tick while the run was running. Used by
-    /// the UI to draw the throughput sparkline.
+    /// Rolling throughput samples in frames/messages per second, one
+    /// per second while the run was running.
     pub throughput_history: Vec<u64>,
+    /// Absolute path of this run's capture file.
+    pub capture_file: Option<PathBuf>,
     /// Live shared counters from sched. Not serialized.
     #[serde(skip)]
     pub ctx: RunContext,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SourceProgressJson {
     pub src_ip: Option<String>,
     pub src_mac: String,
@@ -62,33 +69,22 @@ pub struct SourceProgressJson {
     pub planned: u64,
     pub sent: u64,
     pub bytes: u64,
-    #[serde(default)]
     pub received: u64,
-    #[serde(default)]
     pub unacked: u64,
     /// Slave-benchmark: the local port this session listens on, or 0.
-    #[serde(default)]
     pub listen_port: u16,
     /// Slave-benchmark: the local address the session listens on.
-    /// Defaults to `0.0.0.0` (any interface). User-editable per-slave.
-    #[serde(default)]
     pub listen_ip: String,
     /// Lifecycle state: "pending", "listening", "connected", "active",
-    /// "completed", "failed".
+    /// "completed", "failed", "cancelled".
     pub state: String,
     /// True once the per-session start button has been clicked.
-    #[serde(default)]
     pub ready: bool,
     /// True once this session has been individually cancelled.
-    #[serde(default)]
     pub cancelled: bool,
-    /// Current iteration number (1-based) the session is on. `0`
-    /// before the first iteration starts; equal to `iter_total` once
-    /// the run is complete.
-    #[serde(default)]
+    /// Current iteration number (1-based); 0 before the first.
     pub iter_current: u64,
-    /// Total iterations planned. `0` = unbounded (loop until cancel).
-    #[serde(default)]
+    /// Total iterations planned. `0` = unbounded.
     pub iter_total: u64,
 }
 
@@ -106,11 +102,13 @@ pub(crate) fn state_to_str(s: u8) -> &'static str {
     }
 }
 
-#[derive(Debug, Clone, Copy, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunStatus {
     Running,
     Completed,
+    /// Finished, but some (not all) sessions reported an error.
+    Partial,
     Stopped,
     Failed,
 }
@@ -120,6 +118,7 @@ impl RunStatus {
         match self {
             RunStatus::Running => "running",
             RunStatus::Completed => "completed",
+            RunStatus::Partial => "partial",
             RunStatus::Stopped => "stopped",
             RunStatus::Failed => "failed",
         }
@@ -129,13 +128,26 @@ impl RunStatus {
         match s {
             "running" => RunStatus::Running,
             "completed" => RunStatus::Completed,
+            "partial" => RunStatus::Partial,
             "stopped" => RunStatus::Stopped,
             _ => RunStatus::Failed,
         }
     }
+
+    pub(crate) fn is_terminal(self) -> bool {
+        !matches!(self, RunStatus::Running)
+    }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+fn fmt_mac(m: [u8; 6]) -> String {
+    format!(
+        "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        m[0], m[1], m[2], m[3], m[4], m[5]
+    )
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct RunReportJson {
     pub total_packets: u64,
     pub total_bytes: u64,
@@ -146,7 +158,8 @@ pub struct RunReportJson {
     pub captured_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SourceReportJson {
     pub src_ip: Option<String>,
     pub src_mac: String,
@@ -162,13 +175,9 @@ pub struct SourceReportJson {
 
 impl From<&SourceReport> for SourceReportJson {
     fn from(s: &SourceReport) -> Self {
-        let m = s.src_mac;
         Self {
             src_ip: s.src_ip.map(|i| i.to_string()),
-            src_mac: format!(
-                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                m[0], m[1], m[2], m[3], m[4], m[5]
-            ),
+            src_mac: fmt_mac(s.src_mac),
             tap: s.tap.clone(),
             kind: match s.kind {
                 SourceKind::Ipv4 => "ipv4".to_string(),
@@ -198,7 +207,98 @@ impl From<&RunReport> for RunReportJson {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Pre-binned latency histogram. Bins are log-spaced: bin `i` covers
+/// `[10^(log10_min_us + i*w), 10^(log10_min_us + (i+1)*w))` µs with
+/// `w = (log10_max_us - log10_min_us) / counts.len()`. Samples below
+/// the first edge land in `underflow`, samples at or above the last
+/// edge in `overflow` — nothing is clipped (F136).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct LatencyHistogramJson {
+    pub log10_min_us: f64,
+    pub log10_max_us: f64,
+    pub counts: Vec<u64>,
+    pub underflow: u64,
+    pub overflow: u64,
+    /// Sum of all counts (weighted for the aggregate histogram).
+    pub total: u64,
+}
+
+/// 10 µs .. 10 s, four bins per decade.
+pub(crate) const HIST_LOG_MIN: f64 = 1.0;
+pub(crate) const HIST_LOG_MAX: f64 = 7.0;
+pub(crate) const HIST_BINS: usize = 24;
+
+impl Default for LatencyHistogramJson {
+    fn default() -> Self {
+        Self {
+            log10_min_us: HIST_LOG_MIN,
+            log10_max_us: HIST_LOG_MAX,
+            counts: vec![0; HIST_BINS],
+            underflow: 0,
+            overflow: 0,
+            total: 0,
+        }
+    }
+}
+
+/// Floating-point accumulator behind [`LatencyHistogramJson`], so
+/// weighted contributions are summed before rounding.
+#[derive(Debug, Clone)]
+pub(crate) struct HistAcc {
+    counts: Vec<f64>,
+    underflow: f64,
+    overflow: f64,
+}
+
+impl HistAcc {
+    pub(crate) fn new() -> Self {
+        Self {
+            counts: vec![0.0; HIST_BINS],
+            underflow: 0.0,
+            overflow: 0.0,
+        }
+    }
+
+    pub(crate) fn add(&mut self, sample_us: u64, weight: f64) {
+        let l = (sample_us.max(1) as f64).log10();
+        if sample_us == 0 || l < HIST_LOG_MIN {
+            self.underflow += weight;
+        } else if l >= HIST_LOG_MAX {
+            self.overflow += weight;
+        } else {
+            let w = (HIST_LOG_MAX - HIST_LOG_MIN) / HIST_BINS as f64;
+            let idx = (((l - HIST_LOG_MIN) / w) as usize).min(HIST_BINS - 1);
+            self.counts[idx] += weight;
+        }
+    }
+
+    pub(crate) fn finish(self) -> LatencyHistogramJson {
+        let counts: Vec<u64> = self.counts.iter().map(|c| c.round() as u64).collect();
+        let underflow = self.underflow.round() as u64;
+        let overflow = self.overflow.round() as u64;
+        let total = counts.iter().sum::<u64>() + underflow + overflow;
+        LatencyHistogramJson {
+            log10_min_us: HIST_LOG_MIN,
+            log10_max_us: HIST_LOG_MAX,
+            counts,
+            underflow,
+            overflow,
+            total,
+        }
+    }
+}
+
+pub(crate) fn histogram_of(samples: &[u64]) -> LatencyHistogramJson {
+    let mut acc = HistAcc::new();
+    for &s in samples {
+        acc.add(s, 1.0);
+    }
+    acc.finish()
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct BenchmarkReportJson {
     pub total_messages_sent: u64,
     pub total_messages_received: u64,
@@ -208,10 +308,13 @@ pub struct BenchmarkReportJson {
     pub aggregate_latency_p99_us: u64,
     pub aggregate_latency_max_us: u64,
     pub aggregate_throughput_msgs_per_sec: f64,
-    /// Up to 5000 latency samples in microseconds, flattened across
-    /// every session. The UI uses this to draw the aggregate
-    /// histogram; per-session histograms come from each session's
-    /// `proto_report.latency_samples_us` field.
+    /// Fleet latency histogram. Each session's reservoir is weighted by
+    /// `acked messages / reservoir size`, so heavy sessions count in
+    /// proportion to their traffic (F027).
+    pub aggregate_latency_histogram: Option<LatencyHistogramJson>,
+    /// Legacy (pre-T04) flattened sample prefix. Read from old rows and
+    /// converted into `aggregate_latency_histogram`; never written.
+    #[serde(skip_serializing)]
     pub aggregate_latency_samples_us: Vec<u64>,
     pub per_session: Vec<SessionReportJson>,
     pub capture_path: Option<String>,
@@ -219,7 +322,8 @@ pub struct BenchmarkReportJson {
     pub captured_bytes: u64,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct SessionReportJson {
     pub src_ip: String,
     pub src_mac: String,
@@ -239,19 +343,46 @@ pub struct SessionReportJson {
     pub window_stalls: u64,
     pub unacked_at_end: u64,
     pub error: Option<String>,
+    /// Pre-binned per-session latency histogram (unweighted reservoir).
+    pub latency_histogram: Option<LatencyHistogramJson>,
+    /// Legacy raw samples; read from old rows, never written.
+    #[serde(skip_serializing)]
     pub latency_samples_us: Vec<u64>,
+}
+
+impl BenchmarkReportJson {
+    /// Convert legacy sample vectors (old DB rows) into histograms and
+    /// drop the samples.
+    pub(crate) fn upgrade_legacy(&mut self) {
+        if self.aggregate_latency_histogram.is_none()
+            && !self.aggregate_latency_samples_us.is_empty()
+        {
+            self.aggregate_latency_histogram =
+                Some(histogram_of(&self.aggregate_latency_samples_us));
+        }
+        self.aggregate_latency_samples_us = Vec::new();
+        for s in &mut self.per_session {
+            if s.latency_histogram.is_none() && !s.latency_samples_us.is_empty() {
+                s.latency_histogram = Some(histogram_of(&s.latency_samples_us));
+            }
+            s.latency_samples_us = Vec::new();
+        }
+    }
+
+    pub(crate) fn sessions_failed(&self) -> usize {
+        self.per_session
+            .iter()
+            .filter(|s| s.error.is_some())
+            .count()
+    }
 }
 
 impl From<&SessionReport> for SessionReportJson {
     fn from(s: &SessionReport) -> Self {
-        let m = s.src_mac;
         let pr = &s.proto_report;
         Self {
             src_ip: s.src_ip.to_string(),
-            src_mac: format!(
-                "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
-                m[0], m[1], m[2], m[3], m[4], m[5]
-            ),
+            src_mac: fmt_mac(s.src_mac),
             tap: s.tap.clone(),
             connected: pr.connected,
             messages_sent: pr.messages_sent,
@@ -268,30 +399,82 @@ impl From<&SessionReport> for SessionReportJson {
             window_stalls: pr.window_stalls,
             unacked_at_end: pr.unacked_at_end,
             error: pr.error.clone(),
-            latency_samples_us: pr.latency_samples_us.clone(),
+            latency_histogram: (!pr.latency_samples_us.is_empty())
+                .then(|| histogram_of(&pr.latency_samples_us)),
+            latency_samples_us: Vec::new(),
         }
     }
 }
 
+/// Weight of one reservoir sample: how many acknowledged messages it
+/// stands for. A session's reservoir holds at most a fixed number of
+/// samples however many messages it acked.
+fn session_weight(pr: &protoplay::ProtoReport) -> f64 {
+    let n = pr.latency_samples_us.len();
+    if n == 0 {
+        return 0.0;
+    }
+    let acked = pr.messages_sent.saturating_sub(pr.unacked_at_end) as f64;
+    (acked / n as f64).max(1.0)
+}
+
+/// Weighted percentile over `(value, weight)` pairs sorted by value.
+fn weighted_percentile(sorted: &[(u64, f64)], total: f64, p: f64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let target = total * p;
+    let mut acc = 0.0;
+    for &(v, w) in sorted {
+        acc += w;
+        if acc >= target {
+            return v;
+        }
+    }
+    sorted[sorted.len() - 1].0
+}
+
 impl From<&BenchmarkReport> for BenchmarkReportJson {
     fn from(r: &BenchmarkReport) -> Self {
-        // Cap aggregate samples so the JSON response doesn't balloon.
-        let sample_cap = 5000usize;
-        let samples = if r.aggregate_latency_samples_us.len() > sample_cap {
-            r.aggregate_latency_samples_us[..sample_cap].to_vec()
+        // Weighted fleet histogram and percentiles from every session's
+        // full reservoir.
+        let mut acc = HistAcc::new();
+        let mut pairs: Vec<(u64, f64)> = Vec::new();
+        for s in &r.per_session {
+            let w = session_weight(&s.proto_report);
+            for &v in &s.proto_report.latency_samples_us {
+                acc.add(v, w);
+                pairs.push((v, w));
+            }
+        }
+        let (p50, p90, p99, hist) = if pairs.is_empty() {
+            (
+                r.aggregate_latency_p50_us,
+                r.aggregate_latency_p90_us,
+                r.aggregate_latency_p99_us,
+                None,
+            )
         } else {
-            r.aggregate_latency_samples_us.clone()
+            pairs.sort_unstable_by_key(|p| p.0);
+            let total: f64 = pairs.iter().map(|p| p.1).sum();
+            (
+                weighted_percentile(&pairs, total, 0.50),
+                weighted_percentile(&pairs, total, 0.90),
+                weighted_percentile(&pairs, total, 0.99),
+                Some(acc.finish()),
+            )
         };
         Self {
             total_messages_sent: r.total_messages_sent,
             total_messages_received: r.total_messages_received,
             aggregate_latency_min_us: r.aggregate_latency_min_us,
-            aggregate_latency_p50_us: r.aggregate_latency_p50_us,
-            aggregate_latency_p90_us: r.aggregate_latency_p90_us,
-            aggregate_latency_p99_us: r.aggregate_latency_p99_us,
+            aggregate_latency_p50_us: p50,
+            aggregate_latency_p90_us: p90,
+            aggregate_latency_p99_us: p99,
             aggregate_latency_max_us: r.aggregate_latency_max_us,
             aggregate_throughput_msgs_per_sec: r.aggregate_throughput_msgs_per_sec,
-            aggregate_latency_samples_us: samples,
+            aggregate_latency_histogram: hist,
+            aggregate_latency_samples_us: Vec::new(),
             per_session: r.per_session.iter().map(Into::into).collect(),
             capture_path: r.capture_path.as_ref().map(|p| p.display().to_string()),
             captured_packets: r.captured_packets,
@@ -302,4 +485,205 @@ impl From<&BenchmarkReport> for BenchmarkReportJson {
 
 pub(crate) fn default_proto_name() -> String {
     "iec104".into()
+}
+
+// ---------------------------------------------------------------------------
+// Slim list view (F029/F054).
+
+/// Raw report without the per-source table.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunReportSummary {
+    pub total_packets: u64,
+    pub total_bytes: u64,
+    pub total_errors: u64,
+    pub capture_path: Option<String>,
+    pub captured_packets: u64,
+    pub captured_bytes: u64,
+}
+
+/// Benchmark report without per-session rows or histograms.
+#[derive(Debug, Clone, Serialize)]
+pub struct BenchmarkSummary {
+    pub total_messages_sent: u64,
+    pub total_messages_received: u64,
+    pub aggregate_latency_min_us: u64,
+    pub aggregate_latency_p50_us: u64,
+    pub aggregate_latency_p90_us: u64,
+    pub aggregate_latency_p99_us: u64,
+    pub aggregate_latency_max_us: u64,
+    pub aggregate_throughput_msgs_per_sec: f64,
+    pub capture_path: Option<String>,
+    pub captured_packets: u64,
+    pub captured_bytes: u64,
+    pub sessions: usize,
+    pub sessions_failed: usize,
+}
+
+/// One row of `GET /api/runs`.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunSummary {
+    pub id: u64,
+    pub status: RunStatus,
+    pub started_at: u64,
+    pub finished_at: Option<u64>,
+    pub started_by: Option<String>,
+    pub pcap: String,
+    pub pcap_id: Option<String>,
+    pub target_ip: Ipv4Addr,
+    pub target_mac: String,
+    pub speed: f64,
+    pub top_speed: bool,
+    pub realtime: bool,
+    pub error: Option<String>,
+    pub mode: &'static str,
+    pub role: &'static str,
+    pub target_port: u16,
+    pub proto: String,
+    pub planned: u64,
+    pub sent: u64,
+    pub bytes_progress: u64,
+    pub throughput_history: Vec<u64>,
+    /// Live per-source progress; only filled while the run is running.
+    pub per_source_progress: Vec<SourceProgressJson>,
+    /// Number of per-source progress rows (sessions/sources).
+    pub sources: usize,
+    /// Rows whose final state was "failed".
+    pub sources_failed: usize,
+    /// True when the capture file exists on disk and can be downloaded.
+    pub has_capture: bool,
+    pub report: Option<RunReportSummary>,
+    pub benchmark: Option<BenchmarkSummary>,
+}
+
+impl RunState {
+    pub(crate) fn summary(&self) -> RunSummary {
+        let running = matches!(self.status, RunStatus::Running);
+        RunSummary {
+            id: self.id,
+            status: self.status,
+            started_at: self.started_at,
+            finished_at: self.finished_at,
+            started_by: self.started_by.clone(),
+            pcap: self.pcap.display().to_string(),
+            pcap_id: self.pcap_id.clone(),
+            target_ip: self.target_ip,
+            target_mac: self.target_mac.clone(),
+            speed: self.speed,
+            top_speed: self.top_speed,
+            realtime: self.realtime,
+            error: self.error.clone(),
+            mode: self.mode,
+            role: self.role,
+            target_port: self.target_port,
+            proto: self.proto.clone(),
+            planned: self.planned,
+            sent: self.sent,
+            bytes_progress: self.bytes_progress,
+            throughput_history: self.throughput_history.clone(),
+            per_source_progress: if running {
+                self.per_source_progress.clone()
+            } else {
+                Vec::new()
+            },
+            sources: self.per_source_progress.len(),
+            sources_failed: self
+                .per_source_progress
+                .iter()
+                .filter(|p| p.state == "failed")
+                .count(),
+            has_capture: self.capture_file.as_ref().is_some_and(|p| p.is_file()),
+            report: self.report.as_ref().map(|r| RunReportSummary {
+                total_packets: r.total_packets,
+                total_bytes: r.total_bytes,
+                total_errors: r.total_errors,
+                capture_path: r.capture_path.clone(),
+                captured_packets: r.captured_packets,
+                captured_bytes: r.captured_bytes,
+            }),
+            benchmark: self.benchmark.as_ref().map(|b| BenchmarkSummary {
+                total_messages_sent: b.total_messages_sent,
+                total_messages_received: b.total_messages_received,
+                aggregate_latency_min_us: b.aggregate_latency_min_us,
+                aggregate_latency_p50_us: b.aggregate_latency_p50_us,
+                aggregate_latency_p90_us: b.aggregate_latency_p90_us,
+                aggregate_latency_p99_us: b.aggregate_latency_p99_us,
+                aggregate_latency_max_us: b.aggregate_latency_max_us,
+                aggregate_throughput_msgs_per_sec: b.aggregate_throughput_msgs_per_sec,
+                capture_path: b.capture_path.clone(),
+                captured_packets: b.captured_packets,
+                captured_bytes: b.captured_bytes,
+                sessions: b.per_session.len(),
+                sessions_failed: b.sessions_failed(),
+            }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use protoplay::ProtoReport;
+
+    fn session(samples: Vec<u64>, sent: u64) -> SessionReport {
+        SessionReport {
+            src_ip: Ipv4Addr::new(10, 0, 0, 1),
+            src_mac: [0; 6],
+            tap: String::new(),
+            flow_idx: 0,
+            started_at_ns: 0,
+            proto_report: ProtoReport {
+                messages_sent: sent,
+                latency_samples_us: samples,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn aggregate_is_weighted_by_session_volume() {
+        // Heavy session: 1M messages, reservoir of 1000 samples at 100 µs.
+        // Light session: 1000 messages, all 1000 samples at 100 ms.
+        let r = BenchmarkReport {
+            per_session: vec![
+                session(vec![1_000; 1000], 1_000),
+                session(vec![100; 1000], 1_000_000),
+            ],
+            ..Default::default()
+        };
+        let j = BenchmarkReportJson::from(&r);
+        // Without weighting p50 would be ambiguous (50/50); with it the
+        // heavy session dominates the p90.
+        assert_eq!(j.aggregate_latency_p90_us, 100);
+        let h = j.aggregate_latency_histogram.unwrap();
+        assert_eq!(h.total, 1_000_000 + 1_000);
+    }
+
+    #[test]
+    fn histogram_keeps_tail_in_overflow() {
+        let h = histogram_of(&[5, 50, 5_000_000, 20_000_000, 7_000_000_000]);
+        assert_eq!(h.underflow, 1);
+        assert_eq!(h.overflow, 2);
+        assert_eq!(h.counts.iter().sum::<u64>(), 2);
+        assert_eq!(h.total, 5);
+    }
+
+    #[test]
+    fn legacy_samples_upgrade_to_histogram() {
+        let json = r#"{"total_messages_sent":3,"aggregate_latency_samples_us":[10,20,30],
+            "per_session":[{"src_ip":"10.0.0.1","latency_samples_us":[10]}]}"#;
+        let mut b: BenchmarkReportJson = serde_json::from_str(json).unwrap();
+        b.upgrade_legacy();
+        assert_eq!(b.aggregate_latency_histogram.as_ref().unwrap().total, 3);
+        assert!(b.aggregate_latency_samples_us.is_empty());
+        let out = serde_json::to_value(&b).unwrap();
+        assert!(out.get("aggregate_latency_samples_us").is_none());
+        assert!(out["per_session"][0].get("latency_samples_us").is_none());
+    }
+
+    #[test]
+    fn report_structs_tolerate_missing_fields() {
+        let _: RunReportJson = serde_json::from_str("{}").unwrap();
+        let _: BenchmarkReportJson = serde_json::from_str("{}").unwrap();
+        let _: SessionReportJson = serde_json::from_str("{}").unwrap();
+    }
 }

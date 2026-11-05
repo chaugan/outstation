@@ -2,34 +2,60 @@
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
-use std::thread;
 
-use axum::extract::{Path, State};
-use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::extract::State;
+use axum::http::{HeaderMap, StatusCode};
+use axum::response::Response;
 use axum::Json;
 use netctl::parse_mac;
 use pcapload::load;
-use sched::{
-    run as sched_run, run_benchmark as sched_run_benchmark, BenchmarkConfig, ConcurrencyModel,
-    RunConfig, RunContext,
-};
+use sched::{BenchmarkConfig, ConcurrencyModel, RunConfig, RunContext};
 use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use crate::dto::*;
-use crate::error::AppError;
+use crate::error::{ApiJson, ApiPath, ApiQuery, AppError, LockExt};
 use crate::library::*;
-use crate::persist::*;
 use crate::runs::*;
+use crate::security::{client_id, ClientIp};
 use crate::state::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RunMode {
+    Raw,
+    Benchmark,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RoleReq {
+    Master,
+    Slave,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum PacingReq {
+    Fast,
+    Original,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ConcurrencyReq {
+    AllAtOnce,
+    Staggered,
+}
+
+/// Body of `POST /api/run`. Unknown enum values are rejected with 422
+/// (F056); the pcap is referenced by library id only (F052, F148).
 #[derive(Deserialize)]
 pub(crate) struct RunReq {
+    /// Rejected when present: raw filesystem paths are not accepted.
     #[serde(default)]
-    pub(crate) pcap: Option<PathBuf>,
+    pub(crate) pcap: Option<serde_json::Value>,
     #[serde(default)]
     pub(crate) pcap_id: Option<String>,
     pub(crate) target_ip: Ipv4Addr,
@@ -52,174 +78,198 @@ pub(crate) struct RunReq {
     pub(crate) skip_non_ip: bool,
     #[serde(default)]
     pub(crate) only_src: Vec<Ipv4Addr>,
-    /// Pre-run RTU subset. In slave-mode this filters which captured
-    /// server IPs get a listener; in master-mode it filters which
-    /// client IPs spawn a session. Empty = all (run all).
+    /// Pre-run RTU subset (slave: server IPs; master: client IPs).
     #[serde(default)]
     pub(crate) selected_rtus: Vec<Ipv4Addr>,
-    /// Slave-mode only. When `true`, the slave replays the captured
-    /// script `iterations` times *within one TCP session* (no STOPDT
-    /// between loops). Default `false` keeps the legacy
-    /// "fresh handshake per iteration" behaviour.
+    /// Slave-mode only: loop the script within one TCP session.
     #[serde(default)]
     pub(crate) loop_within_session: bool,
     #[serde(default = "default_warmup")]
     pub(crate) warmup_secs: u64,
-    /// "raw" (default) or "benchmark".
     #[serde(default = "default_mode")]
-    pub(crate) mode: String,
-    /// Benchmark-only: destination port of the target protocol. 2404 for IEC 104.
+    pub(crate) mode: RunMode,
     #[serde(default = "default_target_port")]
     pub(crate) target_port: u16,
-    /// Benchmark-only: which ProtoReplayer module to use.
     #[serde(default = "default_proto_name")]
     pub(crate) proto_name: String,
-    /// Benchmark-only: "all_at_once" | "staggered".
     #[serde(default = "default_concurrency")]
-    pub(crate) concurrency: String,
-    /// Benchmark-only: free-form JSON passed through to the protocol
-    /// module. For IEC 104, this is the ASDU rewrite map
-    /// (`{"common_address": {...}, "cot": {...}, "ioa": {...}}`).
+    pub(crate) concurrency: ConcurrencyReq,
     #[serde(default)]
     pub(crate) proto_config: Option<String>,
-    /// Benchmark-only: "master" (default) = tool connects out to the
-    /// target as a client; "slave" = tool listens and waits for the
-    /// target master to connect in.
     #[serde(default = "default_role")]
-    pub(crate) role: String,
-    /// Benchmark-slave-only: first TCP listen port. Session i listens
-    /// on `listen_port_base + i`.
+    pub(crate) role: RoleReq,
     #[serde(default = "default_listen_port_base")]
     pub(crate) listen_port_base: u16,
-    /// Benchmark-only: "fast" (default) = fire as fast as the
-    /// protocol window allows; "original" = match the original
-    /// pcap's inter-frame cadence, scaled by `speed`.
     #[serde(default = "default_pacing")]
-    pub(crate) pacing: String,
-    /// Number of times to repeat the captured script. `0` = unlimited
-    /// (loop until cancel). Default `1`.
+    pub(crate) pacing: PacingReq,
+    /// Number of times to repeat the captured script. `0` = unlimited.
     #[serde(default = "default_iterations")]
     pub(crate) iterations: u64,
-    /// SCADA-gateway mode (see doc/scada-lab.md): claim this IP as a
-    /// /32 alias on `scada_gateway_iface` for the run, so a SCADA
-    /// guest on an isolated vSwitch routes off-subnet traffic to us.
     #[serde(default)]
     pub(crate) scada_gateway_ip: Option<Ipv4Addr>,
     #[serde(default)]
     pub(crate) scada_gateway_iface: Option<String>,
-    /// Optional upstream NIC for MASQUERADE. If set, IP forwarding is
-    /// enabled and SCADA's non-capture egress is NAT'd out this NIC.
     #[serde(default)]
     pub(crate) upstream_nat_iface: Option<String>,
-    /// Master-mode only: override the per-session bind IP. Default
-    /// (None) keeps the captured client IPs as the source addresses
-    /// of the replayed master sessions. Set to a local IP (or one we
-    /// can alias onto the bridge) to make all master sessions
-    /// originate from a specific local address regardless of what
-    /// the pcap recorded. Useful when the captured master IP
-    /// (e.g. 192.168.10.10) doesn't exist on the replay host.
     #[serde(default)]
     pub(crate) master_bind_ip: Option<Ipv4Addr>,
-    /// Override TCP_NODELAY on the session sockets. Default (None)
-    /// uses the role-based default: slave = true (matches real RTU
-    /// event-driven behaviour), master = false. Set explicitly to
-    /// override either way for debugging or A/B comparisons.
     #[serde(default)]
     pub(crate) tcp_nodelay: Option<bool>,
 }
 
-pub(crate) fn default_iterations() -> u64 {
+fn default_iterations() -> u64 {
     1
 }
-
-pub(crate) fn default_pacing() -> String {
-    "fast".into()
+fn default_pacing() -> PacingReq {
+    PacingReq::Fast
 }
-
-pub(crate) fn default_role() -> String {
-    "master".into()
+fn default_role() -> RoleReq {
+    RoleReq::Master
 }
-pub(crate) fn default_listen_port_base() -> u16 {
+fn default_listen_port_base() -> u16 {
     2404
 }
-
-pub(crate) fn default_mode() -> String {
-    "raw".into()
+fn default_mode() -> RunMode {
+    RunMode::Raw
 }
-pub(crate) fn default_target_port() -> u16 {
+fn default_target_port() -> u16 {
     2404
 }
-pub(crate) fn default_concurrency() -> String {
-    "all_at_once".into()
+fn default_concurrency() -> ConcurrencyReq {
+    ConcurrencyReq::AllAtOnce
 }
-
-pub(crate) fn default_warmup() -> u64 {
+fn default_warmup() -> u64 {
     5
 }
-
-pub(crate) fn default_bridge() -> String {
+fn default_bridge() -> String {
     "pcr_br0".into()
 }
-pub(crate) fn default_tap_prefix() -> String {
+fn default_tap_prefix() -> String {
     "pcr_t".into()
 }
-pub(crate) fn default_speed() -> f64 {
+fn default_speed() -> f64 {
     1.0
 }
 
-#[derive(Serialize)]
-pub(crate) struct RunResp {
-    pub(crate) id: u64,
+/// Longest warmup accepted, in seconds.
+const MAX_WARMUP_SECS: u64 = 3600;
+
+/// Interface-name check: kernel IFNAMSIZ (15 usable chars), no
+/// wildcard (`+`), no option-like leading `-` (F042).
+pub(crate) fn validate_ifname(field: &str, name: &str, max_len: usize) -> Result<(), AppError> {
+    let ok = !name.is_empty()
+        && name.len() <= max_len
+        && !name.starts_with('-')
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'));
+    if ok {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "{field}: {name:?} is not a valid interface name (1..={max_len} chars of \
+             [A-Za-z0-9._-], not starting with '-')"
+        ))
+        .code("invalid_request"))
+    }
 }
 
-pub(crate) async fn api_run(
-    State(state): State<AppState>,
-    Json(req): Json<RunReq>,
-) -> Result<Json<RunResp>, AppError> {
-    let pcap_path: PathBuf = if let Some(id) = req.pcap_id.as_deref() {
-        library_pcap_path(&state.library_dir, id)?
-    } else if let Some(p) = req.pcap.clone() {
-        p
-    } else {
-        return Err(AppError::BadRequest(
-            "run request needs either pcap_id or pcap path".into(),
-        ));
-    };
-    let pcap = load(&pcap_path).map_err(|e| AppError::BadRequest(format!("load pcap: {e}")))?;
-    let pcap = Arc::new(pcap);
-    let is_benchmark = req.mode == "benchmark";
-    let id = state.next_id.fetch_add(1, Ordering::SeqCst);
-    let capture_pb = std::path::PathBuf::from(format!("{CAPTURE_DIR}/run_{id}.pcap"));
+fn bad(msg: impl Into<String>) -> AppError {
+    AppError::BadRequest(msg).code("invalid_request")
+}
 
-    let ctx = RunContext::new();
-    let started_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let mode_str: &'static str = if is_benchmark { "benchmark" } else { "raw" };
-    let role_str: &'static str = if is_benchmark {
-        if req.role == "slave" {
-            "slave"
-        } else {
-            "master"
+/// Cheap field checks that need no I/O.
+pub(crate) fn validate_fields(req: &RunReq) -> Result<(), AppError> {
+    if req.pcap.is_some() {
+        return Err(AppError::BadRequest(
+            "raw filesystem paths are not accepted; upload the pcap to the library and \
+             pass its pcap_id",
+        )
+        .code("raw_path_rejected"));
+    }
+    if req.pcap_id.as_deref().unwrap_or("").is_empty() {
+        return Err(bad("pcap_id is required"));
+    }
+    if !(req.speed.is_finite() && (0.001..=1000.0).contains(&req.speed)) {
+        return Err(bad(format!(
+            "speed must be a finite number in 0.001..=1000, got {}",
+            req.speed
+        )));
+    }
+    if req.warmup_secs > MAX_WARMUP_SECS {
+        return Err(bad(format!("warmup_secs must be <= {MAX_WARMUP_SECS}")));
+    }
+    validate_ifname("bridge", &req.bridge, 15)?;
+    validate_ifname("tap_prefix", &req.tap_prefix, 10)?;
+    for (field, v) in [
+        ("nic", &req.nic),
+        ("scada_gateway_iface", &req.scada_gateway_iface),
+        ("upstream_nat_iface", &req.upstream_nat_iface),
+    ] {
+        if let Some(n) = v.as_deref().filter(|s| !s.is_empty()) {
+            validate_ifname(field, n, 15)?;
         }
-    } else {
-        ""
-    };
-    let target_port_for_state: u16 = if is_benchmark {
-        if req.role == "slave" {
-            req.listen_port_base
-        } else {
-            req.target_port
+    }
+    if req.scada_gateway_ip.is_some()
+        != req
+            .scada_gateway_iface
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+    {
+        return Err(bad(
+            "scada_gateway_ip and scada_gateway_iface must be given together",
+        ));
+    }
+    if let Some(pc) = req.proto_config.as_deref().filter(|s| !s.trim().is_empty()) {
+        serde_json::from_str::<serde_json::Value>(pc)
+            .map_err(|e| bad(format!("proto_config is not valid JSON: {e}")))?;
+    }
+    match req.mode {
+        RunMode::Raw => {
+            parse_mac(&req.target_mac).map_err(|e| bad(format!("target_mac: {e}")))?;
         }
-    } else {
-        0
-    };
-    let initial = RunState {
-        id,
+        RunMode::Benchmark => {
+            if req.target_port == 0 {
+                return Err(bad("target_port must be 1..=65535"));
+            }
+            if req.role == RoleReq::Slave {
+                if req.listen_port_base == 0 {
+                    return Err(bad("listen_port_base must be 1..=65535"));
+                }
+                let n = req.selected_rtus.len().max(1) as u32;
+                if u32::from(req.listen_port_base) + n - 1 > u32::from(u16::MAX) {
+                    return Err(bad(
+                        "listen_port_base + number of selected RTUs exceeds 65535",
+                    ));
+                }
+            }
+            let Some(rep) = get_proto(&req.proto_name) else {
+                return Err(bad(format!("unknown proto_name: {}", req.proto_name)));
+            };
+            if rep.readiness() == protoplay::Readiness::Stub {
+                return Err(AppError::BadRequest(format!(
+                    "protocol {} is a stub and cannot run benchmarks yet",
+                    req.proto_name
+                ))
+                .code("protocol_not_ready"));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Build the scheduler job and the RunState template for a validated
+/// request.
+fn build_job(req: &RunReq, cfg: &ServeConfig) -> (RunJob, RunState) {
+    let is_bench = req.mode == RunMode::Benchmark;
+    let template = RunState {
+        id: 0,
         status: RunStatus::Running,
-        started_at,
-        pcap: pcap_path.clone(),
+        started_at: 0,
+        finished_at: None,
+        started_by: None,
+        pcap: PathBuf::new(),
+        pcap_id: None,
         target_ip: req.target_ip,
         target_mac: req.target_mac.clone(),
         speed: req.speed,
@@ -228,10 +278,18 @@ pub(crate) async fn api_run(
         error: None,
         report: None,
         benchmark: None,
-        mode: mode_str,
-        role: role_str,
-        target_port: target_port_for_state,
-        proto: if is_benchmark {
+        mode: if is_bench { "benchmark" } else { "raw" },
+        role: match (is_bench, req.role) {
+            (false, _) => "",
+            (true, RoleReq::Slave) => "slave",
+            (true, RoleReq::Master) => "master",
+        },
+        target_port: match (is_bench, req.role) {
+            (false, _) => 0,
+            (true, RoleReq::Slave) => req.listen_port_base,
+            (true, RoleReq::Master) => req.target_port,
+        },
+        proto: if is_bench {
             req.proto_name.clone()
         } else {
             default_proto_name()
@@ -242,123 +300,59 @@ pub(crate) async fn api_run(
         bytes_progress: 0,
         per_source_progress: Vec::new(),
         throughput_history: Vec::new(),
-        ctx: ctx.clone(),
+        capture_file: None,
+        ctx: RunContext::new(),
     };
-    if let Err(e) = state.db.insert_run_start(&runstate_to_stored(&initial)) {
-        warn!(id, error = %e, "db insert_run_start failed");
-    }
-    state.runs.lock().unwrap().insert(id, initial);
-
-    let runs = state.runs.clone();
-    let ctx_for_thread = ctx.clone();
-
-    if is_benchmark {
-        // Look up the protocol module.
-        let Some(replayer) = get_proto(&req.proto_name) else {
-            let mut map = runs.lock().unwrap();
-            if let Some(rs) = map.get_mut(&id) {
-                rs.status = RunStatus::Failed;
-                rs.error = Some(format!("unknown proto_name: {}", req.proto_name));
-            }
-            return Err(AppError::BadRequest(format!(
-                "unknown proto_name: {}",
-                req.proto_name
-            )));
-        };
-        let concurrency = match req.concurrency.as_str() {
-            "staggered" => ConcurrencyModel::StaggeredPcapTiming,
-            _ => ConcurrencyModel::AllAtOnce,
-        };
-        let bcfg = BenchmarkConfig {
-            target_ip: req.target_ip,
-            target_port: req.target_port,
-            proto_name: req.proto_name.clone(),
-            bridge_name: req.bridge.clone(),
-            tap_prefix: req.tap_prefix.clone(),
-            egress_nic: req.nic.clone(),
-            concurrency,
-            connect_timeout_secs: 5,
-            startup_delay_secs: req.warmup_secs,
-            capture_path: Some(capture_pb.clone()),
-            proto_config: req.proto_config.clone(),
-            role: match req.role.as_str() {
-                "slave" => protoplay::Role::Slave,
-                _ => protoplay::Role::Master,
+    let job = if is_bench {
+        let replayer = get_proto(&req.proto_name).expect("validated proto");
+        RunJob::Benchmark(
+            BenchmarkConfig {
+                target_ip: req.target_ip,
+                target_port: req.target_port,
+                proto_name: req.proto_name.clone(),
+                bridge_name: req.bridge.clone(),
+                tap_prefix: req.tap_prefix.clone(),
+                egress_nic: req.nic.clone().filter(|s| !s.is_empty()),
+                concurrency: match req.concurrency {
+                    ConcurrencyReq::Staggered => ConcurrencyModel::StaggeredPcapTiming,
+                    ConcurrencyReq::AllAtOnce => ConcurrencyModel::AllAtOnce,
+                },
+                connect_timeout_secs: 5,
+                startup_delay_secs: req.warmup_secs,
+                capture_path: None,
+                proto_config: req.proto_config.clone(),
+                role: match req.role {
+                    RoleReq::Slave => protoplay::Role::Slave,
+                    RoleReq::Master => protoplay::Role::Master,
+                },
+                listen_port_base: req.listen_port_base,
+                pacing: match req.pacing {
+                    PacingReq::Original => protoplay::Pacing::OriginalTiming { speed: req.speed },
+                    PacingReq::Fast => protoplay::Pacing::AsFastAsPossible,
+                },
+                iterations: req.iterations,
+                scada_gateway_ip: req.scada_gateway_ip,
+                scada_gateway_iface: req.scada_gateway_iface.clone(),
+                upstream_nat_iface: req.upstream_nat_iface.clone().filter(|s| !s.is_empty()),
+                alias_state_path: Some(cfg.alias_state_path()),
+                master_bind_ip: req.master_bind_ip,
+                tcp_nodelay: req.tcp_nodelay,
+                selected_endpoints: if req.selected_rtus.is_empty() {
+                    None
+                } else {
+                    Some(req.selected_rtus.iter().copied().collect())
+                },
+                loop_within_session: req.loop_within_session,
             },
-            listen_port_base: req.listen_port_base,
-            pacing: match req.pacing.as_str() {
-                "original" => protoplay::Pacing::OriginalTiming { speed: req.speed },
-                _ => protoplay::Pacing::AsFastAsPossible,
-            },
-            iterations: req.iterations,
-            scada_gateway_ip: req.scada_gateway_ip,
-            scada_gateway_iface: req.scada_gateway_iface.clone(),
-            upstream_nat_iface: req.upstream_nat_iface.clone(),
-            alias_state_path: Some(alias_state_path()),
-            master_bind_ip: req.master_bind_ip,
-            tcp_nodelay: req.tcp_nodelay,
-            selected_endpoints: if req.selected_rtus.is_empty() {
-                None
-            } else {
-                Some(req.selected_rtus.iter().copied().collect())
-            },
-            loop_within_session: req.loop_within_session,
-        };
-        let db_bench = state.db.clone();
-        thread::Builder::new()
-            .name(format!("webui-bench-{id}"))
-            .spawn(move || {
-                info!(id, "starting benchmark run");
-                let result = sched_run_benchmark(pcap, bcfg, replayer, ctx_for_thread);
-                let mut map = runs.lock().unwrap();
-                if let Some(rs) = map.get_mut(&id) {
-                    // Snapshot final progress BEFORE flipping status, so
-                    // refresh_progress's "running-only" guard lets the
-                    // last values through into the stored row.
-                    refresh_progress(rs);
-                    match result {
-                        Ok(r) => {
-                            rs.status = if rs.ctx.is_cancelled() {
-                                RunStatus::Stopped
-                            } else {
-                                RunStatus::Completed
-                            };
-                            rs.benchmark = Some((&r).into());
-                        }
-                        Err(e) => {
-                            warn!(id, error = %e, "benchmark failed");
-                            rs.status = RunStatus::Failed;
-                            rs.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    let stored = runstate_to_stored(rs);
-                    if let Err(e) = db_bench.update_finished(
-                        stored.id,
-                        &stored.status,
-                        stored.error.as_deref(),
-                        stored.report_json.as_deref(),
-                        stored.benchmark_json.as_deref(),
-                        stored.per_source_json.as_deref(),
-                        stored.throughput_json.as_deref(),
-                        stored.planned,
-                        stored.sent,
-                        stored.bytes,
-                    ) {
-                        warn!(id, error = %e, "db update_finished (bench) failed");
-                    }
-                }
-            })
-            .map_err(|e| AppError::Internal(format!("spawn thread: {e}")))?;
+            replayer,
+        )
     } else {
-        // Raw replay path — needs a target MAC.
-        let target_mac_bytes =
-            parse_mac(&req.target_mac).map_err(|e| AppError::BadRequest(format!("{e}")))?;
-        let cfg = RunConfig {
+        RunJob::Raw(RunConfig {
             target_ip: req.target_ip,
-            target_mac: target_mac_bytes,
+            target_mac: parse_mac(&req.target_mac).expect("validated mac"),
             bridge_name: req.bridge.clone(),
             tap_prefix: req.tap_prefix.clone(),
-            egress_nic: req.nic.clone(),
+            egress_nic: req.nic.clone().filter(|s| !s.is_empty()),
             speed: req.speed,
             top_speed: req.top_speed,
             realtime: req.realtime,
@@ -369,173 +363,226 @@ pub(crate) async fn api_run(
             },
             include_non_ip: !req.skip_non_ip,
             startup_delay_secs: req.warmup_secs,
-            capture_path: Some(capture_pb.clone()),
+            capture_path: None,
             iterations: req.iterations,
-        };
-        let db_raw = state.db.clone();
-        thread::Builder::new()
-            .name(format!("webui-run-{id}"))
-            .spawn(move || {
-                info!(id, "starting run");
-                let result = sched_run(pcap, cfg, ctx_for_thread);
-                let mut map = runs.lock().unwrap();
-                if let Some(rs) = map.get_mut(&id) {
-                    // Snapshot final progress BEFORE flipping status, so
-                    // refresh_progress's "running-only" guard lets the
-                    // last values through into the stored row.
-                    refresh_progress(rs);
-                    match result {
-                        Ok(r) => {
-                            rs.status = if rs.ctx.is_cancelled() {
-                                RunStatus::Stopped
-                            } else {
-                                RunStatus::Completed
-                            };
-                            rs.report = Some((&r).into());
-                        }
-                        Err(e) => {
-                            warn!(id, error = %e, "run failed");
-                            rs.status = RunStatus::Failed;
-                            rs.error = Some(format!("{e:#}"));
-                        }
-                    }
-                    let stored = runstate_to_stored(rs);
-                    if let Err(e) = db_raw.update_finished(
-                        stored.id,
-                        &stored.status,
-                        stored.error.as_deref(),
-                        stored.report_json.as_deref(),
-                        stored.benchmark_json.as_deref(),
-                        stored.per_source_json.as_deref(),
-                        stored.throughput_json.as_deref(),
-                        stored.planned,
-                        stored.sent,
-                        stored.bytes,
-                    ) {
-                        warn!(id, error = %e, "db update_finished (raw) failed");
-                    }
-                }
-            })
-            .map_err(|e| AppError::Internal(format!("spawn thread: {e}")))?;
-    }
-
-    // Kick off a background throughput sampler for this run. Every 1 s,
-    // while status is Running, snapshot `ctx.sent` and push
-    // `(sent_this_tick - sent_last_tick)` into the history buffer.
-    let runs_s = state.runs.clone();
-    let ctx_s = ctx;
-    thread::Builder::new()
-        .name(format!("webui-tps-{id}"))
-        .spawn(move || {
-            let mut last = 0u64;
-            loop {
-                std::thread::sleep(std::time::Duration::from_secs(1));
-                let mut map = runs_s.lock().unwrap();
-                let Some(rs) = map.get_mut(&id) else {
-                    return;
-                };
-                if !matches!(rs.status, RunStatus::Running) {
-                    return;
-                }
-                let now = ctx_s.sent.load(Ordering::Relaxed);
-                let delta = now.saturating_sub(last);
-                last = now;
-                rs.throughput_history.push(delta);
-                if rs.throughput_history.len() > 120 {
-                    rs.throughput_history.remove(0);
-                }
-            }
         })
-        .ok();
+    };
+    (job, template)
+}
 
+#[derive(Serialize)]
+pub(crate) struct RunResp {
+    id: u64,
+}
+
+/// Load a pcap on the blocking pool (F053, F087).
+pub(crate) async fn load_blocking(path: PathBuf) -> Result<pcapload::LoadedPcap, AppError> {
+    tokio::task::spawn_blocking(move || load(&path))
+        .await
+        .map_err(|e| AppError::Internal(format!("pcap load task: {e}")))?
+        .map_err(|e| AppError::BadRequest(format!("load pcap: {e:#}")).code("pcap_unreadable"))
+}
+
+pub(crate) async fn api_run(
+    State(state): State<AppState>,
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+    ApiJson(req): ApiJson<RunReq>,
+) -> Result<Json<RunResp>, AppError> {
+    validate_fields(&req)?;
+    // Fail fast before the (possibly slow) pcap load; `launch`
+    // re-checks atomically when it takes the slot.
+    if let Some(a) = state.active_run() {
+        return Err(run_active_error(&a));
+    }
+    let pcap_id = req.pcap_id.clone().unwrap_or_default();
+    let pcap_path = library_pcap_path(&state.library_dir, &pcap_id)?;
+    let pcap = Arc::new(load_blocking(pcap_path.clone()).await?);
+    let (job, template) = build_job(&req, &state.cfg);
+    let id = launch(
+        &state,
+        Launch {
+            pcap,
+            pcap_path,
+            pcap_id,
+            client_ip,
+            client_id: client_id(&headers),
+            job,
+            template,
+        },
+    )?;
     Ok(Json(RunResp { id }))
 }
 
-pub(crate) async fn api_runs(State(state): State<AppState>) -> Json<Vec<RunState>> {
-    let map = state.runs.lock().unwrap();
-    let mut v: Vec<RunState> = map.values().cloned().collect();
-    drop(map);
-    for r in &mut v {
-        refresh_progress(r);
-    }
-    v.sort_by_key(|r| std::cmp::Reverse(r.id));
-    Json(v)
+#[derive(Deserialize, Default)]
+pub(crate) struct RunsQuery {
+    #[serde(default)]
+    status: Option<String>,
+}
+
+/// Slim run list (F029, F054): no per-session rows, no latency
+/// histograms, and live per-source progress only for running runs.
+/// `?status=running` (or any status) filters.
+pub(crate) async fn api_runs(
+    State(state): State<AppState>,
+    ApiQuery(q): ApiQuery<RunsQuery>,
+) -> Result<Json<Vec<RunSummary>>, AppError> {
+    let filter = match q.status.as_deref() {
+        None | Some("") => None,
+        Some(s) => {
+            let st = RunStatus::from_str(s);
+            if st.as_str() != s {
+                return Err(bad(format!("unknown status filter {s:?}")));
+            }
+            Some(st)
+        }
+    };
+    // Copy only the Arc handles under the global lock; each run is
+    // then locked on its own while its summary is built.
+    let mut out: Vec<RunSummary> = state
+        .all_runs()
+        .into_iter()
+        .filter_map(|e| {
+            let mut rs = e.lock_safe();
+            if filter.is_some_and(|f| f != rs.status) {
+                return None;
+            }
+            refresh_progress(&mut rs);
+            Some(rs.summary())
+        })
+        .collect();
+    out.sort_by_key(|r| std::cmp::Reverse(r.id));
+    Ok(Json(out))
+}
+
+/// Full detail of one run, including per-session rows and histograms,
+/// plus `has_capture`.
+#[derive(Serialize)]
+pub(crate) struct RunDetail {
+    #[serde(flatten)]
+    run: RunState,
+    has_capture: bool,
 }
 
 pub(crate) async fn api_run_by_id(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
-) -> Result<Json<RunState>, AppError> {
-    let map = state.runs.lock().unwrap();
-    let mut rs = map
-        .get(&id)
-        .cloned()
+    ApiPath(id): ApiPath<u64>,
+) -> Result<Json<RunDetail>, AppError> {
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    drop(map);
+    let mut rs = entry.lock_safe().clone();
     refresh_progress(&mut rs);
-    Ok(Json(rs))
+    let has_capture = rs.capture_file.as_ref().is_some_and(|p| p.is_file());
+    Ok(Json(RunDetail {
+        run: rs,
+        has_capture,
+    }))
 }
 
+/// Delete a finished run. A run marked running whose worker is gone is
+/// finalised first; a run with a live worker gives 409.
 pub(crate) async fn api_run_delete(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    ApiPath(id): ApiPath<u64>,
 ) -> Result<StatusCode, AppError> {
-    {
-        let map = state.runs.lock().unwrap();
-        if let Some(rs) = map.get(&id) {
-            if matches!(rs.status, RunStatus::Running) {
-                return Err(AppError::BadRequest(format!(
-                    "run {id} is still running — stop it before deleting"
-                )));
-            }
-        } else {
-            return Err(AppError::NotFound(format!("run {id} not found")));
+    let entry = state
+        .get_run(id)
+        .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
+    let (running, capture) = {
+        let rs = entry.lock_safe();
+        (!rs.status.is_terminal(), rs.capture_file.clone())
+    };
+    if running {
+        if state.worker_alive(id) {
+            return Err(AppError::Conflict(
+                "run_running",
+                format!("run {id} is still running; stop it before deleting"),
+            ));
         }
+        finalize(
+            &state,
+            id,
+            RunOutcome::Abandoned("run had no live worker".into()),
+        );
     }
-    state.runs.lock().unwrap().remove(&id);
+    state.runs.lock_safe().remove(&id);
+    state.workers.lock_safe().remove(&id);
+    state.gap_cache.lock_safe().remove(&id);
     if let Err(e) = state.db.delete(id) {
         warn!(id, error = %e, "db delete failed");
     }
-    // Best-effort: also remove the capture file if it exists.
-    let cap = std::path::PathBuf::from(format!("{CAPTURE_DIR}/run_{id}.pcap"));
-    let _ = std::fs::remove_file(&cap);
+    // Only ever delete our own capture file.
+    if let Some(p) = capture.filter(|p| p.starts_with(state.cfg.captures_dir())) {
+        let _ = std::fs::remove_file(p);
+    }
     info!(id, "run deleted");
     Ok(StatusCode::NO_CONTENT)
 }
 
+#[derive(Serialize)]
+pub(crate) struct StopResp {
+    id: u64,
+    status: RunStatus,
+}
+
+/// Request a stop. Running runs get their cancel flags set (202). A run
+/// still marked running with no live worker is finalised as stopped
+/// right away (200), so stop can always clear a zombie (F049, F074).
 pub(crate) async fn api_run_stop(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
-) -> Result<StatusCode, AppError> {
-    let map = state.runs.lock().unwrap();
-    let rs = map
-        .get(&id)
+    ClientIp(client_ip): ClientIp,
+    headers: HeaderMap,
+    ApiPath(id): ApiPath<u64>,
+) -> Result<(StatusCode, Json<StopResp>), AppError> {
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    rs.ctx.cancel.store(true, Ordering::Relaxed);
-    // Fan out: flip every per-session cancel so replayers unwind
-    // promptly at their next check, not just when the top-level
-    // ctx.cancel is read by sched's own loops.
-    let sp = rs.ctx.per_source.lock().unwrap();
-    for entry in sp.iter() {
-        entry.cancel.store(true, Ordering::Relaxed);
-        entry.ready.store(true, Ordering::Relaxed);
+    let status = {
+        let rs = entry.lock_safe();
+        if rs.status.is_terminal() {
+            return Ok((
+                StatusCode::OK,
+                Json(StopResp {
+                    id,
+                    status: rs.status,
+                }),
+            ));
+        }
+        cancel_run(&rs);
+        rs.status
+    };
+    state.emit(
+        "run_stopped",
+        id,
+        &client_ip,
+        client_id(&headers),
+        "stopping",
+    );
+    info!(id, client = %client_ip, "stop requested");
+    if !state.worker_alive(id) {
+        finalize(
+            &state,
+            id,
+            RunOutcome::Abandoned("stopped; run had no live worker".into()),
+        );
+        let st = entry.lock_safe().status;
+        return Ok((StatusCode::OK, Json(StopResp { id, status: st })));
     }
-    drop(sp);
-    info!(id, "stop requested");
-    Ok(StatusCode::ACCEPTED)
+    Ok((StatusCode::ACCEPTED, Json(StopResp { id, status })))
 }
 
 #[derive(Serialize)]
 pub(crate) struct GapHistResp {
     /// Log-spaced bucket boundaries in nanoseconds. 21 entries define 20 buckets.
-    pub(crate) buckets_ns: Vec<u64>,
+    buckets_ns: Vec<u64>,
     /// Original pcap's inter-packet gaps, one count per bucket.
-    pub(crate) original: Vec<u64>,
+    original: Vec<u64>,
     /// Captured replay's inter-packet gaps, one count per bucket.
-    pub(crate) captured: Vec<u64>,
-    /// Source pcap paths used.
-    pub(crate) original_path: String,
-    pub(crate) captured_path: String,
+    captured: Vec<u64>,
+    /// Library id of the source pcap (no server paths are echoed).
+    pcap_id: Option<String>,
+    run_id: u64,
 }
 
 /// Compute a 20-bucket log histogram of inter-packet gaps (ns).
@@ -545,93 +592,106 @@ pub(crate) fn bucket_gaps(packets: &[pcapload::Packet]) -> Vec<u64> {
     if packets.len() < 2 {
         return buckets;
     }
-    let min_log = (1_000f64).log10(); // 1 µs  = 10^3 ns
-    let max_log = (10_000_000_000f64).log10(); // 10 s = 10^10 ns
+    let min_log = (1_000f64).log10();
+    let max_log = (10_000_000_000f64).log10();
     for pair in packets.windows(2) {
         let gap = pair[1].ts_ns.saturating_sub(pair[0].ts_ns);
         if gap == 0 {
             continue;
         }
         let l = (gap as f64).log10();
-        let mut idx = (((l - min_log) / (max_log - min_log)) * 20.0) as isize;
-        if idx < 0 {
-            idx = 0;
-        }
-        if idx >= 20 {
-            idx = 19;
-        }
-        buckets[idx as usize] += 1;
+        let idx = (((l - min_log) / (max_log - min_log)) * 20.0) as isize;
+        buckets[idx.clamp(0, 19) as usize] += 1;
     }
     buckets
 }
 
 pub(crate) async fn api_run_gaps(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
-) -> Result<Json<GapHistResp>, AppError> {
-    // Resolve the two pcap paths from the run's record.
-    let (original_path, captured_path) = {
-        let map = state.runs.lock().unwrap();
-        let rs = map
-            .get(&id)
-            .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-        let orig = rs.pcap.display().to_string();
-        let cap = rs
-            .report
-            .as_ref()
-            .and_then(|r| r.capture_path.clone())
-            .or_else(|| rs.benchmark.as_ref().and_then(|b| b.capture_path.clone()))
-            .ok_or_else(|| AppError::NotFound(format!("run {id} has no capture file")))?;
-        (orig, cap)
-    };
-
-    let orig_pcap =
-        load(&original_path).map_err(|e| AppError::BadRequest(format!("load original: {e}")))?;
-    let cap_pcap =
-        load(&captured_path).map_err(|e| AppError::BadRequest(format!("load capture: {e}")))?;
-
-    // Bucket boundaries for labeling (21 edges, 20 buckets, log-spaced 1 µs → 10 s).
-    let mut edges = Vec::with_capacity(21);
-    for i in 0..=20 {
-        let l = 3.0 + (i as f64) * ((10.0 - 3.0) / 20.0);
-        edges.push(10f64.powf(l) as u64);
+    ApiPath(id): ApiPath<u64>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    if let Some(v) = state.gap_cache.lock_safe().get(&id) {
+        return Ok(Json((**v).clone()));
     }
-
-    Ok(Json(GapHistResp {
-        buckets_ns: edges,
-        original: bucket_gaps(&orig_pcap.packets),
-        captured: bucket_gaps(&cap_pcap.packets),
-        original_path,
-        captured_path,
-    }))
+    let (original_path, captured_path, pcap_id, terminal) = {
+        let entry = state
+            .get_run(id)
+            .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
+        let rs = entry.lock_safe();
+        let cap = rs
+            .capture_file
+            .clone()
+            .filter(|p| p.is_file())
+            .ok_or_else(|| AppError::NotFound(format!("run {id} has no capture file")))?;
+        (
+            rs.pcap.clone(),
+            cap,
+            rs.pcap_id.clone(),
+            rs.status.is_terminal(),
+        )
+    };
+    if !original_path.is_file() {
+        return Err(AppError::NotFound(format!(
+            "source pcap of run {id} is no longer in the library"
+        ))
+        .code("source_pcap_missing"));
+    }
+    let _permit = state
+        .heavy
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let resp = tokio::task::spawn_blocking(move || -> Result<GapHistResp, AppError> {
+        let orig = load(&original_path)
+            .map_err(|e| AppError::BadRequest(format!("load original: {e:#}")))?;
+        let cap = load(&captured_path)
+            .map_err(|e| AppError::BadRequest(format!("load capture: {e:#}")))?;
+        let edges = (0..=20)
+            .map(|i| 10f64.powf(3.0 + (i as f64) * (7.0 / 20.0)) as u64)
+            .collect();
+        Ok(GapHistResp {
+            buckets_ns: edges,
+            original: bucket_gaps(&orig.packets),
+            captured: bucket_gaps(&cap.packets),
+            pcap_id,
+            run_id: id,
+        })
+    })
+    .await
+    .map_err(|e| AppError::Internal(format!("gap task: {e}")))??;
+    let v = serde_json::to_value(&resp).map_err(|e| AppError::Internal(e.to_string()))?;
+    if terminal {
+        state.gap_cache.lock_safe().insert(id, Arc::new(v.clone()));
+    }
+    Ok(Json(v))
 }
 
+pub(crate) fn busy() -> AppError {
+    AppError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        "busy",
+        "too many heavy requests in progress; retry shortly",
+    )
+}
+
+/// Stream a run's capture (raw or benchmark) to the client (F055).
 pub(crate) async fn api_run_download(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    ApiPath(id): ApiPath<u64>,
 ) -> Result<Response, AppError> {
     let path = {
-        let map = state.runs.lock().unwrap();
-        map.get(&id)
-            .and_then(|r| r.report.as_ref().and_then(|rep| rep.capture_path.clone()))
-            .ok_or_else(|| AppError::NotFound(format!("no capture for run {id}")))?
-    };
-    let bytes =
-        std::fs::read(&path).map_err(|e| AppError::Internal(format!("read {path:?}: {e}")))?;
-    let fname = std::path::Path::new(&path)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("replay.pcap")
-        .to_string();
-    let mut headers = HeaderMap::new();
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static("application/vnd.tcpdump.pcap"),
-    );
-    headers.insert(
-        header::CONTENT_DISPOSITION,
-        HeaderValue::from_str(&format!("attachment; filename=\"{fname}\""))
-            .unwrap_or_else(|_| HeaderValue::from_static("attachment")),
-    );
-    Ok((headers, bytes).into_response())
+        let entry = state
+            .get_run(id)
+            .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
+        let rs = entry.lock_safe();
+        rs.capture_file.clone()
+    }
+    .filter(|p| p.is_file())
+    .ok_or_else(|| {
+        AppError::NotFound(format!(
+            "no capture for run {id} (never written or evicted)"
+        ))
+        .code("capture_missing")
+    })?;
+    crate::routes::stream_file(&path, &format!("run_{id}.pcap")).await
 }

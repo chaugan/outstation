@@ -1,7 +1,8 @@
 //! Live WebSocket progress stream.
 
+use crate::error::{ApiPath, LockExt};
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::response::Response;
 use serde::Serialize;
 
@@ -15,7 +16,7 @@ use crate::state::*;
 /// itself once the run reaches a terminal state.
 pub(crate) async fn api_run_live_ws(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    ApiPath(id): ApiPath<u64>,
     ws: WebSocketUpgrade,
 ) -> Response {
     ws.on_upgrade(move |socket| run_live_loop(state, id, socket))
@@ -75,12 +76,10 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
     let mut session_wins: Vec<SessionRateWindow> = Vec::new();
     loop {
         let frame = {
-            let map = state.runs.lock().unwrap();
-            let Some(rs) = map.get(&id).cloned() else {
+            let Some(entry) = state.get_run(id) else {
                 break;
             };
-            drop(map);
-            let mut rs = rs;
+            let mut rs = entry.lock_safe().clone();
             refresh_progress(&mut rs);
 
             let now = std::time::Instant::now();
@@ -122,7 +121,7 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
             (
                 LiveFrame {
                     run_id: rs.id,
-                    status: format!("{:?}", rs.status).to_lowercase(),
+                    status: rs.status.as_str().to_string(),
                     mode: rs.mode,
                     role: rs.role,
                     planned: rs.planned,
@@ -148,7 +147,10 @@ pub(crate) async fn run_live_loop(state: AppState, id: u64, mut socket: WebSocke
             // state before we close.
             break;
         }
-        tokio::time::sleep(interval).await;
+        tokio::select! {
+            _ = tokio::time::sleep(interval) => {}
+            _ = state.shutdown.cancelled() => break,
+        }
     }
 }
 

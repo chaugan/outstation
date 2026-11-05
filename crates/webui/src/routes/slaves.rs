@@ -1,26 +1,33 @@
 //! Per-slave controls for slave-mode benchmark runs.
 
+use crate::error::LockExt;
 use std::net::Ipv4Addr;
 use std::sync::atomic::Ordering;
 
-use axum::extract::{Path, State};
+use axum::extract::State;
 use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 use tracing::info;
 
-use crate::error::AppError;
+use crate::error::{ApiJson, ApiPath, AppError};
 use crate::state::*;
 
 pub(crate) async fn api_run_start_slave(
     State(state): State<AppState>,
-    Path((id, idx)): Path<(u64, usize)>,
+    ApiPath((id, idx)): ApiPath<(u64, usize)>,
 ) -> Result<StatusCode, AppError> {
-    let map = state.runs.lock().unwrap();
-    let rs = map
-        .get(&id)
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    let sp = rs.ctx.per_source.lock().unwrap();
+    let rs = entry.lock_safe();
+    if rs.status.is_terminal() {
+        return Err(AppError::Conflict(
+            "run_finished",
+            format!("run {id} has already finished"),
+        ));
+    }
+    let sp = rs.ctx.per_source.lock_safe();
     let entry = sp
         .get(idx)
         .ok_or_else(|| AppError::NotFound(format!("slave idx {idx} not found in run {id}")))?;
@@ -35,14 +42,20 @@ pub(crate) async fn api_run_start_slave(
 /// rows have already been started is a no-op for those rows.
 pub(crate) async fn api_run_start_all_slaves(
     State(state): State<AppState>,
-    Path(id): Path<u64>,
+    ApiPath(id): ApiPath<u64>,
 ) -> Result<Json<serde_json::Value>, AppError> {
     use protoplay::session_state as ss;
-    let map = state.runs.lock().unwrap();
-    let rs = map
-        .get(&id)
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    let sp = rs.ctx.per_source.lock().unwrap();
+    let rs = entry.lock_safe();
+    if rs.status.is_terminal() {
+        return Err(AppError::Conflict(
+            "run_finished",
+            format!("run {id} has already finished"),
+        ));
+    }
+    let sp = rs.ctx.per_source.lock_safe();
     let mut started = 0u64;
     for entry in sp.iter() {
         if entry.is_cancelled() {
@@ -65,13 +78,19 @@ pub(crate) async fn api_run_start_all_slaves(
 
 pub(crate) async fn api_run_stop_slave(
     State(state): State<AppState>,
-    Path((id, idx)): Path<(u64, usize)>,
+    ApiPath((id, idx)): ApiPath<(u64, usize)>,
 ) -> Result<StatusCode, AppError> {
-    let map = state.runs.lock().unwrap();
-    let rs = map
-        .get(&id)
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    let sp = rs.ctx.per_source.lock().unwrap();
+    let rs = entry.lock_safe();
+    if rs.status.is_terminal() {
+        return Err(AppError::Conflict(
+            "run_finished",
+            format!("run {id} has already finished"),
+        ));
+    }
+    let sp = rs.ctx.per_source.lock_safe();
     let entry = sp
         .get(idx)
         .ok_or_else(|| AppError::NotFound(format!("slave idx {idx} not found in run {id}")))?;
@@ -91,27 +110,33 @@ pub(crate) struct PatchSlaveReq {
 
 pub(crate) async fn api_run_patch_slave(
     State(state): State<AppState>,
-    Path((id, idx)): Path<(u64, usize)>,
-    Json(req): Json<PatchSlaveReq>,
+    ApiPath((id, idx)): ApiPath<(u64, usize)>,
+    ApiJson(req): ApiJson<PatchSlaveReq>,
 ) -> Result<StatusCode, AppError> {
-    let map = state.runs.lock().unwrap();
-    let rs = map
-        .get(&id)
+    let entry = state
+        .get_run(id)
         .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?;
-    let sp = rs.ctx.per_source.lock().unwrap();
+    let rs = entry.lock_safe();
+    if rs.status.is_terminal() {
+        return Err(AppError::Conflict(
+            "run_finished",
+            format!("run {id} has already finished"),
+        ));
+    }
+    let sp = rs.ctx.per_source.lock_safe();
     let entry = sp
         .get(idx)
         .ok_or_else(|| AppError::NotFound(format!("slave idx {idx} not found in run {id}")))?;
     if entry.snapshot_state() != protoplay::session_state::PENDING {
         return Err(AppError::BadRequest(
-            "cannot patch a slave that has already started".into(),
+            "cannot patch a slave that has already started",
         ));
     }
     if let Some(ip_str) = req.listen_ip {
         let ip: Ipv4Addr = ip_str
             .parse()
             .map_err(|e| AppError::BadRequest(format!("bad listen_ip {ip_str:?}: {e}")))?;
-        *entry.listen_ip.lock().unwrap() = ip;
+        *entry.listen_ip.lock_safe() = ip;
         info!(id, idx, %ip, "slave listen_ip updated");
     }
     Ok(StatusCode::ACCEPTED)

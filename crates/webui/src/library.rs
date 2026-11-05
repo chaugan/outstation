@@ -106,12 +106,36 @@ pub(crate) fn library_entry_id_valid(id: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
-pub(crate) fn library_pcap_path(dir: &StdPath, id: &str) -> Result<PathBuf, AppError> {
+/// Resolve `<dir>/<id>.<ext>` for a validated id and check, after
+/// canonicalisation, that it is still inside `dir` (no symlink escape).
+pub(crate) fn contained_path(dir: &StdPath, id: &str, ext: &str) -> Result<PathBuf, AppError> {
     if !library_entry_id_valid(id) {
-        return Err(AppError::BadRequest(format!("invalid pcap id: {id}")));
+        return Err(AppError::BadRequest(format!("invalid pcap id: {id:?}")).code("invalid_id"));
     }
-    let p = dir.join(format!("{id}.pcap"));
+    let p = dir.join(format!("{id}.{ext}"));
     if !p.exists() {
+        return Ok(p);
+    }
+    let canon_dir = dir
+        .canonicalize()
+        .map_err(|e| AppError::Internal(format!("library dir: {e}")))?;
+    let canon = p
+        .canonicalize()
+        .map_err(|e| AppError::Internal(format!("resolve library entry: {e}")))?;
+    if canon.parent() != Some(canon_dir.as_path()) {
+        return Err(
+            AppError::BadRequest(format!("pcap id {id:?} resolves outside the library"))
+                .code("invalid_id"),
+        );
+    }
+    Ok(p)
+}
+
+/// Path of the pcap for library id `id`; must exist and be a regular
+/// file inside the library.
+pub(crate) fn library_pcap_path(dir: &StdPath, id: &str) -> Result<PathBuf, AppError> {
+    let p = contained_path(dir, id, "pcap")?;
+    if !p.is_file() {
         return Err(AppError::NotFound(format!("pcap id not found: {id}")));
     }
     Ok(p)
@@ -121,14 +145,116 @@ pub(crate) fn library_sidecar_path(dir: &StdPath, id: &str) -> PathBuf {
     dir.join(format!("{id}.json"))
 }
 
+/// Load a sidecar. The id stored inside the file is ignored; the
+/// validated path id wins (F057).
 pub(crate) fn load_library_entry(dir: &StdPath, id: &str) -> Option<LibraryEntry> {
-    let bytes = std::fs::read(library_sidecar_path(dir, id)).ok()?;
-    serde_json::from_slice(&bytes).ok()
+    let p = contained_path(dir, id, "json").ok()?;
+    let bytes = std::fs::read(p).ok()?;
+    let mut e: LibraryEntry = serde_json::from_slice(&bytes).ok()?;
+    e.id = id.to_string();
+    Some(e)
 }
 
 pub(crate) fn save_library_entry(dir: &StdPath, entry: &LibraryEntry) -> std::io::Result<()> {
-    let bytes = serde_json::to_vec_pretty(entry).unwrap();
-    std::fs::write(library_sidecar_path(dir, &entry.id), bytes)
+    if !library_entry_id_valid(&entry.id) {
+        return Err(std::io::Error::other("invalid library id"));
+    }
+    let bytes = serde_json::to_vec_pretty(entry).map_err(std::io::Error::other)?;
+    // Write-then-rename so a crash never leaves a truncated sidecar.
+    let tmp = dir.join(format!(".{}.json.part", entry.id));
+    std::fs::write(&tmp, bytes)?;
+    std::fs::rename(&tmp, library_sidecar_path(dir, &entry.id))
+}
+
+/// Create `dir` (and parents) and restrict it to the service user
+/// (0700). Used for the private temp dir.
+pub(crate) fn prepare_private_dir(dir: &StdPath) -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir)?;
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    Ok(())
+}
+
+/// Remove leftover `.*.part` upload files in `dir` (F077, F091).
+pub(crate) fn sweep_part_files(dir: &StdPath) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut n = 0;
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.starts_with('.')
+            && name.ends_with(".part")
+            && std::fs::remove_file(e.path()).is_ok()
+        {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Remove every file in the private temp dir (leftovers of a crash).
+pub(crate) fn sweep_tmp_dir(dir: &StdPath) -> usize {
+    let Ok(rd) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    rd.flatten()
+        .filter(|e| e.path().is_file() && std::fs::remove_file(e.path()).is_ok())
+        .count()
+}
+
+/// Deletes `path` on drop unless [`PartGuard::keep`] was called. Used
+/// for in-progress uploads so every error path cleans up.
+pub(crate) struct PartGuard {
+    path: Option<PathBuf>,
+}
+
+impl PartGuard {
+    pub(crate) fn new(path: PathBuf) -> Self {
+        Self { path: Some(path) }
+    }
+
+    pub(crate) fn keep(mut self) {
+        self.path = None;
+    }
+}
+
+impl Drop for PartGuard {
+    fn drop(&mut self) {
+        if let Some(p) = self.path.take() {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+}
+
+/// RFC 6266 `Content-Disposition: attachment` with an ASCII fallback
+/// and a UTF-8 `filename*` (F057).
+pub(crate) fn content_disposition(name: &str) -> String {
+    let fallback: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_graphic() && !matches!(c, '"' | '\\' | '/' | ';' | '%') || c == ' ' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let fallback = if fallback.trim().is_empty() {
+        "download.pcap".to_string()
+    } else {
+        fallback
+    };
+    let mut enc = String::new();
+    for b in name.bytes() {
+        if b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b) {
+            enc.push(b as char);
+        } else {
+            enc.push_str(&format!("%{b:02X}"));
+        }
+    }
+    format!("attachment; filename=\"{fallback}\"; filename*=UTF-8''{enc}")
 }
 
 pub(crate) struct QuickInspect {

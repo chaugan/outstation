@@ -1,44 +1,67 @@
 //! Web UI: axum backend + embedded static HTML page.
 //!
-//! Endpoints:
-//!   GET  /                → static HTML SPA
-//!   GET  /api/status      → health/version
-//!   GET  /api/protocols   → list registered protocol-aware replayers
-//!   POST /api/inspect     → inspect a pcap file at a given path
-//!   POST /api/run         → start a replay run, returns a run id
-//!   GET  /api/runs        → list active/recent runs
-//!   GET  /api/runs/:id    → full state + stats of one run
+//! Endpoints (all errors are `{"error": .., "code": ..}`):
 //!
-//! Run state lives in a shared `RunRegistry`. `POST /api/run` spawns a
-//! std thread that invokes `sched::run` blockingly and updates the run
-//! state on completion. The API stays non-blocking for clients.
+//! | method | path | notes |
+//! |---|---|---|
+//! | GET | `/` | SPA |
+//! | GET | `/api/status` | health: DB, disk, capabilities, active run |
+//! | GET | `/api/events` | SSE: `hello`, `run_started`, `run_finished`, `run_stopped` |
+//! | GET | `/api/protocols` | registered replayers |
+//! | POST | `/api/inspect` | `{pcap_id}` |
+//! | POST | `/api/run` | start a run (409 `run_active` if one is active) |
+//! | GET | `/api/runs[?status=running]` | slim summaries |
+//! | GET/DELETE | `/api/runs/:id` | full detail / delete |
+//! | POST | `/api/runs/:id/stop` | stop |
+//! | GET | `/api/runs/:id/live` | WebSocket progress |
+//! | GET | `/api/runs/:id/download`, `/gaps` | capture, gap histogram |
+//! | POST | `/api/analyze[?run_id=N]` | fidelity analysis upload |
+//! | * | `/api/pcaps...` | library |
+//!
+//! Only one run may be active at a time. Every request passes the
+//! same-origin/Host guard in [`security`].
 
 mod analysis;
+mod captures;
+mod cleanup;
 mod db;
 mod dto;
 mod error;
+mod events;
 mod library;
 mod netprobe;
 mod persist;
 mod routes;
 mod runs;
+mod security;
 mod state;
+mod sysinfo;
 
+#[cfg(test)]
+mod tests;
+
+use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::DefaultBodyLimit;
 use axum::routing::{delete, get, patch, post};
 use axum::Router;
-use tracing::{info, warn};
+use tower_http::catch_panic::CatchPanicLayer;
+use tracing::{error, info, warn};
 
+pub use cleanup::host_cleanup;
 pub use dto::{
-    BenchmarkReportJson, RunReportJson, RunState, RunStatus, SessionReportJson, SourceProgressJson,
-    SourceReportJson,
+    BenchmarkReportJson, LatencyHistogramJson, RunReportJson, RunState, RunStatus, RunSummary,
+    SessionReportJson, SourceProgressJson, SourceReportJson,
 };
-pub use state::AppState;
+pub use events::RunEvent;
+pub use state::{
+    default_library_dir, default_state_dir, split_hosts, ActiveRun, AppState, ServeConfig,
+};
 
-use persist::stored_to_runstate;
+use error::LockExt;
 use routes::analyze::*;
 use routes::library::*;
 use routes::live::*;
@@ -46,13 +69,18 @@ use routes::misc::*;
 use routes::net::*;
 use routes::runs::*;
 use routes::slaves::*;
-use state::alias_state_path;
 
 pub fn router(state: AppState) -> Router {
+    // Multipart bodies are bounded by the configured upload cap (plus
+    // room for the multipart framing); handlers enforce the exact cap.
+    let body_limit = usize::try_from(state.cfg.max_upload_bytes)
+        .unwrap_or(usize::MAX)
+        .saturating_add(1024 * 1024);
     Router::new()
         .route("/", get(serve_index))
         .route("/echarts.min.js", get(serve_echarts))
         .route("/api/status", get(api_status))
+        .route("/api/events", get(events::api_events))
         .route("/api/protocols", get(api_protocols))
         .route("/api/inspect", post(api_inspect))
         .route("/api/run", post(api_run))
@@ -72,50 +100,31 @@ pub fn router(state: AppState) -> Router {
         .route("/api/arp", post(api_arp))
         .route(
             "/api/analyze",
-            post(api_analyze).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(api_analyze).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/api/runs/:id/download", get(api_run_download))
         .route("/api/runs/:id/gaps", get(api_run_gaps))
         .route("/api/pcaps", get(api_library_list))
         .route(
             "/api/pcaps",
-            post(api_library_upload).layer(DefaultBodyLimit::max(1024 * 1024 * 1024)),
+            post(api_library_upload).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/api/pcaps/:id", delete(api_library_delete))
         .route("/api/pcaps/:id", patch(api_library_rename))
         .route("/api/pcaps/:id/download", get(api_library_download))
+        .fallback(error::not_found_fallback)
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            security::origin_guard,
+        ))
+        .layer(CatchPanicLayer::custom(error::panic_response))
         .with_state(state)
 }
 
-pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
-    // Startup-time reclamation: anything we created and didn't clean
-    // up in a prior run is orphaned now. Walk the state file for
-    // tracked IP aliases, delete them, and also wipe stale pcr_*
-    // veth/bridge interfaces left over from a killed run.
-    let state_path = alias_state_path();
-    match netctl::reclaim_recorded_aliases(&state_path) {
-        Ok(n) if n > 0 => {
-            warn!(count = n, path = %state_path.display(),
-                "reclaimed {n} orphaned ip alias(es) from a previous run — \
-                 the prior run did not clean up properly");
-        }
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "reclaim_recorded_aliases failed"),
-    }
-    match netctl::reclaim_stale("pcr_br0", "pcr_") {
-        Ok(n) if n > 0 => warn!(
-            count = n,
-            "reclaimed {n} stale pcr_* interface(s) at startup"
-        ),
-        Ok(_) => {}
-        Err(e) => warn!(error = %e, "reclaim_stale failed"),
-    }
-
-    let state = AppState::new();
-
-    // Any rows left in status=running are from a process that died
-    // without updating them. Mark them failed so the UI doesn't think
-    // they're still in flight, then reload everything.
+/// Startup work on a freshly opened state: mark orphans, restore runs,
+/// seed the id counter, migrate legacy captures, sweep temp files and
+/// enforce capture retention.
+pub(crate) fn restore(state: &AppState) -> Result<()> {
     match state
         .db
         .mark_orphans_failed("interrupted by server restart")
@@ -124,28 +133,147 @@ pub async fn serve(bind: std::net::SocketAddr) -> Result<()> {
         Ok(_) => {}
         Err(e) => warn!(error = %e, "mark_orphans_failed failed"),
     }
-    match state.db.load_all() {
-        Ok(stored) => {
-            let mut map = state.runs.lock().unwrap();
-            let mut max_id = 0u64;
-            for s in &stored {
-                if let Some(rs) = stored_to_runstate(s) {
-                    if rs.id > max_id {
-                        max_id = rs.id;
-                    }
-                    map.insert(rs.id, rs);
+    // Seed ids from the DB independently of how many rows decode, so a
+    // bad row can never cause an id to be reused (F073).
+    let max_id = state.db.max_id().context("read max run id")?;
+    state.next_id.store(max_id + 1, Ordering::SeqCst);
+
+    let captures_dir = state.cfg.captures_dir();
+    let stored = state.db.load_all().context("load run history")?;
+    let ids: Vec<u64> = stored.iter().map(|s| s.id).collect();
+    captures::migrate_legacy(
+        &captures_dir,
+        &ids,
+        std::path::Path::new(captures::LEGACY_CAPTURE_DIR),
+    );
+    let mut restored = 0usize;
+    {
+        let mut map = state.runs.lock_safe();
+        for s in &stored {
+            match persist::stored_to_runstate(s, &state.cfg.library_dir, &captures_dir) {
+                Ok(rs) => {
+                    map.insert(rs.id, std::sync::Arc::new(std::sync::Mutex::new(rs)));
+                    restored += 1;
                 }
+                Err(e) => warn!(id = s.id, error = %e, "skipping unreadable run"),
             }
-            drop(map);
-            state.next_id.store(max_id + 1, Ordering::SeqCst);
-            info!(count = stored.len(), "restored runs from sqlite");
         }
-        Err(e) => warn!(error = %e, "load_all failed"),
+    }
+    info!(restored, next_id = max_id + 1, "restored runs from sqlite");
+
+    let parts = library::sweep_part_files(&state.cfg.library_dir);
+    let tmps = library::sweep_tmp_dir(&state.cfg.tmp_dir());
+    if parts + tmps > 0 {
+        info!(
+            parts,
+            tmps, "removed leftover partial uploads and temp files"
+        );
+    }
+    captures::enforce_retention(
+        &captures_dir,
+        state.cfg.capture_max_total_bytes,
+        state.cfg.capture_max_count,
+        None,
+    );
+    Ok(())
+}
+
+/// How long shutdown waits for run workers to unwind their guards.
+const WORKER_JOIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// How long shutdown waits for open HTTP connections to finish.
+const HTTP_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        if let Err(e) = tokio::signal::ctrl_c().await {
+            error!(error = %e, "install SIGINT handler failed");
+            std::future::pending::<()>().await;
+        }
+    };
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                error!(error = %e, "install SIGTERM handler failed");
+                std::future::pending::<()>().await;
+            }
+        }
+    };
+    tokio::select! {
+        _ = ctrl_c => info!("SIGINT received"),
+        _ = term => info!("SIGTERM received"),
+    }
+}
+
+/// Stop everything in order: refuse new runs and close event streams,
+/// cancel running runs, then join their workers so the RAII guards in
+/// sched/netctl drop before the process exits (F036, F071).
+pub(crate) async fn shutdown(state: &AppState, join_timeout: Duration) -> Vec<u64> {
+    state.shutdown.cancel();
+    runs::cancel_all(state);
+    let st = state.clone();
+    let left = tokio::task::spawn_blocking(move || runs::join_workers(&st, join_timeout))
+        .await
+        .unwrap_or_default();
+    if left.is_empty() {
+        info!("all run workers finished");
+    } else {
+        warn!(?left, "run workers still busy after the shutdown timeout");
+    }
+    left
+}
+
+/// Run the web UI until SIGTERM/SIGINT, then shut down gracefully.
+pub async fn serve(cfg: ServeConfig) -> Result<()> {
+    let bind = cfg.bind;
+    // Reclaim host state left by a previous process before anything new
+    // is created.
+    let state_dir = cfg.state_dir.clone();
+    tokio::task::spawn_blocking(move || host_cleanup(&state_dir)).await??;
+
+    let state = AppState::open(cfg)?;
+    restore(&state)?;
+    if !state.cfg.allow_hosts.is_empty() {
+        info!(hosts = ?state.cfg.allow_hosts, "extra allowed Host names");
     }
 
-    let app = router(state);
-    let listener = tokio::net::TcpListener::bind(bind).await?;
+    let app = router(state.clone());
+    let listener = tokio::net::TcpListener::bind(bind)
+        .await
+        .with_context(|| format!("bind {bind}"))?;
     info!(addr = %bind, "outstation webui listening");
-    axum::serve(listener, app).await?;
+    let token = state.shutdown.clone();
+    let server = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .with_graceful_shutdown(async move { token.cancelled().await });
+    let mut server = tokio::spawn(async move { server.await });
+
+    tokio::select! {
+        r = &mut server => {
+            // Server ended on its own (error); still clean up.
+            let res = r.context("server task")?;
+            shutdown(&state, WORKER_JOIN_TIMEOUT).await;
+            let sd = state.cfg.state_dir.clone();
+            tokio::task::spawn_blocking(move || host_cleanup(&sd)).await??;
+            return res.context("http server");
+        }
+        _ = shutdown_signal() => {}
+    }
+    info!("shutting down: cancelling runs and draining connections");
+    shutdown(&state, WORKER_JOIN_TIMEOUT).await;
+    if tokio::time::timeout(HTTP_DRAIN_TIMEOUT, &mut server)
+        .await
+        .is_err()
+    {
+        warn!("HTTP connections still open after the drain timeout; closing");
+        server.abort();
+    }
+    let sd = state.cfg.state_dir.clone();
+    tokio::task::spawn_blocking(move || host_cleanup(&sd)).await??;
+    info!("shutdown complete");
     Ok(())
 }
