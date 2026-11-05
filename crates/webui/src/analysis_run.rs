@@ -76,6 +76,18 @@ pub(crate) fn run_info_of(rs: &RunState) -> analysis::RunInfo {
             .as_ref()
             .and_then(|b| b.capture_truncated)
             .unwrap_or(false),
+        capture_warnings: rs
+            .benchmark
+            .as_ref()
+            .map(|b| {
+                b.warnings
+                    .iter()
+                    .filter(|w| analysis::is_capture_warning(w))
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default(),
+        capture_ok: rs.benchmark.as_ref().and_then(|b| b.capture_ok),
     }
 }
 
@@ -505,6 +517,25 @@ mod tests {
             (info.loop_within_session, info.paced_speed, info.source_port),
             (None, None, None)
         );
+    }
+
+    /// T17c: the run's capture warnings and `capture_ok` reach the
+    /// analysis; other warnings do not.
+    #[test]
+    fn capture_warnings_are_passed_to_the_analysis() {
+        let mut rs = run(None);
+        rs.benchmark = Some(BenchmarkReportJson {
+            warnings: vec![
+                "capture on eth1: the per-MAC reply filter for 600 sessions did not fit".into(),
+                "topology teardown: teardown had 1 errors".into(),
+            ],
+            capture_ok: Some(true),
+            ..Default::default()
+        });
+        let info = run_info_of(&rs);
+        assert_eq!(info.capture_warnings.len(), 1);
+        assert!(info.capture_warnings[0].contains("per-MAC"));
+        assert_eq!(info.capture_ok, Some(true));
     }
 
     #[test]
