@@ -15,7 +15,8 @@
 #
 # Usage: scripts/netns-slave-test.sh [extra test-binary args]
 # Env:   NS_O / NS_P (defaults ostest-slave-o / ostest-slave-p; must
-#        start with "ostest-"), CARGO_TARGET_DIR (honoured by cargo).
+#        start with "ostest-"), OUTSTATION_KEEP_DIRS=1 (keep each test's
+#        report and capture), CARGO_TARGET_DIR (honoured by cargo).
 # Needs: sudo, iproute2, python3.
 set -euo pipefail
 
@@ -71,6 +72,7 @@ sudo ip -n "$NS_P" link set s-p up
 sudo ip -n "$NS_P" route add 192.168.10.0/24 dev s-p
 
 sudo ip netns exec "$NS_O" env OUTSTATION_NETNS_TEST=1 \
+  OUTSTATION_KEEP_DIRS="${OUTSTATION_KEEP_DIRS:-0}" \
   OUTSTATION_SLAVE_NIC=s-o OUTSTATION_SLAVE_OWN_IP=10.79.0.1 \
   OUTSTATION_SLAVE_MASTER_IP=10.79.0.2 OUTSTATION_SLAVE_PEER_NS="$NS_P" \
   "$bin" --ignored --test-threads=1 "$@"

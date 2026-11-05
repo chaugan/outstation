@@ -64,6 +64,28 @@ fn fixture() -> PathBuf {
 /// 192.168.10.x).
 const RTUS: [u8; 6] = [49, 67, 16, 132, 156, 106];
 
+/// A test's working directory: a fresh temporary directory, removed on
+/// drop unless `OUTSTATION_KEEP_DIRS=1`, which keeps (and prints) it so
+/// a failure's report and capture can be inspected.
+struct WorkDir {
+    path: PathBuf,
+    _tmp: Option<tempfile::TempDir>,
+}
+
+fn work_dir() -> WorkDir {
+    let d = tempfile::tempdir().unwrap();
+    if std::env::var("OUTSTATION_KEEP_DIRS").as_deref() == Ok("1") {
+        let path = d.keep();
+        eprintln!("working directory kept: {}", path.display());
+        WorkDir { path, _tmp: None }
+    } else {
+        WorkDir {
+            path: d.path().to_path_buf(),
+            _tmp: Some(d),
+        }
+    }
+}
+
 fn write_profile(dir: &Path, p: &Value) -> PathBuf {
     let path = dir.join("run.json");
     std::fs::write(&path, p.to_string()).unwrap();
@@ -232,20 +254,25 @@ fn tcp_seg(f: &[u8]) -> Option<Seg> {
 }
 
 /// The capture holds only TCP to or from (listen ip, PORT), has
-/// traffic for every listener, and no frame twice.
+/// traffic for every listener, and no frame twice (byte-identical).
 fn assert_capture_is_private(capture: &Path, listen: &[Ipv4Addr]) {
     let set: HashSet<Ipv4Addr> = listen.iter().copied().collect();
     let fs = frames(capture);
     assert!(!fs.is_empty(), "empty capture");
     let mut seen_eps = BTreeSet::new();
-    let mut segs = HashSet::new();
+    let mut seen_frames: HashSet<&[u8]> = HashSet::new();
     let mut dups = 0;
     for (i, f) in fs.iter().enumerate() {
         let s = tcp_seg(f).unwrap_or_else(|| panic!("frame {i} is not IPv4 TCP: {f:02x?}"));
         let ours = (set.contains(&s.0) && s.1 == PORT) || (set.contains(&s.2) && s.3 == PORT);
         assert!(ours, "frame {i} is not a session of this run: {s:?}");
         seen_eps.insert(if s.1 == PORT { s.0 } else { s.2 });
-        if !segs.insert(s) {
+        // A frame captured twice (e.g. both copies of a loopback frame)
+        // is byte-identical. A TCP retransmission is not: it carries a
+        // new IP ID and TCP timestamp, and under load the kernel
+        // legitimately sends some (tail-loss probes), so compare whole
+        // frames, not segment headers.
+        if !seen_frames.insert(f.as_slice()) {
             dups += 1;
         }
     }
@@ -311,6 +338,10 @@ fn check_report(r: &Value, n: usize) {
     assert_eq!(r["run"]["role"], "slave");
     assert_eq!(r["run"]["sources"], n);
     assert_eq!(r["run"]["sources_failed"], 0);
+    assert_eq!(
+        r["run"]["benchmark"]["captured_dropped"], 0,
+        "the capture lost frames"
+    );
     let score = r["metrics"]["score"].as_f64().unwrap();
     eprintln!("verdict {} score {score}", r["analysis"]["verdict"]);
     assert!(score >= 99.0, "score {score}: {:#}", r["analysis"]);
@@ -331,7 +362,8 @@ fn slave_bench_scores_full_marks_over_a_lan() {
         .iter()
         .map(|&n| Ipv4Addr::new(192, 168, 10, n))
         .collect();
-    let dir = tempfile::tempdir().unwrap();
+    let work = work_dir();
+    let dir = work.path.as_path();
     let noise_runs = vec![
         // An unrelated IEC 104 server on this host's own address...
         noise(None, &[&own_ip, "0.0.0.0", "40", "server"]),
@@ -343,7 +375,7 @@ fn slave_bench_scores_full_marks_over_a_lan() {
         ),
     ];
     let r = run_slave_bench(
-        dir.path(),
+        dir,
         &fixture(),
         json!({
             "mode": "benchmark",
@@ -414,14 +446,15 @@ fn slave_bench_on_loopback_rtus() {
         .iter()
         .map(|&n| Ipv4Addr::new(127, 0, 10, n))
         .collect();
-    let dir = tempfile::tempdir().unwrap();
-    let pcap = loopback_fixture(dir.path());
+    let work = work_dir();
+    let dir = work.path.as_path();
+    let pcap = loopback_fixture(dir);
     let noise_runs = vec![
         noise(None, &["127.0.0.5", "0.0.0.0", "40", "server"]),
         noise(None, &["127.0.0.5", &listen[0].to_string(), "40", "client"]),
     ];
     let r = run_slave_bench(
-        dir.path(),
+        dir,
         &pcap,
         json!({
             "mode": "benchmark",

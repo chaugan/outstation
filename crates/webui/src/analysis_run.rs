@@ -66,6 +66,11 @@ pub(crate) fn run_info_of(rs: &RunState) -> analysis::RunInfo {
         loop_within_session: facts.map(|f| f.loop_within_session),
         paced_speed: facts.and_then(|f| f.paced_speed),
         source_port: facts.map(|f| f.source_port),
+        capture_dropped: rs
+            .benchmark
+            .as_ref()
+            .map(|b| b.captured_dropped)
+            .unwrap_or(0),
     }
 }
 
