@@ -24,6 +24,18 @@ pub(crate) struct Peer {
     pub vr: u16,
     /// I-frames received since we last acknowledged.
     pub unacked: u16,
+    /// Assert that received I-frames are in sequence (default). When
+    /// off, V(R) follows the received N(S) and every N(S) is logged in
+    /// `ns_log`, so fault-injection tests can inspect the sequence.
+    pub strict: bool,
+    pub ns_log: Vec<u16>,
+    /// APDUs with an invalid length octet seen (non-strict mode).
+    pub malformed: u32,
+    /// Raw bytes received / sent, with the time (ns since the peer was
+    /// created) each frame was read or written, for analyzer tests.
+    pub rx_log: Vec<(u64, Vec<u8>)>,
+    pub tx_log: Vec<(u64, Vec<u8>)>,
+    t0: Instant,
 }
 
 impl Peer {
@@ -34,7 +46,17 @@ impl Peer {
             vs: 0,
             vr: 0,
             unacked: 0,
+            strict: true,
+            ns_log: Vec::new(),
+            malformed: 0,
+            rx_log: Vec::new(),
+            tx_log: Vec::new(),
+            t0: Instant::now(),
         }
+    }
+
+    fn stamp(&self) -> u64 {
+        self.t0.elapsed().as_nanos() as u64
     }
 
     /// Connect to a slave session listening on `port`, retrying while
@@ -60,7 +82,17 @@ impl Peer {
     }
 
     pub fn send(&mut self, apdu: &Apdu) {
-        self.s.write_all(&apdu.serialize()).expect("peer write");
+        let bytes = apdu.serialize();
+        self.s.write_all(&bytes).expect("peer write");
+        let t = self.stamp();
+        self.tx_log.push((t, bytes));
+    }
+
+    /// Abortive close: RST instead of FIN.
+    pub fn reset(self) {
+        socket2::SockRef::from(&self.s)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
     }
 
     pub fn send_u(&mut self, code: u8) {
@@ -90,21 +122,62 @@ impl Peer {
     /// Received I-frames advance V(R); their N(S) is asserted to be in
     /// sequence.
     pub fn recv(&mut self, timeout: Duration) -> Option<Apdu> {
-        self.s
-            .set_read_timeout(Some(timeout.max(Duration::from_millis(1))))
-            .unwrap();
-        let mut hdr = [0u8; 2];
-        self.s.read_exact(&mut hdr).ok()?;
-        assert_eq!(hdr[0], 0x68, "session sent a bad start octet");
-        let mut body = vec![0u8; hdr[1] as usize];
-        self.s.read_exact(&mut body).ok()?;
-        let apdu = Apdu::parse(&body).expect("session sent a malformed APDU");
-        if let Apdu::I { ns, .. } = apdu {
-            assert_eq!(ns, self.vr, "session sent N(S) out of sequence");
-            self.vr = (self.vr + 1) & 0x7fff;
-            self.unacked += 1;
+        let deadline = Instant::now() + timeout;
+        loop {
+            let left = deadline
+                .checked_duration_since(Instant::now())
+                .unwrap_or_default();
+            self.s
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .unwrap();
+            let mut hdr = [0u8; 2];
+            self.s.read_exact(&mut hdr).ok()?;
+            assert_eq!(hdr[0], 0x68, "session sent a bad start octet");
+            let mut body = vec![0u8; hdr[1] as usize];
+            self.s.read_exact(&mut body).ok()?;
+            let t = self.stamp();
+            let parsed = Apdu::parse(&body);
+            let apdu = match parsed {
+                Ok(a) if hdr[1] >= 4 => a,
+                _ if !self.strict => {
+                    self.malformed += 1;
+                    continue;
+                }
+                _ => panic!("session sent a malformed APDU: {hdr:02x?} {body:02x?}"),
+            };
+            let mut raw = hdr.to_vec();
+            raw.extend_from_slice(&body);
+            self.rx_log.push((t, raw));
+            if let Apdu::I { ns, .. } = apdu {
+                if self.strict {
+                    assert_eq!(ns, self.vr, "session sent N(S) out of sequence");
+                } else {
+                    self.ns_log.push(ns);
+                }
+                self.vr = (ns + 1) & 0x7fff;
+                self.unacked += 1;
+            }
+            return Some(apdu);
         }
-        Some(apdu)
+    }
+
+    /// Is the connection reset (RST) within `timeout`?
+    pub fn sees_rst(&mut self, timeout: Duration) -> bool {
+        let deadline = Instant::now() + timeout;
+        let mut buf = [0u8; 512];
+        loop {
+            let Some(left) = deadline.checked_duration_since(Instant::now()) else {
+                return false;
+            };
+            self.s
+                .set_read_timeout(Some(left.max(Duration::from_millis(1))))
+                .unwrap();
+            match self.s.read(&mut buf) {
+                Ok(0) => return false,
+                Ok(_) => continue,
+                Err(e) => return e.kind() == ErrorKind::ConnectionReset,
+            }
+        }
     }
 
     /// Read until `pred` matches (returning that APDU) or `timeout`.

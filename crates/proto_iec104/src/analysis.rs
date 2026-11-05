@@ -19,6 +19,21 @@
 //!   removed from the delivered side only. The source script's own
 //!   captured interrogation bursts stay on both sides, because the
 //!   replayer resends them verbatim.
+//! * **Synthesized command responses**: with command echo on (slave
+//!   role, `commands.enabled`, the default) the captured command
+//!   confirmations are not expected ([`commands::is_captured_command_frame`]),
+//!   and the confirmations, return information and ActTerms the slave
+//!   sent in answer to the live master's commands are removed from the
+//!   delivered side, like synthesized GI/CI responses.
+//! * **Injected faults** (`proto_config.faults`): frames the replayer
+//!   deliberately dropped (an N(S) gap on the wire), duplicated (a
+//!   repeated N(S) with identical content) or sent with a corrupted
+//!   N(S) are not replay infidelity: duplicates leave the delivered
+//!   side, dropped frames are excused from the missing count, a
+//!   session the peer ended in reaction is judged like a stopped run,
+//!   and timing is not judged. The `faults` verdict dimension
+//!   summarises what the capture shows of the faults and the peer's
+//!   reaction.
 //! * **Target side**: what the live peer sent back: U/S/I frame
 //!   counts, STARTDT detection, optional "correct mode" target-script
 //!   comparison (aligned, not positional).
@@ -56,6 +71,8 @@ use crate::asdu::{
     common_address, cot_value, cp56_field_offsets, decode_cp56time2a, decode_cp56time2a_local,
     load_rewrite_map, rewrite_asdu, vsq, Cp56Zone, Iec104ProtoConfig, DUI_LEN, IOA_LEN,
 };
+use crate::commands;
+use crate::faults::FaultPlan;
 use crate::interrogation;
 use crate::inventory::Inventory;
 use crate::responder::{
@@ -133,6 +150,20 @@ pub struct PlaybackReport {
     /// Captured interrogation frames removed from the expected side
     /// because the replayer strips them when synthesis is on.
     pub source_interrogation_stripped: usize,
+    /// Command echo was on for this run (slave role).
+    pub command_echo: bool,
+    /// Captured command confirmations removed from the expected side
+    /// because the replayer strips them when command echo is on.
+    pub source_command_stripped: usize,
+    /// Delivered I-frames identified as synthesized command responses
+    /// (also counted in `synthesized_excluded`).
+    pub command_responses_excluded: usize,
+    /// Missing frames excused because the replayer dropped them on
+    /// purpose (`drop_iframes` fault).
+    pub fault_dropped_excused: usize,
+    /// Delivered duplicates removed because the replayer sent them on
+    /// purpose (`duplicate_iframes` fault).
+    pub fault_duplicates_excluded: usize,
     /// Primary metric: (byte-identical + accepted CP56-only) /
     /// (expected + extra), in percent.
     pub content_score_pct: f64,
@@ -445,26 +476,65 @@ pub fn analyze_iec104_flow(
     // With GI/CI synthesis on, the slave strips the captured
     // interrogation exchanges from its script (it answers live requests
     // instead), so they are not expected either. Same rule as the
-    // replayer: `crate::interrogation`.
+    // replayer: `crate::interrogation`. Likewise for captured command
+    // confirmations with command echo on (`crate::commands`).
     let synthesis_on =
         ctx.role == Role::Slave && interrogation::synthesis_enabled(ctx.proto_config.as_deref());
-    let expected_frames: Vec<IFrame> = if synthesis_on {
-        src.iframes
-            .iter()
-            .filter(|f| !interrogation::is_captured_interrogation_frame(f.asdu))
-            .copied()
-            .collect()
-    } else {
-        src.iframes.clone()
-    };
-    let source_interrogation_stripped = src.iframes.len() - expected_frames.len();
+    let command_cfg = commands::commands_config(ctx.proto_config.as_deref());
+    let echo_on = ctx.role == Role::Slave && command_cfg.enabled;
+    let mut source_interrogation_stripped = 0usize;
+    let mut source_command_stripped = 0usize;
+    let expected_frames: Vec<IFrame> = src
+        .iframes
+        .iter()
+        .filter(|f| {
+            if synthesis_on && interrogation::is_captured_interrogation_frame(f.asdu) {
+                source_interrogation_stripped += 1;
+                false
+            } else if echo_on && commands::is_captured_command_frame(f.asdu) {
+                source_command_stripped += 1;
+                false
+            } else {
+                true
+            }
+        })
+        .copied()
+        .collect();
     if source_interrogation_stripped > 0 {
         notes.push(format!(
             "GI/CI synthesis was on: {source_interrogation_stripped} captured interrogation frames are not replayed and not expected"
         ));
     }
+    if source_command_stripped > 0 {
+        notes.push(format!(
+            "command echo was on: {source_command_stripped} captured command confirmations are not replayed and not expected"
+        ));
+    }
 
-    // --- Synthesized GI/CI responses (slave role only) ---
+    // --- Injected faults: deliberate duplicates leave the delivered
+    // side; deliberate drops are excused below. ---
+    let fault_plan = match FaultPlan::parse(ctx.proto_config.as_deref()) {
+        Ok(p) => p,
+        Err(e) => {
+            notes.push(format!("{e}; analysed as if no faults were configured"));
+            FaultPlan::default()
+        }
+    };
+    let faults_on = !fault_plan.is_empty();
+    let scan = if faults_on {
+        scan_sequence(&cap.iframes, &fault_plan)
+    } else {
+        NsScan::clean(cap.iframes.len())
+    };
+    let cap_frames: Vec<IFrame> = cap
+        .iframes
+        .iter()
+        .zip(&scan.keep)
+        .filter(|(_, &k)| k)
+        .map(|(f, _)| *f)
+        .collect();
+
+    // --- Synthesized GI/CI and command responses (slave role only) ---
     let mut inventory = Inventory::default();
     for f in &src.iframes {
         inventory.ingest_asdu(f.asdu);
@@ -474,16 +544,35 @@ pub fn analyze_iec104_flow(
     } else {
         Vec::new()
     };
-    let synth_flags = identify_synthesized(&live_requests, &cap.iframes, &inventory);
+    let mut synth_flags = identify_synthesized(&live_requests, &cap_frames, &inventory);
+    let live_commands: Vec<&IFrame> = if echo_on {
+        cap_tg
+            .iframes
+            .iter()
+            .filter(|f| {
+                commands::is_command_request(f.asdu) && commands::is_command_type(f.asdu[0])
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let command_responses_excluded =
+        identify_command_responses(&live_commands, &cap_frames, &command_cfg, &mut synth_flags);
     let synthesized_excluded = synth_flags.iter().filter(|&&s| s).count();
-    if synthesized_excluded > 0 {
+    if synthesized_excluded > command_responses_excluded {
         notes.push(format!(
-            "excluded {synthesized_excluded} I-frames the slave synthesized in answer to {} live GI/CI request(s) from the playback comparison",
+            "excluded {} I-frames the slave synthesized in answer to {} live GI/CI request(s) from the playback comparison",
+            synthesized_excluded - command_responses_excluded,
             live_requests.len()
         ));
     }
-    let delivered: Vec<IFrame> = cap
-        .iframes
+    if command_responses_excluded > 0 {
+        notes.push(format!(
+            "excluded {command_responses_excluded} I-frames the slave sent in answer to {} live command(s) from the playback comparison",
+            live_commands.len()
+        ));
+    }
+    let delivered: Vec<IFrame> = cap_frames
         .iter()
         .zip(&synth_flags)
         .filter(|(_, &s)| !s)
@@ -516,9 +605,15 @@ pub fn analyze_iec104_flow(
         tolerance_ms: ctx.cp56_tolerance_ms,
         epoch_ns: ctx.captured_first_ts_ns,
         iterations_configured: ctx.run.iterations_per_session,
-        stopped_early: ctx.run.stopped_early,
-        paced_speed: ctx.run.paced_speed,
+        // A session the peer ended in reaction to an injected fault is
+        // judged like a stopped run: the unsent tail is not missing.
+        stopped_early: ctx.run.stopped_early || faults_on,
+        // Faults stall the sender on purpose: timing is not judged.
+        paced_speed: if faults_on { None } else { ctx.run.paced_speed },
     };
+    if faults_on && ctx.run.paced_speed.is_some() {
+        notes.push("faults were injected: pacing is measured but not judged".into());
+    }
     let cmp = compare_playback(&expected_frames, &delivered, &cmp_cfg);
     if !cmp.alignment_complete {
         notes.push(format!(
@@ -541,6 +636,29 @@ pub fn analyze_iec104_flow(
     playback.synthesized_excluded = synthesized_excluded;
     playback.gi_ci_synthesis = synthesis_on;
     playback.source_interrogation_stripped = source_interrogation_stripped;
+    playback.command_echo = echo_on;
+    playback.source_command_stripped = source_command_stripped;
+    playback.command_responses_excluded = command_responses_excluded;
+    playback.fault_duplicates_excluded = scan.duplicates;
+    // Deliberately dropped frames are not replay infidelity.
+    let excused = scan.dropped.min(playback.missing_count);
+    if excused > 0 {
+        playback.fault_dropped_excused = excused;
+        playback.missing_count -= excused;
+        playback.expected_iframes = playback.expected_iframes.saturating_sub(excused);
+        playback.real_mismatch_count = playback.real_mismatch_count.saturating_sub(excused);
+        notes.push(format!(
+            "{excused} missing I-frame(s) were dropped on purpose (drop_iframes fault) and are not counted"
+        ));
+    }
+    if scan.duplicates > 0 {
+        notes.push(format!(
+            "{} duplicate I-frame(s) sent on purpose (duplicate_iframes fault) were removed from the delivered side",
+            scan.duplicates
+        ));
+    }
+    let faults_report =
+        faults_on.then(|| faults_report(&fault_plan, &scan, &cap, &cap_tg, ctx.role));
     playback.source_stream = src.stats.clone();
     playback.delivered_stream = cap.stats.clone();
 
@@ -601,13 +719,17 @@ pub fn analyze_iec104_flow(
         iterations_complete: playback.iterations_complete,
         iterations_clean: playback.iterations_clean,
         stopped_tail: playback.stopped_tail.clone(),
-        stopped_early: ctx.run.stopped_early,
+        stopped_early: ctx.run.stopped_early || faults_on,
         handshake_ok: startdt_handshake_ok,
         gi_ci_failed,
         timing_failure: cmp.timing.timing_failure.clone(),
         target: target.correctness.as_ref().map(TargetVerdict::from),
+        faults: faults_report.as_ref().map(|f| f.summary.clone()),
     };
     let verdict = decide_verdict(&vin);
+    if let Some(f) = &faults_report {
+        notes.push(f.summary.clone());
+    }
 
     let protocol_specific = json!({
         "playback": playback,
@@ -615,6 +737,7 @@ pub fn analyze_iec104_flow(
         "timing": cmp.timing,
         "cp56_drift": cp56_drift,
         "gi_ci_audit": gi_ci_audit,
+        "faults": faults_report,
         "verdict_dimensions": verdict.dimensions,
     });
 
@@ -788,6 +911,8 @@ pub fn weighted_decimate(sorted: &[(f64, f64, f64)], cap: usize) -> (Vec<[f64; 2
 #[derive(Debug, Clone, Copy)]
 struct IFrame<'a> {
     ts_ns: u64,
+    /// N(S) as sent on the wire.
+    ns: u16,
     asdu: &'a [u8],
 }
 
@@ -801,6 +926,10 @@ impl IFrame<'_> {
 struct ParsedFlow<'a> {
     iframes: Vec<IFrame<'a>>,
     u_codes: Vec<String>,
+    /// (ms, name) of every U-frame.
+    u_events: Vec<(f64, &'static str)>,
+    /// Timestamp (ms) of every frame, in stream order.
+    frame_ts_ms: Vec<f64>,
     u_frames: usize,
     s_frames: usize,
     stats: WalkStats,
@@ -827,16 +956,25 @@ fn parse_flow<'a>(flow: &FlowSnapshot<'a>) -> ParsedFlow<'a> {
         }
         out.stats.frames += 1;
         match f.kind {
-            apci::FrameKind::I => out.iframes.push(IFrame {
-                ts_ns: flow.ts_for_byte(f.offset),
-                asdu: f.asdu().unwrap_or_default(),
-            }),
+            apci::FrameKind::I => {
+                let c = f.apci();
+                out.iframes.push(IFrame {
+                    ts_ns: flow.ts_for_byte(f.offset),
+                    ns: (u16::from(c[0]) >> 1) | (u16::from(c[1]) << 7),
+                    asdu: f.asdu().unwrap_or_default(),
+                })
+            }
             apci::FrameKind::S => out.s_frames += 1,
             apci::FrameKind::U => {
                 out.u_frames += 1;
-                out.u_codes.push(u_code_name(f.apci()[0]).to_string());
+                let name = u_code_name(f.apci()[0]);
+                out.u_codes.push(name.to_string());
+                out.u_events
+                    .push((flow.ts_for_byte(f.offset) as f64 / 1e6, name));
             }
         }
+        out.frame_ts_ms
+            .push(flow.ts_for_byte(f.offset) as f64 / 1e6);
     }
     out.stats.i_frames = out.iframes.len();
     out.stats.truncated_tail_bytes = walker.trailing_bytes();
@@ -1926,6 +2064,8 @@ struct VerdictInputs {
     gi_ci_failed: usize,
     timing_failure: Option<String>,
     target: Option<TargetVerdict>,
+    /// Fault summary when faults were configured.
+    faults: Option<String>,
 }
 
 /// Pass/fail per verdict dimension, serialized next to the verdict.
@@ -1939,6 +2079,10 @@ pub struct VerdictDimensions {
     pub handshake: bool,
     /// `None` outside correct mode.
     pub target: Option<bool>,
+    /// Injected faults: not a pass/fail dimension but a summary ("N
+    /// fault(s) configured …; peer reaction: …"). `None` when the run
+    /// injected no faults.
+    pub faults: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1983,6 +2127,7 @@ fn decide_verdict(v: &VerdictInputs) -> Verdict {
         timing: v.timing_failure.as_ref().map(|_| false),
         handshake: v.handshake_ok,
         target: v.target.as_ref().map(|t| t.total_mismatches == 0),
+        faults: v.faults.clone(),
     };
     let mk = |name: &'static str, reason: String, score: f64, outcome: VerdictOutcome| Verdict {
         name,
@@ -2190,10 +2335,15 @@ fn decide_verdict(v: &VerdictInputs) -> Verdict {
         );
     }
     if v.stopped_tail.is_some() || (v.stopped_early && v.not_sent > 0) {
+        let why = if v.faults.is_some() {
+            "session ended after injected faults"
+        } else {
+            "run stopped"
+        };
         return mk(
             "stopped_clean",
             format!(
-                "run stopped: every one of the {} I-frames sent before the stop was intact{}",
+                "{why}: every one of the {} I-frames sent before the stop was intact{}",
                 v.good,
                 iter_note(v)
             ),
@@ -2304,6 +2454,299 @@ fn compute_cp56_drift(
         zone,
         tolerance_ms,
     )
+}
+
+// ---------------------------------------------------------------------
+// Command echo: synthesized command responses
+// ---------------------------------------------------------------------
+
+/// Flag the delivered frames the slave sent in answer to the live
+/// master's commands (`cmds`, in time order): for each command the
+/// first unflagged answer after it ([`commands::answers`]); after a
+/// positive ActCon to an executed process command also the return
+/// information (when configured) and the ActTerm; for a broadcast,
+/// every station's answer. Returns the number of frames flagged.
+fn identify_command_responses(
+    cmds: &[&IFrame],
+    frames: &[IFrame],
+    cfg: &commands::CommandsConfig,
+    synth: &mut [bool],
+) -> usize {
+    let ri_cot = match cfg.return_info {
+        commands::ReturnInfo::None => None,
+        commands::ReturnInfo::Spontaneous => Some(commands::COT_SPONTANEOUS),
+        commands::ReturnInfo::Retrem => Some(commands::COT_RETREM),
+    };
+    let mut flagged = 0usize;
+    for cmd in cmds {
+        let c = cmd.asdu;
+        let start = frames.partition_point(|f| f.ts_ms() + 0.5 < cmd.ts_ms());
+        let horizon = cmd.ts_ms() + SYNTH_SEARCH_MS;
+        let broadcast = c.len() >= DUI_LEN && common_address(c) == 0xFFFF;
+        let mut j = start;
+        let mut want_term = false;
+        let mut want_ri = false;
+        while j < frames.len() && frames[j].ts_ms() <= horizon {
+            let f = frames[j].asdu;
+            if synth[j] {
+                j += 1;
+                continue;
+            }
+            if commands::answers(c, f) {
+                let part = commands::reply_part(f);
+                let first = !want_term && flagged_none(part);
+                if first || (want_term && part == commands::Part::ActTerm) || broadcast {
+                    synth[j] = true;
+                    flagged += 1;
+                    if part == commands::Part::ActTerm {
+                        break;
+                    }
+                    if first
+                        && part == commands::Part::ActCon
+                        && commands::is_process_command(c[0])
+                        && !commands::is_select(c)
+                    {
+                        want_term = true;
+                        want_ri = ri_cot.is_some();
+                    } else if !broadcast {
+                        break;
+                    }
+                }
+            } else if want_ri
+                && f.len() >= DUI_LEN + IOA_LEN
+                && f[0] < 45
+                && Some(cot_value(f)) == ri_cot
+                && common_address(f) == common_address(c)
+                && crate::asdu::read_ioa(f, DUI_LEN) == crate::asdu::read_ioa(c, DUI_LEN)
+            {
+                synth[j] = true;
+                flagged += 1;
+                want_ri = false;
+            }
+            j += 1;
+        }
+    }
+    flagged
+}
+
+/// A first answer is anything but an ActTerm.
+fn flagged_none(part: commands::Part) -> bool {
+    part != commands::Part::ActTerm
+}
+
+// ---------------------------------------------------------------------
+// Injected faults
+// ---------------------------------------------------------------------
+
+/// What the capture shows of the injected faults.
+#[derive(Serialize, Debug, Clone, Default)]
+pub struct FaultsReport {
+    /// Faults in the plan, and their kinds.
+    pub configured: usize,
+    pub kinds: Vec<&'static str>,
+    pub seed: u64,
+    /// Sequence numbers skipped on the wire (deliberate drops).
+    pub dropped_ns: usize,
+    /// Delivered frames repeated with the same N(S) and content.
+    pub duplicates: usize,
+    /// Delivered frames with an out-of-sequence N(S) after which the
+    /// sequence resumed.
+    pub corrupted_ns: usize,
+    /// Bytes on the replayer's side that did not frame (malformed
+    /// APDUs and anything after them).
+    pub malformed_bytes: usize,
+    /// STOPDT acts the replayer sent.
+    pub stopdt_sent: usize,
+    /// Capture time (ms) of the first fault, estimated from the plan
+    /// and the evidence; `None` if no fault fired within the capture.
+    pub first_fault_ms: Option<f64>,
+    /// The peer sent STOPDT act after the first fault.
+    pub peer_stopdt: bool,
+    /// Frames the peer sent after the first fault.
+    pub peer_frames_after_first_fault: usize,
+    /// How long the captured session lasted after the first fault.
+    pub session_end_after_first_fault_ms: Option<f64>,
+    pub summary: String,
+}
+
+/// Result of walking the delivered N(S) sequence.
+struct NsScan {
+    /// Frames to keep (deliberate duplicates are dropped).
+    keep: Vec<bool>,
+    dropped: usize,
+    duplicates: usize,
+    corrupted: usize,
+    first_ts_ms: Option<f64>,
+}
+
+impl NsScan {
+    fn clean(n: usize) -> Self {
+        NsScan {
+            keep: vec![true; n],
+            dropped: 0,
+            duplicates: 0,
+            corrupted: 0,
+            first_ts_ms: None,
+        }
+    }
+}
+
+/// Classify the delivered N(S) sequence against the fault plan: a
+/// repeat of the previous frame (same N(S), same ASDU) is a deliberate
+/// duplicate, a single out-of-sequence N(S) after which the sequence
+/// resumes is a corrupted N(S), and a forward jump is deliberately
+/// dropped frames. Only kinds the plan contains are recognised.
+fn scan_sequence(frames: &[IFrame], plan: &FaultPlan) -> NsScan {
+    const MASK: u16 = 0x7fff;
+    let (drop_on, dup_on, corrupt_on) = (
+        plan.has("drop_iframes"),
+        plan.has("duplicate_iframes"),
+        plan.has("corrupt_ns"),
+    );
+    let mut sc = NsScan::clean(frames.len());
+    let mut expect: Option<u16> = None;
+    let first = |sc: &mut NsScan, f: &IFrame| {
+        sc.first_ts_ms = Some(sc.first_ts_ms.map_or(f.ts_ms(), |t: f64| t.min(f.ts_ms())));
+    };
+    for i in 0..frames.len() {
+        let f = &frames[i];
+        let Some(e) = expect else {
+            expect = Some((f.ns + 1) & MASK);
+            continue;
+        };
+        if f.ns == e {
+            expect = Some((e + 1) & MASK);
+            continue;
+        }
+        if dup_on && i > 0 && f.ns == frames[i - 1].ns && f.asdu == frames[i - 1].asdu {
+            sc.keep[i] = false;
+            sc.duplicates += 1;
+            first(&mut sc, f);
+            continue;
+        }
+        let resumes = frames.get(i + 1).is_some_and(|n| n.ns == (e + 1) & MASK);
+        if corrupt_on
+            && (resumes || f.ns == e.wrapping_add(crate::faults::CORRUPT_NS_OFFSET) & MASK)
+        {
+            sc.corrupted += 1;
+            first(&mut sc, f);
+            expect = Some((e + 1) & MASK);
+            continue;
+        }
+        let gap = f.ns.wrapping_sub(e) & MASK;
+        if drop_on && gap < 0x4000 {
+            sc.dropped += gap as usize;
+            first(&mut sc, f);
+        }
+        expect = Some((f.ns + 1) & MASK);
+    }
+    sc
+}
+
+fn faults_report(
+    plan: &FaultPlan,
+    scan: &NsScan,
+    cap: &ParsedFlow,
+    cap_tg: &ParsedFlow,
+    role: Role,
+) -> FaultsReport {
+    let mut kinds: Vec<&'static str> = plan.faults.iter().map(|f| f.kind.name()).collect();
+    kinds.sort_unstable();
+    kinds.dedup();
+    let all_ts = cap.frame_ts_ms.iter().chain(&cap_tg.frame_ts_ms);
+    let start = all_ts.clone().copied().fold(f64::INFINITY, f64::min);
+    let end = all_ts.copied().fold(f64::NEG_INFINITY, f64::max);
+    let stopdt_sent: Vec<f64> = cap
+        .u_events
+        .iter()
+        .filter(|(_, n)| *n == "STOPDT_ACT")
+        .map(|(t, _)| *t)
+        .collect();
+    // Earliest trigger that falls inside the capture, and the earliest
+    // evidence of a fault on the wire.
+    let mut first: Option<f64> = scan.first_ts_ms;
+    let mut consider = |t: f64| {
+        if t.is_finite() && t <= end {
+            first = Some(first.map_or(t, |x| x.min(t)));
+        }
+    };
+    for f in &plan.faults {
+        match f.at {
+            crate::faults::Trigger::Ms(ms) => consider(start + ms as f64),
+            crate::faults::Trigger::Frame(n) => {
+                if let Some(fr) = cap.iframes.get(n as usize) {
+                    consider(fr.ts_ms());
+                }
+            }
+        }
+    }
+    // A master's STOPDT before its last one is the stopdt fault.
+    if role == Role::Master && stopdt_sent.len() > 1 {
+        consider(stopdt_sent[0]);
+    }
+    let malformed_bytes = cap.stats.resynced_bytes + cap.stats.truncated_tail_bytes;
+    let mut r = FaultsReport {
+        configured: plan.faults.len(),
+        kinds,
+        seed: plan.seed,
+        dropped_ns: scan.dropped,
+        duplicates: scan.duplicates,
+        corrupted_ns: scan.corrupted,
+        malformed_bytes,
+        stopdt_sent: stopdt_sent.len(),
+        first_fault_ms: first,
+        ..Default::default()
+    };
+    let mut evidence = Vec::new();
+    for (n, what) in [
+        (scan.dropped, "dropped N(S)"),
+        (scan.duplicates, "duplicated frame(s)"),
+        (scan.corrupted, "corrupted N(S)"),
+        (malformed_bytes, "unframeable byte(s)"),
+    ] {
+        if n > 0 {
+            evidence.push(format!("{n} {what}"));
+        }
+    }
+    let evidence = if evidence.is_empty() {
+        "no frame-level evidence".to_string()
+    } else {
+        evidence.join(", ")
+    };
+    let Some(t0) = first else {
+        r.summary = format!(
+            "{} fault(s) configured ({}); none fired within the captured session",
+            r.configured,
+            r.kinds.join(", ")
+        );
+        return r;
+    };
+    r.peer_stopdt = cap_tg
+        .u_events
+        .iter()
+        .any(|(t, n)| *t >= t0 && *n == "STOPDT_ACT");
+    r.peer_frames_after_first_fault = cap_tg.frame_ts_ms.iter().filter(|&&t| t >= t0).count();
+    r.session_end_after_first_fault_ms = Some((end - t0).max(0.0));
+    let mut reaction = Vec::new();
+    if r.peer_stopdt {
+        reaction.push("sent STOPDT act".to_string());
+    }
+    if r.peer_frames_after_first_fault == 0 {
+        reaction.push("went silent".to_string());
+    } else {
+        reaction.push(format!(
+            "sent {} frame(s) after the first fault",
+            r.peer_frames_after_first_fault
+        ));
+    }
+    r.summary = format!(
+        "{} fault(s) configured ({}); in the capture: {evidence}; peer reaction: {}; the session ended {:.0} ms after the first fault (whether the peer closed or reset the connection is in the run report's fault_reaction)",
+        r.configured,
+        r.kinds.join(", "),
+        reaction.join(", "),
+        (end - t0).max(0.0)
+    );
+    r
 }
 
 // ---------------------------------------------------------------------
@@ -3468,6 +3911,141 @@ mod tests {
         assert_eq!(st.frames, 9);
         assert_eq!(st.truncated_tail_bytes, 2 + 4 + 14 - 3);
         assert_eq!(st.resync_events, 0);
+    }
+
+    // ---------------- injected faults ----------------
+
+    /// Delivered stream with explicit N(S) per frame, 100 ms apart.
+    fn with_ns(frames: &[(u16, Vec<u8>)]) -> (Vec<u8>, Vec<(u64, usize)>) {
+        let mut p = Vec::new();
+        let mut offs = Vec::new();
+        for (i, (ns, a)) in frames.iter().enumerate() {
+            offs.push((i as u64 * 100_000_000, p.len()));
+            p.extend_from_slice(&wrap_iframe(a, *ns, 0));
+        }
+        (p, offs)
+    }
+
+    fn run_faulty(
+        exp: &[Vec<u8>],
+        got: &[(u16, Vec<u8>)],
+        cfg: Option<&str>,
+        tg: (Vec<u8>, Vec<(u64, usize)>),
+    ) -> ProtoSlaveAnalysis {
+        let (ep, eo) = stream(exp);
+        let (gp, go) = with_ns(got);
+        analyze_iec104_flow(
+            Some(FlowSnapshot {
+                payload: &ep,
+                packet_offsets: &eo,
+            }),
+            Some(FlowSnapshot {
+                payload: &gp,
+                packet_offsets: &go,
+            }),
+            None,
+            Some(FlowSnapshot {
+                payload: &tg.0,
+                packet_offsets: &tg.1,
+            }),
+            &ctx_with(RunFacts::default(), cfg),
+        )
+    }
+
+    fn numbered(script: &[Vec<u8>]) -> Vec<(u16, Vec<u8>)> {
+        script
+            .iter()
+            .enumerate()
+            .map(|(i, a)| (i as u16, a.clone()))
+            .collect()
+    }
+
+    const DROP_PLAN: &str =
+        r#"{"faults":[{"at":{"frame":3},"kind":"drop_iframes","pct":50,"duration_ms":1000}]}"#;
+    const DUP_PLAN: &str =
+        r#"{"faults":[{"at":{"frame":2},"kind":"duplicate_iframes","pct":50,"duration_ms":1000}]}"#;
+
+    #[test]
+    fn deliberately_dropped_frame_is_excused() {
+        let script = script10();
+        let mut got = numbered(&script);
+        got.remove(3); // N(S) 3 consumed, never sent
+        let r = run_faulty(&script, &got, Some(DROP_PLAN), startdt_act());
+        assert_eq!(
+            r.verdict, "good_delivery",
+            "{} {:?}",
+            r.verdict_reason, r.notes
+        );
+        assert_eq!(r.score_pct, 100.0);
+        let ps = &r.protocol_specific;
+        assert_eq!(ps["playback"]["fault_dropped_excused"], 1);
+        assert_eq!(ps["faults"]["dropped_ns"], 1);
+        let dim = ps["verdict_dimensions"]["faults"].as_str().unwrap();
+        assert!(
+            dim.starts_with("1 fault(s) configured (drop_iframes)"),
+            "{dim}"
+        );
+        assert!(dim.contains("1 dropped N(S)"), "{dim}");
+        // Without the fault plan the same capture is a missing frame.
+        let r = run_faulty(&script, &got, None, startdt_act());
+        assert_eq!(r.verdict, "partial_delivery");
+        assert!(r.protocol_specific["verdict_dimensions"]["faults"].is_null());
+    }
+
+    #[test]
+    fn deliberate_duplicates_and_corrupted_ns_are_not_infidelity() {
+        let script = script10();
+        let mut got = numbered(&script);
+        got.insert(3, got[2].clone()); // frame 2 sent twice
+        let r = run_faulty(&script, &got, Some(DUP_PLAN), startdt_act());
+        assert_eq!(
+            r.verdict, "good_delivery",
+            "{} {:?}",
+            r.verdict_reason, r.notes
+        );
+        assert_eq!(
+            r.protocol_specific["playback"]["fault_duplicates_excluded"],
+            1
+        );
+        assert_eq!(r.protocol_specific["faults"]["duplicates"], 1);
+        let r = run_faulty(&script, &got, None, startdt_act());
+        assert_eq!(r.verdict, "partial_delivery");
+
+        let mut got = numbered(&script);
+        got[4].0 = 4 + crate::faults::CORRUPT_NS_OFFSET;
+        let plan = r#"{"faults":[{"at":{"frame":4},"kind":"corrupt_ns","count":1}]}"#;
+        let r = run_faulty(&script, &got, Some(plan), startdt_act());
+        assert_eq!(r.verdict, "good_delivery", "{}", r.verdict_reason);
+        assert_eq!(r.protocol_specific["faults"]["corrupted_ns"], 1);
+    }
+
+    #[test]
+    fn session_ended_by_a_fault_is_a_clean_stop_with_peer_reaction() {
+        let script = script10();
+        let got = numbered(&script[..6]);
+        // Peer: STARTDT act at 0, STOPDT act at 550 ms.
+        let tg = (
+            vec![0x68, 4, 0x07, 0, 0, 0, 0x68, 4, 0x13, 0, 0, 0],
+            vec![(0, 0), (550_000_000, 6)],
+        );
+        let plan = r#"{"faults":[{"at":{"ms":500},"kind":"rst"}]}"#;
+        let r = run_faulty(&script, &got, Some(plan), tg.clone());
+        assert_eq!(r.verdict, "stopped_clean", "{}", r.verdict_reason);
+        assert!(r
+            .verdict_reason
+            .starts_with("session ended after injected faults"));
+        let f = &r.protocol_specific["faults"];
+        assert_eq!(f["peer_stopdt"], true);
+        assert_eq!(f["first_fault_ms"], 500.0);
+        assert_eq!(f["peer_frames_after_first_fault"], 1);
+        let s = f["summary"].as_str().unwrap();
+        assert!(s.contains("peer reaction: sent STOPDT act"), "{s}");
+        // A trigger beyond the capture never fired.
+        let late = r#"{"faults":[{"at":{"ms":99999},"kind":"rst"}]}"#;
+        let r = run_faulty(&script, &numbered(&script), Some(late), tg);
+        assert_eq!(r.verdict, "good_delivery");
+        let s = r.protocol_specific["faults"]["summary"].as_str().unwrap();
+        assert!(s.contains("none fired"), "{s}");
     }
 
     #[test]

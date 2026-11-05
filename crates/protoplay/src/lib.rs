@@ -435,8 +435,16 @@ pub const SYNTHESIZED_INDICES_CAP: usize = 100_000;
 /// ones are kept).
 pub const COMMAND_RESPONSE_SAMPLES_CAP: usize = 10_000;
 
+/// Cap on the per-type ActCon / ActTerm latency samples in
+/// [`CommandTypeStats`] (the first ones are kept).
+pub const COMMAND_LATENCY_SAMPLES_CAP: usize = 2_000;
+/// Cap on [`ProtocolStats::negative_confirmations`] entries.
+pub const NEGATIVE_CONFIRMATIONS_CAP: usize = 200;
+/// Cap on [`ProtocolStats::faults_injected`] entries.
+pub const FAULT_RECORDS_CAP: usize = 256;
+
 /// One protocol violation or protocol-level failure seen on a session.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProtocolError {
     /// Milliseconds since the connection was established.
     pub at_ms: u64,
@@ -450,9 +458,107 @@ pub struct ProtocolError {
     pub fatal: bool,
 }
 
+/// Application-level command round trips of one command type
+/// (IEC 104: the ASDU type ID, e.g. 45 = C_SC_NA_1, 100 = C_IC_NA_1).
+///
+/// Slave role: commands received from the live master and answered by
+/// the replayer; latencies run from receiving the command to sending
+/// our confirmation / termination. Master role: commands replayed from
+/// the capture; latencies run from sending the command to receiving the
+/// live slave's confirmation / termination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CommandTypeStats {
+    pub type_id: u8,
+    /// Commands seen (slave: received; master: sent).
+    pub commands: u64,
+    /// Positive activation confirmations (or, for a read command, the
+    /// requested data).
+    pub act_con: u64,
+    /// Negative confirmations (P/N = 1, or COT 44..=47).
+    pub negative: u64,
+    /// Activation terminations.
+    pub act_term: u64,
+    /// Deactivation confirmations.
+    pub deact_con: u64,
+    /// Master role: commands that got no confirmation at all before
+    /// the session ended.
+    pub unanswered: u64,
+    /// Command → first confirmation (positive, negative or DeactCon)
+    /// in microseconds, capped at [`COMMAND_LATENCY_SAMPLES_CAP`].
+    pub actcon_us: Vec<u64>,
+    /// Command → ActTerm in microseconds, capped likewise.
+    pub actterm_us: Vec<u64>,
+}
+
+impl CommandTypeStats {
+    fn merge(&mut self, o: CommandTypeStats) {
+        self.commands += o.commands;
+        self.act_con += o.act_con;
+        self.negative += o.negative;
+        self.act_term += o.act_term;
+        self.deact_con += o.deact_con;
+        self.unanswered += o.unanswered;
+        for (dst, src) in [
+            (&mut self.actcon_us, o.actcon_us),
+            (&mut self.actterm_us, o.actterm_us),
+        ] {
+            let room = COMMAND_LATENCY_SAMPLES_CAP.saturating_sub(dst.len());
+            dst.extend(src.into_iter().take(room));
+        }
+    }
+}
+
+/// One negative command confirmation (slave role: one we sent; master
+/// role: one the live slave sent).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NegativeConfirmation {
+    /// Milliseconds since the connection was established.
+    pub at_ms: u64,
+    pub type_id: u8,
+    /// Common address and information object address of the command.
+    pub ca: u16,
+    pub ioa: u32,
+    /// Cause of transmission of the negative reply (7, 9, 44..=47).
+    pub cot: u8,
+}
+
+/// One deliberately injected fault (IEC 104 `proto_config.faults`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FaultRecord {
+    /// Milliseconds since the connection was established at which the
+    /// fault fired.
+    pub at_ms: u64,
+    /// Fault kind as configured, e.g. `"drop_iframes"`.
+    pub kind: String,
+    /// What was done (parameters, affected sequence numbers).
+    pub detail: String,
+    /// Frames the fault acted on (dropped, duplicated, corrupted,
+    /// delayed, malformed frames sent, TESTFR acts ignored, acks held).
+    pub frames_affected: u64,
+}
+
+/// How the peer reacted once the first fault was injected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FaultReaction {
+    /// The peer closed the connection (FIN).
+    pub peer_closed: bool,
+    /// The peer reset the connection (RST).
+    pub peer_reset: bool,
+    /// The peer sent STOPDT act.
+    pub peer_stopdt: bool,
+    /// Distinct protocol error kinds recorded after the first fault
+    /// (see [`ProtocolError::kind`]).
+    pub protocol_errors: Vec<String>,
+    /// Milliseconds from the first fault to the first reaction above.
+    pub first_reaction_ms: Option<u64>,
+    /// One-line summary, e.g. "3 faults injected; peer reaction:
+    /// closed the connection 120 ms after the first fault".
+    pub summary: String,
+}
+
 /// Protocol-level session detail reported next to the generic
 /// counters in [`ProtoReport`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct ProtocolStats {
     /// Number of protocol violations by the peer (sequence-number
     /// errors, malformed frames, unexpected control frames) plus
@@ -462,7 +568,8 @@ pub struct ProtocolStats {
     /// Detail for the first [`PROTOCOL_ERRORS_CAP`] violations.
     pub protocol_errors: Vec<ProtocolError>,
     /// Data messages the replayer generated itself (IEC 104 slave:
-    /// GI/CI responses) rather than replaying from the capture. They
+    /// GI/CI and command responses) rather than replaying from the
+    /// capture. They
     /// are included in `messages_sent`.
     pub synthesized_frames: u64,
     /// 0-based index, among all data messages sent on this session
@@ -474,12 +581,14 @@ pub struct ProtocolStats {
     pub synthesized_send_indices: Vec<u64>,
     /// Application-level response time in microseconds: from receiving
     /// a command the replayer answers itself (IEC 104 slave: GI/CI
-    /// activation) to sending the first response frame (ActCon).
+    /// activation or control-direction command) to sending the first
+    /// response frame (ActCon or negative confirmation).
     /// Capped at [`COMMAND_RESPONSE_SAMPLES_CAP`].
     pub command_response_us: Vec<u64>,
     /// Captured frames removed from the replay script because the
     /// replayer synthesizes their equivalent live (IEC 104 slave:
-    /// captured GI/CI ActCon, Inrogen/Reqcogen data and ActTerm).
+    /// captured GI/CI ActCon, Inrogen/Reqcogen data and ActTerm, and
+    /// captured command confirmations and read replies).
     pub stripped_capture_frames: u64,
     /// Number of capture gaps in the replayed stream.
     pub capture_gaps: u64,
@@ -496,6 +605,16 @@ pub struct ProtocolStats {
     pub acks_sent: u64,
     /// Keep-alive probes sent (IEC 104 TESTFR act after t3 idle).
     pub keepalives_sent: u64,
+    /// Per command type round-trip figures, sorted by type ID.
+    pub commands: Vec<CommandTypeStats>,
+    /// Negative command confirmations, capped at
+    /// [`NEGATIVE_CONFIRMATIONS_CAP`].
+    pub negative_confirmations: Vec<NegativeConfirmation>,
+    /// Deliberately injected faults, capped at [`FAULT_RECORDS_CAP`].
+    pub faults_injected: Vec<FaultRecord>,
+    /// Peer reaction to the injected faults; `None` when no fault
+    /// fired.
+    pub fault_reaction: Option<FaultReaction>,
 }
 
 impl ProtocolStats {
@@ -531,6 +650,38 @@ impl ProtocolStats {
         self.idle_serve_ms += other.idle_serve_ms;
         self.acks_sent += other.acks_sent;
         self.keepalives_sent += other.keepalives_sent;
+        for c in other.commands {
+            match self.commands.iter_mut().find(|x| x.type_id == c.type_id) {
+                Some(x) => x.merge(c),
+                None => self.commands.push(c),
+            }
+        }
+        self.commands.sort_by_key(|c| c.type_id);
+        let room = NEGATIVE_CONFIRMATIONS_CAP.saturating_sub(self.negative_confirmations.len());
+        self.negative_confirmations
+            .extend(other.negative_confirmations.into_iter().take(room));
+        let room = FAULT_RECORDS_CAP.saturating_sub(self.faults_injected.len());
+        self.faults_injected
+            .extend(other.faults_injected.into_iter().take(room));
+        if let Some(o) = other.fault_reaction {
+            match &mut self.fault_reaction {
+                None => self.fault_reaction = Some(o),
+                Some(r) => {
+                    r.peer_closed |= o.peer_closed;
+                    r.peer_reset |= o.peer_reset;
+                    r.peer_stopdt |= o.peer_stopdt;
+                    for k in o.protocol_errors {
+                        if !r.protocol_errors.contains(&k) {
+                            r.protocol_errors.push(k);
+                        }
+                    }
+                    r.first_reaction_ms = r.first_reaction_ms.or(o.first_reaction_ms);
+                    if r.summary.len() < 512 {
+                        r.summary = format!("{}; then: {}", r.summary, o.summary);
+                    }
+                }
+            }
+        }
     }
 }
 

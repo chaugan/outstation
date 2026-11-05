@@ -488,7 +488,9 @@ fn slave_empty_script_idle_serves_without_spinning() {
     let port = free_port();
     let mut c = cfg(Role::Slave, port, Vec::new());
     c.loop_iterations = 0;
-    c.proto_config = Some(r#"{"session":{"t1":2,"t2":0.4,"t3":30}}"#.into());
+    // Command echo off: the command must not be answered here.
+    c.proto_config =
+        Some(r#"{"session":{"t1":2,"t2":0.4,"t3":30},"commands":{"enabled":false}}"#.into());
     let run = Running::spawn(c);
     let mut p = Peer::connect(port);
     master_handshake(&mut p);

@@ -17,7 +17,8 @@
 //!
 //! Slave: listen/accept → STARTDT act/con (and any later STARTDT/STOPDT
 //! from the master) → script, `loop_iterations` times, with live GI/CI
-//! answers interleaved → idle-serve (keep answering GI/CI/TESTFR and
+//! and command answers interleaved → idle-serve (keep answering
+//! GI/CI/commands/TESTFR and
 //! acknowledging) until the master closes, the run is cancelled, or
 //! `session.idle_serve_secs` (default 30 s) elapses → close.
 //!
@@ -35,9 +36,11 @@ use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
 use crate::asdu::{load_rewrite_map, rewrite_asdu, Iec104ProtoConfig, RewriteMap, SessionConfig};
+use crate::commands::CommandBook;
 use crate::inventory::Inventory;
 use crate::link::{
-    now_ns, secs_to_ns, Cp56Rewrite, Link, LinkEnd, LinkOptions, LinkParams, Responder, Transfer,
+    now_ns, secs_to_ns, CommandEcho, Cp56Rewrite, Link, LinkEnd, LinkOptions, LinkParams,
+    Responder, Transfer,
 };
 
 /// How long a slave waits for the master's STARTDT act after accept.
@@ -221,6 +224,7 @@ fn link_options(
         },
         responder,
         reader_name,
+        faults: pc.fault_plan.clone(),
     }
 }
 
@@ -236,6 +240,18 @@ fn finish(mut report: ProtoReport, t_start: Instant) -> ProtoReport {
 
 fn at_idx(e: &LinkEnd, what: &str, idx: usize) -> String {
     format!("{} {what} at idx {idx}", e.describe())
+}
+
+/// The session error for a link end, or `None` when the end is a
+/// deliberate fault (`rst`) or the peer's reaction to an injected
+/// fault; those are reported in `ProtocolStats::fault_reaction`.
+fn fail(link: &Link, e: &LinkEnd, msg: String) -> Option<String> {
+    if link.fault_excused(e) {
+        info!(end = %e.describe(), "session ended by fault injection or the peer's reaction to it");
+        None
+    } else {
+        Some(msg)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -326,10 +342,11 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
 fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<String> {
     // 3. STARTDT act → con within t1.
     if let Err(e) = link.master_start() {
-        return Some(match e {
+        let msg = match &e {
             LinkEnd::Timeout(_) => "timeout waiting for STARTDT con".into(),
             e => format!("STARTDT: {}", e.describe()),
-        });
+        };
+        return fail(link, &e, msg);
     }
     info!("STARTDT handshake complete");
 
@@ -339,12 +356,12 @@ fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<S
     for (idx, frame) in script.frames.iter().enumerate() {
         if let Some(target) = script.target_ns(cfg, idx) {
             if let Err(e) = link.wait_until(epoch + target) {
-                return Some(at_idx(&e, "during pace", idx));
+                return fail(link, &e, at_idx(&e, "during pace", idx));
             }
         }
         if let Err(e) = link.send_script_frame(&frame.asdu) {
             warn!(error = %e.describe(), idx, "master: send aborted");
-            return Some(at_idx(&e, "sending I-frame", idx));
+            return fail(link, &e, at_idx(&e, "sending I-frame", idx));
         }
     }
 
@@ -355,7 +372,10 @@ fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<S
         // Server hung up after the script; unacked_at_end tells the
         // story, and there is nobody left to STOPDT.
         Err(LinkEnd::PeerClosed) => return None,
-        Err(e) => return Some(format!("{} after the last I-frame", e.describe())),
+        Err(e) => {
+            let msg = format!("{} after the last I-frame", e.describe());
+            return fail(link, &e, msg);
+        }
     }
 
     // 6. S-frame flush (inside master_stop), STOPDT act → con. A
@@ -363,7 +383,10 @@ fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<S
     //    otherwise complete run.
     match link.master_stop() {
         Ok(()) | Err(LinkEnd::PeerClosed) | Err(LinkEnd::Timeout(_)) => None,
-        Err(e) => Some(format!("STOPDT: {}", e.describe())),
+        Err(e) => {
+            let msg = format!("STOPDT: {}", e.describe());
+            fail(link, &e, msg)
+        }
     }
 }
 
@@ -395,28 +418,44 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     // matches the addresses the live master uses.
     // Shared on/off switch with the analyzer: `{"gi_ci_synthesis": false}`
     // replays the captured bursts verbatim and answers nothing live.
+    // Command echo (`commands.enabled`, default on) answers the
+    // master's control-direction commands from the same inventory.
     let synthesize = crate::interrogation::synthesis_enabled(cfg.proto_config.as_deref());
-    let responder = synthesize.then(|| {
+    let echo_commands = pc.commands.enabled;
+    let responder = (synthesize || echo_commands).then(|| {
         let mut inventory = Inventory::default();
+        let mut book = CommandBook::default();
         for f in &script.frames {
             inventory.ingest_asdu(&f.asdu);
+            book.ingest_asdu(&f.asdu);
         }
         info!(
             points = inventory.len(),
-            "slave: built point inventory for GI/CI responses"
+            command_points = book.len(),
+            gi_ci = synthesize,
+            commands = echo_commands,
+            "slave: built point inventory for live responses"
         );
-        Responder::new(inventory)
+        let r = Responder::new(inventory).gi_ci(synthesize);
+        if echo_commands {
+            r.with_commands(CommandEcho {
+                cfg: pc.commands.clone(),
+                book,
+                zone: pc.cp56.zone(),
+            })
+        } else {
+            r
+        }
     });
-    if synthesize {
-        // The live master gets synthesized answers to its own GI/CI;
-        // replaying the captured bursts too would hand it unsolicited
-        // ActCon/ActTerm and duplicate data.
-        let before = script.frames.len();
-        script
-            .frames
-            .retain(|f| !crate::interrogation::is_captured_interrogation_frame(&f.asdu));
-        report.protocol.stripped_capture_frames = (before - script.frames.len()) as u64;
-    }
+    // The live master gets synthesized answers to its own GI/CI and
+    // commands; replaying the captured exchanges too would hand it
+    // unsolicited confirmations and duplicate data.
+    let before = script.frames.len();
+    script.frames.retain(|f| {
+        !(synthesize && crate::interrogation::is_captured_interrogation_frame(&f.asdu)
+            || echo_commands && crate::commands::is_captured_command_frame(&f.asdu))
+    });
+    report.protocol.stripped_capture_frames = (before - script.frames.len()) as u64;
     info!(
         count = script.frames.len(),
         stripped = report.protocol.stripped_capture_frames,
@@ -531,7 +570,10 @@ fn drive_slave(
     match link.service(Some(deadline), |l| l.transfer() == Transfer::Started) {
         Ok(()) if link.transfer() == Transfer::Started => {}
         Ok(()) => return Some("timeout waiting for STARTDT act from master".into()),
-        Err(e) => return Some(format!("{} waiting for STARTDT act", e.describe())),
+        Err(e) => {
+            let msg = format!("{} waiting for STARTDT act", e.describe());
+            return fail(link, &e, msg);
+        }
     }
     set_state(progress, session_state::ACTIVE);
     info!("slave: STARTDT handshake complete, now active");
@@ -568,12 +610,12 @@ fn drive_slave(
             for (idx, frame) in script.frames.iter().enumerate() {
                 if let Some(target) = script.target_ns(cfg, idx) {
                     if let Err(e) = link.wait_until(epoch + target) {
-                        return Some(at_idx(&e, "during pace", idx));
+                        return fail(link, &e, at_idx(&e, "during pace", idx));
                     }
                 }
                 if let Err(e) = link.send_script_frame(&frame.asdu) {
                     warn!(error = %e.describe(), idx, "slave: send aborted");
-                    return Some(at_idx(&e, "sending I-frame", idx));
+                    return fail(link, &e, at_idx(&e, "sending I-frame", idx));
                 }
             }
         }
@@ -596,16 +638,30 @@ fn drive_slave(
             // acknowledged, acknowledge the master, then close.
             match link.drain_pending() {
                 Ok(()) | Err(LinkEnd::PeerClosed) | Err(LinkEnd::Cancelled) => {}
-                Err(e) => return Some(format!("{} after idle-serve", e.describe())),
+                Err(e) => {
+                    let msg = format!("{} after idle-serve", e.describe());
+                    return fail(link, &e, msg);
+                }
             }
             link.flush_ack();
             None
         }
         Err(LinkEnd::PeerClosed) | Err(LinkEnd::Cancelled) => None,
-        Err(e) => Some(format!("{} during idle-serve", e.describe())),
+        Err(e) => {
+            let msg = format!("{} during idle-serve", e.describe());
+            fail(link, &e, msg)
+        }
     }
 }
 
 #[cfg(test)]
 #[path = "session_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod command_tests;
+
+#[cfg(test)]
+#[path = "fault_tests.rs"]
+mod fault_tests;

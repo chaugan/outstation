@@ -30,6 +30,8 @@
 
 use std::collections::HashMap;
 
+use crate::commands::CommandsConfig;
+use crate::faults::FaultPlan;
 use anyhow::{bail, Result};
 use serde::Deserialize;
 
@@ -679,9 +681,16 @@ pub fn load_rewrite_map(proto_config: Option<&str>) -> Result<RewriteMap> {
 ///   "cot": {...},
 ///   "ioa": {...},
 ///   "cp56": { "rewrite_to_now": false, "zone": "local" },
-///   "session": { "k": 12, "w": 8, "t1": 15, "t2": 10, "t3": 20 }
+///   "session": { "k": 12, "w": 8, "t1": 15, "t2": 10, "t3": 20 },
+///   "commands": { "enabled": true, "return_info": "none",
+///                 "max_age_ms": 10000, "unknown_ioa": "negative" },
+///   "faults": [ { "at": {"ms": 5000}, "kind": "rst" } ],
+///   "fault_seed": 42
 /// }
 /// ```
+///
+/// `commands` is described in [`crate::commands`], `faults` and
+/// `fault_seed` in [`crate::faults`].
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct Iec104ProtoConfig {
     #[serde(default)]
@@ -689,6 +698,17 @@ pub struct Iec104ProtoConfig {
     /// APCI link parameters and live-session behaviour.
     #[serde(default)]
     pub session: SessionConfig,
+    /// Slave-mode command echo.
+    #[serde(default)]
+    pub commands: CommandsConfig,
+    /// Raw `faults` value; validated into [`Iec104ProtoConfig::fault_plan`].
+    #[serde(default)]
+    faults: Option<serde_json::Value>,
+    #[serde(default)]
+    fault_seed: Option<serde_json::Value>,
+    /// The validated fault plan (empty when `faults` is absent).
+    #[serde(skip)]
+    pub fault_plan: FaultPlan,
 }
 
 /// IEC 60870-5-104 §5 link parameters plus session behaviour knobs.
@@ -870,8 +890,8 @@ impl Iec104ProtoConfig {
         if trimmed.is_empty() || trimmed == "null" || trimmed == "{}" {
             return Ok(Self::default());
         }
-        let cfg: Self = serde_json::from_str(trimmed)
-            .map_err(|e| anyhow::anyhow!("proto_config (cp56): {e}"))?;
+        let cfg: Self =
+            serde_json::from_str(trimmed).map_err(|e| anyhow::anyhow!("proto_config: {e}"))?;
         if Cp56Zone::parse(&cfg.cp56.zone).is_none() {
             bail!(
                 "proto_config (cp56): unknown zone {:?} (expected \"utc\" or \"local\")",
@@ -881,6 +901,12 @@ impl Iec104ProtoConfig {
         cfg.session
             .validate()
             .map_err(|e| anyhow::anyhow!("proto_config (session): {e}"))?;
+        cfg.commands
+            .validate()
+            .map_err(|e| anyhow::anyhow!("proto_config (commands): {e}"))?;
+        let mut cfg = cfg;
+        cfg.fault_plan = FaultPlan::from_values(cfg.faults.as_ref(), cfg.fault_seed.as_ref())
+            .map_err(|e| anyhow::anyhow!("proto_config (faults): {e}"))?;
         Ok(cfg)
     }
 }
@@ -1567,6 +1593,41 @@ mod tests {
                 let b = encode_cp56time2a_local(t * S, false);
                 assert_eq!(dec(b), Some(t), "round trip at {t} bytes={b:x?}");
             }
+        }
+    }
+
+    #[test]
+    fn commands_and_faults_config() {
+        use crate::commands::{ReturnInfo, UnknownIoa};
+        let c = Iec104ProtoConfig::parse(None).unwrap();
+        assert!(c.commands.enabled);
+        assert_eq!(c.commands.return_info, ReturnInfo::None);
+        assert_eq!(c.commands.max_age_ms, 10_000);
+        assert_eq!(c.commands.unknown_ioa, UnknownIoa::Negative);
+        assert!(c.fault_plan.is_empty());
+        let c = Iec104ProtoConfig::parse(Some(
+            r#"{"ioa":{"1":2},"commands":{"enabled":false,"return_info":"spontaneous","max_age_ms":0,"unknown_ioa":"accept"},
+                "faults":[{"at":{"ms":1},"kind":"rst"}],"fault_seed":3}"#,
+        ))
+        .unwrap();
+        assert!(!c.commands.enabled);
+        assert_eq!(c.commands.return_info, ReturnInfo::Spontaneous);
+        assert_eq!(c.commands.max_age_ms, 0);
+        assert_eq!(c.commands.unknown_ioa, UnknownIoa::Accept);
+        assert_eq!(c.fault_plan.faults.len(), 1);
+        assert_eq!(c.fault_plan.seed, 3);
+        for bad in [
+            r#"{"commands":{"enable":true}}"#,
+            r#"{"commands":{"return_info":"always"}}"#,
+            r#"{"commands":{"unknown_ioa":"ignore"}}"#,
+            r#"{"commands":{"max_age_ms":-1}}"#,
+            r#"{"commands":{"max_age_ms":86400001}}"#,
+            r#"{"commands":true}"#,
+            r#"{"faults":[{"at":{"ms":1},"kind":"unplug"}]}"#,
+            r#"{"faults":[{"at":{"ms":1},"kind":"rst"}],"fault_seed":-1}"#,
+        ] {
+            assert!(Iec104ProtoConfig::parse(Some(bad)).is_err(), "{bad}");
+            assert!(validate_proto_config(Some(bad)).is_err(), "{bad}");
         }
     }
 

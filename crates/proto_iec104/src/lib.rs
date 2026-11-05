@@ -20,6 +20,8 @@ pub mod analysis;
 pub mod apci;
 pub mod apdu;
 pub mod asdu;
+pub mod commands;
+pub mod faults;
 pub mod interrogation;
 pub mod inventory;
 mod link;
