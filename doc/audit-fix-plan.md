@@ -177,7 +177,7 @@ Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (merged into `audit
   - Annotate `fidelity_report_run2.md`.
   - Refs: F007, F068, F128, F129, F130, F133, F135, F138; product items #1, #6 and #10.
 - [x] **T16 Privileged netns smoke suite.** `scripts/netns-smoke.sh` runs with sudo inside dedicated namespaces. It covers slave and master runs against a mock peer, concurrent-run rejection, SIGTERM mid-run cleanup, crash reclaim, a pre-existing alias that survives teardown, and refusal of the default-route NIC. It replaces `smoke_v12.sh`, `test_capture.sh` and `test_run_api.sh`. Refs: F080, F084 (e2e half).
-- [ ] **T16b Bugs found by the smoke suite.**
+- [~] **T16b Bugs found by the smoke suite.**
   - B1: the raw mirror capture records each flooded frame once per run port (`mirror_port` mirrors ingress and egress on every port), and at top speed with many sources it drops some frames.
   - B2: `collect_capture` reads its counters before `stop()`, so `captured_packets` can be lower than the file.
   - O1: an unbounded master run with original pacing reconnects 8–12 times a second on short captures; an iteration should last the capture's span divided by speed.
