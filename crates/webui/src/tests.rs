@@ -1463,28 +1463,50 @@ async fn compare_runs() {
     let a = h.run_to(slave_req("pcr_1"), "completed").await;
     let b = h.run_to(slave_req("pcr_1"), "completed").await;
 
-    // analyze=false and no stored analysis: 409.
-    let (s, v) = h
-        .call(
-            Method::GET,
-            &format!("/api/runs/{a}/compare/{b}?analyze=false"),
-            None,
-        )
-        .await;
-    assert_eq!(
-        (s, v["code"].as_str()),
-        (StatusCode::CONFLICT, Some("analysis_missing"))
-    );
-    assert_eq!(v["run_id"], a);
-    assert_eq!(v["has_capture"], true);
+    // GET compare is read-only: no stored analysis gives 409 and never
+    // creates one, however often it is called.
+    for _ in 0..2 {
+        let (s, v) = h
+            .call(Method::GET, &format!("/api/runs/{a}/compare/{b}"), None)
+            .await;
+        assert_eq!(
+            (s, v["code"].as_str()),
+            (StatusCode::CONFLICT, Some("analysis_missing"))
+        );
+        assert_eq!(v["run_id"], a);
+        assert_eq!(v["has_capture"], true);
+    }
+    assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
+    assert!(h.state.db.analyses_for_run(b).unwrap().is_empty());
 
-    // On demand: both sides analysed and stored.
+    // On-demand analysis is a POST behind the same-origin guard.
+    let req = Request::builder()
+        .method(Method::POST)
+        .uri(format!("/api/runs/{a}/analyze"))
+        .header("host", HOST)
+        .header("origin", "http://evil.example")
+        .body(Body::empty())
+        .unwrap();
+    let (s, _, _) = h.send(req).await;
+    assert_eq!(s, StatusCode::FORBIDDEN);
+    assert!(h.state.db.analyses_for_run(a).unwrap().is_empty());
+    for id in [a, b] {
+        let (s, v) = h
+            .call(Method::POST, &format!("/api/runs/{id}/analyze"), None)
+            .await;
+        assert_eq!(s, StatusCode::OK, "{v}");
+        assert_eq!(v["run_id"], id);
+        assert_eq!(v["source"], "on_demand");
+        assert!(v["analysis_id"].as_u64().is_some());
+    }
+    let (_, run) = h.call(Method::GET, &format!("/api/runs/{a}"), None).await;
+    assert_eq!(run["latest_analysis"]["source"], "on_demand");
+
     let (s, v) = h
         .call(Method::GET, &format!("/api/runs/{a}/compare/{b}"), None)
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
     assert_eq!(v["a"]["run_id"], a);
-    assert_eq!(v["a"]["analyzed_now"], true);
     assert_eq!(v["b"]["analysis_source"], "on_demand");
     assert_eq!(v["regressed"], false, "{}", v["regressions"]);
     assert_eq!(v["regressions"], json!([]));
@@ -1500,8 +1522,8 @@ async fn compare_runs() {
     assert_eq!(v["fleet"]["verdict_changed"], false);
     assert_eq!(v["only_in_a"], json!([]));
     assert_eq!(v["thresholds"]["score_drop"], 1.0);
+    assert_eq!(h.state.db.analyses_for_run(a).unwrap().len(), 1);
 
-    // Second time the stored analyses are reused.
     let (s, v) = h
         .call(
             Method::GET,
@@ -1510,7 +1532,6 @@ async fn compare_runs() {
         )
         .await;
     assert_eq!(s, StatusCode::OK, "{v}");
-    assert_eq!(v["a"]["analyzed_now"], false);
     assert_eq!(v["thresholds"]["score_drop"], 5.0);
     assert_eq!(v["thresholds"]["p99_increase_pct"], 50.0);
     let aid = v["a"]["analysis_id"].as_u64().unwrap();

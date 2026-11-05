@@ -300,3 +300,52 @@ pub(crate) async fn api_analysis_detail(
         .map_err(|e| AppError::Internal(format!("read analysis detail: {e:#}")))?;
     parse_stored(json, &format!("endpoint {endpoint} of analysis {id}"))
 }
+
+#[derive(Serialize)]
+pub(crate) struct RunAnalyzeResp {
+    analysis_id: u64,
+    run_id: u64,
+    verdict: String,
+    score_pct: f64,
+    source: String,
+    created_at: u64,
+}
+
+/// `POST /api/runs/:id/analyze`: analyse a finished benchmark run's own
+/// capture now and store it (source `on_demand`). Mutating, so it sits
+/// behind the same-origin guard and the heavy-work limit (429 `busy`).
+/// 409 `capture_missing` when the run has no capture on disk.
+pub(crate) async fn api_run_analyze(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<u64>,
+) -> Result<Json<RunAnalyzeResp>, AppError> {
+    let rs = state
+        .get_run(id)
+        .ok_or_else(|| AppError::NotFound(format!("run {id} not found")))?
+        .lock_safe()
+        .clone();
+    crate::analysis_run::check_analyzable(&rs)?;
+    let capture =
+        crate::analysis_run::run_capture(&rs, &state.cfg.captures_dir()).ok_or_else(|| {
+            AppError::Conflict(
+                "capture_missing",
+                format!("run {id} has no capture to analyse (never written or evicted)"),
+            )
+        })?;
+    let _permit = state
+        .heavy
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| busy())?;
+    let (a, _) =
+        crate::analysis_run::analyze_and_store(&state, rs, capture, AnalysisSource::OnDemand)
+            .await?;
+    Ok(Json(RunAnalyzeResp {
+        analysis_id: a.id,
+        run_id: a.run_id,
+        verdict: a.verdict,
+        score_pct: a.score_pct,
+        source: a.source,
+        created_at: a.created_at,
+    }))
+}

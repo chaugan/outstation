@@ -7,21 +7,20 @@
 //!   `throughput_drop_pct`;
 //! * `analysis_a`, `analysis_b`: compare these stored analyses instead
 //!   of each run's newest one;
-//! * `analyze` (default `true`): when a run has no stored analysis but
-//!   still has its capture, analyse it on demand (stored with source
-//!   `on_demand`). With `analyze=false`, or without a capture, a run
-//!   with no analysis gives 409 `analysis_missing`.
+//!
+//! Strictly read-only: GET is not covered by the same-origin guard, so
+//! it never analyses. A run without a stored analysis gives 409
+//! `analysis_missing` (`run_id`, `has_capture`); the client then calls
+//! `POST /api/runs/:id/analyze` and retries.
 
 use axum::extract::State;
 use axum::Json;
 use serde::{Deserialize, Serialize};
 
-use crate::analysis_run::{analyze_and_store, check_analyzable, run_capture};
+use crate::analysis_run::run_capture;
 use crate::compare::{compare, Comparison, Side, Thresholds};
 use crate::dto::*;
 use crate::error::{ApiPath, ApiQuery, AppError, LockExt};
-use crate::metrics::AnalysisSource;
-use crate::routes::runs::busy;
 use crate::state::AppState;
 
 /// Query string. Thresholds are listed one by one: `serde(flatten)`
@@ -37,7 +36,6 @@ pub(crate) struct CompareQuery {
     throughput_drop_pct: Option<f64>,
     analysis_a: Option<u64>,
     analysis_b: Option<u64>,
-    analyze: Option<bool>,
 }
 
 impl CompareQuery {
@@ -65,8 +63,6 @@ pub(crate) struct SideInfo {
     analysis_id: u64,
     /// `manual`, `auto` or `on_demand`.
     analysis_source: String,
-    /// True when this request ran the analysis.
-    analyzed_now: bool,
 }
 
 #[derive(Serialize)]
@@ -105,12 +101,7 @@ fn comparable_run(state: &AppState, id: u64) -> Result<RunState, AppError> {
     Ok(rs)
 }
 
-async fn load_side(
-    state: &AppState,
-    rs: RunState,
-    pick: Option<u64>,
-    analyze: bool,
-) -> Result<Loaded, AppError> {
+fn load_side(state: &AppState, rs: RunState, pick: Option<u64>) -> Result<Loaded, AppError> {
     let id = rs.id;
     let db_err = |e: anyhow::Error| AppError::Internal(format!("read analyses: {e:#}"));
     let list = state.db.analyses_for_run(id).map_err(db_err)?;
@@ -120,51 +111,31 @@ async fn load_side(
         })?),
         None => list.into_iter().next(),
     };
-    let (stored, summary, analyzed_now) = match chosen {
-        Some(a) => {
-            let json = state
-                .db
-                .analysis_summary(a.id)
-                .map_err(db_err)?
-                .ok_or_else(|| AppError::NotFound(format!("analysis {} not found", a.id)))?;
-            let v = serde_json::from_str(&json)
-                .map_err(|e| AppError::Internal(format!("stored analysis is not JSON: {e}")))?;
-            (a, v, false)
-        }
-        None => {
-            let capture = run_capture(&rs, &state.cfg.captures_dir());
-            let Some(capture) = capture.filter(|_| analyze) else {
-                return Err(AppError::Conflict(
-                    "analysis_missing",
-                    format!(
-                        "run {id} has no stored analysis{}",
-                        if analyze {
-                            " and no capture to analyse"
-                        } else {
-                            " (on-demand analysis disabled by analyze=false)"
-                        }
-                    ),
-                )
-                .with("run_id", id.into())
-                .with(
-                    "has_capture",
-                    rs.capture_file.as_ref().is_some_and(|p| p.is_file()).into(),
-                ));
-            };
-            check_analyzable(&rs)?;
-            let _permit = state
-                .heavy
-                .clone()
-                .try_acquire_owned()
-                .map_err(|_| busy())?;
-            let (a, report) =
-                analyze_and_store(state, rs.clone(), capture, AnalysisSource::OnDemand).await?;
-            let (summary, _) = report.split();
-            let v = serde_json::to_value(&summary)
-                .map_err(|e| AppError::Internal(format!("serialize analysis: {e}")))?;
-            (a, v, true)
-        }
+    let Some(stored) = chosen else {
+        // GET stays read-only (it is not covered by the same-origin
+        // guard): analysing is POST /api/runs/:id/analyze.
+        let has_capture = run_capture(&rs, &state.cfg.captures_dir()).is_some();
+        return Err(AppError::Conflict(
+            "analysis_missing",
+            format!(
+                "run {id} has no stored analysis{}",
+                if has_capture {
+                    format!("; POST /api/runs/{id}/analyze, then retry")
+                } else {
+                    " and no capture to analyse".to_string()
+                }
+            ),
+        )
+        .with("run_id", id.into())
+        .with("has_capture", has_capture.into()));
     };
+    let json = state
+        .db
+        .analysis_summary(stored.id)
+        .map_err(db_err)?
+        .ok_or_else(|| AppError::NotFound(format!("analysis {} not found", stored.id)))?;
+    let summary = serde_json::from_str(&json)
+        .map_err(|e| AppError::Internal(format!("stored analysis is not JSON: {e}")))?;
     Ok(Loaded {
         info: SideInfo {
             run_id: id,
@@ -174,7 +145,6 @@ async fn load_side(
             started_at: rs.started_at,
             analysis_id: stored.id,
             analysis_source: stored.source,
-            analyzed_now,
         },
         summary,
         bench: rs.benchmark,
@@ -190,11 +160,10 @@ pub(crate) async fn api_run_compare(
     thresholds
         .validate()
         .map_err(|e| AppError::BadRequest(e).code("invalid_query"))?;
-    let analyze = q.analyze.unwrap_or(true);
     // Rule out unknown, running and raw runs before analysing anything.
     let (ra, rb) = (comparable_run(&state, a)?, comparable_run(&state, b)?);
-    let la = load_side(&state, ra, q.analysis_a, analyze).await?;
-    let lb = load_side(&state, rb, q.analysis_b, analyze).await?;
+    let la = load_side(&state, ra, q.analysis_a)?;
+    let lb = load_side(&state, rb, q.analysis_b)?;
     let mut warnings = Vec::new();
     if a == b {
         warnings.push("comparing a run with itself".to_string());

@@ -14,7 +14,7 @@
 //! | GET/DELETE | `/api/runs/:id` | full detail / delete |
 //! | POST | `/api/runs/:id/stop` | stop |
 //! | POST | `/api/runs/:id/rerun[?force=true]` | new run with the stored request |
-//! | GET | `/api/runs/:a/compare/:b` | run-to-run deltas and regression flags |
+//! | GET | `/api/runs/:a/compare/:b` | run-to-run deltas and regression flags (read-only) |
 //! | GET/POST | `/api/profiles` | named run requests |
 //! | GET/PUT/DELETE | `/api/profiles/:id` | one profile |
 //! | GET | `/metrics` | Prometheus text exposition |
@@ -22,6 +22,7 @@
 //! | GET | `/api/runs/:id/download`, `/gaps` | capture, gap histogram |
 //! | POST | `/api/analyze[?run_id=N]` | fidelity analysis upload |
 //! | GET | `/api/runs/:id/analyses` | stored analyses of a run |
+//! | POST | `/api/runs/:id/analyze` | analyse the run's own capture now |
 //! | GET | `/api/analyses/:id` | stored analysis summary |
 //! | GET | `/api/analyses/:id/endpoints/:endpoint` | one endpoint's stored detail |
 //! | * | `/api/pcaps...` | library |
@@ -130,6 +131,7 @@ pub fn router(state: AppState) -> Router {
             post(api_analyze).layer(DefaultBodyLimit::max(body_limit)),
         )
         .route("/api/runs/:id/analyses", get(api_run_analyses))
+        .route("/api/runs/:id/analyze", post(api_run_analyze))
         .route("/api/analyses/:id", get(api_analysis_summary))
         .route(
             "/api/analyses/:id/endpoints/:endpoint",
