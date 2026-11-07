@@ -78,7 +78,8 @@ pub use dto::{
 };
 pub use events::RunEvent;
 pub use state::{
-    default_library_dir, default_state_dir, env_flag, split_hosts, ActiveRun, AppState, ServeConfig,
+    default_library_dir, default_state_dir, env_flag, split_hosts, split_origins, ActiveRun,
+    AppState, ServeConfig,
 };
 pub use sysinfo::FreeSpace;
 
@@ -309,6 +310,9 @@ pub async fn serve(cfg: ServeConfig) -> Result<()> {
     analysis_run::queue_startup_backlog(&state, analysis_run::STARTUP_BACKLOG_LIMIT);
     if !state.cfg.allow_hosts.is_empty() {
         info!(hosts = ?state.cfg.allow_hosts, "extra allowed Host names");
+    }
+    if !state.cfg.allow_origins.is_empty() {
+        info!(origins = ?state.cfg.allow_origins, "extra trusted Origins (reverse proxy)");
     }
 
     let app = router(state.clone());

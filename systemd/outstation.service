@@ -18,6 +18,9 @@ Type=simple
 # whose Origin is not the UI itself (CSRF protection). If you reach the
 # UI through another name (a reverse proxy, a DNS alias), add it with
 # --allow-host NAME or Environment=OUTSTATION_ALLOW_HOSTS=name1,name2.
+# Behind a proxy that rewrites Host (e.g. one serving the UI under a
+# path prefix on another site), also trust its public origin with
+# --allow-origin https://proxy.example or OUTSTATION_ALLOW_ORIGINS.
 # Only one run can be active at a time.
 ExecStart=/usr/local/bin/outstation serve --bind 0.0.0.0:8080
 # Undo host network changes even if the process died without its own

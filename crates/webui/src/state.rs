@@ -66,6 +66,10 @@ pub struct ServeConfig {
     /// Extra Host names accepted by the same-origin guard, on top of IP
     /// literals, `localhost` and this machine's host names.
     pub allow_hosts: Vec<String>,
+    /// Extra trusted `Origin`s (`scheme://host[:port]`, normalized) for
+    /// state-changing requests and WebSockets, for a reverse proxy that
+    /// rewrites `Host`. Empty by default.
+    pub allow_origins: Vec<String>,
     /// Largest accepted upload (library and analysis), in bytes.
     pub max_upload_bytes: u64,
     /// Uploads and new captures are refused when free space in the state
@@ -115,7 +119,7 @@ pub fn env_flag(v: &str) -> Option<bool> {
 
 impl ServeConfig {
     /// Defaults derived from the environment. `OUTSTATION_ALLOW_HOSTS`
-    /// is a comma-separated host list.
+    /// and `OUTSTATION_ALLOW_ORIGINS` are comma-separated lists.
     pub fn from_env(bind: SocketAddr) -> Self {
         let library_dir = default_library_dir();
         let state_dir = state_dir_for(&library_dir);
@@ -131,6 +135,9 @@ impl ServeConfig {
             ephemeral: false,
             allow_hosts: std::env::var("OUTSTATION_ALLOW_HOSTS")
                 .map(|v| split_hosts(&v))
+                .unwrap_or_default(),
+            allow_origins: std::env::var("OUTSTATION_ALLOW_ORIGINS")
+                .map(|v| split_origins(&v))
                 .unwrap_or_default(),
             max_upload_bytes: env_u64("OUTSTATION_MAX_UPLOAD_MB")
                 .map(|v| v * MIB)
@@ -185,6 +192,15 @@ impl ServeConfig {
 }
 
 /// Split a comma/whitespace separated host list.
+/// Comma/space-separated `scheme://host[:port]` list, normalized the way
+/// the origin guard compares them (lower case, no trailing slash).
+pub fn split_origins(v: &str) -> Vec<String> {
+    split_hosts(v)
+        .iter()
+        .map(|o| crate::security::normalize_origin(o))
+        .collect()
+}
+
 pub fn split_hosts(v: &str) -> Vec<String> {
     v.split(|c: char| c == ',' || c.is_whitespace())
         .map(|s| s.trim().to_ascii_lowercase())

@@ -69,6 +69,13 @@ struct ServeArgs {
     #[arg(long = "allow-host", value_name = "HOST")]
     allow_host: Vec<String>,
 
+    /// Extra trusted browser origins (scheme://host[:port], repeatable
+    /// or comma-separated) for a reverse proxy that serves the UI under
+    /// another site, e.g. https://portal.example. Also read from
+    /// OUTSTATION_ALLOW_ORIGINS.
+    #[arg(long = "allow-origin", value_name = "ORIGIN")]
+    allow_origin: Vec<String>,
+
     /// Keep run history in memory only. Without this flag the server
     /// refuses to start when the run database cannot be opened.
     #[arg(long)]
@@ -325,6 +332,9 @@ fn main() -> Result<()> {
             for h in &args.allow_host {
                 cfg.allow_hosts.extend(webui::split_hosts(h));
             }
+            for o in &args.allow_origin {
+                cfg.allow_origins.extend(webui::split_origins(o));
+            }
             cfg.ephemeral = args.ephemeral;
             if let Some(mb) = args.max_upload_mb {
                 cfg.max_upload_bytes = mb.saturating_mul(1024 * 1024);
@@ -509,6 +519,8 @@ mod tests {
             "a.lan,b.lan",
             "--allow-host",
             "c.lan",
+            "--allow-origin",
+            "https://Portal.Example/",
             "--ephemeral",
             "--max-upload-mb",
             "10",
@@ -533,6 +545,12 @@ mod tests {
             .flat_map(|h| webui::split_hosts(h))
             .collect();
         assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
+        let origins: Vec<String> = a
+            .allow_origin
+            .iter()
+            .flat_map(|o| webui::split_origins(o))
+            .collect();
+        assert_eq!(origins, ["https://portal.example"]);
         assert_eq!(a.max_upload_mb, Some(10));
         assert_eq!(a.library_max_mb, Some(2048));
         assert_eq!(a.cp56_tolerance_ms, Some(250.0));

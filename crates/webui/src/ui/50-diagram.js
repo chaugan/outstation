@@ -92,8 +92,12 @@ function connectDiagram(runId) {
   const gen = ++diag.gen;
   diag.runId = runId;
   el('diagram-section').hidden = false;
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const sock = new WebSocket(`${proto}//${location.host}/api/runs/${runId}/live`);
+  // Relative to the page, so the UI also works under a reverse-proxy
+  // path prefix (e.g. the dev portal's /p/outstation/).
+  const wsUrl = new URL(`api/runs/${runId}/live`, location.href);
+  wsUrl.protocol = wsUrl.protocol === 'https:' ? 'wss:' : 'ws:';
+  wsUrl.hash = '';
+  const sock = new WebSocket(wsUrl);
   diag.ws = sock;
   sock.onopen = () => { if (gen !== diag.gen) { sock.close(); return; } diag.retry = 0; };
   sock.onmessage = evt => {

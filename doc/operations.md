@@ -81,6 +81,7 @@ Otherwise restrict port 8080 at the network layer. The Host and Origin checks ([
 |---|---|---|---|
 | `--bind ADDR` | | `127.0.0.1:8080` (the unit: `0.0.0.0:8080`) | Listen address |
 | `--allow-host NAME` (repeatable, comma-separated) | `OUTSTATION_ALLOW_HOSTS` | none | Extra `Host` names to accept, on top of IP literals, `localhost` and this machine's names. Needed behind a reverse proxy or a DNS alias |
+| `--allow-origin ORIGIN` (repeatable, comma-separated) | `OUTSTATION_ALLOW_ORIGINS` | none | Extra browser origins (`scheme://host[:port]`, exact match) trusted for state-changing requests and WebSockets. Needed when a reverse proxy rewrites `Host`, e.g. one that serves the UI under a path prefix on another site |
 | `--ephemeral` | | off | Keep run history in memory only. Without it the server refuses to start when the database cannot be opened |
 | `--max-upload-mb N` | `OUTSTATION_MAX_UPLOAD_MB` | 1024 | Largest library or analysis upload |
 | `--capture-max-mb N` | `OUTSTATION_CAPTURE_MAX_MB` | 10240 | Total size of stored run captures; oldest evicted first |
@@ -103,6 +104,16 @@ Environment=OUTSTATION_CAPTURE_MAX_MB=20480
 ```
 
 **Disk limits.** An upload is refused (507 `disk_full`) when free space would drop below the reserve. The check runs before the upload and again while its bytes arrive, so a chunked upload without `Content-Length` is stopped as soon as it would cross the reserve. With a library quota, concurrent uploads reserve their share of it as they stream, so together they never exceed it (507 `quota_exceeded`). While a run is active, the server checks free space every 5 s and stops the run when it falls below half the reserve; the run's `error` says so. Captures are evicted after each run until both the size and the count cap hold; the active run's capture, the capture of the run that just finished and every capture whose auto-analysis is still queued or running are never evicted. One run's capture is capped by `--capture-run-max-mb` (default 4096 MiB): at the cap the capture stops recording, the run gets a warning and `capture_truncated`, and its analysis notes that frames after that point are missing from the capture, not from the wire.
+
+**Behind a reverse proxy.** The UI uses page-relative URLs, so it works under a path prefix (for example `https://portal.example/p/outstation/`) as long as the proxy strips the prefix and forwards WebSocket upgrades. If the proxy rewrites `Host` (most do), also pass `--allow-origin` with the proxy's public origin:
+
+```ini
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/outstation serve --bind 127.0.0.1:8080 --allow-origin https://portal.example
+```
+
+Every request then arrives from the proxy, so run banners and `started_by` show the proxy's address, not the operator's. Concurrent-run notices still work: each browser tab has its own client id.
 
 Logs go to stdout. Under journald (`journalctl -u outstation`) they are plain text without colour; every line of a run carries `run{id=N}`.
 
@@ -216,6 +227,8 @@ Runs recorded before schema 4 have no stored run request, so they cannot be re-r
 **`missing_capabilities` or "Operation not permitted".** Run through the systemd unit, or start the server with `sudo`. Do not rely on `setcap` on the binary: file capabilities are not passed to the `ip`, `tc` and `iptables` subprocesses, which need them too.
 
 **403 `host_not_allowed`.** You reached the UI by a name the server does not know. Add it with `--allow-host` or `OUTSTATION_ALLOW_HOSTS`.
+
+**403 `cross_origin` behind a reverse proxy.** Pages and reads work, but every button that changes something fails. The proxy rewrites `Host` to the backend address, so the browser's `Origin` (the proxy's public URL) no longer matches. Start the server with `--allow-origin https://proxy.example` (the error message names the exact value).
 
 **403 `origin_required` from a script.** Send `Origin: http://<host:port>` matching the URL ([api.md](api.md#the-host-and-origin-rule)).
 

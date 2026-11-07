@@ -678,7 +678,8 @@ async function runFlows(browser, pcapId) {
   const rep = await a.getAttribute('#an-report-html', 'href').catch(() => null);
   check(!!rep, 'analysis offers "Download HTML report"');
   if (rep) {
-    const r = await fetch(BASE + rep);
+    // Links are page-relative so the UI works under a proxy prefix.
+    const r = await fetch(new URL(rep, BASE + '/').href);
     const html = await r.text();
     check(r.ok && /text\/html/.test(r.headers.get('content-type') || '') && /attachment/.test(r.headers.get('content-disposition') || ''),
       `report export is an HTML attachment (${r.status} ${r.headers.get('content-type')})`);
@@ -1009,8 +1010,9 @@ async function healthChecks(browser) {
     await page.click('#health-chip');
     check(await page.isVisible('#degraded-banner'), 'the health chip re-opens a dismissed banner');
   } else notes.push('server is healthy: health banner checks skipped');
-  const href = await page.getAttribute('footer a[href="/metrics"]', 'href').catch(() => null);
-  check(href === '/metrics', 'footer links to /metrics');
+  // Page-relative, so it also works under a reverse-proxy prefix.
+  const href = await page.getAttribute('footer a[href="metrics"]', 'href').catch(() => null);
+  check(href === 'metrics', 'footer links to metrics (page-relative)');
   const m = await fetch(BASE + '/metrics');
   const body = await m.text();
   check(m.ok && /^# (HELP|TYPE) /m.test(body), `/metrics serves Prometheus text (${m.status})`);

@@ -33,7 +33,7 @@ function pcapRange(p) {
 }
 
 async function refreshLibrary() {
-  const res = await api('/api/pcaps');
+  const res = await api('api/pcaps');
   if (!res.ok || !Array.isArray(res.data)) {
     if (!S.libraryLoaded) setText(el('lib-meta'), `could not load the library: ${res.error || 'bad reply'}`);
     return false;
@@ -81,7 +81,7 @@ function renderLibrary() {
         `<button type="button" class="btn btn-text" data-act="pcap-use" data-id="${esc(p.id)}" data-fk="pcap-use-${esc(p.id)}" aria-label="Configure a run with ${esc(p.name)}">Use</button>` +
         menuHtml(`pcap-menu-${slugId(p.id)}`, `More actions for ${p.name}`, [
           `<button type="button" role="menuitem" tabindex="-1" class="menu-item" data-act="pcap-rename" data-id="${esc(p.id)}" data-fk="pcap-rename-${esc(p.id)}">Rename…</button>`,
-          `<a role="menuitem" tabindex="-1" class="menu-item" href="/api/pcaps/${encodeURIComponent(p.id)}/download" download>Download</a>`,
+          `<a role="menuitem" tabindex="-1" class="menu-item" href="api/pcaps/${encodeURIComponent(p.id)}/download" download>Download</a>`,
           `<button type="button" role="menuitem" tabindex="-1" class="menu-item danger" data-act="pcap-delete" data-id="${esc(p.id)}" data-fk="pcap-delete-${esc(p.id)}">Delete…</button>`,
         ]) +
       '</span>';
@@ -158,7 +158,7 @@ async function deletePcap(id) {
     danger: true,
   });
   if (!ok) return;
-  let res = await api(`/api/pcaps/${encodeURIComponent(id)}`, 'DELETE');
+  let res = await api(`api/pcaps/${encodeURIComponent(id)}`, 'DELETE');
   if (res.status === 409 && res.code === 'pcap_in_use') {
     const ids = (res.data && res.data.runs) || [];
     const force = await askDialog({
@@ -171,7 +171,7 @@ async function deletePcap(id) {
       danger: true,
     });
     if (!force) return;
-    res = await api(`/api/pcaps/${encodeURIComponent(id)}?force=1`, 'DELETE');
+    res = await api(`api/pcaps/${encodeURIComponent(id)}?force=1`, 'DELETE');
   }
   if (!res.ok) {
     notify(`Delete ${name} failed: ${res.error}`);
@@ -199,7 +199,7 @@ async function renamePcap(id) {
     confirm: 'Rename',
   });
   if (name === false) return;
-  const res = await apiAction('Rename', `/api/pcaps/${encodeURIComponent(id)}`, 'PATCH', { name: name.trim() });
+  const res = await apiAction('Rename', `api/pcaps/${encodeURIComponent(id)}`, 'PATCH', { name: name.trim() });
   if (res.ok) announce('Renamed');
   refreshLibrary();
 }
@@ -207,7 +207,7 @@ async function renamePcap(id) {
 async function inspectPcap(id) {
   const out = el('inspect-result');
   if (out) out.textContent = 'Inspecting…';
-  const res = await api('/api/inspect', 'POST', { pcap_id: id });
+  const res = await api('api/inspect', 'POST', { pcap_id: id });
   const node = el('inspect-result');
   if (!node) return;
   if (!res.ok) {
@@ -264,7 +264,7 @@ async function uploadFile(file) {
   }
   return new Promise(resolve => {
     const xhr = new XMLHttpRequest();
-    xhr.open('POST', '/api/pcaps', true);
+    xhr.open('POST', 'api/pcaps', true);
     xhr.setRequestHeader('X-Client-Id', CLIENT_ID);
     setUploadStatus(`<p>Uploading ${esc(file.name)}…</p><progress max="100" value="0" aria-label="Upload progress"></progress>`);
     xhr.upload.onprogress = e => {

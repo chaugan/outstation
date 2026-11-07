@@ -219,6 +219,7 @@ fn cfg_for(dir: &Path) -> ServeConfig {
         state_dir: dir.join("state"),
         ephemeral: false,
         allow_hosts: vec!["outstation.lan".into()],
+        allow_origins: vec![],
         max_upload_bytes: 64 * 1024,
         min_free_bytes: 0,
         free_space: Default::default(),

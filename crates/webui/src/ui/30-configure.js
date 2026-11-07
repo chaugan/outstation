@@ -748,7 +748,7 @@ async function startRun(e) {
   saveForm();
   btn.disabled = true;
   setText(el('run-result'), 'Starting…');
-  const res = await api('/api/run', 'POST', buildBody(force), { timeout: 120000 });
+  const res = await api('api/run', 'POST', buildBody(force), { timeout: 120000 });
   btn.disabled = false;
   if (!res.ok) {
     setText(el('run-result'), '');
@@ -812,7 +812,7 @@ actions({
     if (!isIPv4(ip)) { setText(status, 'Enter a valid target IP first.'); status.className = 'hint warn'; return; }
     status.className = 'hint';
     setText(status, 'Probing…');
-    const res = await api('/api/arp', 'POST', { ip, iface: val('cfg-nic') || null }, { timeout: 30000 });
+    const res = await api('api/arp', 'POST', { ip, iface: val('cfg-nic') || null }, { timeout: 30000 });
     const d = res.data || {};
     if (!res.ok || d.error) { status.className = 'hint warn'; setText(status, `ARP failed: ${res.error || d.error}`); return; }
     if (d.mac) {
