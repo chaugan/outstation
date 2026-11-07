@@ -19,8 +19,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use anyhow::{anyhow, Context, Result};
 use tracing::{debug, warn};
 
+pub mod bpf;
 pub mod capture;
-pub use capture::Capture;
+pub use capture::{Capture, CaptureStats};
 
 /// A single frame plus its target send time relative to the start of the
 /// replay window (nanoseconds).
@@ -64,7 +65,9 @@ pub enum Pace {
 /// loop short-circuits every branch on the `None` side.
 #[derive(Default)]
 pub struct RunControls<'a> {
-    /// If set to true, the send loop exits at the next frame boundary.
+    /// If set to true, the send loop exits at the next frame boundary,
+    /// and any pacing sleep in progress returns within
+    /// [`CANCEL_SLICE_NS`].
     pub cancel: Option<&'a AtomicBool>,
     /// Incremented by 1 on each successful send.
     pub sent: Option<&'a AtomicU64>,
@@ -72,6 +75,90 @@ pub struct RunControls<'a> {
     pub bytes: Option<&'a AtomicU64>,
     /// Incremented by 1 on each send error.
     pub send_errors: Option<&'a AtomicU64>,
+    /// Second set of counters, bumped alongside the ones above. Lets a
+    /// caller feed a per-source counter and a run-wide counter live
+    /// from the same hot loop.
+    pub global_sent: Option<&'a AtomicU64>,
+    pub global_bytes: Option<&'a AtomicU64>,
+    pub global_send_errors: Option<&'a AtomicU64>,
+}
+
+/// Anything that can put one Ethernet frame on the wire. Implemented by
+/// [`RawReplayer`]; tests use an in-memory sink.
+pub trait FrameSink {
+    fn send_frame(&self, frame: &[u8]) -> io::Result<usize>;
+}
+
+impl FrameSink for RawReplayer {
+    fn send_frame(&self, frame: &[u8]) -> io::Result<usize> {
+        self.send(frame)
+    }
+}
+
+/// Longest single sleep a pacing wait performs before re-checking the
+/// cancel flag (100 ms). Bounds how long STOP can take in raw mode.
+pub const CANCEL_SLICE_NS: u64 = 100_000_000;
+
+/// Gaps longer than this are slept with `clock_nanosleep` alone, with
+/// no busy-spin tail. Spinning only pays off for sub-millisecond gaps;
+/// above that it burns a CPU (at SCHED_FIFO, possibly starving others)
+/// for no measurable accuracy gain.
+pub const SPIN_TAIL_MAX_GAP_NS: u64 = 1_000_000;
+
+/// Upper bound on how far into the future a single frame may be
+/// scheduled relative to the replay epoch (31 days). A corrupt or
+/// wrapped pcap timestamp (or a speed close to 0) would otherwise ask
+/// for a sleep of centuries; such frames are clamped to this offset.
+pub const MAX_SCHEDULE_OFFSET_NS: u64 = 31 * 24 * 3600 * 1_000_000_000;
+
+/// Slowest and fastest accepted replay speeds. Values outside the range
+/// (including NaN, 0, negative and infinity) are clamped into it.
+pub const MIN_SPEED: f64 = 1e-3;
+pub const MAX_SPEED: f64 = 1e6;
+
+/// SCHED_FIFO priority used for replay workers. Deliberately low: it is
+/// enough to beat SCHED_OTHER tasks but leaves room for kernel threads
+/// and for the capture thread above it.
+pub const REPLAY_RT_PRIORITY: i32 = 10;
+
+/// SCHED_FIFO priority for a run's capture thread (every run, when the
+/// process may use RT scheduling). One above [`REPLAY_RT_PRIORITY`] so
+/// the capture reader, which only ever blocks in `poll` and drains, is
+/// never starved by the replay workers or sessions it is recording.
+pub const CAPTURE_RT_PRIORITY: i32 = REPLAY_RT_PRIORITY + 1;
+
+/// Clamp a user-supplied speed into `[MIN_SPEED, MAX_SPEED]`. Non-finite
+/// or non-positive values become 1.0.
+pub fn sanitize_speed(speed: f64) -> f64 {
+    if !speed.is_finite() || speed <= 0.0 {
+        return 1.0;
+    }
+    speed.clamp(MIN_SPEED, MAX_SPEED)
+}
+
+/// Offset from the replay epoch at which a frame with pcap-relative
+/// timestamp `rel_ts_ns` goes out at `speed`, clamped to
+/// [`MAX_SCHEDULE_OFFSET_NS`].
+#[inline]
+pub fn schedule_offset_ns(rel_ts_ns: u64, speed: f64) -> u64 {
+    let off = (rel_ts_ns as f64) / sanitize_speed(speed);
+    if off.is_nan() || off <= 0.0 {
+        0
+    } else if off >= MAX_SCHEDULE_OFFSET_NS as f64 {
+        MAX_SCHEDULE_OFFSET_NS
+    } else {
+        off as u64
+    }
+}
+
+/// How many replay threads may be promoted to SCHED_FIFO: one fewer
+/// than the number of CPUs, so at least one CPU always stays available
+/// to SCHED_OTHER work (web UI, SSH, teardown commands).
+pub fn realtime_thread_budget() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .saturating_sub(1)
 }
 
 /// Statistics from a completed run.
@@ -110,8 +197,7 @@ impl RawReplayer {
             )
         };
         if fd < 0 {
-            return Err(io::Error::last_os_error())
-                .context("socket(AF_PACKET, SOCK_RAW)");
+            return Err(io::Error::last_os_error()).context("socket(AF_PACKET, SOCK_RAW)");
         }
         let fd = unsafe { OwnedFd::from_raw_fd(fd) };
 
@@ -128,8 +214,7 @@ impl RawReplayer {
             )
         };
         if rc < 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("bind to {iface}"));
+            return Err(io::Error::last_os_error()).with_context(|| format!("bind to {iface}"));
         }
         debug!(iface, ifindex, "AF_PACKET bound");
         Ok(Self {
@@ -173,8 +258,7 @@ fn if_nametoindex(iface: &str) -> Result<i32> {
     let c = CString::new(iface).context("iface name contains nul byte")?;
     let idx = unsafe { libc::if_nametoindex(c.as_ptr()) };
     if idx == 0 {
-        return Err(anyhow!(io::Error::last_os_error())
-            .context(format!("if_nametoindex({iface})")));
+        return Err(anyhow!(io::Error::last_os_error()).context(format!("if_nametoindex({iface})")));
     }
     Ok(idx as i32)
 }
@@ -193,8 +277,8 @@ pub fn now_ns() -> u64 {
 }
 
 /// Absolute-deadline sleep on CLOCK_MONOTONIC. Returns early if the
-/// deadline is already past or if the call is interrupted; the caller
-/// is expected to follow up with a busy-spin.
+/// deadline is already past or if the call is interrupted; callers
+/// loop on the clock.
 fn clock_nanosleep_abs(target_ns: u64) {
     let ts = libc::timespec {
         tv_sec: (target_ns / 1_000_000_000) as libc::time_t,
@@ -210,21 +294,43 @@ fn clock_nanosleep_abs(target_ns: u64) {
     }
 }
 
-/// Hybrid precise sleep: coarse `clock_nanosleep` to within ~100 µs of
-/// the target, then busy-spin on `clock_gettime` to the exact mark.
-#[inline]
-fn sleep_until_precise(target_ns: u64) {
-    let now = now_ns();
+/// Cancellable precise sleep until `target_ns` (CLOCK_MONOTONIC).
+///
+/// * The wait is cut into absolute `clock_nanosleep` slices of at most
+///   [`CANCEL_SLICE_NS`], and `cancel` is checked between slices, so a
+///   STOP lands within ~100 ms however far away the deadline is.
+/// * Gaps above [`SPIN_TAIL_MAX_GAP_NS`] end with a plain absolute
+///   sleep (no spin).
+/// * Shorter gaps sleep to ~100 µs before the target and busy-spin the
+///   rest for sub-100 µs accuracy.
+///
+/// Returns `false` if cancelled before the deadline, `true` otherwise.
+pub fn sleep_until_precise(target_ns: u64, cancel: Option<&AtomicBool>) -> bool {
+    let cancelled = || cancel.is_some_and(|c| c.load(Ordering::Relaxed));
+    let mut now = now_ns();
     if target_ns <= now {
-        return;
+        return !cancelled();
     }
-    let gap = target_ns - now;
-    if gap > 150_000 {
-        clock_nanosleep_abs(target_ns - 100_000);
+    let spin_tail = target_ns - now <= SPIN_TAIL_MAX_GAP_NS;
+    let coarse_target = if spin_tail {
+        target_ns.saturating_sub(100_000)
+    } else {
+        target_ns
+    };
+    while now < coarse_target {
+        if cancelled() {
+            return false;
+        }
+        let slice_end = coarse_target.min(now.saturating_add(CANCEL_SLICE_NS));
+        clock_nanosleep_abs(slice_end);
+        now = now_ns();
     }
-    while now_ns() < target_ns {
-        std::hint::spin_loop();
+    if spin_tail {
+        while now_ns() < target_ns {
+            std::hint::spin_loop();
+        }
     }
+    !cancelled()
 }
 
 /// Drive a replay to completion.
@@ -236,14 +342,30 @@ pub fn run_plan(replayer: &RawReplayer, plan: &Plan, pace: Pace) -> RunStats {
     run_plan_ctl(replayer, plan, pace, RunControls::default())
 }
 
-/// Drive a replay to completion with optional cooperative controls.
-/// Sends stop at the next frame boundary if `controls.cancel` flips to
-/// true. Publishes running totals into the optional counters so an
-/// HTTP handler in another thread can read progress without locking.
+/// Drive a replay to completion with optional cooperative controls,
+/// using "now" as the epoch. See [`run_plan_at`].
 pub fn run_plan_ctl(
     replayer: &RawReplayer,
     plan: &Plan,
     pace: Pace,
+    controls: RunControls<'_>,
+) -> RunStats {
+    run_plan_at(replayer, plan, pace, now_ns(), controls)
+}
+
+/// Drive a replay with an explicit epoch: frame `f` is sent at
+/// `epoch_ns + schedule_offset_ns(f.rel_ts_ns, speed)`. Several workers
+/// given the same `epoch_ns` keep their relative schedules aligned.
+///
+/// Stops at the next frame boundary (or within [`CANCEL_SLICE_NS`] of a
+/// pacing sleep) once `controls.cancel` flips. Publishes running totals
+/// into the optional counters so another thread can read progress
+/// without locking.
+pub fn run_plan_at<S: FrameSink + ?Sized>(
+    sink: &S,
+    plan: &Plan,
+    pace: Pace,
+    epoch_ns: u64,
     controls: RunControls<'_>,
 ) -> RunStats {
     let start = now_ns();
@@ -262,8 +384,11 @@ pub fn run_plan_ctl(
             }
         }
         if let Pace::Original { speed } = pace {
-            let target = start + ((f.rel_ts_ns as f64) / speed) as u64;
-            sleep_until_precise(target);
+            let target = epoch_ns.saturating_add(schedule_offset_ns(f.rel_ts_ns, speed));
+            if !sleep_until_precise(target, controls.cancel) {
+                debug!("run_plan_at cancelled while pacing at {sent} frames");
+                break;
+            }
             let actual = now_ns();
             let delta = actual as i64 - target as i64;
             let abs = delta.unsigned_abs();
@@ -272,28 +397,35 @@ pub fn run_plan_ctl(
                 max_signed = delta;
             }
         }
-        match replayer.send(&f.frame) {
+        match sink.send_frame(&f.frame) {
             Ok(_) => {
+                let len = f.frame.len() as u64;
                 sent += 1;
-                bytes += f.frame.len() as u64;
-                if let Some(c) = controls.sent {
+                bytes += len;
+                for c in [controls.sent, controls.global_sent].into_iter().flatten() {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
-                if let Some(c) = controls.bytes {
-                    c.fetch_add(f.frame.len() as u64, Ordering::Relaxed);
+                for c in [controls.bytes, controls.global_bytes]
+                    .into_iter()
+                    .flatten()
+                {
+                    c.fetch_add(len, Ordering::Relaxed);
                 }
             }
             Err(e) => {
                 warn!(error = %e, "send failed");
                 send_errors += 1;
-                if let Some(c) = controls.send_errors {
+                for c in [controls.send_errors, controls.global_send_errors]
+                    .into_iter()
+                    .flatten()
+                {
                     c.fetch_add(1, Ordering::Relaxed);
                 }
             }
         }
     }
 
-    let elapsed_ns = now_ns() - start;
+    let elapsed_ns = now_ns().saturating_sub(start);
     let (mean_abs, p99_abs) = summarize_jitter(&mut abs_jitter);
     RunStats {
         sent,
@@ -319,8 +451,14 @@ fn summarize_jitter(samples: &mut [u64]) -> (u64, u64) {
 }
 
 /// Raise the current thread's priority to `SCHED_FIFO` with the given
-/// priority. Silently no-ops if the process lacks `CAP_SYS_NICE`.
-pub fn try_set_realtime(priority: i32) {
+/// priority. Returns whether the promotion took effect; without
+/// `CAP_SYS_NICE` it fails and the thread keeps its default policy.
+///
+/// Callers should respect [`realtime_thread_budget`] and never promote
+/// a thread that busy-loops without sleeping (top-speed replay): with
+/// the kernel default `sched_rt_runtime_us=950000`, FIFO threads may
+/// take 95% of every CPU they run on before RT throttling kicks in.
+pub fn try_set_realtime(priority: i32) -> bool {
     let param = libc::sched_param {
         sched_priority: priority,
     };
@@ -328,17 +466,16 @@ pub fn try_set_realtime(priority: i32) {
     if rc != 0 {
         let err = io::Error::last_os_error();
         debug!(error = %err, "SCHED_FIFO not available; continuing with default policy");
+        false
     } else {
         debug!(priority, "thread promoted to SCHED_FIFO");
+        true
     }
 }
 
 /// Build a [`Plan`] from a loaded pcap filtered to one source IP.
 /// Returns the plan plus the number of frames it contains.
-pub fn plan_for_source(
-    pcap: &pcapload::LoadedPcap,
-    src_ip: std::net::Ipv4Addr,
-) -> Result<Plan> {
+pub fn plan_for_source(pcap: &pcapload::LoadedPcap, src_ip: std::net::Ipv4Addr) -> Result<Plan> {
     let src = pcap
         .sources
         .get(&src_ip)
@@ -346,7 +483,7 @@ pub fn plan_for_source(
     let mut plan = Plan::default();
     for &idx in &src.packet_indices {
         let pkt = &pcap.packets[idx];
-        plan.push(pkt.rel_ts_ns, pkt.data.clone());
+        plan.push(pkt.rel_ts_ns, pkt.ether_frame().into_owned());
     }
     Ok(plan)
 }
@@ -373,14 +510,154 @@ mod tests {
     fn sleep_until_precise_respects_deadline() {
         let start = now_ns();
         let target = start + 2_000_000; // 2 ms
-        sleep_until_precise(target);
+        assert!(sleep_until_precise(target, None));
         let actual = now_ns();
         assert!(actual >= target, "woke early: {} < {}", actual, target);
-        // Accept up to 5 ms of scheduling slack on a VM.
+        // Never waking early is the real contract. The upper bound only
+        // catches gross bugs (e.g. oversleeping a whole 100 ms cancel
+        // slice); it must tolerate scheduler delay when the full test
+        // suite saturates every core, which exceeded 5 ms on CI-like load.
         assert!(
-            actual - target < 5_000_000,
-            "jitter too high: {} ns",
+            actual - target < 50_000_000,
+            "overslept by {} ns",
             actual - target
         );
+    }
+
+    #[test]
+    fn sleep_until_precise_short_gap_spins_to_deadline() {
+        let target = now_ns() + 300_000; // 300 us: sleep + spin tail
+        assert!(sleep_until_precise(target, None));
+        assert!(now_ns() >= target);
+    }
+
+    #[test]
+    fn sleep_until_precise_is_cancellable() {
+        let cancel = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            let t0 = now_ns();
+            // One hour away: must return within one slice of the cancel.
+            let ok = sleep_until_precise(t0 + 3_600_000_000_000, Some(&cancel));
+            assert!(!ok);
+            let waited = now_ns() - t0;
+            assert!(waited < 50_000_000 + 2 * CANCEL_SLICE_NS, "{waited}");
+        });
+    }
+
+    #[test]
+    fn schedule_offset_is_clamped() {
+        assert_eq!(schedule_offset_ns(1_000, 1.0), 1_000);
+        assert_eq!(schedule_offset_ns(1_000, 2.0), 500);
+        // Wrapped "584 years" timestamp from a backwards pcap.
+        assert_eq!(schedule_offset_ns(u64::MAX, 1.0), MAX_SCHEDULE_OFFSET_NS);
+        // Speed 0 / NaN / negative fall back to 1.0 instead of dividing by 0.
+        assert_eq!(schedule_offset_ns(1_000, 0.0), 1_000);
+        assert_eq!(schedule_offset_ns(1_000, f64::NAN), 1_000);
+        assert_eq!(schedule_offset_ns(1_000, -3.0), 1_000);
+        // Tiny speed is clamped to MIN_SPEED and the result to the cap.
+        assert_eq!(
+            schedule_offset_ns(u64::MAX / 2, 1e-12),
+            MAX_SCHEDULE_OFFSET_NS
+        );
+    }
+
+    struct VecSink(std::sync::Mutex<Vec<(u64, usize)>>);
+    impl FrameSink for VecSink {
+        fn send_frame(&self, frame: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push((now_ns(), frame.len()));
+            Ok(frame.len())
+        }
+    }
+
+    #[test]
+    fn run_plan_at_absurd_timestamp_is_cancellable() {
+        // P04: a frame scheduled "centuries" out must not pin the worker.
+        let mut plan = Plan::default();
+        plan.push(0, vec![0u8; 60]);
+        plan.push(u64::MAX - 5, vec![0u8; 60]);
+        let sink = VecSink(Default::default());
+        let cancel = AtomicBool::new(false);
+        let sent = AtomicU64::new(0);
+        let global = AtomicU64::new(0);
+        std::thread::scope(|s| {
+            s.spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(30));
+                cancel.store(true, Ordering::Relaxed);
+            });
+            let t0 = now_ns();
+            let stats = run_plan_at(
+                &sink,
+                &plan,
+                Pace::Original { speed: 1.0 },
+                t0,
+                RunControls {
+                    cancel: Some(&cancel),
+                    sent: Some(&sent),
+                    global_sent: Some(&global),
+                    ..Default::default()
+                },
+            );
+            assert_eq!(stats.sent, 1);
+            assert!(now_ns() - t0 < 1_000_000_000);
+        });
+        assert_eq!(sent.load(Ordering::Relaxed), 1);
+        assert_eq!(global.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn run_plan_at_backwards_timestamps_send_immediately() {
+        // pcapload rel times are non-negative but may go backwards; a
+        // frame whose slot is already past goes out at once, no underflow.
+        let mut plan = Plan::default();
+        plan.push(20_000_000, vec![0u8; 20]);
+        plan.push(0, vec![1u8; 20]);
+        plan.push(10_000_000, vec![2u8; 20]);
+        let sink = VecSink(Default::default());
+        let epoch = now_ns();
+        let stats = run_plan_at(
+            &sink,
+            &plan,
+            Pace::Original { speed: 1.0 },
+            epoch,
+            Default::default(),
+        );
+        assert_eq!(stats.sent, 3);
+        let sent = sink.0.lock().unwrap();
+        // The two late frames follow the first one without waiting.
+        assert!(sent[2].0 - sent[0].0 < 5_000_000);
+        assert!(stats.elapsed_ns < 100_000_000);
+    }
+
+    #[test]
+    fn run_plan_at_uses_shared_epoch() {
+        // Two plans run against the same epoch land relative to it,
+        // regardless of when each call starts.
+        let epoch = now_ns() + 20_000_000;
+        let mut plan = Plan::default();
+        plan.push(5_000_000, vec![1u8; 20]);
+        let sink = VecSink(Default::default());
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        run_plan_at(
+            &sink,
+            &plan,
+            Pace::Original { speed: 1.0 },
+            epoch,
+            Default::default(),
+        );
+        let (t, _) = sink.0.lock().unwrap()[0];
+        assert!(t >= epoch + 5_000_000, "sent before its slot");
+        assert!(t < epoch + 5_000_000 + 5_000_000, "sent >5ms late");
+    }
+
+    #[test]
+    fn realtime_budget_leaves_a_cpu() {
+        let cpus = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        assert_eq!(realtime_thread_budget(), cpus - 1);
     }
 }

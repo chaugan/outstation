@@ -1,6 +1,6 @@
 // IEC 60870-5-104 slave-detail UI renderer.
 //
-// Concatenated into `crates/webui/src/index.html` at build time by
+// Spliced into the served page at build time by
 // `crates/webui/build.rs`. Registers its entry points on
 // `window.PROTOCOL_RENDERERS['iec104']`; the core `renderSlaveDetail`
 // dispatcher looks up the right renderer based on the report's
@@ -43,14 +43,23 @@
 
   // Side-by-side ASDU type histogram. Per-type delta (captured − expected)
   // is shown so divergence is obvious at a glance even for thousand-frame pcaps.
+  // `expected` / `captured` are type-ID sequences, or {type: count}
+  // maps (the analyzer caps the sequences, the count maps are complete).
+  function countsOf(x) {
+    if (Array.isArray(x)) return new Map(tidHist(x));
+    const m = new Map();
+    for (const [k, v] of Object.entries(x || {})) m.set(Number(k), v);
+    return m;
+  }
+  function totalOf(m) { let t = 0; for (const v of m.values()) t += v; return t; }
   function renderTidHistogram(expected, captured) {
-    const e = new Map(tidHist(expected));
-    const c = new Map(tidHist(captured));
+    const e = countsOf(expected);
+    const c = countsOf(captured);
     const allTids = new Set([...e.keys(), ...c.keys()]);
     const rows = [...allTids].sort((a, b) => (c.get(b) || e.get(b) || 0) - (c.get(a) || e.get(a) || 0) || a - b);
     let h = `<div class="an-tid-hist">`;
-    h += `<div class="hd">EXPECTED (${expected.length} frames)</div>`;
-    h += `<div class="hd">CAPTURED (${captured.length} frames)</div>`;
+    h += `<div class="hd">Expected (${totalOf(e)} frames)</div>`;
+    h += `<div class="hd">Captured (${totalOf(c)} frames)</div>`;
     for (const t of rows) {
       const ec = e.get(t) || 0;
       const cc = c.get(t) || 0;
@@ -66,7 +75,7 @@
   // Collapsible full-sequence dump for byte-for-byte inspection.
   // Default closed; truncated past 2000 IDs to keep the DOM lean.
   function renderTidSequenceCollapsible(label, ids) {
-    if (!ids.length) return '';
+    if (!ids || !ids.length) return '';
     const MAX_DUMP = 2000;
     const head = ids.length <= MAX_DUMP
       ? ids.join(' ')
@@ -93,14 +102,14 @@
       const ent = [x, y, tids[i] || 0];
       if (Math.abs(y) <= tol) inP.push(ent); else outP.push(ent);
     }
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     c.setOption({
       backgroundColor: 'transparent',
       animation: false,
       grid: { left: 56, right: 14, top: 34, bottom: 56 },
       legend: {
         data: ['in tolerance', 'out of tolerance'],
-        textStyle: { color: dimColor, fontSize: 10 },
+        textStyle: { color: dimColor, fontSize: 11 },
         itemWidth: 10, itemHeight: 10, itemGap: 14,
         top: 6, left: 8,
       },
@@ -120,22 +129,22 @@
         },
       },
       xAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 },
                splitLine: { show: false } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
-          textStyle: { color: dimColor, fontSize: 9 } },
+          textStyle: { color: dimColor, fontSize: 11 } },
       ],
       series: [
         { name: 'in tolerance', type: 'scatter', data: inP, symbolSize: 4,
           large: true, largeThreshold: 1500, itemStyle: { color: okColor },
           markArea: {
             silent: true,
-            itemStyle: { color: 'rgba(63,100,48,0.07)' },
+            itemStyle: { color: getCssVar('--ok-soft') || 'rgba(63,100,48,0.07)' },
             data: [[{ yAxis: -tol }, { yAxis: tol }]],
           },
         },
@@ -156,7 +165,7 @@
     const accColor = getCssVar('--accent') || '#b8441a';
     const dimColor = getCssVar('--dim')    || '#857f70';
     const inkColor = getCssVar('--ink-2')  || '#5a5750';
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     c.setOption({
       backgroundColor: 'transparent',
       animation: false,
@@ -171,7 +180,7 @@
       },
       legend: {
         data: ['original', 'captured'],
-        textStyle: { color: dimColor, fontSize: 10 },
+        textStyle: { color: dimColor, fontSize: 11 },
         itemWidth: 18, itemHeight: 8, itemGap: 14,
         top: 6, left: 8,
       },
@@ -187,19 +196,19 @@
       },
       xAxis: { type: 'category',
                data: Array.from({ length: Math.max(orig.length, cap.length) }, (_, i) => String(i + 1)),
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 } },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10, formatter: '{value} ms' },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11, formatter: '{value} ms' },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       dataZoom: [
         { type: 'inside', xAxisIndex: 0 },
         { type: 'slider', xAxisIndex: 0, height: 16, bottom: 8, borderColor: 'transparent',
-          textStyle: { color: dimColor, fontSize: 9 } },
+          textStyle: { color: dimColor, fontSize: 11 } },
       ],
       series: [
         { name: 'original', type: 'line', data: orig, showSymbol: false, smooth: false,
           lineStyle: { color: inkColor, width: 1, type: 'dashed' },
-          areaStyle: { color: 'rgba(90,87,80,0.08)' }, sampling: 'lttb' },
+          areaStyle: { color: getCssVar('--ch-grid') || 'rgba(90,87,80,0.08)' }, sampling: 'lttb' },
         { name: 'captured', type: 'line', data: cap, showSymbol: false, smooth: false,
           lineStyle: { color: accColor, width: 1.4 }, sampling: 'lttb' },
       ],
@@ -234,7 +243,7 @@
       const lo = i * step;
       return { value: ct, itemStyle: { color: lo + step <= tol ? okColor : errColor } };
     });
-    const c = echarts.init(node, null, { renderer: 'canvas' });
+    const c = echarts.init(node, typeof chartTheme === 'function' ? chartTheme() : null, { renderer: 'canvas' });
     const rotate = labels.length > 8;
     c.setOption({
       backgroundColor: 'transparent',
@@ -245,14 +254,14 @@
       xAxis: { type: 'category',
                data: labels, axisLine: { lineStyle: { color: dimColor } },
                axisTick: { alignWithLabel: true },
-               axisLabel: { color: dimColor, fontSize: 9, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
+               axisLabel: { color: dimColor, fontSize: 11, rotate: rotate ? 40 : 0, interval: 0, margin: 8 } },
       yAxis: { type: 'value',
-               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 10 },
-               splitLine: { lineStyle: { color: 'rgba(0,0,0,0.06)' } } },
+               axisLine: { lineStyle: { color: dimColor } }, axisLabel: { color: dimColor, fontSize: 11 },
+               splitLine: { lineStyle: { color: getCssVar('--ch-grid') || 'rgba(0,0,0,0.06)' } } },
       series: [{
         type: 'bar', data: bars, barCategoryGap: '20%',
         markLine: { silent: true, symbol: 'none',
-          data: [{ xAxis: Math.floor(tol / step) - 0.5, label: { formatter: `${tol} ms tolerance`, color: dimColor, fontSize: 9 },
+          data: [{ xAxis: Math.floor(tol / step) - 0.5, label: { formatter: `${tol} ms tolerance`, color: dimColor, fontSize: 11 },
                    lineStyle: { color: dimColor, type: 'dashed' } }] },
       }],
     });
@@ -281,13 +290,13 @@
       const ctx = Math.abs(r.d) <= tol ? `within tolerance` : `exceeds ${tol.toFixed(0)} ms`;
       h += `<div class="row">`;
       h += `  <div class="idx">#${r.idx}</div>`;
-      h += `  <div class="name">${esc(tidName(r.tid))} <span style="color:var(--dim);font-size:10px">[${r.tid}]</span></div>`;
+      h += `  <div class="name">${esc(tidName(r.tid))} <span class="ctx">[${r.tid}]</span></div>`;
       h += `  <div class="${driftCls}">${sign}${r.d.toFixed(1)} ms</div>`;
       h += `  <div class="ctx">${esc(ctx)}</div>`;
       h += `</div>`;
     }
     if (drift.samples_truncated) {
-      h += `<div class="ctx" style="margin-top:6px">note: per-frame samples were capped at the analyzer's safety limit; aggregate stats above remain accurate.</div>`;
+      h += `<div class="ctx ctx-note">note: per-frame samples were capped at the analyzer's safety limit; aggregate stats above remain accurate.</div>`;
     }
     node.innerHTML = h;
   }
@@ -310,15 +319,48 @@
       h += `</div>`;
     }
 
+    const dims = ps.verdict_dimensions;
+    if (dims) {
+      const names = { content: 'content', time_tags: 'time tags', gi_ci: 'GI/CI audit', timing: 'timing', handshake: 'STARTDT handshake', target: 'target replies' };
+      h += `<ul class="an-dims" aria-label="Verdict dimensions">`;
+      for (const [k, label] of Object.entries(names)) {
+        const v = dims[k];
+        const cls = v === true ? 'ok' : v === false ? 'bad' : 'muted';
+        const word = v === true ? 'pass' : v === false ? 'fail' : 'not judged';
+        h += `<li class="${cls}"><span aria-hidden="true">${v === true ? '✓' : v === false ? '✗' : '–'}</span> ${esc(label)}: ${word}</li>`;
+      }
+      h += `</ul>`;
+      // Injected faults are not pass/fail: a summary string, or null.
+      if (typeof dims.faults === 'string' && dims.faults) {
+        h += `<div class="warn-box an-faults-dim"><b>Fault injection:</b> ${esc(dims.faults)}</div>`;
+      }
+    }
+
     if (pb) {
-      h += `<div class="an-h">PLAYBACK SIDE (${esc(pb.direction)})</div>`;
+      h += `<div class="an-h">Playback side (${esc(pb.direction)})</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">expected i-frames</div><div class="v">${pb.expected_iframes}</div>`;
+      if (pb.gi_ci_synthesis != null) {
+        h += `<div class="k">GI/CI synthesis</div><div class="v">${pb.gi_ci_synthesis ? 'on' : 'off'}${pb.source_interrogation_stripped ? ` · ${pb.source_interrogation_stripped} captured interrogation frames not expected` : ''}${pb.synthesized_excluded ? ` · ${pb.synthesized_excluded} synthesized frames excluded` : ''}</div>`;
+      }
+      const cmdParts = [];
+      if (pb.command_echo != null) cmdParts.push(`command echo ${pb.command_echo ? 'on' : 'off'}`);
+      if (pb.source_command_stripped) cmdParts.push(`${pb.source_command_stripped} captured command confirmations not expected`);
+      if (pb.source_return_info_stripped) cmdParts.push(`${pb.source_return_info_stripped} captured return-information frames (COT 11) not expected`);
+      if (pb.command_responses_excluded) cmdParts.push(`${pb.command_responses_excluded} synthesized command responses excluded`);
+      if (cmdParts.length) h += `<div class="k">commands</div><div class="v">${esc(cmdParts.join(' · '))}</div>`;
+      const faultParts = [];
+      if (pb.fault_dropped_excused) faultParts.push(`${pb.fault_dropped_excused} missing frames excused (dropped on purpose)`);
+      if (pb.fault_duplicates_excluded) faultParts.push(`${pb.fault_duplicates_excluded} duplicates excluded (sent on purpose)`);
+      if (faultParts.length) h += `<div class="k">fault effects</div><div class="v warn">${esc(faultParts.join(' · '))}</div>`;
+      if (pb.iterations_observed != null) {
+        h += `<div class="k">iterations</div><div class="v">${pb.iterations_observed} observed${pb.iterations_configured ? ' of ' + pb.iterations_configured : ''} · ${pb.iterations_complete || 0} complete · ${pb.iterations_clean || 0} clean${pb.extra_passes ? ` · <span class="bad">${pb.extra_passes} extra pass${pb.extra_passes === 1 ? '' : 'es'} beyond the configured count</span>` : ''}${pb.stopped_tail ? ` · stopped in iteration ${pb.stopped_tail.iteration} after ${pb.stopped_tail.sent}/${pb.stopped_tail.script_iframes} frames${pb.stopped_tail.clean ? ' (clean)' : ''}` : ''}</div>`;
+      }
       const delivOk = pb.delivered_iframes === pb.expected_iframes;
       h += `<div class="k">delivered</div><div class="v ${delivOk?'ok':'bad'}">${pb.delivered_iframes}</div>`;
       h += `<div class="k">type-id sequence</div><div class="v ${pb.type_id_sequence_match?'ok':'warn'}">${pb.type_id_sequence_match ? 'match' : 'divergent'} · ${pb.matched_type_ids}/${pb.expected_iframes} matched</div>`;
       const cp56Only = pb.cp56_only_count || 0;
-      const realMm = (pb.real_mismatch_count != null) ? pb.real_mismatch_count : pb.mismatches.length;
+      const realMm = (pb.real_mismatch_count != null) ? pb.real_mismatch_count : (pb.mismatches || []).length;
       const allOk = (pb.byte_identical_count + cp56Only) === pb.expected_iframes && realMm === 0;
       const parts = [];
       parts.push(`<span class="ok">${pb.byte_identical_count} byte-identical</span>`);
@@ -332,19 +374,23 @@
       }
       const bdLine = `${pb.expected_iframes} frames &middot; ${parts.join(' &middot; ')}`;
       h += `<div class="k">body diff</div><div class="v ${allOk?'ok':(realMm>0?'bad':'')}">${bdLine}</div>`;
-      if (pb.missing_indices.length) {
+      if ((pb.missing_indices || []).length) {
         h += `<div class="k">missing idx</div><div class="v bad">${pb.missing_indices.slice(0,20).join(', ')}${pb.missing_indices.length>20?'…':''}</div>`;
       }
       h += `</div>`;
-      h += renderTidHistogram(pb.expected_type_ids, pb.delivered_type_ids);
+      h += renderTidHistogram(pb.expected_type_id_counts || pb.expected_type_ids || [], pb.delivered_type_id_counts || pb.delivered_type_ids || []);
+      if (pb.type_id_sequences_truncated) h += `<p class="hint">The sequences below are truncated; the histogram counts every frame.</p>`;
       h += renderTidSequenceCollapsible('expected', pb.expected_type_ids);
       h += renderTidSequenceCollapsible('captured', pb.delivered_type_ids);
-      if (pb.mismatches.length) {
-        h += `<div class="an-h">REAL MISMATCHES (${pb.mismatches.length})</div>`;
-        h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">CP56-only diffs (timestamps we deliberately rewrote) are excluded — they're tallied above.</div>`;
-        for (const m of pb.mismatches.slice(0, 20)) {
+      const mm = pb.mismatches || [];
+      if (mm.length) {
+        const total = pb.mismatches_total || mm.length;
+        h += `<div class="an-h">Real mismatches (${total}${total > mm.length ? ', first ' + mm.length + ' listed' : ''})</div>`;
+        h += `<p class="hint">CP56-only differences (timestamps rewritten on purpose) are excluded; they are counted above.</p>`;
+        const tid = v => (v == null ? '—' : `${esc(tidName(v))} [${v}]`);
+        for (const m of mm.slice(0, 20)) {
           h += `<div class="an-diff-row">`;
-          h += `  <div><span class="lbl">idx</span> ${m.index} · exp tid=${m.expected_type_id} · got tid=${m.actual_type_id}</div>`;
+          h += `  <div><span class="lbl">${esc(m.kind || 'diff')}</span> idx ${m.index}${m.iteration != null ? ' · iteration ' + m.iteration : ''} · expected ${tid(m.expected_type_id)} · got ${tid(m.actual_type_id)}</div>`;
           h += `  <div><span class="lbl">exp asdu</span> ${esc(m.expected_asdu_hex)}</div>`;
           h += `  <div><span class="lbl">got asdu</span> ${esc(m.actual_asdu_hex)}</div>`;
           h += `</div>`;
@@ -353,16 +399,16 @@
     }
 
     if (tg) {
-      h += `<div class="an-h">TARGET SIDE (${esc(tg.direction)})</div>`;
+      h += `<div class="an-h">Target side (${esc(tg.direction)})</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">u / s / i frames</div><div class="v">${tg.u_frames} · ${tg.s_frames} · ${tg.i_frames}</div>`;
-      h += `<div class="k">u-codes seen</div><div class="v">${tg.u_codes_seen.map(esc).join(', ') || '—'}</div>`;
+      h += `<div class="k">u-codes seen</div><div class="v">${(tg.u_codes_seen || []).map(esc).join(', ') || '—'}</div>`;
       h += `<div class="k">startdt handshake</div><div class="v ${tg.startdt_handshake_ok?'ok':'bad'}">${tg.startdt_handshake_ok ? 'completed' : 'missing'}</div>`;
       h += `</div>`;
-      if (tg.target_type_ids.length) {
-        h += `<div class="muted" style="font-family:var(--sans);font-size:10px;text-transform:uppercase;letter-spacing:0.06em;color:var(--dim);margin-top:8px">target's I-frame types</div>`;
+      if ((tg.target_type_ids || []).length) {
+        h += `<div class="an-chart-caption">Target's I-frame types</div>`;
         const hist = tidHist(tg.target_type_ids);
-        h += `<div class="an-tid-hist" style="grid-template-columns:1fr">`;
+        h += `<div class="an-tid-hist one-col">`;
         h += `<div class="hd">${tg.target_type_ids.length} frames sent by target</div>`;
         for (const [tid, ct] of hist) {
           h += `<div class="row"><span class="nm">${esc(tidName(tid))} <span class="ct">[${tid}]</span></span><span class="ct">${ct}</span></div>`;
@@ -379,12 +425,12 @@
           divergent: 'TARGET RAN ITS OWN SCRIPT',
           silent: 'TARGET SENT NO I-FRAMES',
         }[c.target_script_kind] || c.target_script_kind.toUpperCase();
-        const kindColor = {
-          same_script: 'var(--ok)',
-          subset: 'var(--blue)',
-          divergent: 'var(--blue)',
-          silent: 'var(--warn)',
-        }[c.target_script_kind] || 'var(--dim)';
+        const kindTone = {
+          same_script: 'ok',
+          subset: 'blue',
+          divergent: 'blue',
+          silent: 'warn',
+        }[c.target_script_kind] || 'dim';
         const kindHelp = {
           same_script: "the live target produced the same iec 104 command sequence as the captured master. if the target is a separate piece of software, this is a strong positive signal.",
           subset: "the live target produced a prefix/subset of the captured script. probably a truncated run or a simpler master that only issues a few commands.",
@@ -392,10 +438,10 @@
           silent: "the live target never sent any i-frames of its own. it handshook and ack'd, but it didn't issue any commands. expected for a purely passive master or when the session was cut short.",
         }[c.target_script_kind] || '';
 
-        h += `<div class="an-h">TARGET SCRIPT COMPARISON (correct mode)</div>`;
-        h += `<div style="padding:10px 12px;background:var(--surface-2);border:1px solid var(--rule);border-left:2px solid ${kindColor};margin:6px 0 10px">`;
-        h += `  <div style="font-family:var(--sans);font-size:10px;font-weight:700;letter-spacing:0.1em;color:${kindColor};margin-bottom:6px">${esc(kindLabel)}</div>`;
-        h += `  <div style="font-family:var(--mono);font-size:11px;color:var(--ink-2);line-height:1.5">${esc(kindHelp)}</div>`;
+        h += `<div class="an-h">Target script comparison (correct mode)</div>`;
+        h += `<div class="script-kind tone-${kindTone}">`;
+        h += `  <div class="script-kind-label">${esc(kindLabel)}</div>`;
+        h += `  <div class="script-kind-help">${esc(kindHelp)}</div>`;
         h += `</div>`;
         h += `<div class="an-kv">`;
         h += `<div class="k">original sent</div><div class="v">${c.expected_iframes} i-frames</div>`;
@@ -421,15 +467,17 @@
     }
 
     if (t) {
-      h += `<div class="an-h">TIMING</div>`;
+      h += `<div class="an-h">Timing</div>`;
       h += `<div class="an-kv">`;
       h += `<div class="k">duration (original)</div><div class="v">${(t.original_duration_ms/1000).toFixed(3)} s</div>`;
       h += `<div class="k">duration (captured)</div><div class="v">${(t.captured_duration_ms/1000).toFixed(3)} s</div>`;
       if (t.speedup_factor > 0) {
         const sp = t.speedup_factor;
-        const label = sp > 2 ? `${sp.toFixed(1)}× faster (fast mode)` : sp > 0.5 ? `~matched (original pacing)` : `${(1/sp).toFixed(1)}× slower`;
+        // The analyzer's label ("matched" within ±5 %, else "N.NN× faster/slower").
+        const label = t.speed_label || (Math.abs(sp - 1) <= 0.05 ? 'matched' : sp > 1 ? `${sp.toFixed(2)}× faster` : `${(1 / sp).toFixed(2)}× slower`);
         h += `<div class="k">speedup</div><div class="v">${esc(label)}</div>`;
       }
+      if (t.timing_failure) h += `<div class="k">timing</div><div class="v bad">${esc(t.timing_failure)}</div>`;
       h += `<div class="k">mean gap</div><div class="v">orig ${t.original_mean_gap_ms.toFixed(1)} ms · capt ${t.captured_mean_gap_ms.toFixed(2)} ms</div>`;
       h += `<div class="k">p50 gap</div><div class="v">orig ${t.original_p50_gap_ms.toFixed(1)} ms · capt ${t.captured_p50_gap_ms.toFixed(2)} ms</div>`;
       h += `<div class="k">p99 gap</div><div class="v">orig ${t.original_p99_gap_ms.toFixed(1)} ms · capt ${t.captured_p99_gap_ms.toFixed(2)} ms</div>`;
@@ -442,22 +490,32 @@
     const haveGapData = t && ((t.original_gaps_ms || []).length > 0
                            || (t.captured_gaps_ms || []).length > 0);
     if (haveDriftSamples || haveGapData) {
-      h += `<div class="an-h">ANOMALY DETECTION</div>`;
-      h += `<div class="muted" style="font-family:var(--mono);font-size:10px;margin-bottom:6px">scroll inside a chart to zoom &middot; drag to pan &middot; use the toolbox icons (top-right) for rectangular zoom or reset</div>`;
+      h += `<div class="an-h">Anomaly detection</div>`;
+      h += `<p class="hint">Scroll inside a chart to zoom, drag to pan, or use the toolbox icons at the top right.</p>`;
+      // Each chart is a figure: caption and axes describe it, and the
+      // canvas has role="img" with the key numbers (F126).
+      const fig = (id, caption, axes, label) =>
+        `<figure class="an-figure"><figcaption id="${id}-cap"><div class="an-chart-caption">${caption}</div>` +
+        `<div class="an-chart-axes">${axes}</div></figcaption>` +
+        `<div id="${id}" class="an-chart" role="img" aria-label="${esc(label)}" aria-describedby="${id}-cap"></div></figure>`;
+      const driftLabel = cp
+        ? `${cp.samples} CP56 drift samples: median ${Number(cp.p50_ms).toFixed(1)} ms, p99 ${Number(cp.p99_ms).toFixed(1)} ms, ` +
+          `largest ${Number(cp.max_ms).toFixed(1)} ms; ${cp.out_of_tolerance} outside ±${Number(cp.tolerance_ms).toFixed(0)} ms.`
+        : '';
       if (haveDriftSamples) {
-        h += `<div class="an-chart-caption">CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)</div>`;
-        h += `<div class="an-chart-axes">X: frame index &middot; Y: drift (ms, signed)</div>`;
-        h += `<div id="an-chart-drift-${slug}" class="an-chart"></div>`;
+        h += fig(`an-chart-drift-${slug}`, 'CP56 drift over time &middot; every event vs. wire send moment (band = ±tolerance)',
+          'X: frame index &middot; Y: drift (ms, signed)', `CP56 drift over time. ${driftLabel}`);
       }
       if (haveGapData) {
-        h += `<div class="an-chart-caption">inter-frame gap timing &middot; original (dashed) vs. captured (solid)</div>`;
-        h += `<div class="an-chart-axes">X: inter-frame gap index &middot; Y: gap duration (ms)</div>`;
-        h += `<div id="an-chart-gap-${slug}" class="an-chart"></div>`;
+        const gapLabel = `Inter-frame gaps, original against captured: mean ${Number(t.original_mean_gap_ms || 0).toFixed(1)} against ` +
+          `${Number(t.captured_mean_gap_ms || 0).toFixed(1)} ms, p99 ${Number(t.original_p99_gap_ms || 0).toFixed(1)} against ` +
+          `${Number(t.captured_p99_gap_ms || 0).toFixed(1)} ms.`;
+        h += fig(`an-chart-gap-${slug}`, 'inter-frame gap timing &middot; original (dashed) vs. captured (solid)',
+          'X: inter-frame gap index &middot; Y: gap duration (ms)', gapLabel);
       }
       if (haveDriftSamples) {
-        h += `<div class="an-chart-caption">drift distribution &middot; bars beyond the dashed line are out-of-tolerance</div>`;
-        h += `<div class="an-chart-axes">X: |drift| bucket (ms) &middot; Y: sample count</div>`;
-        h += `<div id="an-chart-hist-${slug}" class="an-chart"></div>`;
+        h += fig(`an-chart-hist-${slug}`, 'drift distribution &middot; bars beyond the dashed line are out-of-tolerance',
+          'X: |drift| bucket (ms) &middot; Y: sample count', `Distribution of CP56 drift. ${driftLabel}`);
         h += `<div class="an-chart-caption">worst CP56 drifts (top 10)</div>`;
         h += `<div id="an-anomalies-${slug}" class="an-anomaly-list"></div>`;
       }
@@ -468,15 +526,15 @@
       const withinPct = cp.samples > 0
         ? (100 * (cp.samples - cp.out_of_tolerance) / cp.samples).toFixed(2)
         : '0.00';
-      h += `<div class="an-h">EMBEDDED TIMESTAMP ACCURACY <span class="opt">(fresh-timestamps mode)</span></div>`;
+      h += `<div class="an-h">Embedded timestamp accuracy <span class="opt">(fresh-timestamps mode)</span></div>`;
       h += `<div class="an-kv">`;
-      h += `<div class="k">verdict</div><div class="v" style="color:${passed ? 'var(--ok,#6a0)' : 'var(--err,#c33)'}">` +
+      h += `<div class="k">verdict</div><div class="v ${passed ? 'ok' : 'bad'}">` +
            `${withinPct}% of ${cp.samples} CP56Time2a fields within ±${cp.tolerance_ms.toFixed(0)} ms of wire time</div>`;
       h += `<div class="k">frames with CP56</div><div class="v">${cp.iframes_with_cp56}</div>`;
       h += `<div class="k">mean drift</div><div class="v">${cp.mean_ms.toFixed(2)} ms (signed ${cp.mean_signed_ms.toFixed(2)})</div>`;
       h += `<div class="k">p50 / p99 / max</div><div class="v">${cp.p50_ms.toFixed(2)} / ${cp.p99_ms.toFixed(2)} / ${cp.max_ms.toFixed(2)} ms</div>`;
       if (cp.out_of_tolerance > 0) {
-        h += `<div class="k">out of tolerance</div><div class="v" style="color:var(--err,#c33)">${cp.out_of_tolerance} / ${cp.samples}</div>`;
+        h += `<div class="k">out of tolerance</div><div class="v bad">${cp.out_of_tolerance} / ${cp.samples}</div>`;
       }
       if (cp.invalid_flag_count > 0 || cp.summer_flag_count > 0) {
         h += `<div class="k">flags observed</div><div class="v">IV=${cp.invalid_flag_count} · SU=${cp.summer_flag_count}</div>`;
@@ -489,11 +547,30 @@
       h += renderGiCiAudit(audit);
     }
 
+    if (ps.faults) h += renderFaultsSection(ps.faults);
+
     if (d.notes && d.notes.length) {
-      h += `<div class="an-h">NOTES</div>`;
+      h += `<div class="an-h">Notes</div>`;
       for (const n of d.notes) h += `<div class="an-note">· ${esc(n)}</div>`;
     }
 
+    return h;
+  }
+
+  // Analyzer's view of the injected faults (protocol_specific.faults):
+  // what the capture shows of them and how the peer reacted.
+  function renderFaultsSection(f) {
+    const ms = v => (v == null ? '—' : `${Number(v).toFixed(0)} ms`);
+    let h = `<div class="an-h">Injected faults</div>`;
+    if (f.summary) h += `<p class="hint">${esc(f.summary)}</p>`;
+    h += `<div class="an-kv">`;
+    h += `<div class="k">configured</div><div class="v">${esc(f.configured)}${(f.kinds || []).length ? ' · ' + (f.kinds || []).map(k => `<code>${esc(k)}</code>`).join(', ') : ''}${f.seed != null ? ` · seed ${esc(f.seed)}` : ''}</div>`;
+    h += `<div class="k">in the capture</div><div class="v">${esc(f.dropped_ns || 0)} dropped N(S) · ${esc(f.duplicates || 0)} duplicates · ${esc(f.corrupted_ns || 0)} corrupted N(S) · ${esc(f.malformed_bytes || 0)} unframeable bytes · ${esc(f.stopdt_sent || 0)} STOPDT sent</div>`;
+    h += `<div class="k">first fault</div><div class="v">${f.first_fault_ms == null ? 'did not fire in the captured session' : 'at ' + ms(f.first_fault_ms)}</div>`;
+    if (f.first_fault_ms != null) {
+      h += `<div class="k">peer reaction</div><div class="v">${f.peer_stopdt ? '<span class="warn">sent STOPDT</span> · ' : ''}${esc(f.peer_frames_after_first_fault || 0)} frames after the first fault · session ended ${ms(f.session_end_after_first_fault_ms)} after it</div>`;
+    }
+    h += `</div>`;
     return h;
   }
 
@@ -512,7 +589,7 @@
     const giTot = a.gi_total || 0;
     const ciTot = a.ci_total || 0;
 
-    let s = `<div class="an-h">MASTER COMMANDS — GI / CI AUDIT</div>`;
+    let s = `<div class="an-h">Master commands: GI / CI audit</div>`;
 
     // Summary strip.
     s += `<div class="an-kv">`;
@@ -538,6 +615,7 @@
     }
     s += `</div>`;
 
+    if (a.events_truncated) s += `<p class="hint">The event list was truncated by the analyzer.</p>`;
     if (!a.events || !a.events.length) {
       return s;
     }
@@ -553,14 +631,14 @@
     //   COT?   — every data frame in the expected COT bucket
     //   bytes? — byte-for-byte match vs inventory-derived expected
     //   verdict
-    s += `<div style="overflow-x:auto;margin:6px 0 10px">`;
-    s += `<table class="an-tbl" style="width:100%;border-collapse:collapse;font-family:var(--mono);font-size:11px">`;
-    s += `<thead><tr style="text-align:left;color:var(--dim);font-weight:600">`;
-    s += `<th style="padding:4px 8px">t (ms)</th><th>kind</th><th>qual</th><th>CA</th>`;
-    s += `<th>AC Δ ms</th><th>data (frames / elems)</th><th>AT Δ ms</th>`;
-    s += `<th>COT?</th><th>bytes?</th><th>verdict</th>`;
+    s += `<div class="table-scroll audit-scroll">`;
+    s += `<table class="t an-tbl"><caption class="sr-only">GI and CI events of this endpoint</caption>`;
+    s += `<thead><tr>`;
+    s += `<th scope="col" class="num">t (ms)</th><th scope="col">kind</th><th scope="col" class="num">qual</th><th scope="col" class="num">CA</th>`;
+    s += `<th scope="col" class="num">ActCon Δ (ms)</th><th scope="col" class="num">data (frames / elements)</th><th scope="col" class="num">ActTerm Δ (ms)</th>`;
+    s += `<th scope="col">COT ok</th><th scope="col">bytes ok</th><th scope="col">verdict</th>`;
     s += `</tr></thead><tbody>`;
-    const rowColor = (v) => v === 'compliant' ? '' : (v === 'partial' ? 'background:rgba(255,200,0,0.06)' : 'background:rgba(255,80,80,0.06)');
+    const rowClass = (v) => v === 'compliant' ? 'ev-ok' : (v === 'partial' ? 'ev-partial' : 'ev-bad');
     const tickClass = (b) => b ? 'ok' : 'bad';
     const tick = (b) => b ? '✓' : '✗';
     for (const ev of a.events.slice(0, 200)) {
@@ -569,26 +647,26 @@
       const expected = ev.expected_data_element_count;
       const dataCell = `${ev.data_frame_count} / ${ev.data_element_count}` +
         (expected !== ev.data_element_count ? ` <span class="muted" title="inventory-derived expected element count">(exp ${expected})</span>` : '');
-      const verdictColor = ev.verdict === 'compliant' ? 'var(--ok)' : (ev.verdict === 'partial' ? 'var(--warn)' : 'var(--err,#c33)');
-      s += `<tr style="border-top:1px solid var(--rule);${rowColor(ev.verdict)}">`;
-      s += `<td style="padding:4px 8px">${ev.request_ts_ms.toFixed(0)}</td>`;
+      const verdictTone = ev.verdict === 'compliant' ? 'ok' : (ev.verdict === 'partial' ? 'warn' : 'bad');
+      s += `<tr class="${rowClass(ev.verdict)}">`;
+      s += `<td class="num">${ev.request_ts_ms.toFixed(0)}</td>`;
       s += `<td>${esc(ev.kind)}</td>`;
-      s += `<td>${ev.qualifier}</td>`;
-      s += `<td>${ev.ca}</td>`;
-      s += `<td class="${ev.actcon_present ? '' : 'bad'}">${ev.actcon_present ? acΔ : '—'}</td>`;
-      s += `<td>${dataCell}</td>`;
-      s += `<td class="${ev.actterm_present ? '' : 'bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
+      s += `<td class="num">${ev.qualifier}</td>`;
+      s += `<td class="num">${ev.ca}</td>`;
+      s += `<td class="num${ev.actcon_present ? '' : ' bad'}">${ev.actcon_present ? acΔ : '—'}</td>`;
+      s += `<td class="num">${dataCell}</td>`;
+      s += `<td class="num${ev.actterm_present ? '' : ' bad'}">${ev.actterm_present ? atΔ : '—'}</td>`;
       s += `<td class="${tickClass(ev.all_cots_match_bucket)}">${tick(ev.all_cots_match_bucket)}</td>`;
       s += `<td class="${tickClass(ev.bytewise_matches_inventory)}">${tick(ev.bytewise_matches_inventory)}</td>`;
-      s += `<td style="color:${verdictColor};font-weight:600">${esc(ev.verdict)}</td>`;
+      s += `<td class="${verdictTone} strong">${esc(ev.verdict)}</td>`;
       s += `</tr>`;
       if (ev.notes && ev.notes.length) {
-        s += `<tr style="${rowColor(ev.verdict)}"><td></td><td colspan="9" class="muted" style="padding:0 8px 4px;font-size:10px">${ev.notes.map(esc).join(' · ')}</td></tr>`;
+        s += `<tr class="${rowClass(ev.verdict)}"><td></td><td colspan="9" class="muted">${ev.notes.map(esc).join(' · ')}</td></tr>`;
       }
     }
     s += `</tbody></table>`;
     if (a.events.length > 200) {
-      s += `<div class="muted" style="font-size:10px;margin-top:4px">showing first 200 of ${a.events.length} events</div>`;
+      s += `<p class="hint">Showing the first 200 of ${a.events.length} events.</p>`;
     }
     s += `</div>`;
     return s;
@@ -612,15 +690,22 @@
     }
   }
 
-  // Fleet-level rollup of GI/CI events across every slave. Walks
-  // `r.details_by_ip[*].protocol_specific.gi_ci_audit` so the backend
-  // doesn't need a parallel aggregator. Renders headline counts plus
-  // two stacked bars (GI / CI) split by verdict bucket.
+  // Fleet-level rollup of GI/CI events across every slave. The summary
+  // carries the summed counters (`fleet_gi_ci_audit`, F067), so no
+  // endpoint detail has to be fetched; older replies with
+  // `details_by_ip` are summed here. Renders headline counts plus two
+  // stacked bars (GI / CI) split by verdict bucket.
   function renderFleetExtras(r) {
-    const details = r.details_by_ip || {};
     let giOk = 0, giPt = 0, giNc = 0, giTot = 0;
     let ciOk = 0, ciPt = 0, ciNc = 0, ciTot = 0;
     let slavesWithEvents = 0;
+    const fa = r.fleet_gi_ci_audit;
+    if (fa) {
+      giOk = fa.gi_compliant || 0; giPt = fa.gi_partial || 0; giNc = fa.gi_non_compliant || 0; giTot = fa.gi_total || 0;
+      ciOk = fa.ci_compliant || 0; ciPt = fa.ci_partial || 0; ciNc = fa.ci_non_compliant || 0; ciTot = fa.ci_total || 0;
+      slavesWithEvents = fa.endpoints_with_events || 0;
+    }
+    const details = fa ? {} : (r.details_by_ip || {});
     for (const ip of Object.keys(details)) {
       const a = ((details[ip] || {}).protocol_specific || {}).gi_ci_audit;
       if (!a) continue;
@@ -639,29 +724,30 @@
       return ``; // no GI/CI activity in this run; suppress the panel.
     }
 
-    const seg = (count, color, title) => count > 0
-      ? `<div title="${title}: ${count}" style="flex:${count};background:${color};color:#fff;padding:6px 8px;font-family:var(--mono);font-size:11px;text-align:center;min-width:24px">${count}</div>`
+    // `flex` carries the count, so it stays an inline value.
+    const seg = (count, tone, title) => count > 0
+      ? `<div class="audit-seg tone-${tone}" title="${title}: ${count}" style="flex:${count}">${count}</div>`
       : '';
 
-    let h = `<div class="an-h">FLEET INTERROGATION AUDIT &middot; ${slavesWithEvents} SLAVE${slavesWithEvents===1?'':'S'} WITH GI/CI ACTIVITY</div>`;
-    h += `<div class="muted" style="font-family:var(--mono);font-size:11px;margin:-6px 0 8px">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
-    h += `<div style="display:grid;grid-template-columns:120px 1fr;gap:8px;align-items:center;font-family:var(--mono);font-size:11px;margin-bottom:8px">`;
+    let h = `<div class="an-h">Fleet interrogation audit &middot; ${slavesWithEvents} endpoint${slavesWithEvents===1?'':'s'} with GI/CI activity</div>`;
+    h += `<div class="hint">each event judged on: ActCon present + within 1×t1, ActTerm present + reasonable delay, all data frames in the right COT bucket, byte-for-byte match against the source-pcap inventory</div>`;
+    h += `<div class="audit-grid">`;
     if (giTot > 0) {
       h += `<div>general (GI)</div>`;
-      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
-      h += seg(giOk, 'var(--ok,#3a3)',  'compliant');
-      h += seg(giPt, 'var(--warn,#fa0)', 'partial');
-      h += seg(giNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${giTot} total</div>`;
+      h += `<div class="audit-bar">`;
+      h += seg(giOk, 'ok', 'compliant');
+      h += seg(giPt, 'warn', 'partial');
+      h += seg(giNc, 'bad', 'non-compliant');
+      h += `<div class="audit-total">${giTot} total</div>`;
       h += `</div>`;
     }
     if (ciTot > 0) {
       h += `<div>counter (CI)</div>`;
-      h += `<div style="display:flex;border:1px solid var(--rule);border-radius:2px;overflow:hidden">`;
-      h += seg(ciOk, 'var(--ok,#3a3)',  'compliant');
-      h += seg(ciPt, 'var(--warn,#fa0)', 'partial');
-      h += seg(ciNc, 'var(--err,#c33)',  'non-compliant');
-      h += `<div style="margin-left:auto;padding:6px 8px;font-family:var(--mono);font-size:11px;color:var(--dim)">${ciTot} total</div>`;
+      h += `<div class="audit-bar">`;
+      h += seg(ciOk, 'ok', 'compliant');
+      h += seg(ciPt, 'warn', 'partial');
+      h += seg(ciNc, 'bad', 'non-compliant');
+      h += `<div class="audit-total">${ciTot} total</div>`;
       h += `</div>`;
     }
     h += `</div>`;
@@ -669,5 +755,5 @@
   }
 
   window.PROTOCOL_RENDERERS = window.PROTOCOL_RENDERERS || {};
-  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts, renderFleetExtras };
+  window.PROTOCOL_RENDERERS['iec104'] = { renderSlaveDetail, initSlaveCharts, renderFleetExtras, tidName };
 })();

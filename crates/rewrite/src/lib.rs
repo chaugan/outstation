@@ -58,10 +58,18 @@ pub fn ipv4_header_checksum(ip_header: &[u8]) -> u16 {
 pub fn l4_checksum_ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, l4: &[u8]) -> u16 {
     let len = l4.len() as u16;
     let pseudo = [
-        src[0], src[1], src[2], src[3],
-        dst[0], dst[1], dst[2], dst[3],
-        0, proto,
-        (len >> 8) as u8, (len & 0xff) as u8,
+        src[0],
+        src[1],
+        src[2],
+        src[3],
+        dst[0],
+        dst[1],
+        dst[2],
+        dst[3],
+        0,
+        proto,
+        (len >> 8) as u8,
+        (len & 0xff) as u8,
     ];
     internet_checksum(&[&pseudo, l4])
 }
@@ -75,11 +83,7 @@ pub fn l4_checksum_ipv4(src: [u8; 4], dst: [u8; 4], proto: u8, l4: &[u8]) -> u16
 /// header, so their L4 checksum is not touched. The first fragment's L4
 /// checksum would need the full reassembled segment to recompute, so we
 /// also skip it and let the caller handle fragmented flows separately.
-pub fn rewrite_in_place(
-    frame: &mut [u8],
-    target_ip: Ipv4Addr,
-    target_mac: [u8; 6],
-) -> Result<()> {
+pub fn rewrite_in_place(frame: &mut [u8], target_ip: Ipv4Addr, target_mac: [u8; 6]) -> Result<()> {
     if frame.len() < ETH_HDR_LEN {
         bail!("frame shorter than Ethernet header");
     }
@@ -178,28 +182,20 @@ mod tests {
     fn make_tcp_syn() -> Vec<u8> {
         // Ethernet: dst 11:22:33:44:55:66, src aa:bb:cc:dd:ee:ff, type 0x0800
         let eth = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-            0x08, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00,
         ];
         // IPv4: version=4, ihl=5, tos=0, total_len=44, id=0, flags/frag=0,
         // ttl=64, proto=TCP, cksum=0, src=10.0.0.1, dst=20.0.0.1
         let mut ipv4 = vec![
-            0x45, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00,
-            0x40, 0x06, 0x00, 0x00,
-            10, 0, 0, 1,
+            0x45, 0x00, 0x00, 0x2c, 0x00, 0x00, 0x00, 0x00, 0x40, 0x06, 0x00, 0x00, 10, 0, 0, 1,
             20, 0, 0, 1,
         ];
         // TCP: src_port=12345, dst_port=80, seq=1, ack=0,
         // data_offset=6 (24 bytes, 4 bytes of options), flags=SYN,
         // window=0xffff, cksum=0, urg=0, options: MSS=1460
         let mut tcp = vec![
-            0x30, 0x39, 0x00, 0x50,
-            0x00, 0x00, 0x00, 0x01,
-            0x00, 0x00, 0x00, 0x00,
-            0x60, 0x02, 0xff, 0xff,
-            0x00, 0x00, 0x00, 0x00,
-            0x02, 0x04, 0x05, 0xb4,
+            0x30, 0x39, 0x00, 0x50, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x60, 0x02,
+            0xff, 0xff, 0x00, 0x00, 0x00, 0x00, 0x02, 0x04, 0x05, 0xb4,
         ];
         // Fill in IP checksum.
         let ck = ipv4_header_checksum(&ipv4);
@@ -218,29 +214,46 @@ mod tests {
 
     fn make_udp_echo() -> Vec<u8> {
         let eth = [
-            0x11, 0x22, 0x33, 0x44, 0x55, 0x66,
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-            0x08, 0x00,
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x08, 0x00,
         ];
         let payload = b"hello";
         let udp_len = 8 + payload.len();
         let total_len = 20 + udp_len;
         let mut ipv4 = vec![
-            0x45, 0x00,
-            (total_len >> 8) as u8, (total_len & 0xff) as u8,
-            0x00, 0x00, 0x00, 0x00,
-            0x40, 0x11, 0x00, 0x00,
-            10, 0, 0, 2,
-            20, 0, 0, 2,
+            0x45,
+            0x00,
+            (total_len >> 8) as u8,
+            (total_len & 0xff) as u8,
+            0x00,
+            0x00,
+            0x00,
+            0x00,
+            0x40,
+            0x11,
+            0x00,
+            0x00,
+            10,
+            0,
+            0,
+            2,
+            20,
+            0,
+            0,
+            2,
         ];
         let ck = ipv4_header_checksum(&ipv4);
         ipv4[10] = (ck >> 8) as u8;
         ipv4[11] = (ck & 0xff) as u8;
 
         let mut udp = vec![
-            0x13, 0x88, 0x13, 0x89,
-            (udp_len >> 8) as u8, (udp_len & 0xff) as u8,
-            0x00, 0x00,
+            0x13,
+            0x88,
+            0x13,
+            0x89,
+            (udp_len >> 8) as u8,
+            (udp_len & 0xff) as u8,
+            0x00,
+            0x00,
         ];
         udp.extend_from_slice(payload);
         let ck = l4_checksum_ipv4([10, 0, 0, 2], [20, 0, 0, 2], IPPROTO_UDP, &udp);
@@ -272,29 +285,31 @@ mod tests {
         // IPv4 header still valid.
         assert_eq!(internet_checksum(&[&frame[14..34]]), 0);
         // TCP segment still valid against new pseudo-header.
-        let pseudo = [
-            10u8, 0, 0, 1, 30, 0, 0, 99, 0, IPPROTO_TCP,
-            0, 24,
-        ];
+        let pseudo = [10u8, 0, 0, 1, 30, 0, 0, 99, 0, IPPROTO_TCP, 0, 24];
         assert_eq!(internet_checksum(&[&pseudo, &frame[34..58]]), 0);
     }
 
     #[test]
     fn udp_rewrite_keeps_checksums_valid() {
         let mut frame = make_udp_echo();
-        rewrite_in_place(
-            &mut frame,
-            "30.0.0.42".parse().unwrap(),
-            [0xaa; 6],
-        )
-        .unwrap();
+        rewrite_in_place(&mut frame, "30.0.0.42".parse().unwrap(), [0xaa; 6]).unwrap();
         assert_eq!(&frame[0..6], &[0xaa; 6]);
         assert_eq!(&frame[30..34], &[30, 0, 0, 42]);
         assert_eq!(internet_checksum(&[&frame[14..34]]), 0);
         let udp_len = frame.len() - 34;
         let pseudo = [
-            10u8, 0, 0, 2, 30, 0, 0, 42, 0, IPPROTO_UDP,
-            (udp_len >> 8) as u8, (udp_len & 0xff) as u8,
+            10u8,
+            0,
+            0,
+            2,
+            30,
+            0,
+            0,
+            42,
+            0,
+            IPPROTO_UDP,
+            (udp_len >> 8) as u8,
+            (udp_len & 0xff) as u8,
         ];
         assert_eq!(internet_checksum(&[&pseudo, &frame[34..]]), 0);
     }
@@ -303,9 +318,7 @@ mod tests {
     fn non_ipv4_only_updates_mac() {
         // GOOSE frame: EtherType 0x88B8, opaque payload.
         let mut frame = vec![
-            0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00,
-            0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-            0x88, 0xb8,
+            0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x88, 0xb8,
         ];
         frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x00]);
         let before_payload = frame[14..].to_vec();

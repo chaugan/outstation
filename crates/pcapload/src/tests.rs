@@ -37,7 +37,7 @@ fn eth_ip_tcp(
     f.extend_from_slice(&[0x11, 0x22, 0x33, 0x44, 0x55, 0x66]);
     f.extend_from_slice(&src_mac);
     f.extend_from_slice(&[0x08, 0x00]); // IPv4
-    // IPv4 header (20 bytes)
+                                        // IPv4 header (20 bytes)
     let total_len: u16 = 20 + 20;
     f.push(0x45);
     f.push(0x00);
@@ -97,12 +97,18 @@ fn splits_by_source_and_identifies_flows() {
     // Flow 1: A -> B, TCP, full handshake then data.
     // Flow 2: C -> B, UDP, single packet.
     let frames: Vec<(u64, Vec<u8>)> = vec![
-        (0, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_SYN)),                     // client SYN
-        (1_000_000, eth_ip_tcp(mac_b, ip_b, ip_a, 80, 40000, TCP_SYN | TCP_ACK)),   // server SYN-ACK
-        (2_000_000, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_ACK)),              // client ACK
-        (3_000_000, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_ACK)),              // client data
-        (4_000_000, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_FIN | TCP_ACK)),   // client FIN
-        (5_000_000, eth_ip_udp(mac_c, ip_c, ip_b)),                                  // UDP from C
+        (0, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_SYN)), // client SYN
+        (
+            1_000_000,
+            eth_ip_tcp(mac_b, ip_b, ip_a, 80, 40000, TCP_SYN | TCP_ACK),
+        ), // server SYN-ACK
+        (2_000_000, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_ACK)), // client ACK
+        (3_000_000, eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_ACK)), // client data
+        (
+            4_000_000,
+            eth_ip_tcp(mac_a, ip_a, ip_b, 40000, 80, TCP_FIN | TCP_ACK),
+        ), // client FIN
+        (5_000_000, eth_ip_udp(mac_c, ip_c, ip_b)),             // UDP from C
     ];
     let pcap_bytes = make_pcap(&frames);
     let loaded = load_bytes(&pcap_bytes, PathBuf::from("test.pcap")).unwrap();
@@ -202,13 +208,52 @@ fn reassembles_client_stream_with_retransmit() {
     // Flow: SYN, SYN-ACK, ACK, client sends "HELLO" (seq=1000),
     // retransmit of "HELLO" overlapped (seq=1000), then "WORLD" (seq=1005), FIN.
     let frames = vec![
-        (0, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_SYN, 999, &[])),
-        (1_000_000, eth_ip_tcp_with_payload(server_mac, s_ip, c_ip, 80, 40000, TCP_SYN | TCP_ACK, 500, &[])),
-        (2_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, &[])),
-        (3_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"HELLO")),
-        (4_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"HELLO")), // retransmit
-        (5_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1005, b"WORLD")),
-        (6_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_FIN | TCP_ACK, 1010, &[])),
+        (
+            0,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_SYN, 999, &[]),
+        ),
+        (
+            1_000_000,
+            eth_ip_tcp_with_payload(
+                server_mac,
+                s_ip,
+                c_ip,
+                80,
+                40000,
+                TCP_SYN | TCP_ACK,
+                500,
+                &[],
+            ),
+        ),
+        (
+            2_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, &[]),
+        ),
+        (
+            3_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"HELLO"),
+        ),
+        (
+            4_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"HELLO"),
+        ), // retransmit
+        (
+            5_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1005, b"WORLD"),
+        ),
+        (
+            6_000_000,
+            eth_ip_tcp_with_payload(
+                client_mac,
+                c_ip,
+                s_ip,
+                40000,
+                80,
+                TCP_FIN | TCP_ACK,
+                1010,
+                &[],
+            ),
+        ),
     ];
     let pcap_bytes = make_pcap(&frames);
     let loaded = load_bytes(&pcap_bytes, PathBuf::from("t.pcap")).unwrap();
@@ -223,31 +268,63 @@ fn reassembles_client_stream_with_retransmit() {
 }
 
 #[test]
-fn reassembly_detects_gap() {
+fn reassembly_records_gap_and_continues() {
     let client_mac: MacAddr = [0x02, 0, 0, 0, 0, 0x01];
     let server_mac: MacAddr = [0x02, 0, 0, 0, 0, 0x02];
     let c_ip = [10, 0, 0, 1];
     let s_ip = [10, 0, 0, 2];
     // SYN (seq 999) then a client segment at seq 1100 — gap from 1000..1100.
     let frames = vec![
-        (0, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_SYN, 999, &[])),
-        (1_000_000, eth_ip_tcp_with_payload(server_mac, s_ip, c_ip, 80, 40000, TCP_SYN | TCP_ACK, 500, &[])),
-        (2_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"AA")),
-        (3_000_000, eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1100, b"BB")),
+        (
+            0,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_SYN, 999, &[]),
+        ),
+        (
+            1_000_000,
+            eth_ip_tcp_with_payload(
+                server_mac,
+                s_ip,
+                c_ip,
+                80,
+                40000,
+                TCP_SYN | TCP_ACK,
+                500,
+                &[],
+            ),
+        ),
+        (
+            2_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1000, b"AA"),
+        ),
+        (
+            3_000_000,
+            eth_ip_tcp_with_payload(client_mac, c_ip, s_ip, 40000, 80, TCP_ACK, 1100, b"BB"),
+        ),
     ];
     let loaded = load_bytes(&make_pcap(&frames), PathBuf::from("gap.pcap")).unwrap();
-    let err = loaded.reassemble_client_payload(0).unwrap_err();
-    assert!(err.to_string().contains("gap"), "unexpected error: {err}");
+    // A hole no longer fails the direction: both sides are spliced and
+    // the hole is recorded.
+    let r = loaded.reassemble_client_payload(0).unwrap();
+    assert_eq!(&r.payload, b"AABB");
+    assert_eq!(
+        r.gaps,
+        vec![StreamGap {
+            offset: 2,
+            missing: 98
+        }]
+    );
+    assert!(!r.is_contiguous());
+    assert_eq!(r.missing_bytes(), 98);
+    let chunks: Vec<_> = r.contiguous_chunks().collect();
+    assert_eq!(chunks, vec![(0, &b"AA"[..]), (2, &b"BB"[..])]);
 }
 
 #[test]
 fn non_ip_frames_are_counted_but_not_sourced_by_ip() {
     // GOOSE-style: dst 01:0c:cd:01:00:00, src aa.., ethertype 0x88b8.
     let frame = vec![
-        0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00,
-        0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff,
-        0x88, 0xb8,
-        0xde, 0xad, 0xbe, 0xef,
+        0x01, 0x0c, 0xcd, 0x01, 0x00, 0x00, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x88, 0xb8, 0xde,
+        0xad, 0xbe, 0xef,
     ];
     let loaded = load_bytes(&make_pcap(&[(0, frame)]), PathBuf::from("goose.pcap")).unwrap();
     assert_eq!(loaded.non_ip_count, 1);
@@ -270,10 +347,10 @@ fn non_ip_sources_are_indexed_by_mac() {
         v
     };
     let frames = vec![
-        (0, goose(mac_a, 0x88b8, 0x01)),                   // GOOSE from A
-        (1_000_000, goose(mac_a, 0x88ba, 0x02)),           // SV from A
-        (2_000_000, goose(mac_b, 0x88b8, 0x03)),           // GOOSE from B
-        (3_000_000, goose(mac_a, 0x88b8, 0x04)),           // GOOSE from A again
+        (0, goose(mac_a, 0x88b8, 0x01)),         // GOOSE from A
+        (1_000_000, goose(mac_a, 0x88ba, 0x02)), // SV from A
+        (2_000_000, goose(mac_b, 0x88b8, 0x03)), // GOOSE from B
+        (3_000_000, goose(mac_a, 0x88b8, 0x04)), // GOOSE from A again
     ];
     let loaded = load_bytes(&make_pcap(&frames), PathBuf::from("l2.pcap")).unwrap();
     assert_eq!(loaded.non_ip_count, 4);
@@ -285,4 +362,13 @@ fn non_ip_sources_are_indexed_by_mac() {
     // Both GOOSE and SV should be observed under A.
     assert!(a.ethertypes.contains(&0x88b8));
     assert!(a.ethertypes.contains(&0x88ba));
+}
+
+/// proto_iec104's viability estimate (`PER_PACKET_RAM_BYTES` = 128)
+/// assumes a packet costs at most this much beyond its bytes: the
+/// `Packet` itself plus one flow and one source index entry.
+#[test]
+fn packet_overhead_fits_the_viability_estimate() {
+    let per_packet = std::mem::size_of::<Packet>() + 2 * std::mem::size_of::<usize>();
+    assert!(per_packet <= 128, "{per_packet} B per packet");
 }

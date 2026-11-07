@@ -25,9 +25,9 @@
 
 use std::collections::BTreeMap;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
@@ -66,8 +66,17 @@ pub struct MessageProgress {
     /// Total messages the replayer plans to send for this session.
     /// Filled in by the replayer once it has parsed the pcap payload.
     pub planned: Arc<AtomicU64>,
-    /// Client messages sent on the wire so far.
+    /// Client messages sent on the wire in the current iteration.
     pub sent: Arc<AtomicU64>,
+    /// Sum of `sent` over finished iterations; see
+    /// [`MessageProgress::fold_iteration`].
+    pub sent_done_iters: Arc<AtomicU64>,
+    /// Sum of `bytes_written` over finished iterations.
+    pub bytes_done_iters: Arc<AtomicU64>,
+    /// Sequence counter guarding the fold of the per-iteration counters
+    /// into the `*_done_iters` totals (odd while a fold is under way),
+    /// so readers of a total never see it dip. See [`fold_counters`].
+    pub fold_seq: Arc<AtomicU64>,
     /// Server messages received so far.
     pub received: Arc<AtomicU64>,
     pub bytes_written: Arc<AtomicU64>,
@@ -101,27 +110,395 @@ pub struct MessageProgress {
     pub iter_current: Arc<AtomicU64>,
     /// Total iterations planned for this session (0 = unlimited).
     pub iter_total: Arc<AtomicU64>,
+    /// Run-level cancel flag shared by every session of the run (the
+    /// scheduler passes `RunContext::cancel` here). Replayers should
+    /// treat it exactly like [`MessageProgress::cancel`]; use
+    /// [`MessageProgress::is_cancelled`], which checks both.
+    pub run_cancel: Arc<AtomicBool>,
+    /// Ack latency of every acknowledged message so far, all
+    /// iterations, for live percentiles. Replayers that measure ack
+    /// latency record into it as they retire acknowledged messages.
+    pub ack_latency: Arc<LiveLatencyHist>,
+}
+
+impl MessageProgress {
+    /// True if either this session or the whole run was cancelled.
+    #[inline]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed) || self.run_cancel.load(Ordering::Relaxed)
+    }
+
+    /// Start a new iteration: move `sent` and `bytes_written` into the
+    /// `*_done_iters` totals and restart them at zero. The totals
+    /// ([`MessageProgress::sent_total`]) never dip while this runs.
+    /// Call it only from the thread that sends.
+    pub fn fold_iteration(&self) {
+        fold_counters(
+            &self.fold_seq,
+            &[
+                (&self.sent, &self.sent_done_iters),
+                (&self.bytes_written, &self.bytes_done_iters),
+            ],
+        );
+    }
+
+    /// Messages sent over all iterations, monotonic.
+    pub fn sent_total(&self) -> u64 {
+        read_folded(&self.fold_seq, &self.sent, &self.sent_done_iters)
+    }
+}
+
+/// Move every `current` counter into its `done` total and zero it, as
+/// one step for readers using [`read_folded`] with the same `seq` (a
+/// seqlock: `seq` is odd while the fold runs). A reader of
+/// `done + current` therefore never sees the amount in neither (a dip)
+/// nor in both (a spike). Only one thread may fold a given `seq`, and
+/// nobody else may write the `current` counters during the fold (both
+/// hold when the sending thread folds its own counters).
+pub fn fold_counters(seq: &AtomicU64, pairs: &[(&AtomicU64, &AtomicU64)]) {
+    let s = seq.load(Ordering::Relaxed);
+    seq.store(s.wrapping_add(1), Ordering::Relaxed);
+    std::sync::atomic::fence(Ordering::Release);
+    for (current, done) in pairs {
+        let v = current.swap(0, Ordering::Relaxed);
+        done.fetch_add(v, Ordering::Relaxed);
+    }
+    seq.store(s.wrapping_add(2), Ordering::Release);
+}
+
+/// `done + current`, consistent with respect to [`fold_counters`] on
+/// the same `seq`: monotonic as long as the counters only grow between
+/// folds.
+pub fn read_folded(seq: &AtomicU64, current: &AtomicU64, done: &AtomicU64) -> u64 {
+    let mut spins = 0u32;
+    loop {
+        let s1 = seq.load(Ordering::Acquire);
+        if s1 & 1 == 0 {
+            let v = done
+                .load(Ordering::Relaxed)
+                .saturating_add(current.load(Ordering::Relaxed));
+            std::sync::atomic::fence(Ordering::Acquire);
+            if seq.load(Ordering::Relaxed) == s1 {
+                return v;
+            }
+        }
+        spins += 1;
+        if spins % 64 == 0 {
+            std::thread::yield_now();
+        } else {
+            std::hint::spin_loop();
+        }
+    }
+}
+
+/// Cancellation check for the common `Option<MessageProgress>` shape.
+/// `None` (no progress sink) is never cancelled.
+#[inline]
+pub fn progress_cancelled(progress: &Option<MessageProgress>) -> bool {
+    progress.as_ref().is_some_and(MessageProgress::is_cancelled)
+}
+
+/// Longest time any cancellable wait sleeps before re-checking its
+/// cancel condition. Bounds STOP latency for every helper below.
+pub const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Sleep until `deadline`, waking at least every
+/// [`CANCEL_POLL_INTERVAL`] to evaluate `cancelled`. Returns `true` if
+/// the deadline was reached and `false` if the wait was cancelled.
+pub fn sleep_until_cancellable(deadline: Instant, cancelled: impl Fn() -> bool) -> bool {
+    loop {
+        if cancelled() {
+            return false;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return true;
+        }
+        std::thread::sleep((deadline - now).min(CANCEL_POLL_INTERVAL));
+    }
+}
+
+/// Sleep for `dur` in [`CANCEL_POLL_INTERVAL`] slices. Same return
+/// convention as [`sleep_until_cancellable`].
+pub fn sleep_cancellable(dur: Duration, cancelled: impl Fn() -> bool) -> bool {
+    match Instant::now().checked_add(dur) {
+        Some(deadline) => sleep_until_cancellable(deadline, cancelled),
+        // Absurd duration: sleep "forever", i.e. until cancelled.
+        None => loop {
+            if cancelled() {
+                return false;
+            }
+            std::thread::sleep(CANCEL_POLL_INTERVAL);
+        },
+    }
+}
+
+/// Run `poll(slice)` repeatedly until it returns `Some`, `deadline`
+/// passes, or `cancelled()` is true. `slice` is the remaining time
+/// capped at [`CANCEL_POLL_INTERVAL`], so a blocking receive inside
+/// `poll` (e.g. `Receiver::recv_timeout(slice)`) never holds off a
+/// cancel for more than 100 ms. Returns [`Wait::Done`] with the value,
+/// [`Wait::TimedOut`] or [`Wait::Cancelled`].
+pub fn poll_until_cancellable<T>(
+    deadline: Instant,
+    cancelled: impl Fn() -> bool,
+    mut poll: impl FnMut(Duration) -> Option<T>,
+) -> Wait<T> {
+    loop {
+        if cancelled() {
+            return Wait::Cancelled;
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return Wait::TimedOut;
+        }
+        if let Some(v) = poll((deadline - now).min(CANCEL_POLL_INTERVAL)) {
+            return Wait::Done(v);
+        }
+    }
+}
+
+/// Outcome of [`poll_until_cancellable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Wait<T> {
+    Done(T),
+    TimedOut,
+    Cancelled,
+}
+
+/// Default number of latency samples kept per session.
+pub const LATENCY_RESERVOIR_CAP: usize = 10_000;
+
+/// Bounded uniform sample of a latency stream (Vitter's Algorithm R).
+/// Keeps at most `capacity` values no matter how many are pushed, so
+/// per-session memory stays bounded across any number of iterations.
+/// Uses a tiny inline LCG so the crate needs no `rand` dependency.
+#[derive(Debug, Clone)]
+pub struct LatencyReservoir {
+    capacity: usize,
+    samples: Vec<u64>,
+    seen: u64,
+    rng_state: u64,
+}
+
+impl LatencyReservoir {
+    /// New reservoir, seeded from the clock plus a per-process counter
+    /// so concurrent sessions draw different sequences.
+    pub fn new(capacity: usize) -> Self {
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let clock = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0);
+        let salt = NEXT
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0xD1B5_4A32_D192_ED03);
+        Self::with_seed(capacity, clock ^ salt)
+    }
+
+    /// Deterministic variant for tests.
+    pub fn with_seed(capacity: usize, seed: u64) -> Self {
+        Self {
+            capacity: capacity.max(1),
+            samples: Vec::with_capacity(capacity.clamp(1, 1024)),
+            seen: 0,
+            rng_state: seed.wrapping_add(0x9E37_79B9_7F4A_7C15) | 1,
+        }
+    }
+
+    #[inline]
+    fn next_rand(&mut self) -> u64 {
+        self.rng_state = self
+            .rng_state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        // Use the high bits; the low bits of an LCG are weak.
+        self.rng_state >> 16
+    }
+
+    pub fn push(&mut self, sample: u64) {
+        self.seen = self.seen.saturating_add(1);
+        if self.samples.len() < self.capacity {
+            self.samples.push(sample);
+            return;
+        }
+        let i = (self.next_rand() % self.seen) as usize;
+        if i < self.capacity {
+            self.samples[i] = sample;
+        }
+    }
+
+    pub fn extend(&mut self, samples: impl IntoIterator<Item = u64>) {
+        for s in samples {
+            self.push(s);
+        }
+    }
+
+    /// Number of values pushed so far (kept or not).
+    pub fn seen(&self) -> u64 {
+        self.seen
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+
+    pub fn capacity(&self) -> usize {
+        self.capacity
+    }
+
+    pub fn as_slice(&self) -> &[u64] {
+        &self.samples
+    }
+
+    pub fn into_vec(self) -> Vec<u64> {
+        self.samples
+    }
+}
+
+/// Lowest bin edge of the live ack-latency histogram, as log10(µs):
+/// 10 µs. Shared with the web UI's report histogram so both bin alike.
+pub const LATENCY_HIST_LOG10_MIN_US: f64 = 1.0;
+/// Highest bin edge, as log10(µs): 10 s.
+pub const LATENCY_HIST_LOG10_MAX_US: f64 = 7.0;
+/// Log-spaced bins between the two edges: four per decade.
+pub const LATENCY_HIST_BINS: usize = 24;
+
+/// Lower edge of bin `i` in whole µs, `ceil(10^(1 + i/4))`, plus the
+/// overflow edge (10 s) last. An integer sample `s` lies in bin `i`
+/// exactly when `log10(s) >= 1 + i/4`, so this integer table bins
+/// like the floating-point formula without a `log10` per sample.
+const LATENCY_HIST_EDGES_US: [u64; LATENCY_HIST_BINS + 1] = [
+    10, 18, 32, 57, 100, 178, 317, 563, 1_000, 1_779, 3_163, 5_624, 10_000, 17_783, 31_623, 56_235,
+    100_000, 177_828, 316_228, 562_342, 1_000_000, 1_778_280, 3_162_278, 5_623_414, 10_000_000,
+];
+
+/// Lock-free, fixed log-scale histogram of ack latencies that a
+/// session updates as it retires acknowledged messages and the UI
+/// reads while the run goes on. Slot 0 counts samples below 10 µs,
+/// slots `1..=24` the bins of [`LATENCY_HIST_LOG10_MIN_US`]..
+/// [`LATENCY_HIST_LOG10_MAX_US`], the last slot samples of 10 s or
+/// more. One relaxed `fetch_add` per sample; each session owns its
+/// histogram, so writers never contend.
+#[derive(Debug)]
+pub struct LiveLatencyHist {
+    slots: [AtomicU64; LATENCY_HIST_BINS + 2],
+}
+
+impl Default for LiveLatencyHist {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+impl LiveLatencyHist {
+    /// Count one latency sample of `us` microseconds.
+    #[inline]
+    pub fn record_us(&self, us: u64) {
+        let slot = LATENCY_HIST_EDGES_US.partition_point(|&e| e <= us);
+        self.slots[slot].fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Current counts (relaxed; good enough for display).
+    pub fn snapshot(&self) -> LatencyHistSnapshot {
+        LatencyHistSnapshot {
+            slots: std::array::from_fn(|i| self.slots[i].load(Ordering::Relaxed)),
+        }
+    }
+}
+
+/// Point-in-time copy of a [`LiveLatencyHist`]; snapshots of several
+/// sessions add up with [`LatencyHistSnapshot::add`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct LatencyHistSnapshot {
+    slots: [u64; LATENCY_HIST_BINS + 2],
+}
+
+impl Default for LatencyHistSnapshot {
+    fn default() -> Self {
+        Self {
+            slots: [0; LATENCY_HIST_BINS + 2],
+        }
+    }
+}
+
+impl LatencyHistSnapshot {
+    /// Samples below 10 µs.
+    pub fn underflow(&self) -> u64 {
+        self.slots[0]
+    }
+    /// Samples of 10 s or more.
+    pub fn overflow(&self) -> u64 {
+        self.slots[LATENCY_HIST_BINS + 1]
+    }
+    /// The [`LATENCY_HIST_BINS`] in-range bin counts.
+    pub fn bins(&self) -> &[u64] {
+        &self.slots[1..=LATENCY_HIST_BINS]
+    }
+    /// Number of samples.
+    pub fn total(&self) -> u64 {
+        self.slots.iter().sum()
+    }
+    /// Add another session's counts.
+    pub fn add(&mut self, other: &LatencyHistSnapshot) {
+        for (a, b) in self.slots.iter_mut().zip(other.slots.iter()) {
+            *a = a.saturating_add(*b);
+        }
+    }
+
+    /// Estimated `q`-quantile (0..=1) in µs, `None` without samples.
+    /// Interpolates log-linearly inside the bin that holds the rank,
+    /// so the estimate is within one bin (a factor of 1.78) of the
+    /// true value. Underflow reports 10 µs, overflow 10 s.
+    pub fn quantile_us(&self, q: f64) -> Option<u64> {
+        let total = self.total();
+        if total == 0 {
+            return None;
+        }
+        // 1-based rank of the sample to report, as with nearest-rank.
+        let rank = ((q.clamp(0.0, 1.0) * total as f64).ceil() as u64).clamp(1, total);
+        let mut below = 0u64;
+        for (slot, &n) in self.slots.iter().enumerate() {
+            if n == 0 || below + n < rank {
+                below += n;
+                continue;
+            }
+            if slot == 0 {
+                return Some(LATENCY_HIST_EDGES_US[0]);
+            }
+            if slot == LATENCY_HIST_BINS + 1 {
+                return Some(LATENCY_HIST_EDGES_US[LATENCY_HIST_BINS]);
+            }
+            let w =
+                (LATENCY_HIST_LOG10_MAX_US - LATENCY_HIST_LOG10_MIN_US) / LATENCY_HIST_BINS as f64;
+            let lo = LATENCY_HIST_LOG10_MIN_US + (slot - 1) as f64 * w;
+            let frac = (rank - below) as f64 / n as f64;
+            return Some(10f64.powf(lo + frac * w).round() as u64);
+        }
+        None
+    }
 }
 
 /// Controls how the replayer paces its own sends. Benchmark mode
 /// defaults to firing as fast as the protocol's flow control allows
 /// (`AsFastAsPossible`); the other variant waits between sends to
 /// match the original pcap's inter-frame cadence.
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
 pub enum Pacing {
     /// Pipelined as fast as possible, limited only by the protocol's
     /// own window (e.g., IEC 104 k=12).
+    #[default]
     AsFastAsPossible,
     /// Sleep before each send so frame `i` is emitted at
     /// `session_epoch + frame_times_ns[i] / speed`. Requires the
     /// caller to populate `ProtoRunCfg::frame_times_ns`.
     OriginalTiming { speed: f64 },
-}
-
-impl Default for Pacing {
-    fn default() -> Self {
-        Self::AsFastAsPossible
-    }
 }
 
 /// Which side of the captured conversation the replayer will act as.
@@ -195,6 +572,13 @@ pub struct ProtoRunCfg {
     /// looping within one session is more spec-realistic than the
     /// outer "fresh handshake per iteration" model.
     pub loop_iterations: u64,
+    /// Byte offsets into the concatenated `client_segments` stream at
+    /// which the capture lost bytes (TCP reassembly gaps, see
+    /// `pcapload::ReassembledFlow::gaps`). The bytes on either side of
+    /// each offset were spliced together, so a protocol framer must
+    /// restart at every offset instead of reading a frame across it.
+    /// Empty = the stream is contiguous.
+    pub capture_gaps: Vec<usize>,
     // Note: protocol-specific knobs (e.g. IEC 104 CP56Time2a rewrite
     // settings, ASDU rewrite map) live inside `proto_config` JSON.
     // The protocol replayer parses what it needs from there.
@@ -206,15 +590,24 @@ pub struct ProtoReport {
     pub connected: bool,
     pub bytes_written: u64,
     pub bytes_read: u64,
+    /// Wall-clock length of the session (all iterations when merged),
+    /// idle-serve included. See [`ProtoReport::active_ms`].
     pub elapsed_ms: u64,
     pub messages_sent: u64,
     pub messages_received: u64,
     pub error: Option<String>,
 
     // --- benchmark stats ---
-    /// Raw per-message latency samples in microseconds, one entry per
-    /// client message whose matching server acknowledgement was seen.
-    /// Kept so the web UI can render a histogram.
+    /// Raw per-message **ack latency** samples in microseconds: the
+    /// time from writing a data message to receiving the peer's
+    /// protocol-level acknowledgement of it (IEC 104: the N(R) in an
+    /// S- or I-frame). The receive side is timestamped in the reader
+    /// thread when the frame arrives, not when the session loop gets
+    /// round to it. Note that this includes the peer's ack-deferral
+    /// policy (IEC 104 w / t2), so it is not a pure responsiveness
+    /// measure. One entry per message whose acknowledgement was seen.
+    /// Kept so the web UI can render a histogram. The `latency_*_us`
+    /// fields below are percentiles of these samples.
     pub latency_samples_us: Vec<u64>,
     pub latency_min_us: u64,
     pub latency_p50_us: u64,
@@ -222,7 +615,8 @@ pub struct ProtoReport {
     pub latency_p99_us: u64,
     pub latency_max_us: u64,
     pub latency_mean_us: u64,
-    /// Client messages per second sustained over the active session.
+    /// Client messages per second over the session's active time
+    /// ([`ProtoReport::active_ms`]), idle-serve excluded.
     pub throughput_msgs_per_sec: f64,
     /// Number of times the send loop blocked waiting for the server
     /// to free the flow-control window.
@@ -230,15 +624,390 @@ pub struct ProtoReport {
     /// Messages still in flight (sent, not yet acknowledged) when the
     /// session ended.
     pub unacked_at_end: u64,
+    /// Protocol-level conformance and session-behaviour detail
+    /// (violations, synthesized frames, stripped capture frames, idle
+    /// time). Protocols that do not track these leave it at default.
+    pub protocol: ProtocolStats,
+}
+
+/// Cap on [`ProtocolStats::protocol_errors`] entries kept per session.
+pub const PROTOCOL_ERRORS_CAP: usize = 64;
+/// Cap on [`ProtocolStats::synthesized_send_indices`] entries.
+pub const SYNTHESIZED_INDICES_CAP: usize = 100_000;
+/// Cap on [`ProtocolStats::command_response_us`] samples (the first
+/// ones are kept).
+pub const COMMAND_RESPONSE_SAMPLES_CAP: usize = 10_000;
+
+/// Cap on the per-type ActCon / ActTerm latency samples in
+/// [`CommandTypeStats`] (the first ones are kept).
+pub const COMMAND_LATENCY_SAMPLES_CAP: usize = 2_000;
+/// Cap on [`ProtocolStats::negative_confirmations`] entries.
+pub const NEGATIVE_CONFIRMATIONS_CAP: usize = 200;
+/// Cap on [`ProtocolStats::faults_injected`] entries.
+pub const FAULT_RECORDS_CAP: usize = 256;
+
+/// One protocol violation or protocol-level failure seen on a session.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProtocolError {
+    /// Milliseconds since the connection was established.
+    pub at_ms: u64,
+    /// Short machine-readable class, e.g. `"ns_mismatch"`,
+    /// `"nr_out_of_window"`, `"malformed_frame"`, `"t1_timeout"`,
+    /// `"unexpected_u_frame"`.
+    pub kind: String,
+    /// Human-readable detail (expected vs. received values).
+    pub detail: String,
+    /// True if the session closed the connection because of it.
+    pub fatal: bool,
+}
+
+/// Application-level command round trips of one command type
+/// (IEC 104: the ASDU type ID, e.g. 45 = C_SC_NA_1, 100 = C_IC_NA_1).
+///
+/// Slave role: commands received from the live master and answered by
+/// the replayer; latencies run from receiving the command to sending
+/// our confirmation / termination. Master role: commands replayed from
+/// the capture; latencies run from sending the command to receiving the
+/// live slave's confirmation / termination.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct CommandTypeStats {
+    pub type_id: u8,
+    /// Commands seen (slave: received; master: sent).
+    pub commands: u64,
+    /// Positive activation confirmations (or, for a read command, the
+    /// requested data).
+    pub act_con: u64,
+    /// Negative confirmations (P/N = 1, or COT 44..=47).
+    pub negative: u64,
+    /// Activation terminations.
+    pub act_term: u64,
+    /// Deactivation confirmations.
+    pub deact_con: u64,
+    /// Master role: commands that got no confirmation at all before
+    /// the session ended.
+    pub unanswered: u64,
+    /// Command → first confirmation (positive, negative or DeactCon)
+    /// in microseconds, capped at [`COMMAND_LATENCY_SAMPLES_CAP`].
+    pub actcon_us: Vec<u64>,
+    /// Command → ActTerm in microseconds, capped likewise.
+    pub actterm_us: Vec<u64>,
+}
+
+impl CommandTypeStats {
+    fn merge(&mut self, o: CommandTypeStats) {
+        self.commands += o.commands;
+        self.act_con += o.act_con;
+        self.negative += o.negative;
+        self.act_term += o.act_term;
+        self.deact_con += o.deact_con;
+        self.unanswered += o.unanswered;
+        for (dst, src) in [
+            (&mut self.actcon_us, o.actcon_us),
+            (&mut self.actterm_us, o.actterm_us),
+        ] {
+            let room = COMMAND_LATENCY_SAMPLES_CAP.saturating_sub(dst.len());
+            dst.extend(src.into_iter().take(room));
+        }
+    }
+}
+
+/// One negative command confirmation (slave role: one we sent; master
+/// role: one the live slave sent).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct NegativeConfirmation {
+    /// Milliseconds since the connection was established.
+    pub at_ms: u64,
+    pub type_id: u8,
+    /// Common address and information object address of the command.
+    pub ca: u16,
+    pub ioa: u32,
+    /// Cause of transmission of the negative reply (7, 9, 44..=47).
+    pub cot: u8,
+}
+
+/// One deliberately injected fault (IEC 104 `proto_config.faults`).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FaultRecord {
+    /// Milliseconds since the connection was established at which the
+    /// fault fired.
+    pub at_ms: u64,
+    /// Fault kind as configured, e.g. `"drop_iframes"`.
+    pub kind: String,
+    /// What was done (parameters, affected sequence numbers).
+    pub detail: String,
+    /// Frames the fault acted on (dropped, duplicated, corrupted,
+    /// delayed, malformed frames sent, TESTFR acts ignored, acks held).
+    pub frames_affected: u64,
+}
+
+/// How the peer reacted once the first fault was injected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct FaultReaction {
+    /// The peer closed the connection (FIN).
+    pub peer_closed: bool,
+    /// The peer reset the connection (RST).
+    pub peer_reset: bool,
+    /// The peer sent STOPDT act.
+    pub peer_stopdt: bool,
+    /// Distinct protocol error kinds recorded after the first fault
+    /// (see [`ProtocolError::kind`]).
+    pub protocol_errors: Vec<String>,
+    /// Milliseconds from the first fault to the first reaction above.
+    pub first_reaction_ms: Option<u64>,
+    /// One-line summary, e.g. "3 faults injected; peer reaction:
+    /// closed the connection 120 ms after the first fault".
+    pub summary: String,
+}
+
+/// Protocol-level session detail reported next to the generic
+/// counters in [`ProtoReport`].
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct ProtocolStats {
+    /// Number of protocol violations by the peer (sequence-number
+    /// errors, malformed frames, unexpected control frames) plus
+    /// protocol timer expiries. Every one is counted even when
+    /// `protocol_errors` is capped.
+    pub protocol_violations: u64,
+    /// Detail for the first [`PROTOCOL_ERRORS_CAP`] violations.
+    pub protocol_errors: Vec<ProtocolError>,
+    /// Data messages the replayer generated itself (IEC 104 slave:
+    /// GI/CI and command responses) rather than replaying from the
+    /// capture. They
+    /// are included in `messages_sent`.
+    pub synthesized_frames: u64,
+    /// 0-based index, among all data messages sent on this session
+    /// (`messages_sent` order), of each synthesized message, so the
+    /// analyzer can tell them apart from replayed ones. Capped at
+    /// [`SYNTHESIZED_INDICES_CAP`]. When reports from several
+    /// connections are merged, indices are offset by the earlier
+    /// sessions' `messages_sent`.
+    pub synthesized_send_indices: Vec<u64>,
+    /// Application-level response time in microseconds: from receiving
+    /// a command the replayer answers itself (IEC 104 slave: GI/CI
+    /// activation or control-direction command) to sending the first
+    /// response frame (ActCon or negative confirmation).
+    /// Capped at [`COMMAND_RESPONSE_SAMPLES_CAP`].
+    pub command_response_us: Vec<u64>,
+    /// Captured frames removed from the replay script because the
+    /// replayer synthesizes their equivalent live (IEC 104 slave:
+    /// captured GI/CI ActCon, Inrogen/Reqcogen data and ActTerm, and
+    /// captured command confirmations and read replies).
+    pub stripped_capture_frames: u64,
+    /// Number of capture gaps in the replayed stream.
+    pub capture_gaps: u64,
+    /// Bytes of the captured stream that did not frame (leading
+    /// partial frame, bytes around capture gaps, truncated tail).
+    pub script_skipped_bytes: u64,
+    /// Captured frames that straddled a capture gap and were dropped
+    /// instead of being sent corrupted.
+    pub script_dropped_frames: u64,
+    /// Time spent serving the peer after the captured script ended
+    /// (IEC 104 slave idle-serve phase), in milliseconds.
+    pub idle_serve_ms: u64,
+    /// Standalone acknowledgement frames sent (IEC 104 S-frames).
+    pub acks_sent: u64,
+    /// Keep-alive probes sent (IEC 104 TESTFR act after t3 idle).
+    pub keepalives_sent: u64,
+    /// Slave role: master connections that ended before the master's
+    /// STARTDT act (a port probe, a master that redialled); the
+    /// listener kept accepting after each.
+    pub connections_before_startdt: u64,
+    /// Per command type round-trip figures, sorted by type ID.
+    pub commands: Vec<CommandTypeStats>,
+    /// Negative command confirmations, capped at
+    /// [`NEGATIVE_CONFIRMATIONS_CAP`].
+    pub negative_confirmations: Vec<NegativeConfirmation>,
+    /// Deliberately injected faults, capped at [`FAULT_RECORDS_CAP`].
+    pub faults_injected: Vec<FaultRecord>,
+    /// Peer reaction to the injected faults; `None` when no fault
+    /// fired.
+    pub fault_reaction: Option<FaultReaction>,
+    /// How the peer acknowledged our data messages (F009): on a full
+    /// window, below it (timer-driven), or piggybacked on its own data.
+    pub ack_cadence: AckCadence,
+}
+
+/// The peer's observed acknowledgement cadence (F009). Ack latency
+/// mostly reflects this policy (IEC 104: a receiver acknowledges after
+/// at most w I-frames or when t2 expires), so the report says which of
+/// the two drove the acks. Only acknowledgements that retire at least
+/// one of our data messages count.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct AckCadence {
+    /// Standalone acknowledgements (IEC 104 S-frames).
+    pub standalone_acks: u64,
+    /// Standalone acknowledgements that covered at least the receive
+    /// window w configured for the session.
+    pub window_acks: u64,
+    /// Standalone acknowledgements that covered fewer than w messages.
+    pub below_window_acks: u64,
+    /// Of `below_window_acks`: the oldest message they acknowledged had
+    /// waited at least 90% of t2, so the peer's t2 timer sent them.
+    pub timer_acks: u64,
+    /// Acknowledgements carried by the peer's own data messages (IEC
+    /// 104: N(R) of a received I-frame).
+    pub piggybacked_acks: u64,
+    /// Data messages retired by all of the above.
+    pub messages_acked: u64,
+    /// Most messages retired by a single acknowledgement.
+    pub max_messages_per_ack: u64,
+    /// Longest time, in microseconds, the oldest message covered by a
+    /// below-window acknowledgement had waited. The peer's t2 shows up
+    /// here even when it differs from the session's configured t2.
+    pub below_window_max_wait_us: u64,
+}
+
+impl AckCadence {
+    /// Record one acknowledgement that retired `n` (> 0) messages.
+    /// `standalone` is false for an ack carried by a data message;
+    /// `window` is the session's w; `oldest_wait_ns` how long the
+    /// oldest retired message waited; `t2_ns` the session's t2.
+    pub fn record(
+        &mut self,
+        n: u64,
+        standalone: bool,
+        window: u64,
+        oldest_wait_ns: u64,
+        t2_ns: u64,
+    ) {
+        if n == 0 {
+            return;
+        }
+        self.messages_acked = self.messages_acked.saturating_add(n);
+        self.max_messages_per_ack = self.max_messages_per_ack.max(n);
+        if !standalone {
+            self.piggybacked_acks = self.piggybacked_acks.saturating_add(1);
+            return;
+        }
+        self.standalone_acks = self.standalone_acks.saturating_add(1);
+        if n >= window.max(1) {
+            self.window_acks = self.window_acks.saturating_add(1);
+        } else {
+            self.below_window_acks = self.below_window_acks.saturating_add(1);
+            self.below_window_max_wait_us =
+                self.below_window_max_wait_us.max(oldest_wait_ns / 1_000);
+            if t2_ns > 0 && oldest_wait_ns >= t2_ns / 10 * 9 {
+                self.timer_acks = self.timer_acks.saturating_add(1);
+            }
+        }
+    }
+
+    /// Fold another connection's or session's figures into `self`.
+    pub fn merge(&mut self, o: &AckCadence) {
+        self.standalone_acks = self.standalone_acks.saturating_add(o.standalone_acks);
+        self.window_acks = self.window_acks.saturating_add(o.window_acks);
+        self.below_window_acks = self.below_window_acks.saturating_add(o.below_window_acks);
+        self.timer_acks = self.timer_acks.saturating_add(o.timer_acks);
+        self.piggybacked_acks = self.piggybacked_acks.saturating_add(o.piggybacked_acks);
+        self.messages_acked = self.messages_acked.saturating_add(o.messages_acked);
+        self.max_messages_per_ack = self.max_messages_per_ack.max(o.max_messages_per_ack);
+        self.below_window_max_wait_us = self
+            .below_window_max_wait_us
+            .max(o.below_window_max_wait_us);
+    }
+}
+
+impl ProtocolStats {
+    /// Fold `other` (a later connection of the same session slot) into
+    /// `self`. `send_offset` is the number of data messages already
+    /// accounted in `self`'s report, used to rebase
+    /// `synthesized_send_indices`.
+    pub fn merge(&mut self, other: ProtocolStats, send_offset: u64) {
+        self.protocol_violations += other.protocol_violations;
+        let room = PROTOCOL_ERRORS_CAP.saturating_sub(self.protocol_errors.len());
+        self.protocol_errors
+            .extend(other.protocol_errors.into_iter().take(room));
+        self.synthesized_frames += other.synthesized_frames;
+        let room = SYNTHESIZED_INDICES_CAP.saturating_sub(self.synthesized_send_indices.len());
+        self.synthesized_send_indices.extend(
+            other
+                .synthesized_send_indices
+                .into_iter()
+                .take(room)
+                .map(|i| i + send_offset),
+        );
+        let room = COMMAND_RESPONSE_SAMPLES_CAP.saturating_sub(self.command_response_us.len());
+        self.command_response_us
+            .extend(other.command_response_us.into_iter().take(room));
+        // Script-level figures are identical for every connection of
+        // the same slot, so keep one copy rather than summing.
+        self.stripped_capture_frames = self
+            .stripped_capture_frames
+            .max(other.stripped_capture_frames);
+        self.capture_gaps = self.capture_gaps.max(other.capture_gaps);
+        self.script_skipped_bytes = self.script_skipped_bytes.max(other.script_skipped_bytes);
+        self.script_dropped_frames = self.script_dropped_frames.max(other.script_dropped_frames);
+        self.idle_serve_ms += other.idle_serve_ms;
+        self.acks_sent += other.acks_sent;
+        self.keepalives_sent += other.keepalives_sent;
+        self.connections_before_startdt += other.connections_before_startdt;
+        for c in other.commands {
+            match self.commands.iter_mut().find(|x| x.type_id == c.type_id) {
+                Some(x) => x.merge(c),
+                None => self.commands.push(c),
+            }
+        }
+        self.commands.sort_by_key(|c| c.type_id);
+        let room = NEGATIVE_CONFIRMATIONS_CAP.saturating_sub(self.negative_confirmations.len());
+        self.negative_confirmations
+            .extend(other.negative_confirmations.into_iter().take(room));
+        let room = FAULT_RECORDS_CAP.saturating_sub(self.faults_injected.len());
+        self.faults_injected
+            .extend(other.faults_injected.into_iter().take(room));
+        if let Some(o) = other.fault_reaction {
+            match &mut self.fault_reaction {
+                None => self.fault_reaction = Some(o),
+                Some(r) => {
+                    r.peer_closed |= o.peer_closed;
+                    r.peer_reset |= o.peer_reset;
+                    r.peer_stopdt |= o.peer_stopdt;
+                    for k in o.protocol_errors {
+                        if !r.protocol_errors.contains(&k) {
+                            r.protocol_errors.push(k);
+                        }
+                    }
+                    r.first_reaction_ms = r.first_reaction_ms.or(o.first_reaction_ms);
+                    if r.summary.len() < 512 {
+                        r.summary = format!("{}; then: {}", r.summary, o.summary);
+                    }
+                }
+            }
+        }
+        self.ack_cadence.merge(&other.ack_cadence);
+    }
 }
 
 impl ProtoReport {
+    /// Active time of the session in milliseconds: `elapsed_ms` (the
+    /// total, wall clock) minus the time spent idle-serving the peer
+    /// after the script ([`ProtocolStats::idle_serve_ms`]). Both add up
+    /// when reports are merged, so this stays the sum of the active
+    /// times (N4).
+    pub fn active_ms(&self) -> u64 {
+        self.elapsed_ms.saturating_sub(self.protocol.idle_serve_ms)
+    }
+
     /// Compute latency percentile fields and throughput from the raw
-    /// `latency_samples_us` and the session's active send window.
-    /// Call this once at the end of a session, after all samples have
-    /// been recorded and `elapsed_ms` and `messages_sent` are set.
+    /// `latency_samples_us` and the session's active time
+    /// ([`ProtoReport::active_ms`]). Call this once at the end of a
+    /// session, after all samples have been recorded and `elapsed_ms`,
+    /// `protocol.idle_serve_ms` and `messages_sent` are set.
     pub fn finalize_latency(&mut self) {
+        // Throughput does not depend on the latency samples; a session
+        // that never saw an ACK still sent messages.
+        let active_ms = self.active_ms();
+        self.throughput_msgs_per_sec = if active_ms > 0 {
+            (self.messages_sent as f64) * 1000.0 / (active_ms as f64)
+        } else {
+            0.0
+        };
         if self.latency_samples_us.is_empty() {
+            self.latency_min_us = 0;
+            self.latency_max_us = 0;
+            self.latency_p50_us = 0;
+            self.latency_p90_us = 0;
+            self.latency_p99_us = 0;
+            self.latency_mean_us = 0;
             return;
         }
         let mut v = self.latency_samples_us.clone();
@@ -255,10 +1024,6 @@ impl ProtoReport {
         self.latency_p99_us = at(0.99);
         let sum: u128 = v.iter().map(|x| *x as u128).sum();
         self.latency_mean_us = (sum / n as u128) as u64;
-        if self.elapsed_ms > 0 {
-            self.throughput_msgs_per_sec =
-                (self.messages_sent as f64) * 1000.0 / (self.elapsed_ms as f64);
-        }
     }
 }
 
@@ -339,6 +1104,13 @@ pub trait ProtoReplayer: Send + Sync {
     fn readiness(&self) -> Readiness;
     fn run(&self, cfg: ProtoRunCfg) -> ProtoReport;
 
+    /// Validate a protocol-specific `proto_config` JSON string up front,
+    /// so a bad config is rejected when the run is submitted instead of
+    /// surfacing later as a session error. Default: accept anything.
+    fn validate_config(&self, _proto_config: Option<&str>) -> anyhow::Result<()> {
+        Ok(())
+    }
+
     /// Extract one timestamp per protocol-level message in the
     /// reassembled flow `payload`. Each timestamp is in nanoseconds,
     /// **relative to the first message** (so `out[0]` is always 0).
@@ -375,11 +1147,7 @@ pub trait ProtoReplayer: Send + Sync {
     /// matches any of those ports and produces a verdict from raw
     /// session counts. Protocols that need richer analysis (e.g.
     /// IEC 104's mid-flow vs handshake breakdown) override this.
-    fn quick_viability(
-        &self,
-        p: &dyn LoadedPcapView,
-        file_size_bytes: u64,
-    ) -> ProtoViability {
+    fn quick_viability(&self, p: &dyn LoadedPcapView, file_size_bytes: u64) -> ProtoViability {
         use std::collections::HashSet;
         let ports: &[u16] = self.well_known_ports();
         let mut client_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
@@ -387,9 +1155,17 @@ pub trait ProtoReplayer: Send + Sync {
         let mut client_bytes = 0u64;
         let mut server_bytes = 0u64;
         for f in p.flows() {
-            let (sip, sp) = match f.server { Some(x) => x, None => continue };
-            if !ports.contains(&sp) { continue; }
-            let (cip, _) = match f.client { Some(x) => x, None => continue };
+            let (sip, sp) = match f.server {
+                Some(x) => x,
+                None => continue,
+            };
+            if !ports.contains(&sp) {
+                continue;
+            }
+            let (cip, _) = match f.client {
+                Some(x) => x,
+                None => continue,
+            };
             client_ips.insert(cip);
             server_ips.insert(sip);
             let (cb, sb) = p.flow_payload_bytes(f.flow_idx);
@@ -399,12 +1175,18 @@ pub trait ProtoReplayer: Send + Sync {
         let m = client_ips.len() as u64;
         let s = server_ips.len() as u64;
         let max_sess = m.max(s);
-        let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
+        let mb = |b: u64| b.div_ceil(1024 * 1024);
         let est = mb(file_size_bytes) + mb(client_bytes.max(server_bytes)) + max_sess * 2 + 32;
         let (verdict, reason): (&str, String) = if max_sess == 0 {
-            ("ok", format!("no flows for protocol {} on ports {:?}", self.name(), ports))
+            (
+                "ok",
+                format!("no flows for protocol {} on ports {:?}", self.name(), ports),
+            )
         } else {
-            ("ok", format!("{} session(s) detected for {}", max_sess, self.name()))
+            (
+                "ok",
+                format!("{} session(s) detected for {}", max_sess, self.name()),
+            )
         };
         ProtoViability {
             client_payload_bytes: client_bytes,
@@ -480,6 +1262,109 @@ pub trait LoadedPcapView {
     fn flow_server_payload(&self, _flow_idx: usize) -> Vec<u8> {
         Vec::new()
     }
+    /// Reassemble one side of a flow once and hand it to `f` without
+    /// copying (P07). `f` is not called when that side carries no
+    /// payload. The default is built on
+    /// [`LoadedPcapView::flow_server_payload`] (server side only, no
+    /// gap information); real views override it.
+    fn with_flow_side(
+        &self,
+        flow_idx: usize,
+        side: FlowSide,
+        f: &mut dyn FnMut(&FlowSideView<'_>),
+    ) {
+        if side == FlowSide::Server {
+            let payload = self.flow_server_payload(flow_idx);
+            if !payload.is_empty() {
+                f(&FlowSideView {
+                    payload: &payload,
+                    gap_offsets: &[],
+                    missing_bytes: 0,
+                });
+            }
+        }
+    }
+    /// Packets in the capture (for the memory estimate); 0 = unknown.
+    fn packet_count(&self) -> u64 {
+        0
+    }
+}
+
+/// One side of a TCP flow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlowSide {
+    /// Bytes the client sent (master role replays them).
+    Client,
+    /// Bytes the server sent (slave role replays them).
+    Server,
+}
+
+/// One reassembled side of a flow, see
+/// [`LoadedPcapView::with_flow_side`].
+#[derive(Debug, Clone, Copy)]
+pub struct FlowSideView<'a> {
+    pub payload: &'a [u8],
+    /// Payload offsets of the capture gaps (TCP sequence holes), in
+    /// order; an offset of 0 is a lost first segment.
+    pub gap_offsets: &'a [usize],
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+/// How well one captured flow side lends itself to replay, to pick one
+/// flow per endpoint when an endpoint appears in several (reconnects,
+/// port reuse). The scheduler and the upload viability rank flows the
+/// same way (N18): the longest contiguous run of bytes first (the most
+/// that replays without a hole), then fewer gaps, then more bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FlowQuality {
+    /// Longest stretch of payload without a capture gap inside it.
+    pub longest_chunk: usize,
+    /// Capture gaps, a lost first segment included.
+    pub gaps: usize,
+    pub payload_bytes: usize,
+    /// Sequence-space bytes the capture lost.
+    pub missing_bytes: u64,
+}
+
+impl FlowQuality {
+    /// Quality of a side with `payload_len` bytes and capture gaps at
+    /// `gap_offsets` (sorted payload offsets).
+    pub fn new(payload_len: usize, gap_offsets: &[usize], missing_bytes: u64) -> Self {
+        let mut longest = 0usize;
+        let mut start = 0usize;
+        for &o in gap_offsets {
+            let o = o.min(payload_len);
+            longest = longest.max(o.saturating_sub(start));
+            start = start.max(o);
+        }
+        longest = longest.max(payload_len.saturating_sub(start));
+        Self {
+            longest_chunk: longest,
+            gaps: gap_offsets.len(),
+            payload_bytes: payload_len,
+            missing_bytes,
+        }
+    }
+
+    /// Quality of a reassembled side.
+    pub fn of(side: &FlowSideView<'_>) -> Self {
+        Self::new(side.payload.len(), side.gap_offsets, side.missing_bytes)
+    }
+
+    /// Strictly better replay candidate than `other` (ties keep the
+    /// flow seen first).
+    pub fn better_than(&self, other: &FlowQuality) -> bool {
+        (
+            self.longest_chunk,
+            std::cmp::Reverse(self.gaps),
+            self.payload_bytes,
+        ) > (
+            other.longest_chunk,
+            std::cmp::Reverse(other.gaps),
+            other.payload_bytes,
+        )
+    }
 }
 
 /// Minimal flow descriptor a viability impl needs.
@@ -553,6 +1438,46 @@ pub struct AnalyzeCtx {
     /// only concept — not part of the run's proto_config (the runner
     /// never needs it).
     pub cp56_tolerance_ms: f64,
+    /// Facts about the run (or this endpoint's session) the capture is
+    /// judged against. `RunFacts::default()` means "unknown": the
+    /// analyzer then infers loop iterations from the stream and does
+    /// not judge timing.
+    pub run: RunFacts,
+}
+
+/// Run-level facts a protocol analyzer needs to judge one captured
+/// session fairly. Supplied by the caller (the webui shell) per
+/// endpoint; every field has a conservative default.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RunFacts {
+    /// Script iterations this TCP session was configured to play
+    /// back-to-back (loop-within-session). `0` = unknown or unbounded:
+    /// the analyzer detects iterations as restarts of the script.
+    pub iterations_per_session: u64,
+    /// The run (or this endpoint's session) ended on a user stop or
+    /// cancel, so a truncated final iteration is expected and is
+    /// reported as a stopped tail rather than as missing frames.
+    pub stopped_early: bool,
+    /// Pacing speed factor when the run replayed original timing
+    /// (`1.0` = real time). `None` = as-fast-as-possible or unknown:
+    /// timing is measured and reported but not judged.
+    pub paced_speed: Option<f64>,
+}
+
+/// Pass/fail class of a per-endpoint verdict, so the protocol-agnostic
+/// fleet rollup never has to interpret protocol verdict strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum VerdictOutcome {
+    /// The replay was verified correct.
+    Pass,
+    /// The replay was verified to deviate (or did not happen).
+    Fail,
+    /// Nothing could be verified (no reference, unparseable input…).
+    /// The default, so a protocol that never sets it cannot be counted
+    /// as correct by accident.
+    #[default]
+    Inconclusive,
 }
 
 /// Per-slave result the analyzer shell gets back from [`ProtoReplayer::analyze_flow`].
@@ -589,6 +1514,14 @@ pub struct ProtoSlaveAnalysis {
     /// has a "when should each message have gone out" concept, so this
     /// is a generic field rather than protocol_specific.
     pub pacing_samples: Vec<[f64; 2]>,
+    /// How many pacing samples `pacing_samples` stands for before the
+    /// protocol decimated it. `0` means "not decimated" (same as
+    /// `pacing_samples.len()`). Lets the fleet timeline weight each
+    /// endpoint by its real frame count.
+    pub pacing_samples_total: usize,
+    /// Pass / fail / inconclusive class of `verdict`, used by the
+    /// fleet rollup.
+    pub outcome: VerdictOutcome,
 }
 
 impl Default for ProtoSlaveAnalysis {
@@ -603,6 +1536,8 @@ impl Default for ProtoSlaveAnalysis {
             notes: Vec::new(),
             protocol_specific: serde_json::Value::Null,
             pacing_samples: Vec::new(),
+            pacing_samples_total: 0,
+            outcome: VerdictOutcome::Inconclusive,
         }
     }
 }
@@ -628,11 +1563,12 @@ pub struct FleetDriftTimeline {
 
 /// Boilerplate helper for stub implementations.
 pub fn stub_report(name: &str) -> ProtoReport {
-    let mut r = ProtoReport::default();
-    r.error = Some(format!(
-        "proto_{name} is a v1 stub — fall back to raw or generic TCP session"
-    ));
-    r
+    ProtoReport {
+        error: Some(format!(
+            "proto_{name} is a v1 stub — fall back to raw or generic TCP session"
+        )),
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]
@@ -640,17 +1576,177 @@ mod tests {
     use super::*;
 
     #[test]
+    fn ack_cadence_classifies_and_merges() {
+        let t2 = 10_000_000_000; // 10 s
+        let mut a = AckCadence::default();
+        a.record(0, true, 8, 0, t2); // retired nothing: ignored
+        a.record(8, true, 8, 50_000_000, t2); // full window
+        a.record(12, true, 8, 50_000_000, t2); // more than w
+        a.record(3, true, 8, 9_500_000_000, t2); // t2 timer
+        a.record(3, true, 8, 1_000_000_000, t2); // early, below w
+        a.record(2, false, 8, 9_999_000_000, t2); // piggybacked
+        assert_eq!(a.standalone_acks, 4);
+        assert_eq!(a.window_acks, 2);
+        assert_eq!(a.below_window_acks, 2);
+        assert_eq!(a.timer_acks, 1);
+        assert_eq!(a.piggybacked_acks, 1);
+        assert_eq!(a.messages_acked, 28);
+        assert_eq!(a.max_messages_per_ack, 12);
+        assert_eq!(a.below_window_max_wait_us, 9_500_000);
+        let mut b = AckCadence::default();
+        b.record(20, true, 8, 0, t2);
+        let mut stats = ProtocolStats {
+            ack_cadence: a,
+            ..Default::default()
+        };
+        stats.merge(
+            ProtocolStats {
+                ack_cadence: b,
+                ..Default::default()
+            },
+            0,
+        );
+        assert_eq!(stats.ack_cadence.window_acks, 3);
+        assert_eq!(stats.ack_cadence.messages_acked, 48);
+        assert_eq!(stats.ack_cadence.max_messages_per_ack, 20);
+    }
+
+    #[test]
+    fn live_hist_edges_match_the_log_formula() {
+        let w = (LATENCY_HIST_LOG10_MAX_US - LATENCY_HIST_LOG10_MIN_US) / LATENCY_HIST_BINS as f64;
+        for (i, &e) in LATENCY_HIST_EDGES_US.iter().enumerate() {
+            let exact = 10f64.powf(LATENCY_HIST_LOG10_MIN_US + i as f64 * w);
+            assert_eq!(e, (exact - 1e-9).ceil() as u64, "edge {i}");
+        }
+        // Every integer sample lands where the float formula puts it.
+        let h = LiveLatencyHist::default();
+        for us in [
+            0u64,
+            1,
+            9,
+            10,
+            17,
+            18,
+            31,
+            32,
+            999,
+            1_000,
+            1_778,
+            1_779,
+            9_999_999,
+            10_000_000,
+            u64::MAX,
+        ] {
+            h.record_us(us);
+        }
+        let s = h.snapshot();
+        assert_eq!(s.underflow(), 3);
+        assert_eq!(s.overflow(), 2);
+        assert_eq!(s.total(), 15);
+        assert_eq!(s.bins()[0], 2); // 10, 17
+        assert_eq!(s.bins()[1], 2); // 18, 31
+        assert_eq!(s.bins()[2], 1); // 32
+        assert_eq!(s.bins()[7], 1); // 999 in [563, 1000)
+        assert_eq!(s.bins()[8], 2); // 1000, 1778
+        assert_eq!(s.bins()[9], 1); // 1779
+        assert_eq!(s.bins()[23], 1); // 9_999_999
+    }
+
+    #[test]
+    fn live_hist_quantiles_are_within_one_bin() {
+        assert_eq!(LatencyHistSnapshot::default().quantile_us(0.5), None);
+        let h = LiveLatencyHist::default();
+        // 90 samples at ~2 ms, 10 at ~200 ms.
+        for _ in 0..90 {
+            h.record_us(2_000);
+        }
+        for _ in 0..10 {
+            h.record_us(200_000);
+        }
+        let s = h.snapshot();
+        let p50 = s.quantile_us(0.5).unwrap();
+        let p99 = s.quantile_us(0.99).unwrap();
+        assert!((1_779..3_163).contains(&p50), "p50 {p50}");
+        assert!((177_828..316_228).contains(&p99), "p99 {p99}");
+        // Sums of sessions add up.
+        let mut sum = s;
+        sum.add(&s);
+        assert_eq!(sum.total(), 200);
+        assert_eq!(sum.quantile_us(0.5), Some(p50));
+        // Out-of-range samples report the edges.
+        let lo = LiveLatencyHist::default();
+        lo.record_us(3);
+        assert_eq!(lo.snapshot().quantile_us(0.99), Some(10));
+        let hi = LiveLatencyHist::default();
+        hi.record_us(20_000_000);
+        assert_eq!(hi.snapshot().quantile_us(0.5), Some(10_000_000));
+    }
+
+    #[test]
+    fn flow_quality_prefers_the_longest_contiguous_run() {
+        let clean = FlowQuality::new(1000, &[], 0);
+        assert_eq!(clean.longest_chunk, 1000);
+        let gapped = FlowQuality::new(1200, &[300], 50);
+        assert_eq!(gapped.longest_chunk, 900);
+        assert_eq!(gapped.gaps, 1);
+        assert!(clean.better_than(&gapped));
+        assert!(!gapped.better_than(&clean));
+        // A lost first segment splits nothing but counts as a gap.
+        let lead = FlowQuality::new(1000, &[0], 6);
+        assert_eq!(lead.longest_chunk, 1000);
+        assert!(clean.better_than(&lead));
+        // A big flow with one small hole beats a short clean one.
+        let short = FlowQuality::new(100, &[], 0);
+        assert!(gapped.better_than(&short));
+        // Ties keep the first.
+        assert!(!clean.better_than(&clean));
+        assert_eq!(FlowQuality::new(10, &[3, 3, 8], 1).longest_chunk, 5);
+    }
+
+    #[test]
+    fn protocol_stats_merge_respects_caps() {
+        let mut a = ProtocolStats {
+            command_response_us: vec![1; COMMAND_RESPONSE_SAMPLES_CAP - 1],
+            synthesized_send_indices: vec![0, 1],
+            protocol_errors: vec![ProtocolError::default(); PROTOCOL_ERRORS_CAP],
+            protocol_violations: PROTOCOL_ERRORS_CAP as u64,
+            ..Default::default()
+        };
+        let b = ProtocolStats {
+            command_response_us: vec![2; 10],
+            synthesized_send_indices: vec![0, 3],
+            protocol_errors: vec![ProtocolError::default(); 3],
+            protocol_violations: 3,
+            stripped_capture_frames: 4,
+            ..Default::default()
+        };
+        a.merge(b.clone(), 10);
+        assert_eq!(a.command_response_us.len(), COMMAND_RESPONSE_SAMPLES_CAP);
+        assert_eq!(a.synthesized_send_indices, vec![0, 1, 10, 13]);
+        assert_eq!(a.protocol_errors.len(), PROTOCOL_ERRORS_CAP);
+        assert_eq!(a.protocol_violations, PROTOCOL_ERRORS_CAP as u64 + 3);
+        a.merge(b, 20);
+        assert_eq!(a.stripped_capture_frames, 4);
+    }
+
+    #[test]
     fn finalize_latency_basic() {
-        let mut r = ProtoReport::default();
-        r.latency_samples_us = (1..=100).collect(); // 1..100 µs uniform
-        r.messages_sent = 100;
-        r.elapsed_ms = 100;
+        let mut r = ProtoReport {
+            latency_samples_us: (1..=100).collect(), // 1..100 µs uniform
+            messages_sent: 100,
+            elapsed_ms: 100,
+            ..Default::default()
+        };
         r.finalize_latency();
         assert_eq!(r.latency_min_us, 1);
         assert_eq!(r.latency_max_us, 100);
         // With 100 evenly-spaced samples, p50 lands around the middle,
         // p99 lands near the top. Exact index is (n-1)*p rounded.
-        assert!(r.latency_p50_us >= 49 && r.latency_p50_us <= 52, "p50 was {}", r.latency_p50_us);
+        assert!(
+            r.latency_p50_us >= 49 && r.latency_p50_us <= 52,
+            "p50 was {}",
+            r.latency_p50_us
+        );
         assert!(r.latency_p99_us >= 98, "p99 was {}", r.latency_p99_us);
         assert_eq!(r.latency_mean_us, 50);
         // 100 messages in 100 ms -> 1000 msg/s
@@ -663,5 +1759,77 @@ mod tests {
         r.finalize_latency();
         assert_eq!(r.latency_p99_us, 0);
         assert_eq!(r.latency_mean_us, 0);
+    }
+
+    #[test]
+    fn finalize_latency_throughput_without_samples() {
+        let mut r = ProtoReport {
+            messages_sent: 50,
+            elapsed_ms: 500,
+            ..Default::default()
+        };
+        r.finalize_latency();
+        assert_eq!(r.throughput_msgs_per_sec as u64, 100);
+    }
+
+    #[test]
+    fn reservoir_is_bounded_and_counts_everything() {
+        let mut r = LatencyReservoir::with_seed(100, 7);
+        r.extend(0..10_000u64);
+        assert_eq!(r.len(), 100);
+        assert_eq!(r.seen(), 10_000);
+        // Uniform sample of 0..10000: the mean should be near 5000.
+        let mean = r.as_slice().iter().sum::<u64>() / 100;
+        assert!((3000..7000).contains(&mean), "mean {mean}");
+    }
+
+    #[test]
+    fn reservoir_keeps_all_below_capacity() {
+        let mut r = LatencyReservoir::with_seed(10, 1);
+        r.extend([5, 6, 7]);
+        assert_eq!(r.into_vec(), vec![5, 6, 7]);
+    }
+
+    #[test]
+    fn progress_cancel_checks_run_and_session_flags() {
+        let p = MessageProgress::default();
+        assert!(!p.is_cancelled());
+        p.run_cancel.store(true, Ordering::Relaxed);
+        assert!(p.is_cancelled());
+        let q = MessageProgress::default();
+        q.cancel.store(true, Ordering::Relaxed);
+        assert!(progress_cancelled(&Some(q)));
+        assert!(!progress_cancelled(&None));
+    }
+
+    #[test]
+    fn cancellable_sleep_returns_promptly() {
+        let flag = AtomicBool::new(true);
+        let t = Instant::now();
+        assert!(!sleep_cancellable(Duration::from_secs(3600), || flag.load(Ordering::Relaxed)));
+        assert!(t.elapsed() < Duration::from_millis(50));
+        // Huge durations must not overflow Instant arithmetic.
+        assert!(!sleep_cancellable(Duration::MAX, || true));
+        assert!(sleep_cancellable(Duration::from_millis(5), || false));
+    }
+
+    #[test]
+    fn poll_until_cancellable_outcomes() {
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let r: Wait<u8> = poll_until_cancellable(
+            deadline,
+            || false,
+            |slice| {
+                assert!(slice <= CANCEL_POLL_INTERVAL);
+                std::thread::sleep(slice.min(Duration::from_millis(5)));
+                None
+            },
+        );
+        assert_eq!(r, Wait::TimedOut);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let r = poll_until_cancellable(deadline, || false, |_| Some(3u8));
+        assert_eq!(r, Wait::Done(3));
+        let r: Wait<u8> = poll_until_cancellable(deadline, || true, |_| None);
+        assert_eq!(r, Wait::Cancelled);
     }
 }

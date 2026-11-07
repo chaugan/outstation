@@ -1,14 +1,54 @@
-//! Manage Linux bridges and TAP interfaces for outstation.
+//! Manage Linux bridges and veth ports for outstation, safely.
 //!
 //! v1 shells out to `ip` from iproute2. This keeps the crate tiny and the
-//! error messages transparent. A future revision can swap to rtnetlink for
-//! fewer process spawns at setup time.
+//! error messages transparent.
+//!
+//! Host safety is enforced here, in the library, regardless of what a
+//! caller (e.g. an unauthenticated HTTP request) asks for:
+//!
+//! * [`names`]: interface names are strictly validated and, by default,
+//!   derived from the run id; every interface we create carries an
+//!   `outstation:<run_id>` ifalias marker, and reclaim only deletes
+//!   marked interfaces ([`reclaim_stale`], [`reclaim_run_ifaces`]).
+//! * [`protect`]: the default-route NIC, NICs carrying protected
+//!   addresses, real bridges and bridge ports are never enslaved or
+//!   aliased unless the caller sets an explicit `force`.
+//! * [`alias`]: `/32 noprefixroute` aliases, reference-counted, and
+//!   never deleting an address we did not add.
+//! * [`guard`] + [`journal`]: every sysctl, offload and iptables change
+//!   is journaled (locked, atomic writes) before it is applied, and
+//!   [`cleanup_all`] restores the host from the journal after a crash.
 
 use std::ffi::OsStr;
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
+
+pub mod alias;
+pub mod cleanup;
+pub mod dad;
+pub mod guard;
+pub mod harden;
+pub mod journal;
+pub mod local;
+pub mod names;
+pub mod protect;
+
+pub use alias::{
+    add_ip_alias, del_ip_alias, forget_alias, ip_is_local, reclaim_recorded_aliases, record_alias,
+    AliasLease, AliasOutcome,
+};
+pub use cleanup::{cleanup_all, iface_owner, reclaim_run_ifaces, reclaim_stale, CleanupReport};
+pub use dad::{check_address_free, probe_address_in_use, DAD_TIMEOUT};
+pub use guard::{EgressGuard, GatewayGuard};
+pub use journal::{aliases_path, guards_path, DEFAULT_STATE_DIR};
+pub use local::{local_iface_of, session_ifaces};
+pub use names::{IfaceNames, PortKind};
+pub use protect::{
+    check_nic_allowed, is_bridge, is_bridge_port, nic_assessment, validate_alias_ip,
+    validate_port_ip, validate_port_ips, NicAssessment, Protection,
+};
 
 pub type MacAddr = [u8; 6];
 
@@ -32,41 +72,180 @@ pub fn parse_mac(s: &str) -> Result<MacAddr> {
     Ok(out)
 }
 
-/// A bridge plus any number of TAP interfaces enslaved to it.
+/// One port of a batch, see [`Topology::add_ports`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PortSpec {
+    /// Bridge-side interface name; the inject side is `{id}i`.
+    pub id: String,
+    pub mac: Option<MacAddr>,
+    pub src_ip: Option<std::net::Ipv4Addr>,
+}
+
+/// Largest number of worker threads that set up or tear down ports at
+/// once. Each port is a dozen `ip`/`tc`/`ethtool` processes and sysctl
+/// writes: process start-up dominates and runs in parallel, while the
+/// kernel serialises the netlink changes themselves (rtnl).
+pub const PORT_WORKERS: usize = 8;
+
+fn port_workers(jobs: usize) -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .clamp(1, PORT_WORKERS)
+        .min(jobs.max(1))
+}
+
+/// Run `f` over `items` on at most [`PORT_WORKERS`] threads and return
+/// the results in item order. After the first error no new item is
+/// started (items not started return `None`).
+fn par_map<T: Sync, R: Send>(items: &[T], f: impl Fn(&T) -> (R, bool) + Sync) -> Vec<Option<R>> {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Mutex;
+    let next = AtomicUsize::new(0);
+    let failed = AtomicBool::new(false);
+    let out: Mutex<Vec<Option<R>>> = Mutex::new((0..items.len()).map(|_| None).collect());
+    std::thread::scope(|sc| {
+        for _ in 0..port_workers(items.len()) {
+            sc.spawn(|| loop {
+                if failed.load(Ordering::Relaxed) {
+                    return;
+                }
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                let Some(item) = items.get(i) else { return };
+                let (r, ok) = f(item);
+                if !ok {
+                    failed.store(true, Ordering::Relaxed);
+                }
+                out.lock().unwrap_or_else(|e| e.into_inner())[i] = Some(r);
+            });
+        }
+    });
+    out.into_inner().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Set the `outstation:<run_id>` ownership marker on `iface`.
+fn mark_owned(iface: &str, run_id: u64) -> Result<()> {
+    ip([
+        "link",
+        "set",
+        "dev",
+        iface,
+        "alias",
+        &names::owner_marker(run_id),
+    ])
+}
+
+/// A bridge plus the veth ports outstation created on it, all marked
+/// with the run's ownership marker.
 ///
-/// Tear down explicitly with [`Topology::teardown`]. Dropping without
-/// teardown logs a warning and leaves interfaces in place — which is what
-/// you want if the process crashed, so they can be reclaimed on restart.
+/// [`Topology::teardown`] removes everything explicitly and reports
+/// errors. Dropping a topology without teardown also tears it down
+/// (best effort, with a warning), so early `?` returns cannot leak
+/// interfaces. Use [`Topology::leak`] to keep them on purpose.
 pub struct Topology {
     pub bridge: String,
     pub taps: Vec<String>,
-    /// True if `create_bridge` created the bridge on this run. If the
-    /// bridge already existed when we started, we leave it in place on
-    /// teardown — the caller owns its lifecycle.
-    bridge_owned: bool,
-    leaked: bool,
+    run_id: u64,
+    bridge_created: bool,
+    /// Pre-existing NICs we enslaved; released (`nomaster`) on teardown.
+    enslaved: Vec<String>,
+    /// Host-stack isolation of the run's interfaces ([`harden`]).
+    hardening: Option<harden::Hardening>,
+    /// Capture device every port's ingress is mirrored to (`tc mirred`).
+    mirror: Option<String>,
+    /// MAC of every port's source identity (the end that sends its
+    /// frames), see [`Topology::port_macs`].
+    port_macs: Vec<MacAddr>,
+    done: bool,
 }
 
 impl Topology {
-    pub fn new(bridge: impl Into<String>) -> Self {
-        Self {
-            bridge: bridge.into(),
+    /// A topology for `bridge`, owned by `run_id`. The bridge name must
+    /// pass [`names::validate_prefix`] (`^pcr[a-z0-9_]{0,8}$`).
+    pub fn new(bridge: impl Into<String>, run_id: u64) -> Result<Self> {
+        let bridge = bridge.into();
+        names::validate_prefix(&bridge).context("bridge name")?;
+        Ok(Self {
+            bridge,
             taps: Vec::new(),
-            bridge_owned: false,
-            leaked: false,
-        }
+            run_id,
+            bridge_created: false,
+            enslaved: Vec::new(),
+            hardening: None,
+            mirror: None,
+            port_macs: Vec::new(),
+            done: false,
+        })
     }
 
-    /// Create (or reuse) the bridge and bring it up. If the bridge
-    /// already existed, [`Topology::teardown`] will leave it in place.
+    /// Isolate every interface this topology creates from the host
+    /// stack (see [`harden`]): `prefix` is the run's interface prefix
+    /// (`pcr<tag>_`), `peer` the run's target, the only address allowed
+    /// to reach session source IPs. Call before [`Topology::create_bridge`].
+    /// Ports with a source IP are refused without it.
+    pub fn harden(
+        &mut self,
+        prefix: &str,
+        peer: Option<std::net::Ipv4Addr>,
+        peer_port: Option<u16>,
+        state_dir: &std::path::Path,
+    ) -> Result<()> {
+        if self.hardening.is_some() {
+            bail!("topology is already hardened");
+        }
+        self.hardening = Some(harden::Hardening::install(
+            prefix,
+            peer,
+            peer_port,
+            self.run_id,
+            state_dir,
+        )?);
+        Ok(())
+    }
+
+    pub fn run_id(&self) -> u64 {
+        self.run_id
+    }
+
+    /// Create the bridge, mark it as ours and bring it up. Refuses to
+    /// reuse an interface that already exists: a stale one of ours
+    /// must be reclaimed first ([`reclaim_run_ifaces`]), and a foreign
+    /// one is never touched.
     pub fn create_bridge(&mut self) -> Result<()> {
         if iface_exists(&self.bridge)? {
-            info!(name = %self.bridge, "bridge already exists, reusing — will not delete on teardown");
-            self.bridge_owned = false;
-        } else {
-            ip(["link", "add", &self.bridge, "type", "bridge"])?;
-            self.bridge_owned = true;
+            let owner = iface_owner(&self.bridge);
+            match owner {
+                Some(r) => bail!(
+                    "bridge {} already exists (left by outstation run {r}); \
+                     run cleanup or pick another name",
+                    self.bridge
+                ),
+                None => bail!(
+                    "interface {} already exists and is not managed by outstation; \
+                     refusing to reuse or delete it",
+                    self.bridge
+                ),
+            }
         }
+        // No multicast snooping: a snooping bridge joins the
+        // all-snoopers group (224.0.0.106) and sends IGMPv3 reports onto
+        // the LAN, from the bridge's MAC, which is a replayed source's
+        // (O2).
+        ip([
+            "link",
+            "add",
+            &self.bridge,
+            "type",
+            "bridge",
+            "mcast_snooping",
+            "0",
+        ])?;
+        self.bridge_created = true;
+        mark_owned(&self.bridge, self.run_id)?;
+        if self.hardening.is_some() {
+            harden::harden_iface(&self.bridge, harden::RpFilter::Strict)?;
+        }
+        harden::quiet_iface(&self.bridge)?;
         ip(["link", "set", "dev", &self.bridge, "up"])?;
         Ok(())
     }
@@ -85,43 +264,219 @@ impl Topology {
     /// bridge's receive path.
     ///
     /// `id` is the bridge-side interface name. The inject-side name is
-    /// `{id}i` (one extra char, to stay under IFNAMSIZ).
+    /// `{id}i`; both must be valid outstation names within IFNAMSIZ.
     pub fn add_port(&mut self, id: impl Into<String>, mac: Option<MacAddr>) -> Result<String> {
-        self.add_port_with_ip(id, mac, None)
+        self.add_port_with_ip(id, mac, None, &Protection::default())
     }
 
-    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` to
-    /// the bridge-side end so that the kernel can own TCP sockets bound
-    /// to that IP. Needed for `tcp_session` and protocol-aware modules.
+    /// Same as [`Topology::add_port`], but also assigns `src_ip/32` (and
+    /// `mac`) to the returned inject-side end, so the kernel can own TCP
+    /// sockets bound to that IP. Needed for protocol-aware modules,
+    /// whose sockets must bind to the inject side: a socket bound to the
+    /// bridge-enslaved end transmits into its veth peer, not into the
+    /// bridge, and never reaches the target.
+    ///
+    /// On a hardened topology ([`Topology::harden`]) the inject end is
+    /// isolated before it comes up, and only the run's peer may reach
+    /// `src_ip`. A source IP on an unhardened topology is refused.
+    ///
+    /// `src_ip` is checked with [`protect::validate_port_ip`] before
+    /// anything is created: loopback/multicast/broadcast/reserved
+    /// addresses, the host's default gateways and `prot`'s protected
+    /// addresses are always refused, and an address already configured
+    /// on any interface other than this topology's own bridge and ports
+    /// is refused unless `prot.force`.
     pub fn add_port_with_ip(
         &mut self,
         id: impl Into<String>,
         mac: Option<MacAddr>,
         src_ip: Option<std::net::Ipv4Addr>,
+        prot: &Protection,
     ) -> Result<String> {
         let bridge_side = id.into();
+        if let Some(ip) = src_ip {
+            let own_inject: Vec<String> = self.taps.iter().map(|t| format!("{t}i")).collect();
+            let own: Vec<&str> = std::iter::once(self.bridge.as_str())
+                .chain(self.taps.iter().map(String::as_str))
+                .chain(own_inject.iter().map(String::as_str))
+                .collect();
+            protect::validate_port_ip(ip, prot, &own)?;
+            match &self.hardening {
+                None => bail!(
+                    "refusing a port with source IP {ip} on a topology without host-stack \
+                     isolation (Topology::harden)"
+                ),
+                Some(h) if h.peer.is_none() => {
+                    bail!("a port with source IP {ip} needs the run's peer address")
+                }
+                Some(_) => {}
+            }
+        }
         let inject_side = format!("{bridge_side}i");
-        if bridge_side.len() > 14 {
-            bail!("port id {bridge_side:?} too long (max 14 chars to leave room for 'i' suffix)");
+        names::validate_owned_ifname(&bridge_side)?;
+        names::validate_owned_ifname(&inject_side).with_context(|| {
+            format!("port id {bridge_side:?} leaves no room for the 'i' suffix")
+        })?;
+        for n in [&bridge_side, &inject_side] {
+            if iface_exists(n)? {
+                bail!("interface {n} already exists");
+            }
         }
-        if iface_exists(&bridge_side)? {
-            bail!("interface {bridge_side} already exists");
+        if let (Some(h), Some(ip_addr)) = (self.hardening.as_mut(), src_ip) {
+            h.allow_session(ip_addr)?;
         }
-        ip([
-            "link", "add", &bridge_side, "type", "veth", "peer", "name", &inject_side,
-        ])?;
-        if let Some(mac) = mac {
-            set_mac(&bridge_side, mac)?;
+        let ctx = self.port_ctx();
+        let (created, mac) = build_port(&ctx, &bridge_side, mac, src_ip);
+        if created {
+            // Tracked once created, so teardown/drop removes it
+            // whatever failed next (and never an interface we did not
+            // create).
+            self.taps.push(bridge_side.clone());
         }
-        ip(["link", "set", "dev", &bridge_side, "master", &self.bridge])?;
-        ip(["link", "set", "dev", &bridge_side, "up"])?;
-        ip(["link", "set", "dev", &inject_side, "up"])?;
-        if let Some(ip_addr) = src_ip {
-            let cidr = format!("{ip_addr}/32");
-            ip(["addr", "add", &cidr, "dev", &bridge_side])?;
-        }
-        self.taps.push(bridge_side);
+        self.port_macs.push(mac?);
         Ok(inject_side)
+    }
+
+    /// What [`build_port`] needs from the topology.
+    fn port_ctx(&self) -> PortCtx {
+        PortCtx {
+            bridge: self.bridge.clone(),
+            run_id: self.run_id,
+            hardened: self.hardening.is_some(),
+            mirror: self.mirror.clone(),
+        }
+    }
+
+    /// [`Topology::add_port_with_ip`] for many ports at once (T17c):
+    /// the source addresses are checked against one snapshot of the
+    /// host ([`validate_port_ips`]) and the names against one interface
+    /// listing, every session ACCEPT is installed in one journaled
+    /// iptables transaction ([`harden::Hardening::allow_sessions`]), and
+    /// the ports are built by a bounded pool of [`PORT_WORKERS`]
+    /// threads. Fail closed: the first error stops the batch (no new
+    /// port is started) and is returned; every port created so far is
+    /// tracked, so teardown removes it. Returns the inject-side names in
+    /// `specs` order.
+    pub fn add_ports(&mut self, specs: &[PortSpec], prot: &Protection) -> Result<Vec<String>> {
+        let ips: Vec<std::net::Ipv4Addr> = specs.iter().filter_map(|p| p.src_ip).collect();
+        let mut seen = std::collections::HashSet::new();
+        for p in specs {
+            let inject = format!("{}i", p.id);
+            names::validate_owned_ifname(&p.id)?;
+            names::validate_owned_ifname(&inject)
+                .with_context(|| format!("port id {:?} leaves no room for the 'i' suffix", p.id))?;
+            if !seen.insert(p.id.clone()) {
+                bail!("port {} given twice", p.id);
+            }
+        }
+        if !ips.is_empty() {
+            let own_inject: Vec<String> = self.taps.iter().map(|t| format!("{t}i")).collect();
+            let own: Vec<&str> = std::iter::once(self.bridge.as_str())
+                .chain(self.taps.iter().map(String::as_str))
+                .chain(own_inject.iter().map(String::as_str))
+                .collect();
+            protect::validate_port_ips(&ips, prot, &own)?;
+            match &self.hardening {
+                None => bail!(
+                    "refusing ports with source IPs on a topology without host-stack isolation \
+                     (Topology::harden)"
+                ),
+                Some(h) if h.peer.is_none() => {
+                    bail!("ports with source IPs need the run's peer address")
+                }
+                Some(_) => {}
+            }
+        }
+        let existing = list_with_prefix(names::IFNAME_PREFIX)?;
+        for p in specs {
+            for n in [p.id.clone(), format!("{}i", p.id)] {
+                if existing.contains(&n) {
+                    bail!("interface {n} already exists");
+                }
+            }
+        }
+        if let Some(h) = self.hardening.as_mut() {
+            h.allow_sessions(&ips)?;
+        }
+        let ctx = self.port_ctx();
+        let results = par_map(specs, |p| {
+            let (created, mac) = build_port(&ctx, &p.id, p.mac, p.src_ip);
+            let ok = mac.is_ok();
+            ((created, mac), ok)
+        });
+        let mut first_err = None;
+        let mut out = Vec::with_capacity(specs.len());
+        for (p, r) in specs.iter().zip(results) {
+            let Some((created, mac)) = r else { continue };
+            if created {
+                self.taps.push(p.id.clone());
+            }
+            match mac {
+                Ok(m) => {
+                    self.port_macs.push(m);
+                    out.push(format!("{}i", p.id));
+                }
+                Err(e) => {
+                    first_err.get_or_insert(e.context(format!("add port {}", p.id)));
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(out),
+        }
+    }
+
+    /// The source MAC of every port added with [`Topology::add_port`] /
+    /// [`Topology::add_port_with_ip`]: replies from the LAN are
+    /// addressed to these.
+    pub fn port_macs(&self) -> &[MacAddr] {
+        &self.port_macs
+    }
+
+    /// Pre-existing NICs enslaved with [`Topology::enslave_existing`].
+    pub fn enslaved(&self) -> &[String] {
+        &self.enslaved
+    }
+
+    /// Create the capture device `name`: a `dummy` interface, not a
+    /// bridge port, that every port of this topology (present and
+    /// future) mirrors its *ingress* to with
+    /// `tc ... ingress matchall action mirred egress mirror`. Ingress
+    /// of a run port is what enters the bridge from the port's inject
+    /// end, i.e. every replayed or session frame, and a frame enters
+    /// the bridge exactly once however often the bridge then floods it,
+    /// so a capture on the device holds each of them exactly once. The
+    /// bridge keeps learning MACs (no hub mode), and nothing on the
+    /// host NICs is touched: the filters live on our own ports and go
+    /// away with them.
+    ///
+    /// Frames from the LAN enter the bridge through the enslaved NIC,
+    /// which carries no filter: capture them on the NIC itself
+    /// (incoming direction only), see [`Topology::enslaved`] and
+    /// [`Topology::port_macs`]. Needs `tc` (iproute2) with clsact,
+    /// matchall and mirred.
+    pub fn add_capture_mirror(&mut self, name: &str) -> Result<()> {
+        names::validate_owned_ifname(name)?;
+        if self.mirror.is_some() {
+            bail!("topology already has a capture mirror");
+        }
+        if iface_exists(name)? {
+            bail!("interface {name} already exists");
+        }
+        ip(["link", "add", name, "type", "dummy"])?;
+        self.taps.push(name.to_string());
+        mark_owned(name, self.run_id)?;
+        if self.hardening.is_some() {
+            harden::harden_iface(name, harden::RpFilter::Strict)?;
+        }
+        ip(["link", "set", "dev", name, "arp", "off"])?;
+        harden::quiet_iface(name)?;
+        ip(["link", "set", "dev", name, "up"])?;
+        let ports: Vec<String> = self.taps.iter().filter(|t| *t != name).cloned().collect();
+        mirror_ports(&ports, name)?;
+        self.mirror = Some(name.to_string());
+        Ok(())
     }
 
     /// Create a persistent TAP interface and enslave it. Retained for
@@ -129,45 +484,89 @@ impl Topology {
     /// IDS to `/dev/net/tun`) — not suitable for AF_PACKET injection.
     pub fn add_tap(&mut self, name: impl Into<String>, mac: Option<MacAddr>) -> Result<()> {
         let name = name.into();
+        names::validate_owned_ifname(&name)?;
         if iface_exists(&name)? {
             bail!("interface {name} already exists");
         }
         ip(["tuntap", "add", "dev", &name, "mode", "tap"])?;
+        self.taps.push(name.clone());
+        mark_owned(&name, self.run_id)?;
         if let Some(mac) = mac {
             set_mac(&name, mac)?;
         }
         ip(["link", "set", "dev", &name, "master", &self.bridge])?;
         ip(["link", "set", "dev", &name, "up"])?;
-        self.taps.push(name);
         Ok(())
     }
 
-    /// Attach an already-existing interface (e.g., a physical NIC) to the
-    /// bridge. The caller owns its lifecycle; we do not add it to `taps`.
-    pub fn enslave_existing(&self, iface: &str) -> Result<()> {
+    /// Attach an existing interface (e.g., a physical NIC) to the
+    /// bridge after checking it against `prot` (see [`protect`]). The
+    /// NIC is released from the bridge on teardown.
+    pub fn enslave_existing(&mut self, iface: &str, prot: &Protection) -> Result<()> {
+        check_nic_allowed(iface, "enslave", prot)?;
         ip(["link", "set", "dev", iface, "master", &self.bridge])?;
+        self.enslaved.push(iface.to_string());
         ip(["link", "set", "dev", iface, "up"])?;
         Ok(())
     }
 
-    /// Delete every port we created. Also deletes the bridge, but only
-    /// if we created it on this run (i.e., it didn't exist when we
-    /// started). Consumes self.
-    pub fn teardown(mut self) -> Result<()> {
+    fn do_teardown(&mut self) -> usize {
         let mut errors = 0usize;
-        for tap in std::mem::take(&mut self.taps) {
-            if let Err(e) = delete_iface(&tap) {
-                warn!(iface = %tap, error = %e, "port teardown failed");
+        self.mirror = None;
+        self.port_macs.clear();
+        for nic in std::mem::take(&mut self.enslaved) {
+            if let Err(e) = ip(["link", "set", "dev", &nic, "nomaster"]) {
+                warn!(iface = %nic, error = %e, "release of enslaved NIC failed");
                 errors += 1;
             }
         }
-        if self.bridge_owned && iface_exists(&self.bridge).unwrap_or(false) {
+        // In parallel (T17c); every port is tried whatever the others
+        // do, and each failure is counted.
+        let taps = std::mem::take(&mut self.taps);
+        let failed = par_map(&taps, |tap| {
+            let bad = iface_exists(tap).unwrap_or(true) && {
+                match delete_iface(tap) {
+                    Ok(()) => false,
+                    Err(e) => {
+                        warn!(iface = %tap, error = %e, "port teardown failed");
+                        true
+                    }
+                }
+            };
+            (bad, true)
+        });
+        errors += failed.into_iter().filter(|b| *b == Some(true)).count();
+        if self.bridge_created && iface_exists(&self.bridge).unwrap_or(false) {
             if let Err(e) = delete_iface(&self.bridge) {
                 warn!(iface = %self.bridge, error = %e, "bridge teardown failed");
                 errors += 1;
             }
         }
-        self.leaked = true; // suppress Drop warning
+        self.bridge_created = false;
+        // Only drop the isolation rules once every run interface is
+        // really gone. If any deletion failed, an interface may still
+        // carry a session address: keep the rules installed and
+        // journaled (fail closed) so `cleanup_all` removes them together
+        // with the leftover interfaces (security review).
+        if let Some(mut h) = self.hardening.take() {
+            if errors == 0 {
+                errors += h.release();
+            } else {
+                warn!(
+                    prefix = %h.prefix,
+                    "interface teardown incomplete; keeping isolation rules for cleanup_all"
+                );
+                std::mem::forget(h);
+            }
+        }
+        self.done = true;
+        errors
+    }
+
+    /// Release enslaved NICs, delete every port we created and the
+    /// bridge. Consumes self.
+    pub fn teardown(mut self) -> Result<()> {
+        let errors = self.do_teardown();
         if errors == 0 {
             Ok(())
         } else {
@@ -175,23 +574,196 @@ impl Topology {
         }
     }
 
-    /// Suppress the Drop warning. Use when you intentionally leave the
-    /// topology up after the process exits.
+    /// Keep the interfaces after this value is dropped (CLI tools).
+    /// Their isolation rules are kept too (still journaled, so
+    /// [`cleanup_all`] removes them with the interfaces).
     pub fn leak(mut self) {
-        self.leaked = true;
+        std::mem::forget(self.hardening.take());
+        self.done = true;
     }
 }
 
 impl Drop for Topology {
     fn drop(&mut self) {
-        if !self.leaked {
+        if !self.done {
             warn!(
                 bridge = %self.bridge,
                 taps = ?self.taps,
-                "Topology dropped without explicit teardown — interfaces may remain"
+                "Topology dropped without explicit teardown — tearing down now"
             );
+            self.do_teardown();
         }
     }
+}
+
+/// Topology facts a port build needs; shared by the worker threads.
+struct PortCtx {
+    bridge: String,
+    run_id: u64,
+    hardened: bool,
+    mirror: Option<String>,
+}
+
+/// Create one veth port `bridge_side` / `{bridge_side}i` and wire it up
+/// (see [`Topology::add_port_with_ip`]); names and the source address
+/// are already validated and the session ACCEPT installed. Returns
+/// whether the veth pair was created (so the caller tracks it for
+/// teardown even when a later step failed) and the port's source MAC.
+fn build_port(
+    ctx: &PortCtx,
+    bridge_side: &str,
+    mac: Option<MacAddr>,
+    src_ip: Option<std::net::Ipv4Addr>,
+) -> (bool, Result<MacAddr>) {
+    let inject_side = format!("{bridge_side}i");
+    if let Err(e) = ip([
+        "link",
+        "add",
+        bridge_side,
+        "type",
+        "veth",
+        "peer",
+        "name",
+        &inject_side,
+    ]) {
+        return (false, Err(e));
+    }
+    let rest = || -> Result<MacAddr> {
+        mark_owned(bridge_side, ctx.run_id)?;
+        mark_owned(&inject_side, ctx.run_id)?;
+        if let Some(mac) = mac {
+            // With a source IP the kernel builds the frames on the
+            // inject end, so that end carries the source identity.
+            set_mac(
+                if src_ip.is_some() {
+                    &inject_side
+                } else {
+                    bridge_side
+                },
+                mac,
+            )?;
+        }
+        if ctx.hardened {
+            // Loose reverse-path check on session ends: the host's own
+            // route to the target normally uses another interface, and
+            // the raw ACCEPT rule already pins the source to the peer.
+            harden::harden_iface(&inject_side, harden::RpFilter::Loose)?;
+        }
+        // Neither end originates anything of its own (IGMP, IPv6
+        // DAD/RS/MLD): only replayed or session frames reach the LAN.
+        harden::quiet_iface(&inject_side)?;
+        harden::quiet_iface(bridge_side)?;
+        if src_ip.is_some() {
+            // The kernel builds session frames on the inject end. With
+            // checksum offload (and so TSO/GSO) left on, they enter the
+            // bridge with partial checksums or as one oversized
+            // segment, and the port mirror would record them so;
+            // computed in software they are recorded as they leave on
+            // the wire. Our own interface: nothing to restore.
+            if let Err(e) = guard::set_tx_checksum(&inject_side, false) {
+                warn!(iface = %inject_side, error = %format!("{e:#}"),
+                    "could not turn checksum offload off; the capture may show partial checksums");
+            }
+        }
+        ip(["link", "set", "dev", bridge_side, "master", &ctx.bridge])?;
+        ip(["link", "set", "dev", bridge_side, "up"])?;
+        ip(["link", "set", "dev", &inject_side, "up"])?;
+        if let Some(ip_addr) = src_ip {
+            let cidr = format!("{ip_addr}/32");
+            ip(["addr", "add", &cidr, "dev", &inject_side])?;
+        }
+        let identity = if src_ip.is_some() {
+            inject_side.as_str()
+        } else {
+            bridge_side
+        };
+        let m = match mac {
+            Some(m) => m,
+            None => read_mac(identity)?,
+        };
+        if let Some(cap) = &ctx.mirror {
+            mirror_port(bridge_side, cap)?;
+        }
+        Ok(m)
+    };
+    (true, rest())
+}
+
+/// [`mirror_port`] for many ports in one `tc -batch` process (T17c):
+/// every `tc` start dumps all host links, which made one process per
+/// port quadratic in the session count (5 s for 400 ports). Stops at
+/// the first failing command and reports it.
+fn mirror_ports(ports: &[String], cap: &str) -> Result<()> {
+    use std::io::Write;
+    if ports.is_empty() {
+        return Ok(());
+    }
+    names::validate_owned_ifname(cap)?;
+    let mut script = String::new();
+    for p in ports {
+        names::validate_owned_ifname(p)?;
+        script.push_str(&format!(
+            "qdisc add dev {p} clsact\nfilter add dev {p} ingress matchall action mirred egress mirror dev {cap}\n"
+        ));
+    }
+    debug!(ports = ports.len(), cap, "tc -batch");
+    let mut child = Command::new("tc")
+        .args(["-batch", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("spawn `tc -batch`")?;
+    let wrote = child
+        .stdin
+        .take()
+        .context("tc stdin")?
+        .write_all(script.as_bytes());
+    let out = child.wait_with_output().context("wait for tc")?;
+    wrote.context("write to tc")?;
+    if !out.status.success() {
+        bail!(
+            "`tc -batch` (mirror {} ports to {cap}) failed: {}",
+            ports.len(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
+/// Mirror the ingress of `port` to `cap` with tc. Only ingress: a
+/// frame the bridge floods leaves through every other port, and
+/// mirroring egress too recorded it once per port (B1).
+fn mirror_port(port: &str, cap: &str) -> Result<()> {
+    tc(["qdisc", "add", "dev", port, "clsact"])?;
+    tc([
+        "filter", "add", "dev", port, "ingress", "matchall", "action", "mirred", "egress",
+        "mirror", "dev", cap,
+    ])?;
+    Ok(())
+}
+
+/// The MAC address of `iface`, from sysfs.
+fn read_mac(iface: &str) -> Result<MacAddr> {
+    let p = format!("/sys/class/net/{iface}/address");
+    let s = std::fs::read_to_string(&p).with_context(|| format!("read {p}"))?;
+    parse_mac(s.trim())
+}
+
+fn tc<const N: usize>(args: [&str; N]) -> Result<()> {
+    debug!(args = ?args, "tc");
+    let out = Command::new("tc")
+        .args(args)
+        .output()
+        .with_context(|| format!("spawn `tc {}`", args.join(" ")))?;
+    if !out.status.success() {
+        bail!(
+            "`tc {}` failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
+    Ok(())
 }
 
 pub fn set_mac(iface: &str, mac: MacAddr) -> Result<()> {
@@ -207,7 +779,10 @@ pub fn iface_exists(name: &str) -> Result<bool> {
     Ok(out.status.success())
 }
 
+/// `ip link del dev <name>`. Only accepts outstation-style names
+/// (`pcr...`); use the reclaim functions to delete stale interfaces.
 pub fn delete_iface(name: &str) -> Result<()> {
+    names::validate_owned_ifname(name)?;
     ip(["link", "del", "dev", name])
 }
 
@@ -288,121 +863,9 @@ pub fn default_route_iface() -> Result<String> {
 /// subnet (e.g., /24 if the iface is already /24).
 pub fn find_iface_prefix(iface: &str) -> Option<u8> {
     let list = list_local_ipv4().ok()?;
-    list.into_iter().find(|x| x.iface == iface).map(|x| x.prefix)
-}
-
-// ---------------------------------------------------------------------------
-// Tracked IP-alias management.
-//
-// Because outstation runs as a long-lived service that may crash or get
-// killed, a flat-text state file at a caller-supplied path records every
-// IP alias we add. On startup the caller calls `reclaim_recorded_aliases`
-// which reads the file, removes each leftover alias, and truncates the
-// file. Format: one alias per line, "<iface> <ip> <prefix>".
-
-/// Append an alias entry to the state file. Best-effort: if the file
-/// can't be written we log and continue (the alias still gets cleaned
-/// up on graceful drop, just not on crash).
-pub fn record_alias(state_path: &std::path::Path, iface: &str, ip: std::net::Ipv4Addr, prefix: u8) {
-    use std::io::Write;
-    if let Some(parent) = state_path.parent() {
-        let _ = std::fs::create_dir_all(parent);
-    }
-    let line = format!("{iface} {ip} {prefix}\n");
-    match std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(state_path)
-    {
-        Ok(mut f) => {
-            if let Err(e) = f.write_all(line.as_bytes()) {
-                warn!(error = %e, path = %state_path.display(), "alias record write failed");
-            }
-        }
-        Err(e) => warn!(error = %e, path = %state_path.display(), "alias record open failed"),
-    }
-}
-
-/// Remove a single alias entry from the state file. Rewrites the file
-/// in place without that line. No-op if the file is missing.
-pub fn forget_alias(state_path: &std::path::Path, iface: &str, ip: std::net::Ipv4Addr, prefix: u8) {
-    let want = format!("{iface} {ip} {prefix}");
-    let Ok(content) = std::fs::read_to_string(state_path) else {
-        return;
-    };
-    let mut kept: Vec<&str> = Vec::new();
-    let mut removed = false;
-    for line in content.lines() {
-        if !removed && line.trim() == want {
-            removed = true;
-            continue;
-        }
-        kept.push(line);
-    }
-    if !removed {
-        return;
-    }
-    let new = if kept.is_empty() {
-        String::new()
-    } else {
-        kept.join("\n") + "\n"
-    };
-    if let Err(e) = std::fs::write(state_path, new) {
-        warn!(error = %e, path = %state_path.display(), "alias forget write failed");
-    }
-}
-
-/// At server startup: read the state file, attempt to remove every
-/// recorded alias, and truncate the file so the next clean exit
-/// starts fresh. Returns the number of aliases successfully removed.
-pub fn reclaim_recorded_aliases(state_path: &std::path::Path) -> Result<usize> {
-    let Ok(content) = std::fs::read_to_string(state_path) else {
-        return Ok(0);
-    };
-    let mut removed = 0usize;
-    for line in content.lines() {
-        let parts: Vec<&str> = line.split_ascii_whitespace().collect();
-        if parts.len() != 3 {
-            continue;
-        }
-        let iface = parts[0];
-        let Ok(ip) = parts[1].parse::<std::net::Ipv4Addr>() else {
-            continue;
-        };
-        let Ok(prefix) = parts[2].parse::<u8>() else {
-            continue;
-        };
-        match del_ip_alias(iface, ip, prefix) {
-            Ok(()) => {
-                removed += 1;
-                info!(%iface, %ip, prefix, "reclaimed orphaned ip alias from prior run");
-            }
-            Err(e) => {
-                warn!(%iface, %ip, prefix, error = %e, "alias reclaim failed");
-            }
-        }
-    }
-    let _ = std::fs::write(state_path, "");
-    Ok(removed)
-}
-
-/// `ip addr add <ip>/<prefix> dev <iface>`. Idempotent-ish: treats
-/// "File exists" as success so repeated adds are harmless.
-pub fn add_ip_alias(iface: &str, ip: std::net::Ipv4Addr, prefix: u8) -> Result<()> {
-    let cidr = format!("{ip}/{prefix}");
-    let out = Command::new("ip")
-        .args(["addr", "add", &cidr, "dev", iface])
-        .output()
-        .with_context(|| format!("spawn `ip addr add {cidr} dev {iface}`"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.contains("File exists") {
-        // Already present — fine. Another alias add or a prior crash.
-        return Ok(());
-    }
-    bail!("`ip addr add {cidr} dev {iface}` failed: {}", err.trim())
+    list.into_iter()
+        .find(|x| x.iface == iface)
+        .map(|x| x.prefix)
 }
 
 /// One network interface candidate for the egress-NIC dropdown.
@@ -413,7 +876,12 @@ pub struct NicSummary {
     pub ipv4: Vec<std::net::Ipv4Addr>,
     pub up: bool,
     pub loopback: bool,
+    /// A real Linux bridge (`/sys/class/net/<if>/bridge`).
     pub bridge: bool,
+    /// Already a port of some bridge (`/sys/class/net/<if>/brport`).
+    pub bridge_port: bool,
+    /// Carries a default route (protected; see [`protect`]).
+    pub default_route: bool,
 }
 
 /// Enumerate every interface on the host. Used by the webui to
@@ -433,6 +901,7 @@ pub fn list_nics() -> Result<Vec<NicSummary>> {
     let text = String::from_utf8_lossy(&out.stdout);
 
     let local_ipv4 = list_local_ipv4().unwrap_or_default();
+    let default_ifaces = protect::default_route_ifaces().unwrap_or_default();
     let mut nics: Vec<NicSummary> = Vec::new();
     for line in text.lines() {
         // format: "N: <name>: <FLAGS> ... link/<type> <mac> brd ..."
@@ -448,24 +917,24 @@ pub fn list_nics() -> Result<Vec<NicSummary>> {
             .split_once('@')
             .map_or(name_field, |(n, _)| n)
             .to_string();
-        // skip our own pcr_* allocations
-        if name.starts_with("pcr_") {
+        // skip our own pcr* allocations
+        if name.starts_with(names::IFNAME_PREFIX) {
             continue;
         }
         let flags_end = after_name.find('>').unwrap_or(0);
         let flags = &after_name[..flags_end];
         let up = flags.contains("UP");
         let loopback = flags.contains("LOOPBACK");
-        // detect bridge or veth from the link/<type>
-        let is_bridge = after_name.contains("link/ether") && after_name.contains("bridge");
+        // `ip -o link show` never prints the link kind, so ask sysfs.
+        let is_bridge = protect::is_bridge(&name);
+        let bridge_port = protect::is_bridge_port(&name);
+        let default_route = default_ifaces.contains(&name);
         // mac after `link/ether `
-        let mac = after_name
-            .find("link/ether ")
-            .and_then(|i| {
-                let s = &after_name[i + "link/ether ".len()..];
-                let mac_str: String = s.chars().take(17).collect();
-                parse_mac(&mac_str).ok()
-            });
+        let mac = after_name.find("link/ether ").and_then(|i| {
+            let s = &after_name[i + "link/ether ".len()..];
+            let mac_str: String = s.chars().take(17).collect();
+            parse_mac(&mac_str).ok()
+        });
         let ipv4: Vec<std::net::Ipv4Addr> = local_ipv4
             .iter()
             .filter(|x| x.iface == name)
@@ -478,468 +947,15 @@ pub fn list_nics() -> Result<Vec<NicSummary>> {
             up,
             loopback,
             bridge: is_bridge,
+            bridge_port,
+            default_route,
         });
     }
     Ok(nics)
 }
 
-// ---------------------------------------------------------------------------
-// Egress safety guard.
-//
-// When a run enslaves a real physical NIC to our bridge, three host-stack
-// gotchas can ruin the replay:
-//
-//   1. `br_netfilter` makes iptables rules apply to bridged frames. The
-//      host firewall may answer ARPs or RST forged TCP flows it didn't
-//      originate. Mitigation: set `net.bridge.bridge-nf-call-iptables=0`
-//      and install an `iptables -t raw -A PREROUTING -i <bridge> -j DROP`
-//      rule so the host stack ignores everything bridged through.
-//
-//   2. NIC TX checksum offload may rewrite/mangle the L4 checksums we
-//      computed in software. Mitigation: `ethtool -K <nic> tx off` for
-//      the duration of the run.
-//
-//   3. (Future) generic-receive-offload, large-receive-offload — not yet
-//      handled.
-//
-// `EgressGuard` snapshots the current state on construction, switches to
-// the safe state, and restores everything on `Drop` so a panic mid-run
-// still leaves the host as we found it.
-
-/// Best-effort safe-egress guard. Captured state is restored on drop.
-pub struct EgressGuard {
-    pub bridge: String,
-    pub nic: String,
-    /// Previous `net.bridge.bridge-nf-call-iptables` value, if the
-    /// sysctl was readable. None = sysctl not present (br_netfilter
-    /// kernel module not loaded).
-    prev_bridge_nf: Option<String>,
-    /// Previous `tx-checksumming` state on the NIC, if readable.
-    prev_tx_checksum: Option<String>,
-    /// Whether we installed the iptables drop rule (so we know to remove it).
-    iptables_rule_installed: bool,
-    /// Set to true after Drop to suppress cleanup if the caller has
-    /// explicitly released the guard.
-    released: bool,
-}
-
-impl EgressGuard {
-    /// Apply safe-egress measures around the bridge + NIC pair. Always
-    /// returns a guard, even when individual steps fail (logs warning).
-    pub fn install(bridge: &str, nic: &str) -> Self {
-        let prev_bridge_nf = read_bridge_nf();
-        if prev_bridge_nf.is_some() {
-            if let Err(e) = write_bridge_nf("0") {
-                warn!(error = %e, "could not disable bridge-nf-call-iptables");
-            } else {
-                info!("disabled bridge-nf-call-iptables for run");
-            }
-        } else {
-            debug!("bridge-nf-call-iptables sysctl not present (br_netfilter not loaded)");
-        }
-
-        let prev_tx_checksum = read_tx_checksum(nic);
-        if prev_tx_checksum.is_some() {
-            if let Err(e) = set_tx_checksum(nic, false) {
-                warn!(nic, error = %e, "could not disable NIC tx-checksum offload");
-            } else {
-                info!(nic, "disabled NIC tx-checksum offload for run");
-            }
-        }
-
-        let iptables_rule_installed = match install_iptables_drop(bridge) {
-            Ok(()) => {
-                info!(bridge, "installed iptables drop rule");
-                true
-            }
-            Err(e) => {
-                warn!(bridge, error = %e, "could not install iptables drop rule");
-                false
-            }
-        };
-
-        Self {
-            bridge: bridge.to_string(),
-            nic: nic.to_string(),
-            prev_bridge_nf,
-            prev_tx_checksum,
-            iptables_rule_installed,
-            released: false,
-        }
-    }
-
-    /// Manually release the guard before drop (e.g., after explicit
-    /// teardown). Idempotent.
-    pub fn release(mut self) {
-        self.do_restore();
-        self.released = true;
-    }
-
-    fn do_restore(&mut self) {
-        if self.released {
-            return;
-        }
-        if self.iptables_rule_installed {
-            if let Err(e) = remove_iptables_drop(&self.bridge) {
-                warn!(bridge = %self.bridge, error = %e, "could not remove iptables drop rule");
-            }
-        }
-        if let Some(prev) = &self.prev_tx_checksum {
-            // Restore the previous on/off state.
-            let want_on = prev.contains("on");
-            if let Err(e) = set_tx_checksum(&self.nic, want_on) {
-                warn!(nic = %self.nic, error = %e, "could not restore NIC tx-checksum offload");
-            }
-        }
-        if let Some(prev) = &self.prev_bridge_nf {
-            if let Err(e) = write_bridge_nf(prev.trim()) {
-                warn!(error = %e, "could not restore bridge-nf-call-iptables");
-            }
-        }
-    }
-}
-
-impl Drop for EgressGuard {
-    fn drop(&mut self) {
-        self.do_restore();
-    }
-}
-
-fn read_bridge_nf() -> Option<String> {
-    std::fs::read_to_string("/proc/sys/net/bridge/bridge-nf-call-iptables").ok()
-}
-
-fn write_bridge_nf(value: &str) -> Result<()> {
-    let out = Command::new("sysctl")
-        .args(["-w", &format!("net.bridge.bridge-nf-call-iptables={value}")])
-        .output()
-        .context("spawn sysctl")?;
-    if !out.status.success() {
-        bail!(
-            "sysctl failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn read_tx_checksum(nic: &str) -> Option<String> {
-    let out = Command::new("ethtool").args(["-k", nic]).output().ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    for line in text.lines() {
-        let trimmed = line.trim();
-        if let Some(rest) = trimmed.strip_prefix("tx-checksumming:") {
-            return Some(rest.trim().to_string());
-        }
-    }
-    None
-}
-
-fn set_tx_checksum(nic: &str, on: bool) -> Result<()> {
-    let val = if on { "on" } else { "off" };
-    let out = Command::new("ethtool")
-        .args(["-K", nic, "tx", val])
-        .output()
-        .context("spawn ethtool")?;
-    if !out.status.success() {
-        let err = String::from_utf8_lossy(&out.stderr);
-        // Some virtual NICs report "Cannot change ..." for fixed
-        // offload state. Treat as a soft failure rather than crashing.
-        if err.contains("not changed") || err.contains("Cannot") {
-            return Ok(());
-        }
-        bail!("`ethtool -K {nic} tx {val}` failed: {}", err.trim());
-    }
-    Ok(())
-}
-
-fn install_iptables_drop(bridge: &str) -> Result<()> {
-    let out = Command::new("iptables")
-        .args(["-t", "raw", "-I", "PREROUTING", "1", "-i", bridge, "-j", "DROP"])
-        .output()
-        .context("spawn iptables")?;
-    if !out.status.success() {
-        bail!(
-            "iptables install failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn remove_iptables_drop(bridge: &str) -> Result<()> {
-    let out = Command::new("iptables")
-        .args(["-t", "raw", "-D", "PREROUTING", "-i", bridge, "-j", "DROP"])
-        .output()
-        .context("spawn iptables")?;
-    if !out.status.success() {
-        bail!(
-            "iptables remove failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// SCADA-gateway mode:
-//
-// When the outstation box is the only L2 neighbor of a SCADA guest (typical
-// virtual-lab setup — see doc/scada-lab.md), we want outstation to act as the
-// SCADA's default gateway AND to NAT unrelated egress back out to the real
-// lab. This guard owns all the reversible side effects of that setup:
-//
-//   1. A /32 IP alias on the "inner" NIC so SCADA's gateway ARP gets a reply.
-//   2. `net.ipv4.ip_forward=1` (saving the previous value).
-//   3. An iptables MASQUERADE rule on the "outer" NIC, if one is set.
-//
-// On Drop, or via explicit `release()`, all three are undone in reverse
-// order. The alias is also recorded in the state file so a server restart
-// that misses the drop still reclaims it via `reclaim_recorded_aliases`.
-pub struct GatewayGuard {
-    pub inner_nic: String,
-    pub gateway_ip: std::net::Ipv4Addr,
-    pub outer_nic: Option<String>,
-    prev_ip_forward: Option<String>,
-    masq_rule_installed: bool,
-    alias_added: bool,
-    state_path: std::path::PathBuf,
-    released: bool,
-}
-
-impl GatewayGuard {
-    /// Install the gateway alias + optional NAT. Never panics; individual
-    /// failures are logged and the guard still returns so Drop cleans up
-    /// whatever did succeed.
-    pub fn install(
-        inner_nic: &str,
-        gateway_ip: std::net::Ipv4Addr,
-        outer_nic: Option<&str>,
-        state_path: &std::path::Path,
-    ) -> Self {
-        // 1. /32 alias for the gateway IP. A /32 prefix means "just this
-        //    address, no subnet-level route" — we don't want to steal the
-        //    inner NIC's routing table.
-        let alias_added = match add_ip_alias(inner_nic, gateway_ip, 32) {
-            Ok(()) => {
-                record_alias(state_path, inner_nic, gateway_ip, 32);
-                info!(inner_nic, %gateway_ip, "installed SCADA-gateway alias /32");
-                true
-            }
-            Err(e) => {
-                // "File exists" is fine — alias was already there (reclaim,
-                // previous run, whatever). Treat as installed so we clean
-                // it up on drop.
-                let msg = format!("{e:#}");
-                if msg.contains("File exists") {
-                    record_alias(state_path, inner_nic, gateway_ip, 32);
-                    info!(inner_nic, %gateway_ip, "SCADA-gateway alias already present, adopted");
-                    true
-                } else {
-                    warn!(inner_nic, %gateway_ip, error = %e, "add gateway alias failed");
-                    false
-                }
-            }
-        };
-
-        // 2. Enable IP forwarding, saving the previous value for restore.
-        let prev_ip_forward = std::fs::read_to_string("/proc/sys/net/ipv4/ip_forward")
-            .ok()
-            .map(|s| s.trim().to_string());
-        if prev_ip_forward.is_some() {
-            if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", "1\n") {
-                warn!(error = %e, "could not set net.ipv4.ip_forward=1");
-            } else {
-                info!("enabled net.ipv4.ip_forward for SCADA-gateway mode");
-            }
-        }
-
-        // 3. MASQUERADE out the outer NIC so SCADA's non-RTU egress reaches
-        //    the real lab. Skipped if outer_nic isn't set.
-        let masq_rule_installed = if let Some(outer) = outer_nic {
-            match install_masquerade(outer) {
-                Ok(()) => {
-                    info!(outer, "installed MASQUERADE rule for SCADA upstream");
-                    true
-                }
-                Err(e) => {
-                    warn!(outer, error = %e, "install masquerade failed");
-                    false
-                }
-            }
-        } else {
-            false
-        };
-
-        Self {
-            inner_nic: inner_nic.to_string(),
-            gateway_ip,
-            outer_nic: outer_nic.map(|s| s.to_string()),
-            prev_ip_forward,
-            masq_rule_installed,
-            alias_added,
-            state_path: state_path.to_path_buf(),
-            released: false,
-        }
-    }
-
-    pub fn release(mut self) {
-        self.do_restore();
-        self.released = true;
-    }
-
-    fn do_restore(&mut self) {
-        if self.released {
-            return;
-        }
-        if self.masq_rule_installed {
-            if let Some(outer) = &self.outer_nic {
-                if let Err(e) = remove_masquerade(outer) {
-                    warn!(outer = %outer, error = %e, "remove masquerade failed");
-                }
-            }
-        }
-        if let Some(prev) = &self.prev_ip_forward {
-            if let Err(e) = std::fs::write("/proc/sys/net/ipv4/ip_forward", format!("{prev}\n")) {
-                warn!(error = %e, "could not restore net.ipv4.ip_forward");
-            }
-        }
-        if self.alias_added {
-            if let Err(e) = del_ip_alias(&self.inner_nic, self.gateway_ip, 32) {
-                warn!(inner_nic = %self.inner_nic, ip = %self.gateway_ip, error = %e,
-                    "remove gateway alias failed");
-            }
-            forget_alias(&self.state_path, &self.inner_nic, self.gateway_ip, 32);
-        }
-    }
-}
-
-impl Drop for GatewayGuard {
-    fn drop(&mut self) {
-        self.do_restore();
-    }
-}
-
-fn install_masquerade(outer_nic: &str) -> Result<()> {
-    let out = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-A",
-            "POSTROUTING",
-            "-o",
-            outer_nic,
-            "-j",
-            "MASQUERADE",
-        ])
-        .output()
-        .context("spawn iptables -t nat -A POSTROUTING")?;
-    if !out.status.success() {
-        bail!(
-            "iptables masquerade install failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-fn remove_masquerade(outer_nic: &str) -> Result<()> {
-    let out = Command::new("iptables")
-        .args([
-            "-t",
-            "nat",
-            "-D",
-            "POSTROUTING",
-            "-o",
-            outer_nic,
-            "-j",
-            "MASQUERADE",
-        ])
-        .output()
-        .context("spawn iptables -t nat -D POSTROUTING")?;
-    if !out.status.success() {
-        bail!(
-            "iptables masquerade remove failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        );
-    }
-    Ok(())
-}
-
-/// `ip addr del <ip>/<prefix> dev <iface>`. "Cannot assign" is ignored
-/// so we don't complain about double-cleans.
-pub fn del_ip_alias(iface: &str, ip: std::net::Ipv4Addr, prefix: u8) -> Result<()> {
-    let cidr = format!("{ip}/{prefix}");
-    let out = Command::new("ip")
-        .args(["addr", "del", &cidr, "dev", iface])
-        .output()
-        .with_context(|| format!("spawn `ip addr del {cidr} dev {iface}`"))?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let err = String::from_utf8_lossy(&out.stderr);
-    if err.contains("Cannot assign") || err.contains("does not exist") {
-        return Ok(());
-    }
-    bail!("`ip addr del {cidr} dev {iface}` failed: {}", err.trim())
-}
-
-/// Delete every stale interface whose name starts with `tap_prefix`,
-/// the hardcoded `pcr_cap` capture port, and the named bridge if it
-/// exists. Called by sched at the start of each run so a previously
-/// crashed or killed run doesn't block the next one with
-/// "interface pcr_t0 already exists".
-///
-/// Only warns on individual delete failures — the caller still gets
-/// Ok, because a stale bridge without stale veths (or vice versa) is
-/// still a usable starting point.
-pub fn reclaim_stale(bridge: &str, tap_prefix: &str) -> Result<usize> {
-    let mut deleted = 0usize;
-    // Veth pairs: delete the bridge-side; the peer auto-vanishes.
-    let mut candidates: Vec<String> = Vec::new();
-    if let Ok(list) = list_with_prefix(tap_prefix) {
-        candidates.extend(list);
-    }
-    if let Ok(cap_list) = list_with_prefix("pcr_cap") {
-        candidates.extend(cap_list);
-    }
-    // Dedup and drop anything ending in 'i' (inject-side peer; deleting
-    // the bridge-side takes both ends with it).
-    candidates.sort();
-    candidates.dedup();
-    candidates.retain(|n| !n.ends_with('i') || n == "pcr_capi");
-    for name in candidates {
-        // Skip the inject-side peers; the bridge-side delete will clean them.
-        if name.ends_with('i') && name != "pcr_capi" {
-            continue;
-        }
-        if iface_exists(&name).unwrap_or(false) {
-            match delete_iface(&name) {
-                Ok(_) => {
-                    deleted += 1;
-                    info!(iface = %name, "reclaimed stale interface");
-                }
-                Err(e) => warn!(iface = %name, error = %e, "reclaim delete failed"),
-            }
-        }
-    }
-    if iface_exists(bridge).unwrap_or(false) {
-        match delete_iface(bridge) {
-            Ok(_) => {
-                deleted += 1;
-                info!(iface = %bridge, "reclaimed stale bridge");
-            }
-            Err(e) => warn!(iface = %bridge, error = %e, "reclaim bridge delete failed"),
-        }
-    }
-    Ok(deleted)
-}
-
-/// Return every interface whose name starts with `prefix`. Useful for
-/// reclaiming stale `pr_*` TAPs on startup.
+/// Return every interface whose name starts with `prefix`. Listing
+/// only; reclaim uses ownership markers, never a bare prefix.
 pub fn list_with_prefix(prefix: &str) -> Result<Vec<String>> {
     let out = Command::new("ip")
         .args(["-o", "link", "show"])
@@ -974,8 +990,10 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let args: Vec<std::ffi::OsString> =
-        args.into_iter().map(|s| s.as_ref().to_os_string()).collect();
+    let args: Vec<std::ffi::OsString> = args
+        .into_iter()
+        .map(|s| s.as_ref().to_os_string())
+        .collect();
     let pretty: Vec<String> = args
         .iter()
         .map(|s| s.to_string_lossy().into_owned())
@@ -996,8 +1014,31 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn test_nonce() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static N: AtomicU64 = AtomicU64::new(0);
+    N.fetch_add(1, Ordering::Relaxed)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn topology_rejects_foreign_bridge_names() {
+        assert!(Topology::new("br0", 1).is_err());
+        assert!(Topology::new("", 1).is_err());
+        assert!(Topology::new("docker0", 1).is_err());
+        let t = Topology::new("pcr_br0", 1).unwrap();
+        t.leak();
+    }
+
+    #[test]
+    fn delete_iface_refuses_foreign_names() {
+        assert!(delete_iface("eth0").is_err());
+        assert!(delete_iface("docker0").is_err());
+        assert!(delete_iface("").is_err());
+    }
 
     #[test]
     fn mac_roundtrip() {

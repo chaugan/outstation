@@ -7,7 +7,6 @@ members = [
     "crates/raw_replay",
     "crates/sched",
     "crates/outstation",
-    "crates/tcp_session",
     "crates/protoplay",
     "crates/proto_iec104",
     "crates/proto_modbus_tcp",
@@ -21,7 +20,7 @@ members = [
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]

@@ -1,160 +1,51 @@
-//! IEC 104 client session state machine.
+//! IEC 104 session drivers: master (outstation impersonates the
+//! captured client) and slave (outstation impersonates the captured
+//! server).
 //!
-//! Responsibilities:
-//!   1. Open TCP from source IP to target:port.
-//!   2. Drive STARTDT handshake.
-//!   3. Walk the pcap's client I-frames and re-send them with live N(S)
-//!      / N(R) numbers (taking over sequence management from the pcap).
-//!   4. Acknowledge server I-frames with S-frames as the window fills.
-//!   5. Reply TESTFR act with TESTFR con.
-//!   6. Close with STOPDT act → con.
+//! Both drivers:
+//!   1. extract the captured I-frame script from the reassembled
+//!      payload, restarting the framer at every capture gap so no
+//!      spliced (corrupted) APDU is ever sent;
+//!   2. establish the connection and hand it to a [`Link`], which owns
+//!      the reader thread, sequence numbers, the k/w window, the
+//!      t1/t2/t3 timers, STARTDT/STOPDT/TESTFR handling and teardown;
+//!   3. walk the script with live N(S)/N(R), pacing through
+//!      [`Link::wait_until`] so the peer is serviced during every gap.
 //!
-//! Threading: one reader thread framing incoming APDUs into a channel,
-//! main thread owning writes + pcap walk + timers.
+//! Master: connect → STARTDT act/con → script → wait for acks → S-frame
+//! flush → STOPDT act/con → close.
+//!
+//! Slave: listen/accept → STARTDT act/con (and any later STARTDT/STOPDT
+//! from the master) → script, `loop_iterations` times, with live GI/CI
+//! and command answers interleaved → idle-serve (keep answering
+//! GI/CI/commands/TESTFR and
+//! acknowledging) until the master closes, the run is cancelled, or
+//! `session.idle_serve_secs` (default 30 s) elapses → close.
+//!
+//! Every exit path drops the [`Link`], which shuts the socket down in
+//! both directions (FIN) and joins the reader thread.
 
-use std::collections::VecDeque;
 use std::net::{SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::Ordering;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
-use std::thread;
 use std::time::{Duration, Instant};
 
-use protoplay::{session_state, MessageProgress, Pacing, ProtoReport, ProtoRunCfg};
+use protoplay::{
+    progress_cancelled, session_state, MessageProgress, Pacing, ProtoReport, ProtoRunCfg, Role,
+};
 use socket2::{Domain, Protocol as SocketProtocol, Socket, Type};
 use tracing::{debug, info, warn};
 
-use crate::apdu::{
-    write_apdu, Apdu, ApduReader, APCI_LEN, MAX_APDU_LEN, START_BYTE, U_STARTDT_ACT,
-    U_STARTDT_CON, U_STOPDT_ACT, U_STOPDT_CON, U_TESTFR_ACT, U_TESTFR_CON,
-};
-use crate::asdu::{
-    common_address, load_rewrite_map, rewrite_asdu, rewrite_cp56time2a_to_now_zoned, Cp56Zone,
-    Iec104ProtoConfig, RewriteMap, DUI_LEN, IOA_LEN,
-};
+use crate::asdu::{load_rewrite_map, rewrite_asdu, Iec104ProtoConfig, RewriteMap, SessionConfig};
+use crate::commands::CommandBook;
 use crate::inventory::Inventory;
-use crate::responder::{build_ci_response, build_gi_response, RequestEcho};
+use crate::link::{
+    now_ns, secs_to_ns, CommandEcho, Cp56Rewrite, Link, LinkEnd, LinkOptions, LinkParams,
+    Responder, Transfer,
+};
 
-#[inline]
-fn wall_clock_unix_ns() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-}
-
-const DEFAULT_W: u16 = 8;
-const DEFAULT_K: u16 = 12;
+/// How long a slave waits for the master's STARTDT act after accept.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(60);
-const IDLE_POLL: Duration = Duration::from_millis(50);
-/// `t1` from the IEC 104 spec: max time the client will wait for the
-/// server to acknowledge an outstanding I-frame before declaring the
-/// session broken.
-const T1_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[inline]
-fn now_ns() -> u64 {
-    // Reuse raw_replay's monotonic clock so latency samples share a
-    // time base with the replay engine's jitter measurements.
-    raw_replay::now_ns()
-}
-
-/// One in-flight I-frame awaiting acknowledgment.
-#[derive(Debug, Clone, Copy)]
-struct PendingIFrame {
-    ns: u16,
-    send_ns: u64,
-}
-
-/// Maximum latency samples retained per session. With reservoir
-/// sampling this gives unbiased percentile estimation up to ~1%
-/// p99 error from any stream length, while bounding per-session
-/// memory to ~80 KB. 10k × 8 B = 80 KB.
-const LATENCY_RESERVOIR_CAP: usize = 10_000;
-
-/// Reservoir-sample collector for per-session latency. Uses a small
-/// inline PCG-style LCG so we don't pull in the `rand` crate.
-struct LatencyReservoir {
-    capacity: usize,
-    samples: Vec<u64>,
-    /// Total samples seen, including ones we didn't keep.
-    count: u64,
-    rng_state: u64,
-    /// Fast accept-all path while we're still under capacity. Once
-    /// we've filled the reservoir this flips to false and the
-    /// random replacement path takes over.
-    full: bool,
-}
-
-impl LatencyReservoir {
-    fn new(capacity: usize) -> Self {
-        // Seed the RNG from the monotonic clock so concurrent
-        // sessions don't draw the same sequence.
-        let seed = now_ns().wrapping_add(0x9E3779B97F4A7C15);
-        Self {
-            capacity,
-            samples: Vec::with_capacity(capacity.min(1024)),
-            count: 0,
-            rng_state: seed | 1,
-            full: false,
-        }
-    }
-
-    #[inline]
-    fn next_rand(&mut self) -> u64 {
-        // PCG-style LCG step. Quality is fine for sampling.
-        self.rng_state = self
-            .rng_state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        self.rng_state
-    }
-
-    fn push(&mut self, sample: u64) {
-        self.count = self.count.saturating_add(1);
-        if !self.full {
-            self.samples.push(sample);
-            if self.samples.len() >= self.capacity {
-                self.full = true;
-            }
-            return;
-        }
-        // Algorithm R: pick uniform i in [0, count); if i < capacity
-        // it replaces the i-th sample.
-        let r = self.next_rand();
-        let i = (r % self.count) as usize;
-        if i < self.capacity {
-            self.samples[i] = sample;
-        }
-    }
-
-    fn into_vec(self) -> Vec<u64> {
-        self.samples
-    }
-}
-
-/// Pop every pending I-frame whose `ns` is now considered acknowledged
-/// by the server's latest `n(r)` and record the measured send→ack
-/// latency for each. Sequence numbers wrap at 2^15, so we compare
-/// modulo that range.
-fn retire_acked(
-    pending: &mut VecDeque<PendingIFrame>,
-    server_nr: u16,
-    samples: &mut LatencyReservoir,
-) {
-    let now = now_ns();
-    while let Some(front) = pending.front().copied() {
-        // An I-frame with sequence `ns` is acked when the server's
-        // `n(r)` is strictly greater than `ns` (mod 2^15). We treat
-        // a wrap-around difference > 2^14 as "already past".
-        let diff = server_nr.wrapping_sub(front.ns) & 0x7fff;
-        if diff == 0 || diff > 0x4000 {
-            break;
-        }
-        pending.pop_front();
-        let lat_ns = now.saturating_sub(front.send_ns);
-        samples.push(lat_ns / 1_000);
-    }
-}
+const LISTEN_ACCEPT_TIMEOUT: Duration = Duration::from_secs(600);
 
 #[inline]
 fn bump(pg: &Option<MessageProgress>, f: impl FnOnce(&MessageProgress)) {
@@ -163,34 +54,19 @@ fn bump(pg: &Option<MessageProgress>, f: impl FnOnce(&MessageProgress)) {
     }
 }
 
-/// Sleep until `target_ns` (monotonic clock, ns since `epoch_ns`),
-/// checking the per-session cancel flag on every short slice so a
-/// user abort unwinds promptly even during a multi-second wait.
-fn pace_sleep_until(epoch_ns: u64, target_ns: u64, progress: &Option<MessageProgress>) {
-    loop {
-        let now = now_ns();
-        if now >= epoch_ns + target_ns {
-            return;
-        }
-        if check_cancel(progress) {
-            return;
-        }
-        let remaining_ns = (epoch_ns + target_ns).saturating_sub(now);
-        // 100 ms max slice so a cancel is observed within ~100 ms.
-        let slice_ns = remaining_ns.min(100_000_000);
-        std::thread::sleep(Duration::from_nanos(slice_ns));
-    }
+fn set_state(progress: &Option<MessageProgress>, new_state: u8) {
+    bump(progress, |p| p.state.store(new_state, Ordering::Relaxed));
 }
 
-/// Compute the target send time (ns, relative to the session's send
-/// epoch) for I-frame `idx`, honoring the configured pacing and
-/// speed multiplier. Returns `None` if pacing is AsFastAsPossible or
-/// there's no timing entry for this index.
-fn paced_target_ns(cfg_pacing: Pacing, frame_times_ns: &[u64], idx: usize) -> Option<u64> {
+/// Compute the target send time (ns, relative to the first captured
+/// I-frame) for the I-frame with pacing index `time_idx`, honoring the
+/// configured pacing and speed multiplier. Returns `None` if pacing is
+/// AsFastAsPossible or there's no timing entry for this index.
+fn paced_target_ns(cfg_pacing: Pacing, frame_times_ns: &[u64], time_idx: usize) -> Option<u64> {
     match cfg_pacing {
         Pacing::AsFastAsPossible => None,
         Pacing::OriginalTiming { speed } => {
-            let raw = *frame_times_ns.get(idx)?;
+            let raw = *frame_times_ns.get(time_idx)?;
             if speed <= 0.0 || !speed.is_finite() {
                 return Some(raw);
             }
@@ -199,106 +75,213 @@ fn paced_target_ns(cfg_pacing: Pacing, frame_times_ns: &[u64], idx: usize) -> Op
     }
 }
 
-/// Parse client segment bytes into an ordered list of I-frame ASDUs.
-/// Drops any embedded U/S frames from the client side — we run the
-/// handshake and ACKs ourselves.
-fn extract_client_iframes(cfg: &ProtoRunCfg) -> Vec<Vec<u8>> {
-    extract_iframes(cfg, "client")
+// ---------------------------------------------------------------------------
+// Script extraction
+// ---------------------------------------------------------------------------
+
+/// One captured I-frame ASDU to replay.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ScriptFrame {
+    pub asdu: Vec<u8>,
+    /// Index into `ProtoRunCfg::frame_times_ns`. Those timestamps are
+    /// computed over the whole (gap-spliced) stream, so this is the
+    /// index of the same frame in that walk, or of the frame just
+    /// before it for a frame only found after a gap.
+    pub time_idx: usize,
 }
 
-fn extract_iframes(cfg: &ProtoRunCfg, side_label: &str) -> Vec<Vec<u8>> {
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Script {
+    pub frames: Vec<ScriptFrame>,
+    pub gaps: u64,
+    pub skipped_bytes: u64,
+    /// I-frames the whole-stream walk sees that straddle a gap and so
+    /// were left out.
+    pub dropped_frames: u64,
+}
+
+impl Script {
+    fn record(&self, report: &mut ProtoReport) {
+        report.protocol.capture_gaps = self.gaps;
+        report.protocol.script_skipped_bytes = self.skipped_bytes;
+        report.protocol.script_dropped_frames = self.dropped_frames;
+    }
+
+    /// Pacing target of frame `idx`, relative to the first frame of the
+    /// script (so stripping a leading frame does not delay the start).
+    fn target_ns(&self, cfg: &ProtoRunCfg, idx: usize) -> Option<u64> {
+        let t = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, self.frames[idx].time_idx)?;
+        let base =
+            paced_target_ns(cfg.pacing, &cfg.frame_times_ns, self.frames[0].time_idx).unwrap_or(0);
+        Some(t.saturating_sub(base))
+    }
+}
+
+/// Frame the captured stream into the I-frame script. The stream is
+/// cut at every `capture_gaps` offset and each contiguous chunk is
+/// framed on its own ([`crate::apci::frames`] resyncs at the start of
+/// each chunk), so a frame is never assembled from bytes on both sides
+/// of a capture gap.
+pub(crate) fn extract_script(cfg: &ProtoRunCfg, side_label: &str) -> Script {
     let mut stream = Vec::new();
     for seg in &cfg.client_segments {
         stream.extend_from_slice(&seg.bytes);
     }
-    // Mid-flow capture: the byte stream may begin partway through an
-    // APCI frame. Scan forward for the first self-consistent boundary
-    // (0x68 LEN ... where the next frame also starts on 0x68) and
-    // discard the leading partial-frame bytes.
-    let resync = find_apci_resync(&stream);
-    if resync > 0 {
+    // The pacing timestamps were computed over the whole stream; keep
+    // its I-frame offsets to map each script frame to its timestamp.
+    let whole = crate::apci::iframe_offsets(&stream);
+    let mut cuts: Vec<usize> = cfg
+        .capture_gaps
+        .iter()
+        .copied()
+        .filter(|&g| g > 0 && g < stream.len())
+        .collect();
+    cuts.sort_unstable();
+    cuts.dedup();
+    let mut bounds = Vec::with_capacity(cuts.len() + 2);
+    bounds.push(0);
+    bounds.extend_from_slice(&cuts);
+    bounds.push(stream.len());
+
+    // A gap at offset 0 (the first segment after the handshake was
+    // lost) cuts nothing but is a gap all the same (N19).
+    let leading_gap = cfg.capture_gaps.contains(&0) && !stream.is_empty();
+    let mut script = Script {
+        gaps: cuts.len() as u64 + u64::from(leading_gap),
+        ..Script::default()
+    };
+    let mut matched = 0usize;
+    for w in bounds.windows(2) {
+        let (a, b) = (w[0], w[1]);
+        let mut walk = crate::apci::frames(&stream[a..b]);
+        for f in walk.by_ref() {
+            let Some(asdu) = f.asdu() else { continue };
+            let abs = a + f.offset;
+            let pp = whole.partition_point(|&o| o <= abs);
+            if pp > 0 && whole[pp - 1] == abs {
+                matched += 1;
+            }
+            script.frames.push(ScriptFrame {
+                asdu: asdu.to_vec(),
+                time_idx: pp.saturating_sub(1),
+            });
+        }
+        script.skipped_bytes += (walk.skipped_bytes() + walk.trailing_bytes()) as u64;
+    }
+    script.dropped_frames = whole.len().saturating_sub(matched) as u64;
+    if script.skipped_bytes > 0 || script.gaps > 0 {
         info!(
             side = side_label,
-            dropped_bytes = resync,
+            gaps = script.gaps,
+            skipped_bytes = script.skipped_bytes,
+            dropped_frames = script.dropped_frames,
             total_bytes = stream.len(),
-            "skipped leading mid-frame bytes for APCI resync"
+            "skipped unframed bytes for APCI resync"
         );
     }
-    let mut reader = ApduReader::new(&stream[resync..]);
-    let mut out = Vec::new();
-    loop {
-        match reader.next_apdu() {
-            Ok(Some(Apdu::I { asdu, .. })) => out.push(asdu),
-            Ok(Some(_)) => {}
-            Ok(None) => break,
-            Err(e) => {
-                warn!(error = %e, side = side_label, "parse error; stopping reassembly");
-                break;
-            }
-        }
-    }
-    out
+    script
 }
 
-/// Find the first byte offset where an APCI frame both parses cleanly
-/// and is followed by another frame boundary (or clean EOF). The
-/// two-frame self-consistency check rejects coincidental 0x68 bytes
-/// that appear inside ASDU payload. Returns 0 if the stream already
-/// begins on a frame; returns `stream.len()` if no boundary is found.
-pub(crate) fn find_apci_resync(stream: &[u8]) -> usize {
-    let mut i = 0usize;
-    while i + 2 + APCI_LEN <= stream.len() {
-        if stream[i] == START_BYTE {
-            let len = stream[i + 1] as usize;
-            if len >= APCI_LEN && len <= MAX_APDU_LEN {
-                let next = i + 2 + len;
-                let boundary_ok = next == stream.len()
-                    || (next < stream.len() && stream[next] == START_BYTE);
-                if boundary_ok && Apdu::parse(&stream[i + 2..i + 2 + APCI_LEN]).is_ok() {
-                    return i;
-                }
-            }
+fn apply_rewrite(script: &mut Script, map: &RewriteMap) {
+    if !map.is_empty() {
+        for f in script.frames.iter_mut() {
+            rewrite_asdu(&mut f.asdu, map);
         }
-        i += 1;
     }
-    stream.len()
 }
+
+/// Parse the rewrite map and the structured IEC 104 config.
+fn load_config(cfg: &ProtoRunCfg) -> Result<(RewriteMap, Iec104ProtoConfig), String> {
+    let map = load_rewrite_map(cfg.proto_config.as_deref())
+        .map_err(|e| format!("proto_config (rewrite map): {e}"))?;
+    let pc = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).map_err(|e| format!("{e}"))?;
+    for w in pc.session.warnings() {
+        warn!("{w}");
+    }
+    if !map.is_empty() {
+        info!(
+            ca = map.common_address.len(),
+            cot = map.cot.len(),
+            ioa = map.ioa.len(),
+            "loaded ASDU rewrite map"
+        );
+    }
+    Ok((map, pc))
+}
+
+fn link_options(
+    role: Role,
+    s: &SessionConfig,
+    pc: &Iec104ProtoConfig,
+    progress: &Option<MessageProgress>,
+    responder: Option<Responder>,
+    reader_name: String,
+) -> LinkOptions {
+    LinkOptions {
+        role,
+        params: LinkParams::from_config(s),
+        progress: progress.clone(),
+        cp56: Cp56Rewrite {
+            enabled: pc.cp56.rewrite_to_now,
+            zone: pc.cp56.zone(),
+        },
+        responder,
+        reader_name,
+        faults: pc.fault_plan.clone(),
+    }
+}
+
+/// Final figures: total elapsed time, and latency/throughput over the
+/// active part of the session ([`ProtoReport::active_ms`]: idle-serve
+/// time excluded).
+fn finish(mut report: ProtoReport, t_start: Instant) -> ProtoReport {
+    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
+    report.finalize_latency();
+    report
+}
+
+fn at_idx(e: &LinkEnd, what: &str, idx: usize) -> String {
+    format!("{} {what} at idx {idx}", e.describe())
+}
+
+/// The session error for a link end, or `None` when the end is a
+/// deliberate fault (`rst`) or the peer's reaction to an injected
+/// fault; those are reported in `ProtocolStats::fault_reaction`.
+fn fail(link: &Link, e: &LinkEnd, msg: String) -> Option<String> {
+    if link.fault_excused(e) {
+        info!(end = %e.describe(), "session ended by fault injection or the peer's reaction to it");
+        None
+    } else {
+        Some(msg)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Master
+// ---------------------------------------------------------------------------
 
 pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
     let t_start = Instant::now();
     let mut report = ProtoReport::default();
     let progress = cfg.progress.clone();
 
-    let rewrite_map: RewriteMap = match load_rewrite_map(cfg.proto_config.as_deref()) {
-        Ok(m) => m,
+    let (rewrite_map, pc) = match load_config(&cfg) {
+        Ok(x) => x,
         Err(e) => {
-            report.error = Some(format!("proto_config (rewrite map): {e}"));
+            report.error = Some(e);
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
-    if !rewrite_map.is_empty() {
-        info!(
-            ca = rewrite_map.common_address.len(),
-            cot = rewrite_map.cot.len(),
-            ioa = rewrite_map.ioa.len(),
-            "loaded ASDU rewrite map"
-        );
-    }
-
-    let mut client_iframes = extract_client_iframes(&cfg);
-    if !rewrite_map.is_empty() {
-        for asdu in client_iframes.iter_mut() {
-            rewrite_asdu(asdu, &rewrite_map);
-        }
-    }
+    let mut script = extract_script(&cfg, "client");
+    apply_rewrite(&mut script, &rewrite_map);
+    script.record(&mut report);
     info!(
-        count = client_iframes.len(),
+        count = script.frames.len(),
         "extracted client I-frame ASDUs from pcap"
     );
     bump(&progress, |p| {
-        p.planned.store(client_iframes.len() as u64, Ordering::Relaxed);
+        p.planned
+            .store(script.frames.len() as u64, Ordering::Relaxed);
     });
 
     // 1. Connect.
@@ -321,457 +304,167 @@ pub fn run_session(cfg: ProtoRunCfg) -> ProtoReport {
         return report;
     }
     let tgt: SocketAddr = SocketAddrV4::new(cfg.target_ip, cfg.target_port).into();
-    if let Err(e) = sock.connect_timeout(&tgt.into(), cfg.connect_timeout) {
-        report.error = Some(format!("connect({tgt}): {e}"));
+    // t0 from proto_config wins; otherwise the run's connect timeout.
+    let connect_timeout = pc
+        .session
+        .t0
+        .map(Duration::from_secs_f64)
+        .unwrap_or(cfg.connect_timeout);
+    if let Err(e) = connect_cancellable(&sock, &tgt.into(), connect_timeout, &progress) {
+        report.error = Some(if e.kind() == std::io::ErrorKind::Interrupted {
+            format!("cancelled while connecting to {tgt}")
+        } else {
+            format!("connect({tgt}): {e}")
+        });
         report.elapsed_ms = t_start.elapsed().as_millis() as u64;
         return report;
     }
     report.connected = true;
-
     let stream: TcpStream = sock.into();
     stream.set_nodelay(cfg.tcp_nodelay).ok();
-    let read_stream = match stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            report.error = Some(format!("clone stream: {e}"));
-            report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-            return report;
-        }
-    };
-    let mut write_stream = stream;
-    read_stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok();
 
-    // 2. Reader thread.
-    let (tx, rx): (mpsc::Sender<Apdu>, Receiver<Apdu>) = mpsc::channel();
-    thread::Builder::new()
-        .name("iec104-reader".into())
-        .spawn(move || {
-            let mut r = ApduReader::new(read_stream);
+    // 2. Hand the connection to the link engine.
+    let opts = link_options(
+        Role::Master,
+        &pc.session,
+        &pc,
+        &progress,
+        None,
+        "iec104-reader".into(),
+    );
+    let mut link = match Link::start(stream, opts, report) {
+        Ok(l) => l,
+        Err(r) => return finish(*r, t_start),
+    };
+    let error = drive_master(&mut link, &cfg, &script);
+    let mut report = link.into_report();
+    if report.error.is_none() {
+        report.error = error;
+    }
+    finish(report, t_start)
+}
+
+/// Poll interval of a pending master connect, see [`connect_cancellable`].
+const CONNECT_SLICE: Duration = Duration::from_millis(100);
+
+/// Connect `sock` to `tgt` within `timeout`, checking the cancel flags
+/// every [`CONNECT_SLICE`] (a blocking `connect_timeout(t0)` could not
+/// be stopped, F028). A cancel returns `ErrorKind::Interrupted`. The
+/// socket is left in blocking mode.
+fn connect_cancellable(
+    sock: &Socket,
+    tgt: &socket2::SockAddr,
+    timeout: Duration,
+    progress: &Option<MessageProgress>,
+) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    use std::os::fd::AsRawFd;
+    sock.set_nonblocking(true)?;
+    match sock.connect(tgt) {
+        Ok(()) => {}
+        Err(e) if e.raw_os_error() == Some(libc::EINPROGRESS) => {
+            let deadline = Instant::now() + timeout;
             loop {
-                match r.next_apdu() {
-                    Ok(Some(a)) => {
-                        if tx.send(a).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        // Spin back for more, letting the main thread
-                        // do work (and detect channel close at shutdown).
+                if progress_cancelled(progress) {
+                    return Err(Error::new(ErrorKind::Interrupted, "cancelled"));
+                }
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return Err(Error::new(ErrorKind::TimedOut, "connection timed out"));
+                }
+                let mut pfd = libc::pollfd {
+                    fd: sock.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let slice_ms = left.min(CONNECT_SLICE).as_millis().max(1) as libc::c_int;
+                // SAFETY: one valid pollfd.
+                let rc = unsafe { libc::poll(&mut pfd, 1, slice_ms) };
+                if rc < 0 {
+                    let err = Error::last_os_error();
+                    if err.kind() == ErrorKind::Interrupted {
                         continue;
                     }
-                    Err(e) => {
-                        debug!(error = %e, "reader exiting");
-                        break;
+                    return Err(err);
+                }
+                if rc > 0 {
+                    if let Some(err) = sock.take_error()? {
+                        return Err(err);
                     }
+                    break;
                 }
             }
-        })
-        .expect("spawn iec104-reader");
-
-    // 3. STARTDT handshake.
-    if let Err(e) = write_apdu(
-        &mut write_stream,
-        &Apdu::U {
-            code: U_STARTDT_ACT,
-        },
-    ) {
-        report.error = Some(format!("send STARTDT act: {e}"));
-        report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-        return report;
+        }
+        Err(e) => return Err(e),
     }
-    // STARTDT is protocol plumbing, not a data frame — don't count it
-    // in messages_sent (that field must match `planned`, which only
-    // tracks I-frames). Bandwidth is still tallied via bytes_written.
-    report.bytes_written += 6;
-    bump(&progress, |p| {
-        p.bytes_written.fetch_add(6, Ordering::Relaxed);
-    });
-    if !wait_for_u(&rx, U_STARTDT_CON, HANDSHAKE_TIMEOUT) {
-        report.error = Some("timeout waiting for STARTDT con".into());
-        report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-        return report;
+    sock.set_nonblocking(false)
+}
+
+/// STARTDT, script, drain, STOPDT. Returns the session error, if any.
+fn drive_master(link: &mut Link, cfg: &ProtoRunCfg, script: &Script) -> Option<String> {
+    // 3. STARTDT act → con within t1.
+    if let Err(e) = link.master_start() {
+        let msg = match &e {
+            LinkEnd::Timeout(_) => "timeout waiting for STARTDT con".into(),
+            e => format!("STARTDT: {}", e.describe()),
+        };
+        return fail(link, &e, msg);
     }
     info!("STARTDT handshake complete");
 
-    // 4. Windowed client-I-frame replay.
-    //
-    //    Each captured client I-frame is sent with live N(S)/N(R). The
-    //    k-window is enforced: at most DEFAULT_K I-frames may be in
-    //    flight (sent but not yet acknowledged by the server's n(r)).
-    //    When the window is full we block on rx until a server frame
-    //    frees at least one slot. Per-message latency is measured
-    //    send→ack and stored for histogram output.
-    let mut my_ns: u16 = 0;
-    let mut my_nr: u16 = 0;
-    let mut unacked_received: u16 = 0;
-    let w = DEFAULT_W;
-    let k = DEFAULT_K;
-    let mut pending: VecDeque<PendingIFrame> = VecDeque::with_capacity(k as usize);
-    let mut latency = LatencyReservoir::new(LATENCY_RESERVOIR_CAP);
-    let send_start_ns = now_ns();
+    // 4. Windowed, paced client-I-frame replay. Pacing waits service
+    //    the link, so TESTFR, acks and t1/t2/t3 keep running in gaps.
+    let epoch = now_ns();
+    for (idx, frame) in script.frames.iter().enumerate() {
+        if let Some(target) = script.target_ns(cfg, idx) {
+            if let Err(e) = link.wait_until(epoch + target) {
+                return fail(link, &e, at_idx(&e, "during pace", idx));
+            }
+        }
+        if let Err(e) = link.send_script_frame(&frame.asdu) {
+            warn!(error = %e.describe(), idx, "master: send aborted");
+            return fail(link, &e, at_idx(&e, "sending I-frame", idx));
+        }
+    }
 
-    'outer: for (idx, asdu) in client_iframes.iter().enumerate() {
-        if check_cancel(&progress) {
-            report.error = Some(format!("cancelled at idx {idx}"));
-            break 'outer;
-        }
-        // Honor original-pcap pacing if configured. This sleep is
-        // cancellation-aware so the user can abort even during long
-        // multi-second waits between captured frames.
-        if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
-            pace_sleep_until(send_start_ns, target, &progress);
-            if check_cancel(&progress) {
-                report.error = Some(format!("cancelled during pace at idx {idx}"));
-                break 'outer;
-            }
-        }
-        // Keep the unacked window from exceeding k. If it's already at
-        // k, block on recv until a server frame advances n(r) and
-        // retires at least one pending I-frame, or t1 elapses.
-        while pending.len() as u16 >= k {
-            report.window_stalls += 1;
-            let deadline = Instant::now() + T1_TIMEOUT;
-            let mut freed = false;
-            while Instant::now() < deadline {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match rx.recv_timeout(remaining.min(IDLE_POLL)) {
-                    Ok(apdu) => {
-                        handle_incoming(
-                            apdu,
-                            &mut write_stream,
-                            &mut my_nr,
-                            &mut unacked_received,
-                            w,
-                            &mut pending,
-                            &mut report,
-                            &progress,
-                            &mut latency,
-                        );
-                        if (pending.len() as u16) < k {
-                            freed = true;
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        report.error = Some(format!(
-                            "server closed before acking I-frame idx {idx} (pending={})",
-                            pending.len()
-                        ));
-                        break 'outer;
-                    }
-                }
-            }
-            if !freed {
-                report.error = Some(format!(
-                    "t1 timeout at idx {idx}: server never acked {} pending I-frames",
-                    pending.len()
-                ));
-                break 'outer;
-            }
-        }
-
-        // Non-blocking drain between sends so we can emit S-frame ACKs
-        // for server-originated I-frames promptly and keep pending
-        // tight.
-        while let Ok(apdu) = rx.try_recv() {
-            handle_incoming(
-                apdu,
-                &mut write_stream,
-                &mut my_nr,
-                &mut unacked_received,
-                w,
-                &mut pending,
-                &mut report,
-                &progress,
-                &mut latency,
+    // 5. Wait (t1-bounded) for the server to acknowledge everything,
+    //    so every in-flight I-frame gets a latency sample.
+    match link.drain_pending() {
+        Ok(()) => {}
+        // Server hung up after the script, with everything
+        // acknowledged: there is nobody left to STOPDT.
+        Err(LinkEnd::PeerClosed) if link.unacked_sent() == 0 => return None,
+        // Hung up on unacknowledged frames: as much a failure as the
+        // t1 expiry it would be if the peer had stayed open (N1).
+        Err(e @ LinkEnd::PeerClosed) => {
+            let msg = format!(
+                "{} with {} I-frame(s) unacknowledged after the last I-frame",
+                e.describe(),
+                link.unacked_sent()
             );
+            return fail(link, &e, msg);
         }
-
-        let mut patched = asdu.clone();
-        if cp56_cfg.rewrite_to_now {
-            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
+        Err(e) => {
+            let msg = format!("{} after the last I-frame", e.describe());
+            return fail(link, &e, msg);
         }
-        let apdu = Apdu::I {
-            ns: my_ns,
-            nr: my_nr,
-            asdu: patched,
-        };
-        let send_ns = now_ns();
-        let wire_len = apdu.serialize().len() as u64;
-        if let Err(e) = write_apdu(&mut write_stream, &apdu) {
-            warn!(error = %e, "send I-frame failed, aborting");
-            report.error = Some(format!("send I-frame at idx {idx}: {e}"));
-            break;
-        }
-        pending.push_back(PendingIFrame { ns: my_ns, send_ns });
-        my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
-        report.messages_sent += 1;
-        report.bytes_written += wire_len;
-        bump(&progress, |p| {
-            p.sent.fetch_add(1, Ordering::Relaxed);
-            p.bytes_written.fetch_add(wire_len, Ordering::Relaxed);
-            p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-        });
     }
 
-    // Drain remaining server frames for up to t1 so we can record
-    // latency samples for every in-flight I-frame before we hand the
-    // session off to STOPDT.
-    let final_deadline = Instant::now() + T1_TIMEOUT;
-    while !pending.is_empty() && Instant::now() < final_deadline {
-        let remaining = final_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-            Ok(apdu) => handle_incoming(
-                apdu,
-                &mut write_stream,
-                &mut my_nr,
-                &mut unacked_received,
-                w,
-                &mut pending,
-                &mut report,
-                &progress,
-                &mut latency,
-            ),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
+    // 6. S-frame flush (inside master_stop), STOPDT act → con. A
+    //    missing con is recorded as a t1 violation but does not fail an
+    //    otherwise complete run.
+    match link.master_stop() {
+        Ok(()) | Err(LinkEnd::PeerClosed) | Err(LinkEnd::Timeout(_)) => None,
+        Err(e) => {
+            let msg = format!("STOPDT: {}", e.describe());
+            fail(link, &e, msg)
         }
     }
-    report.unacked_at_end = pending.len() as u64;
-    bump(&progress, |p| {
-        p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-    });
-
-    // Total elapsed for the I-frame phase — used by finalize_latency
-    // for throughput calc.
-    let send_elapsed_ms = (now_ns().saturating_sub(send_start_ns)) / 1_000_000;
-    report.elapsed_ms = send_elapsed_ms;
-
-    // 5. STOPDT close (best effort). Plumbing frame — bytes only, no
-    //    messages_sent bump.
-    if let Err(e) = write_apdu(
-        &mut write_stream,
-        &Apdu::U {
-            code: U_STOPDT_ACT,
-        },
-    ) {
-        debug!(error = %e, "STOPDT act failed");
-    } else {
-        report.bytes_written += 6;
-        bump(&progress, |p| {
-            p.bytes_written.fetch_add(6, Ordering::Relaxed);
-        });
-        // Short wait for STOPDT con.
-        let _ = wait_for_u(&rx, U_STOPDT_CON, Duration::from_secs(2));
-    }
-    // Dropping write_stream sends FIN.
-    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-    report.latency_samples_us = latency.into_vec();
-    report.finalize_latency();
-    report
-}
-
-/// Process one incoming APDU: advance `my_nr` for I-frames, retire
-/// pending I-frames against `n(r)` in S/I frames, auto-ack TESTFR, and
-/// Slave-mode wrapper around [`handle_incoming`]. Detects master
-/// commands the slave is expected to answer (currently `C_IC_NA_1`
-/// general interrogation and `C_CI_NA_1` counter interrogation) and
-/// queues the spec-correct response ASDUs into `response_queue`. The
-/// main slave send-loop drains that queue between captured-payload
-/// frames so responses go out interleaved with spontaneous data,
-/// preserving k-window ordering.
-///
-/// All other APDUs (S-frames, U-frames, spontaneous I-frames the master
-/// happens to echo) are forwarded verbatim to [`handle_incoming`] for
-/// the existing receive-side accounting.
-fn slave_handle_incoming(
-    apdu: Apdu,
-    writer: &mut TcpStream,
-    my_nr: &mut u16,
-    unacked_received: &mut u16,
-    w: u16,
-    pending: &mut VecDeque<PendingIFrame>,
-    report: &mut ProtoReport,
-    progress: &Option<MessageProgress>,
-    latency: &mut LatencyReservoir,
-    inventory: &Inventory,
-    response_queue: &mut VecDeque<Vec<u8>>,
-) {
-    if let Apdu::I { ref asdu, .. } = apdu {
-        try_queue_master_command_response(asdu, inventory, response_queue);
-    }
-    handle_incoming(
-        apdu,
-        writer,
-        my_nr,
-        unacked_received,
-        w,
-        pending,
-        report,
-        progress,
-        latency,
-    );
-}
-
-/// Inspect an incoming I-frame ASDU; if it is a recognised master
-/// command (currently `C_IC_NA_1` type 100 or `C_CI_NA_1` type 101,
-/// COT=6 = Activation), build the spec-correct response sequence
-/// (ActCon → data frames → ActTerm) using [`crate::responder`] and
-/// push the resulting ASDUs into `queue`. Other ASDUs are no-ops.
-fn try_queue_master_command_response(
-    asdu: &[u8],
-    inventory: &Inventory,
-    queue: &mut VecDeque<Vec<u8>>,
-) {
-    if asdu.len() < DUI_LEN + IOA_LEN + 1 {
-        return;
-    }
-    let type_id = asdu[0];
-    if !matches!(type_id, 100 | 101) {
-        return;
-    }
-    let cot_low = asdu[2] & 0x3f;
-    if cot_low != 6 {
-        // Activation only. ActCon (7) and ActTerm (10) shouldn't come
-        // from master; ignore. Other COTs (negative ack etc.) we don't
-        // synthesise replies for.
-        return;
-    }
-    let echo = RequestEcho {
-        ca: common_address(asdu),
-        oa: asdu[3],
-        test: asdu[2] & 0x80 != 0,
-        negative: false,
-    };
-    let element_byte = asdu[DUI_LEN + IOA_LEN]; // QOI for type 100, QCC for 101
-    let frames = match type_id {
-        100 => build_gi_response(inventory, echo, element_byte),
-        101 => build_ci_response(inventory, echo, element_byte),
-        _ => return,
-    };
-    for f in frames {
-        queue.push_back(f);
-    }
-}
-
-/// emit an S-frame when our receive window hits `w`.
-fn handle_incoming(
-    apdu: Apdu,
-    writer: &mut TcpStream,
-    my_nr: &mut u16,
-    unacked_received: &mut u16,
-    w: u16,
-    pending: &mut VecDeque<PendingIFrame>,
-    report: &mut ProtoReport,
-    progress: &Option<MessageProgress>,
-    latency: &mut LatencyReservoir,
-) {
-    match apdu {
-        Apdu::I { nr, asdu, .. } => {
-            retire_acked(pending, nr, latency);
-            *my_nr = my_nr.wrapping_add(1) & 0x7fff;
-            *unacked_received += 1;
-            report.messages_received += 1;
-            let iframe_bytes = 6 + asdu.len() as u64;
-            report.bytes_read += iframe_bytes;
-            bump(progress, |p| {
-                p.received.fetch_add(1, Ordering::Relaxed);
-                p.bytes_read.fetch_add(iframe_bytes, Ordering::Relaxed);
-                p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-            });
-        }
-        Apdu::S { nr } => {
-            retire_acked(pending, nr, latency);
-            report.bytes_read += 6;
-            bump(progress, |p| {
-                p.bytes_read.fetch_add(6, Ordering::Relaxed);
-                p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-            });
-        }
-        Apdu::U { code: U_TESTFR_ACT } => {
-            let _ = write_apdu(
-                writer,
-                &Apdu::U {
-                    code: U_TESTFR_CON,
-                },
-            );
-            // TESTFR con is plumbing — bandwidth only, no data counter.
-            report.bytes_written += 6;
-            report.bytes_read += 6;
-            bump(progress, |p| {
-                p.bytes_written.fetch_add(6, Ordering::Relaxed);
-                p.bytes_read.fetch_add(6, Ordering::Relaxed);
-            });
-        }
-        Apdu::U { .. } => {
-            report.bytes_read += 6;
-            bump(progress, |p| {
-                p.bytes_read.fetch_add(6, Ordering::Relaxed);
-            });
-        }
-    }
-    if *unacked_received >= w {
-        // Automatic S-frame ack — plumbing, not a data frame.
-        let _ = write_apdu(writer, &Apdu::S { nr: *my_nr });
-        report.bytes_written += 6;
-        *unacked_received = 0;
-        bump(progress, |p| {
-            p.bytes_written.fetch_add(6, Ordering::Relaxed);
-        });
-    }
-}
-
-fn wait_for_u(rx: &Receiver<Apdu>, code: u8, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining.min(IDLE_POLL)) {
-            Ok(Apdu::U { code: c }) if c == code => return true,
-            Ok(_other) => {}
-            Err(RecvTimeoutError::Timeout) => {}
-            Err(RecvTimeoutError::Disconnected) => return false,
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
-// Slave-mode session: outstation impersonates the captured server.
-//
-// Flow:
-//   1. Bind a TcpListener on 0.0.0.0:cfg.listen_port.
-//   2. accept() exactly one connection from the live master.
-//   3. Wait for STARTDT act from the master, reply STARTDT con.
-//   4. Walk the captured server-originated I-frames with live N(S)/N(R),
-//      pipelined to k, measuring send→ack latency just like master mode.
-//   5. Handle inbound client I-frames by advancing my_nr + emitting an
-//      S-frame when the receive window fills.
-//   6. Handle STOPDT act → con; drop the socket.
-
-const LISTEN_ACCEPT_TIMEOUT: Duration = Duration::from_secs(600);
-
-/// Helper: transition the session-state atomic if progress is present.
-fn set_state(progress: &Option<MessageProgress>, new_state: u8) {
-    if let Some(p) = progress {
-        p.state.store(new_state, Ordering::Relaxed);
-    }
-}
-
-#[inline]
-fn check_cancel(progress: &Option<MessageProgress>) -> bool {
-    progress
-        .as_ref()
-        .map(|p| p.cancel.load(Ordering::Relaxed))
-        .unwrap_or(false)
-}
+// Slave
+// ---------------------------------------------------------------------------
 
 pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     let t_start = Instant::now();
@@ -779,69 +472,98 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     let progress = cfg.progress.clone();
     set_state(&progress, session_state::PENDING);
 
-    let rewrite_map: RewriteMap = match load_rewrite_map(cfg.proto_config.as_deref()) {
-        Ok(m) => m,
+    let (rewrite_map, pc) = match load_config(&cfg) {
+        Ok(x) => x,
         Err(e) => {
-            report.error = Some(format!("proto_config (rewrite map): {e}"));
+            report.error = Some(e);
+            set_state(&progress, session_state::FAILED);
             return report;
         }
     };
-    let cp56_cfg = Iec104ProtoConfig::parse(cfg.proto_config.as_deref()).cp56;
-    let cp56_zone = Cp56Zone::parse(&cp56_cfg.zone).unwrap_or(Cp56Zone::Local);
-    if !rewrite_map.is_empty() {
-        info!(
-            ca = rewrite_map.common_address.len(),
-            cot = rewrite_map.cot.len(),
-            ioa = rewrite_map.ioa.len(),
-            "loaded ASDU rewrite map (slave)"
-        );
-    }
+    let mut script = extract_script(&cfg, "server");
+    apply_rewrite(&mut script, &rewrite_map);
+    script.record(&mut report);
 
-    let mut server_iframes = extract_iframes(&cfg, "server");
-    if !rewrite_map.is_empty() {
-        for asdu in server_iframes.iter_mut() {
-            rewrite_asdu(asdu, &rewrite_map);
+    // Point database for live GI/CI answers, built from the resynced,
+    // CA/IOA-rewritten frames (including the captured interrogation
+    // responses, which carry values too) so the responder's CA filter
+    // matches the addresses the live master uses.
+    // Shared on/off switch with the analyzer: `{"gi_ci_synthesis": false}`
+    // replays the captured bursts verbatim and answers nothing live.
+    // Command echo (`commands.enabled`, default on) answers the
+    // master's control-direction commands from the same inventory.
+    // Validated by `load_config`: a boolean or absent (= on).
+    let synthesize = pc.gi_ci_synthesis.unwrap_or(true);
+    let echo_commands = pc.commands.enabled;
+    let live = (synthesize || echo_commands).then(|| {
+        let mut inventory = Inventory::default();
+        let mut book = CommandBook::default();
+        for f in &script.frames {
+            inventory.ingest_asdu(&f.asdu);
+            book.ingest_asdu(&f.asdu);
         }
-    }
+        info!(
+            points = inventory.len(),
+            command_points = book.len(),
+            gi_ci = synthesize,
+            commands = echo_commands,
+            "slave: built point inventory for live responses"
+        );
+        (inventory, book)
+    });
+    // A fresh responder per connection: a master that closed before
+    // STARTDT leaves nothing behind for the next one (T17c).
+    let make_responder = || {
+        live.as_ref().map(|(inventory, book)| {
+            let r = Responder::new(inventory.clone()).gi_ci(synthesize);
+            if echo_commands {
+                r.with_commands(CommandEcho {
+                    cfg: pc.commands.clone(),
+                    book: book.clone(),
+                    zone: pc.cp56.zone(),
+                })
+            } else {
+                r
+            }
+        })
+    };
+    // The live master gets synthesized answers to its own GI/CI and
+    // commands; replaying the captured exchanges too would hand it
+    // unsolicited confirmations and duplicate data (and, with return
+    // information on, the capture's COT 11 reports of remote commands
+    // it never sent). Same rule as the analyzer:
+    // `crate::interrogation::CaptureStrip`.
+    let strip = crate::interrogation::CaptureStrip::new(synthesize, &pc.commands);
+    let before = script.frames.len();
+    let mut stripped_return_info = 0u64;
+    script.frames.retain(|f| match strip.classify(&f.asdu) {
+        None => true,
+        Some(kind) => {
+            if kind == crate::interrogation::Stripped::ReturnInfo {
+                stripped_return_info += 1;
+            }
+            false
+        }
+    });
+    report.protocol.stripped_capture_frames = (before - script.frames.len()) as u64;
     info!(
-        count = server_iframes.len(),
+        count = script.frames.len(),
+        stripped = report.protocol.stripped_capture_frames,
+        stripped_return_info,
         port = cfg.listen_port,
         "slave: extracted server-originated I-frame ASDUs"
     );
-
-    // Build the per-RTU point database from the same captured payload
-    // we will replay. Used to answer GI/CI commands the live master
-    // sends (C_IC_NA_1, C_CI_NA_1) with spec-correct Inrogen/Reqcogen
-    // sequences carrying the most recently seen value per (CA, IOA).
-    // Spec-strict: see crate::responder for the per-IEC-60870-5-101
-    // semantics (ActCon -> values -> ActTerm, QOI/QCC echo, group
-    // filtering, k-window aware chunking).
-    let mut inventory = crate::inventory::Inventory::default();
-    {
-        let mut full = Vec::new();
-        for seg in &cfg.client_segments {
-            full.extend_from_slice(&seg.bytes);
-        }
-        inventory.ingest_payload(&full);
-    }
-    info!(
-        points = inventory.len(),
-        "slave: built point inventory for GI/CI responses"
-    );
     bump(&progress, |p| {
-        p.planned.store(server_iframes.len() as u64, Ordering::Relaxed);
+        p.planned
+            .store(script.frames.len() as u64, Ordering::Relaxed);
     });
 
     // Note: the ready-gate and user-editable listen-IP snapshot live
     // in sched (see `run_benchmark_slave`). By the time we get here,
     // `cfg.bind_ip` is the final listen address, already approved.
 
-    // 1. Bind the listener. `bind_ip` carries the user-chosen local
-    //    address (0.0.0.0 for any-interface, or a specific RTU IP the
-    //    user has aliased to a host interface).
-    let listen_addr: SocketAddr = format!("{}:{}", cfg.bind_ip, cfg.listen_port)
-        .parse()
-        .expect("valid socket addr");
+    // 1. Bind the listener.
+    let listen_addr: SocketAddr = SocketAddrV4::new(cfg.bind_ip, cfg.listen_port).into();
     let listener = match TcpListener::bind(listen_addr) {
         Ok(l) => l,
         Err(e) => {
@@ -852,432 +574,87 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     };
     set_state(&progress, session_state::LISTENING);
     info!(%listen_addr, "slave: listening for master connect");
-    if let Err(e) = listener.set_nonblocking(false) {
-        debug!(error = %e, "set_nonblocking(false) failed");
-    }
 
-    // 3. Accept. We block up to LISTEN_ACCEPT_TIMEOUT for the master
-    //    to show up, then fail the session. Also honour cancel so the
-    //    user can abort a slave that's waiting for a connection.
-    let accept_deadline = Instant::now() + LISTEN_ACCEPT_TIMEOUT;
+    // 2. Accept, honouring cancel and LISTEN_ACCEPT_TIMEOUT, until a
+    //    master completes STARTDT. A master that closes (or resets) its
+    //    connection before that, e.g. a port probe or a master that
+    //    gives up and redials, leaves the session listening again
+    //    (T17c): the listener stays open until STARTDT.
     listener.set_nonblocking(true).ok();
-    let (write_stream, peer_addr) = loop {
-        if check_cancel(&progress) {
-            report.error = Some("cancelled while listening".into());
-            report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-            set_state(&progress, session_state::FAILED);
-            return report;
-        }
-        match listener.accept() {
-            Ok((s, addr)) => break (s, addr),
-            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                if Instant::now() >= accept_deadline {
-                    report.error = Some(format!(
-                        "no master connected within {}s",
-                        LISTEN_ACCEPT_TIMEOUT.as_secs()
-                    ));
-                    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-                    set_state(&progress, session_state::FAILED);
-                    return report;
-                }
-                std::thread::sleep(Duration::from_millis(100));
+    let base_report = report;
+    let mut dropped_before_startdt = 0u64;
+    let mut link = loop {
+        let (stream, peer_addr) = match accept_master(&listener, &progress, t_start) {
+            Ok(x) => x,
+            Err(mut r) => {
+                let mut report = base_report;
+                report.error = r.error.take();
+                report.elapsed_ms = r.elapsed_ms;
+                report.protocol.connections_before_startdt = dropped_before_startdt;
+                return report;
             }
-            Err(e) => {
-                report.error = Some(format!("accept: {e}"));
-                report.elapsed_ms = t_start.elapsed().as_millis() as u64;
+        };
+        stream.set_nonblocking(false).ok();
+        info!(%peer_addr, "slave: master connected");
+        set_state(&progress, session_state::CONNECTED);
+        stream.set_nodelay(cfg.tcp_nodelay).ok();
+        let opts = link_options(
+            Role::Slave,
+            &pc.session,
+            &pc,
+            &progress,
+            make_responder(),
+            format!("iec104-slave-reader-{}", cfg.listen_port),
+        );
+        let mut fresh = base_report.clone();
+        fresh.connected = true;
+        let mut link = match Link::start(stream, opts, fresh) {
+            Ok(l) => l,
+            Err(r) => {
                 set_state(&progress, session_state::FAILED);
+                return finish(*r, t_start);
+            }
+        };
+        match wait_startdt(&mut link) {
+            Startdt::Started => break link,
+            Startdt::Closed(why) => {
+                dropped_before_startdt += 1;
+                info!(%peer_addr, reason = %why, dropped_before_startdt,
+                    "slave: master left before STARTDT; listening again");
+                drop(link);
+                set_state(&progress, session_state::LISTENING);
+            }
+            Startdt::Failed(error) => {
+                let mut report = link.into_report();
+                report.protocol.connections_before_startdt = dropped_before_startdt;
+                if report.error.is_none() {
+                    report.error = error;
+                }
+                let report = finish(report, t_start);
+                set_state(
+                    &progress,
+                    if report.error.is_some() {
+                        session_state::FAILED
+                    } else {
+                        session_state::COMPLETED
+                    },
+                );
                 return report;
             }
         }
     };
-    listener.set_nonblocking(false).ok();
-    info!(%peer_addr, "slave: master connected");
-    set_state(&progress, session_state::CONNECTED);
-    report.connected = true;
-
-    write_stream.set_nodelay(cfg.tcp_nodelay).ok();
-    let read_stream = match write_stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            report.error = Some(format!("clone stream: {e}"));
-            report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-            return report;
-        }
-    };
-    let mut write_stream = write_stream;
-    read_stream
-        .set_read_timeout(Some(Duration::from_millis(200)))
-        .ok();
-
-    // 3. Reader thread.
-    let (tx, rx): (mpsc::Sender<Apdu>, Receiver<Apdu>) = mpsc::channel();
-    thread::Builder::new()
-        .name(format!("iec104-slave-reader-{}", cfg.listen_port))
-        .spawn(move || {
-            let mut r = ApduReader::new(read_stream);
-            loop {
-                match r.next_apdu() {
-                    Ok(Some(a)) => {
-                        if tx.send(a).is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e)
-                        if matches!(
-                            e.kind(),
-                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-                        ) =>
-                    {
-                        continue;
-                    }
-                    Err(e) => {
-                        debug!(error = %e, "slave reader exiting");
-                        break;
-                    }
-                }
-            }
-        })
-        .expect("spawn iec104-slave-reader");
-
-    // 5. Wait for STARTDT act from the master, reply STARTDT con.
-    if !wait_for_u(&rx, U_STARTDT_ACT, HANDSHAKE_TIMEOUT) {
-        report.error = Some("timeout waiting for STARTDT act from master".into());
-        report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-        set_state(&progress, session_state::FAILED);
-        return report;
-    }
-    if let Err(e) = write_apdu(
-        &mut write_stream,
-        &Apdu::U {
-            code: U_STARTDT_CON,
-        },
-    ) {
-        report.error = Some(format!("send STARTDT con: {e}"));
-        report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-        set_state(&progress, session_state::FAILED);
-        return report;
-    }
-    // STARTDT con is plumbing, not a data frame.
-    report.bytes_written += 6;
-    bump(&progress, |p| {
-        p.bytes_written.fetch_add(6, Ordering::Relaxed);
-    });
+    // One connection per session: stop accepting.
+    drop(listener);
+    link.report.protocol.connections_before_startdt = dropped_before_startdt;
     set_state(&progress, session_state::ACTIVE);
     info!("slave: STARTDT handshake complete, now active");
 
-    // 5. Windowed send of captured server I-frames.
-    let mut my_ns: u16 = 0;
-    let mut my_nr: u16 = 0;
-    let mut unacked_received: u16 = 0;
-    let w = DEFAULT_W;
-    let k = DEFAULT_K;
-    let mut pending: VecDeque<PendingIFrame> = VecDeque::with_capacity(k as usize);
-    let mut latency = LatencyReservoir::new(LATENCY_RESERVOIR_CAP);
-    let send_start_ns = now_ns();
-    // Pacing reference. With OriginalTiming pacing this is the wall-
-    // clock anchor `frame_times_ns[idx]` is added to before sleeping.
-    // Reset at the top of every script-loop iteration so loop 2/3/...
-    // don't fire instantly because every captured timestamp is in the
-    // past (which would flood the master and collapse the chart).
-    let mut pacing_epoch_ns = send_start_ns;
-
-    // Response queue for GI/CI bursts the slave synthesises in reply
-    // to incoming master commands. slave_handle_incoming pushes into
-    // this; the loop below drains a few entries between every
-    // captured-payload frame so responses go out promptly without
-    // blowing past the k-window.
-    let mut response_queue: VecDeque<Vec<u8>> = VecDeque::new();
-
-    // Inner-loop iteration plan: replay the captured script
-    // `cfg.loop_iterations` times within this single TCP session.
-    // 0 = loop forever (until cancel or master disconnect). pending /
-    // my_ns / my_nr / unacked_received persist across loops because
-    // IEC 104 sequence numbers are session-scoped, not script-scoped.
-    let unlimited_loops = cfg.loop_iterations == 0;
-    let inner_loops = if unlimited_loops {
-        u64::MAX
-    } else {
-        cfg.loop_iterations.max(1)
-    };
-    bump(&progress, |p| {
-        p.iter_total.store(
-            if unlimited_loops { 0 } else { inner_loops },
-            Ordering::Relaxed,
-        );
-    });
-    let mut early_break = false;
-    'replay: for loop_idx in 0..inner_loops {
-        // Reset per-iteration UI counters so the bar restarts from 0
-        // each loop. Cumulative totals stay in `report` for the
-        // post-run report.
-        bump(&progress, |p| {
-            p.iter_current
-                .store(loop_idx + 1, Ordering::Relaxed);
-            p.sent.store(0, Ordering::Relaxed);
-            p.bytes_written.store(0, Ordering::Relaxed);
-        });
-        if loop_idx > 0 {
-            // Re-anchor pacing so the next loop's frame_times_ns[0]
-            // means "fire now" rather than "fire at original session
-            // start" (which would already be way in the past, flooding
-            // the master with the entire script in milliseconds).
-            pacing_epoch_ns = now_ns();
-            info!(loop_idx, "slave: starting next within-session iteration");
-        }
-        'outer: for (idx, asdu) in server_iframes.iter().enumerate() {
-            if check_cancel(&progress) {
-                report.error = Some(format!("cancelled at idx {idx}"));
-                early_break = true;
-                break 'outer;
-            }
-        if let Some(target) = paced_target_ns(cfg.pacing, &cfg.frame_times_ns, idx) {
-            // Pace until the next captured send time, but stay
-            // responsive to incoming master traffic during the wait —
-            // critical for long inter-frame gaps where TESTFR_act
-            // would otherwise miss its t1 reply window.
-            let target_abs_ns = pacing_epoch_ns.saturating_add(target);
-            'pace: loop {
-                let now = now_ns();
-                if now >= target_abs_ns {
-                    break 'pace;
-                }
-                if check_cancel(&progress) {
-                    report.error = Some(format!("cancelled during pace at idx {idx}"));
-                    early_break = true;
-                    break 'outer;
-                }
-                let remaining_ns = target_abs_ns.saturating_sub(now);
-                let slice = Duration::from_nanos(remaining_ns.min(IDLE_POLL.as_nanos() as u64));
-                match rx.recv_timeout(slice) {
-                    Ok(apdu) => slave_handle_incoming(
-                        apdu,
-                        &mut write_stream,
-                        &mut my_nr,
-                        &mut unacked_received,
-                        w,
-                        &mut pending,
-                        &mut report,
-                        &progress,
-                        &mut latency,
-                        &inventory,
-                        &mut response_queue,
-                    ),
-                    Err(RecvTimeoutError::Timeout) => {}
-                    Err(RecvTimeoutError::Disconnected) => {
-                        // Master tore down during the gap; let the
-                        // next write fail naturally so the existing
-                        // error path runs.
-                        break 'pace;
-                    }
-                }
-            }
-        }
-        while pending.len() as u16 >= k {
-            report.window_stalls += 1;
-            let deadline = Instant::now() + T1_TIMEOUT;
-            let mut freed = false;
-            while Instant::now() < deadline {
-                let remaining = deadline.saturating_duration_since(Instant::now());
-                match rx.recv_timeout(remaining.min(IDLE_POLL)) {
-                    Ok(apdu) => {
-                        slave_handle_incoming(
-                            apdu,
-                            &mut write_stream,
-                            &mut my_nr,
-                            &mut unacked_received,
-                            w,
-                            &mut pending,
-                            &mut report,
-                            &progress,
-                            &mut latency,
-                            &inventory,
-                            &mut response_queue,
-                        );
-                        if (pending.len() as u16) < k {
-                            freed = true;
-                            break;
-                        }
-                    }
-                    Err(RecvTimeoutError::Timeout) => continue,
-                    Err(RecvTimeoutError::Disconnected) => {
-                        report.error = Some(format!(
-                            "master closed before acking I-frame idx {idx} (pending={})",
-                            pending.len()
-                        ));
-                        early_break = true;
-                        break 'outer;
-                    }
-                }
-            }
-            if !freed {
-                report.error = Some(format!(
-                    "t1 timeout at idx {idx}: master never acked {} pending I-frames",
-                    pending.len()
-                ));
-                early_break = true;
-                break 'outer;
-            }
-        }
-
-        while let Ok(apdu) = rx.try_recv() {
-            slave_handle_incoming(
-                apdu,
-                &mut write_stream,
-                &mut my_nr,
-                &mut unacked_received,
-                w,
-                &mut pending,
-                &mut report,
-                &progress,
-                &mut latency,
-                &inventory,
-                &mut response_queue,
-            );
-        }
-
-        // Drain any queued GI/CI response frames first so a master
-        // command that arrived during the pacing wait gets answered
-        // before we resume captured-payload replay. Bounded by the
-        // remaining k-window slot count so we never overrun the
-        // master's receive window.
-        while !response_queue.is_empty() && (pending.len() as u16) < k {
-            let mut resp_asdu = response_queue
-                .pop_front()
-                .expect("len > 0 just checked");
-            if cp56_cfg.rewrite_to_now {
-                rewrite_cp56time2a_to_now_zoned(
-                    &mut resp_asdu,
-                    wall_clock_unix_ns(),
-                    cp56_zone,
-                );
-            }
-            let resp_apdu = Apdu::I {
-                ns: my_ns,
-                nr: my_nr,
-                asdu: resp_asdu,
-            };
-            let resp_send_ns = now_ns();
-            let resp_wire_len = resp_apdu.serialize().len() as u64;
-            if let Err(e) = write_apdu(&mut write_stream, &resp_apdu) {
-                warn!(error = %e, "slave: send GI/CI response frame failed");
-                report.error = Some(format!("send GI/CI response: {e}"));
-                early_break = true;
-                break 'outer;
-            }
-            pending.push_back(PendingIFrame { ns: my_ns, send_ns: resp_send_ns });
-            my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
-            report.messages_sent += 1;
-            report.bytes_written += resp_wire_len;
-            bump(&progress, |p| {
-                p.sent.fetch_add(1, Ordering::Relaxed);
-                p.bytes_written.fetch_add(resp_wire_len, Ordering::Relaxed);
-                p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-            });
-        }
-
-        let mut patched = asdu.clone();
-        if cp56_cfg.rewrite_to_now {
-            rewrite_cp56time2a_to_now_zoned(&mut patched, wall_clock_unix_ns(), cp56_zone);
-        }
-        let apdu = Apdu::I {
-            ns: my_ns,
-            nr: my_nr,
-            asdu: patched,
-        };
-        let send_ns = now_ns();
-        let wire_len = apdu.serialize().len() as u64;
-        if let Err(e) = write_apdu(&mut write_stream, &apdu) {
-            warn!(error = %e, "slave: send I-frame failed");
-            report.error = Some(format!("send I-frame at idx {idx}: {e}"));
-            break;
-        }
-        pending.push_back(PendingIFrame { ns: my_ns, send_ns });
-        my_ns = (my_ns.wrapping_add(1)) & 0x7fff;
-        report.messages_sent += 1;
-        report.bytes_written += wire_len;
-        bump(&progress, |p| {
-            p.sent.fetch_add(1, Ordering::Relaxed);
-            p.bytes_written.fetch_add(wire_len, Ordering::Relaxed);
-            p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-        });
+    let error = drive_slave(&mut link, &cfg, &script, &pc.session);
+    let mut report = link.into_report();
+    if report.error.is_none() {
+        report.error = error;
     }
-        // End of one within-session script play. Bail out of the
-        // replay loop if the inner 'outer broke for cancel/error
-        // (no point re-running once the master has gone away).
-        if early_break || check_cancel(&progress) {
-            break 'replay;
-        }
-    }
-
-    // 6. Drain remaining server frames so pending clears.
-    let final_deadline = Instant::now() + T1_TIMEOUT;
-    while !pending.is_empty() && Instant::now() < final_deadline {
-        let remaining = final_deadline.saturating_duration_since(Instant::now());
-        match rx.recv_timeout(remaining.min(Duration::from_millis(200))) {
-            Ok(apdu) => slave_handle_incoming(
-                apdu,
-                &mut write_stream,
-                &mut my_nr,
-                &mut unacked_received,
-                w,
-                &mut pending,
-                &mut report,
-                &progress,
-                &mut latency,
-                &inventory,
-                &mut response_queue,
-            ),
-            Err(RecvTimeoutError::Timeout) => continue,
-            Err(RecvTimeoutError::Disconnected) => break,
-        }
-    }
-    report.unacked_at_end = pending.len() as u64;
-    bump(&progress, |p| {
-        p.unacked.store(pending.len() as u64, Ordering::Relaxed);
-    });
-
-    // 6.5 Polite final S-frame flush: ACK every received I-frame
-    // before we go away, even if `unacked_received` never hit `w` and
-    // therefore never triggered the in-loop S-frame send. Spec doesn't
-    // let the slave initiate STOPDT, but a final S-frame with our
-    // current N(R) tells the master "I have received everything you
-    // sent up to this point" — strictly polite, 100% per IEC 104
-    // Annex C. Best-effort: a closed socket here is fine.
-    if unacked_received > 0 {
-        if write_apdu(&mut write_stream, &Apdu::S { nr: my_nr }).is_ok() {
-            report.bytes_written += 6;
-            bump(&progress, |p| {
-                p.bytes_written.fetch_add(6, Ordering::Relaxed);
-            });
-            // No further sends after this; counter intentionally
-            // not zeroed to avoid an unused-write warning.
-        }
-    }
-
-    // 7. Wait briefly for STOPDT act from master. If it arrives, reply
-    //    STOPDT con. Either way, drop the socket to close.
-    if wait_for_u(&rx, U_STOPDT_ACT, Duration::from_secs(2)) {
-        if write_apdu(
-            &mut write_stream,
-            &Apdu::U {
-                code: U_STOPDT_CON,
-            },
-        )
-        .is_ok()
-        {
-            // STOPDT con is plumbing.
-            report.bytes_written += 6;
-            bump(&progress, |p| {
-                p.bytes_written.fetch_add(6, Ordering::Relaxed);
-            });
-        }
-    }
-
-    let _ = send_start_ns; // currently unused; reserved for per-session throughput refinement
-    report.elapsed_ms = t_start.elapsed().as_millis() as u64;
-    report.latency_samples_us = latency.into_vec();
-    report.finalize_latency();
+    let report = finish(report, t_start);
     set_state(
         &progress,
         if report.error.is_some() {
@@ -1289,304 +666,174 @@ pub fn run_slave_session(cfg: ProtoRunCfg) -> ProtoReport {
     report
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::apdu::Apdu;
-    use protoplay::ClientSegment;
-    use std::io::{Read, Write};
-    use std::net::{Ipv4Addr, TcpListener};
-
-    /// Helper: assemble a set of I-frames serialized into a single
-    /// client_segments byte buffer.
-    fn iframes_blob(count: u16) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        for i in 0..count {
-            let asdu = vec![
-                0x65,
-                0x01,
-                0x06,
-                0x00,
-                0x01,
-                0x00,
-                i as u8,
-                (i >> 8) as u8,
-                0x00,
-                0x00,
-            ];
-            bytes.extend_from_slice(
-                &Apdu::I {
-                    ns: i,
-                    nr: 0,
-                    asdu,
-                }
-                .serialize(),
-            );
+/// Wait for the next master connection on the (non-blocking)
+/// `listener`, honouring cancel and [`LISTEN_ACCEPT_TIMEOUT`] (counted
+/// from now). On cancel, timeout or an accept error the returned
+/// report carries the error and elapsed time, and the session state is
+/// set.
+fn accept_master(
+    listener: &TcpListener,
+    progress: &Option<MessageProgress>,
+    t_start: Instant,
+) -> Result<(std::net::TcpStream, SocketAddr), Box<ProtoReport>> {
+    let accept_deadline = Instant::now() + LISTEN_ACCEPT_TIMEOUT;
+    let end = |msg: String, state: u8| {
+        set_state(progress, state);
+        Err(Box::new(ProtoReport {
+            error: Some(msg),
+            elapsed_ms: t_start.elapsed().as_millis() as u64,
+            ..Default::default()
+        }))
+    };
+    loop {
+        if progress_cancelled(progress) {
+            // Stopped before any master connected: not a failure.
+            return end("cancelled while listening".into(), session_state::CANCELLED);
         }
-        bytes
-    }
-
-    #[test]
-    fn windowed_send_blocks_until_server_acks() {
-        // Plan: 15 client I-frames. k=12. Server reads 12 silently,
-        // waits 100ms, sends an S-frame acking all 12. Client should
-        // stall after the 12th I-frame, unblock on the S-frame,
-        // finish sending the last 3. All 15 should have latency
-        // samples; the first 12 should have elevated latency (≥ 100 ms)
-        // since they sat in the pending deque until the S-frame.
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(5))).ok();
-
-            // STARTDT act -> STARTDT con
-            let mut buf = [0u8; 6];
-            sock.read_exact(&mut buf).unwrap();
-            assert_eq!(buf, [0x68, 4, U_STARTDT_ACT, 0, 0, 0]);
-            sock.write_all(&[0x68, 4, U_STARTDT_CON, 0, 0, 0]).unwrap();
-
-            // Read the first 12 I-frames (headers + ASDUs).
-            let mut got = 0u16;
-            while got < 12 {
-                let mut hdr = [0u8; 2];
-                sock.read_exact(&mut hdr).unwrap();
-                assert_eq!(hdr[0], 0x68);
-                let mut body = vec![0u8; hdr[1] as usize];
-                sock.read_exact(&mut body).unwrap();
-                if body[0] & 0x01 == 0 {
-                    got += 1;
+        match listener.accept() {
+            Ok(x) => return Ok(x),
+            Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                if Instant::now() >= accept_deadline {
+                    return end(
+                        format!(
+                            "no master connected within {}s",
+                            LISTEN_ACCEPT_TIMEOUT.as_secs()
+                        ),
+                        session_state::FAILED,
+                    );
                 }
+                std::thread::sleep(Duration::from_millis(50));
             }
-            // Delay, then S-frame acking all 12 (n(r)=12).
-            std::thread::sleep(Duration::from_millis(120));
-            // S-frame: APCI 01 00 cf3 cf4 where (cf4<<7)|(cf3>>1) = 12
-            let nr: u16 = 12;
-            let cf3 = ((nr << 1) & 0xfe) as u8;
-            let cf4 = ((nr >> 7) & 0xff) as u8;
-            sock.write_all(&[0x68, 4, 0x01, 0x00, cf3, cf4]).unwrap();
-
-            // Read the remaining I-frames + STOPDT act.
-            let mut data = Vec::new();
-            let mut tmp = [0u8; 1024];
-            while let Ok(n) = sock.read(&mut tmp) {
-                if n == 0 {
-                    break;
-                }
-                data.extend_from_slice(&tmp[..n]);
-                if data
-                    .windows(6)
-                    .any(|w| w == [0x68, 4, U_STOPDT_ACT, 0, 0, 0])
-                {
-                    sock.write_all(&[0x68, 4, U_STOPDT_CON, 0, 0, 0]).ok();
-                    break;
-                }
-            }
-        });
-
-        let cfg = ProtoRunCfg {
-            bind_ip: Ipv4Addr::new(127, 0, 0, 1),
-            bind_iface: None,
-            target_ip: Ipv4Addr::new(127, 0, 0, 1),
-            target_port: port,
-            tcp_nodelay: true,
-            client_segments: vec![ClientSegment {
-                rel_ts_ns: 0,
-                bytes: iframes_blob(15),
-            }],
-            connect_timeout: Duration::from_secs(2),
-            speed: 1.0,
-            proto_config: None,
-            progress: None,
-            role: protoplay::Role::Master,
-            listen_port: 0,
-            pacing: protoplay::Pacing::AsFastAsPossible,
-            frame_times_ns: Vec::new(),
-            loop_iterations: 1,
-        };
-
-        let report = run_session(cfg);
-        server.join().unwrap();
-
-        assert!(report.connected, "connect failed: {:?}", report.error);
-        assert!(
-            report.error.is_none(),
-            "unexpected error: {:?}",
-            report.error
-        );
-        // messages_sent now tracks data I-frames only (STARTDT / STOPDT
-        // / S-frame acks are plumbing and excluded). The test sends 15
-        // client I-frames.
-        assert!(
-            report.messages_sent >= 15,
-            "messages_sent = {}",
-            report.messages_sent
-        );
-        assert!(
-            report.window_stalls >= 1,
-            "expected window to stall at least once, got {}",
-            report.window_stalls
-        );
-        assert_eq!(
-            report.latency_samples_us.len(),
-            12,
-            "expected 12 latency samples (for the 12 window-full frames), got {}: {:?}",
-            report.latency_samples_us.len(),
-            report.latency_samples_us
-        );
-        // Those 12 I-frames waited roughly 120 ms for the S-frame.
-        let min = *report.latency_samples_us.iter().min().unwrap();
-        assert!(
-            min >= 80_000 && min <= 400_000,
-            "min latency out of expected window: {min} µs"
-        );
-        // The last 3 I-frames are sent but never acked (no more
-        // S-frames from the server), so they end up in unacked_at_end.
-        assert!(
-            report.unacked_at_end >= 1,
-            "expected some unacked I-frames at end, got {}",
-            report.unacked_at_end
-        );
-        // Latency percentile fields are populated.
-        assert!(report.latency_p50_us > 0);
-        assert!(report.latency_p99_us >= report.latency_p50_us);
-    }
-
-    #[test]
-    fn session_handshake_roundtrips_against_mock_server() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-
-        let server = std::thread::spawn(move || {
-            let (mut sock, _) = listener.accept().unwrap();
-            sock.set_read_timeout(Some(Duration::from_secs(3))).ok();
-
-            // Expect STARTDT act, reply STARTDT con.
-            let mut buf = [0u8; 6];
-            sock.read_exact(&mut buf).unwrap();
-            assert_eq!(buf, [0x68, 4, U_STARTDT_ACT, 0, 0, 0]);
-            sock.write_all(&[0x68, 4, U_STARTDT_CON, 0, 0, 0]).unwrap();
-
-            // Read whatever else comes until the client closes. We
-            // accept an I-frame and a STOPDT act; reply STOPDT con.
-            let mut received = Vec::new();
-            let mut buf = [0u8; 512];
-            while let Ok(n) = sock.read(&mut buf) {
-                if n == 0 {
-                    break;
-                }
-                received.extend_from_slice(&buf[..n]);
-                // If we just saw STOPDT act (0x13), reply con and bail.
-                if received.windows(6).any(|w| w == [0x68, 4, U_STOPDT_ACT, 0, 0, 0]) {
-                    sock.write_all(&[0x68, 4, U_STOPDT_CON, 0, 0, 0]).ok();
-                    break;
-                }
-            }
-            received
-        });
-
-        // Build a ProtoRunCfg that contains one client I-frame.
-        let i_frame = Apdu::I {
-            ns: 0,
-            nr: 0,
-            asdu: vec![
-                0x65, 0x01, 0x06, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
-            ],
+            Err(e) => return end(format!("accept: {e}"), session_state::FAILED),
         }
-        .serialize();
-        let cfg = ProtoRunCfg {
-            bind_ip: Ipv4Addr::new(127, 0, 0, 1),
-            bind_iface: None,
-            target_ip: Ipv4Addr::new(127, 0, 0, 1),
-            target_port: port,
-            tcp_nodelay: true,
-            client_segments: vec![ClientSegment {
-                rel_ts_ns: 0,
-                bytes: i_frame,
-            }],
-            connect_timeout: Duration::from_secs(2),
-            speed: 1.0,
-            proto_config: None,
-            progress: None,
-            role: protoplay::Role::Master,
-            listen_port: 0,
-            pacing: protoplay::Pacing::AsFastAsPossible,
-            frame_times_ns: Vec::new(),
-            loop_iterations: 1,
-        };
-
-        let report = run_session(cfg);
-        assert!(report.connected, "not connected: {:?}", report.error);
-        assert!(report.error.is_none(), "error: {:?}", report.error);
-        // Data-frame semantics: exactly one I-frame is sent. STARTDT /
-        // STOPDT are plumbing and no longer counted.
-        assert_eq!(
-            report.messages_sent, 1,
-            "messages_sent = {}",
-            report.messages_sent
-        );
-
-        let received = server.join().unwrap();
-        // Confirm the I-frame reached the server.
-        assert!(
-            received.windows(3).any(|w| w[0] == 0x68 && w[2] & 0x01 == 0),
-            "did not see an I-frame in server receive buffer"
-        );
-    }
-
-    #[test]
-    fn resync_skips_leading_partial_frame_bytes() {
-        // Build a stream of three valid I-frames, then prepend bytes
-        // that look like the tail of a partial frame — including a
-        // coincidental 0x68 byte that does NOT begin a valid frame.
-        let mut clean = Vec::new();
-        for ns in 0..3u16 {
-            clean.extend_from_slice(
-                &Apdu::I {
-                    ns,
-                    nr: 0,
-                    asdu: vec![0x65, 0x01, 0x06, 0x00, 0x01, 0x00, ns as u8, 0x00, 0x00, 0x00],
-                }
-                .serialize(),
-            );
-        }
-        // Junk prefix: arbitrary mid-frame ASDU bytes including one
-        // 0x68 to confirm two-frame self-consistency rejects it.
-        let mut junk = vec![0x42, 0x68, 0xff, 0x00, 0x07, 0x99, 0xaa];
-        junk.extend_from_slice(&clean);
-        let offset = super::find_apci_resync(&junk);
-        assert_eq!(offset, 7, "should skip 7 junk bytes");
-        // Decode from resync point and confirm we recover all 3 I-frames.
-        let mut reader = crate::apdu::ApduReader::new(&junk[offset..]);
-        let mut count = 0;
-        while let Ok(Some(apdu)) = reader.next_apdu() {
-            if matches!(apdu, Apdu::I { .. }) {
-                count += 1;
-            }
-        }
-        assert_eq!(count, 3, "expected 3 I-frames after resync");
-    }
-
-    #[test]
-    fn resync_no_op_on_clean_stream() {
-        let mut clean = Vec::new();
-        clean.extend_from_slice(&Apdu::U { code: 0x07 }.serialize());
-        clean.extend_from_slice(
-            &Apdu::I {
-                ns: 1,
-                nr: 0,
-                asdu: vec![0xde, 0xad, 0xbe, 0xef],
-            }
-            .serialize(),
-        );
-        assert_eq!(super::find_apci_resync(&clean), 0);
-    }
-
-    #[test]
-    fn resync_returns_len_when_no_boundary_found() {
-        let garbage = vec![0xff; 32];
-        assert_eq!(super::find_apci_resync(&garbage), garbage.len());
     }
 }
 
+/// How the wait for the master's STARTDT act ended.
+enum Startdt {
+    Started,
+    /// The master closed or reset its connection first: the session
+    /// listens again.
+    Closed(String),
+    /// Timeout, protocol violation, cancel: the session ends with this
+    /// error (`None` = excused by fault injection).
+    Failed(Option<String>),
+}
+
+/// Wait for STARTDT act (the link replies con).
+fn wait_startdt(link: &mut Link) -> Startdt {
+    let deadline = now_ns() + HANDSHAKE_TIMEOUT.as_nanos() as u64;
+    match link.service(Some(deadline), |l| l.transfer() == Transfer::Started) {
+        Ok(()) if link.transfer() == Transfer::Started => Startdt::Started,
+        Ok(()) => Startdt::Failed(Some("timeout waiting for STARTDT act from master".into())),
+        Err(e @ (LinkEnd::PeerClosed | LinkEnd::Io(_))) if !link.fault_excused(&e) => {
+            Startdt::Closed(e.describe())
+        }
+        Err(e) => {
+            let msg = format!("{} waiting for STARTDT act", e.describe());
+            Startdt::Failed(fail(link, &e, msg))
+        }
+    }
+}
+
+/// Script loops and idle-serve after STARTDT. Returns the session error.
+fn drive_slave(
+    link: &mut Link,
+    cfg: &ProtoRunCfg,
+    script: &Script,
+    session: &SessionConfig,
+) -> Option<String> {
+    let progress = &cfg.progress;
+
+    // 3. STARTDT is done (see `run_slave_session`).
+    // 4. Replay the captured script `loop_iterations` times within this
+    //    connection (0 = until cancel or disconnect). Sequence numbers
+    //    and the window persist across loops. An empty script goes
+    //    straight to idle-serve.
+    if !script.frames.is_empty() {
+        let unlimited = cfg.loop_iterations == 0;
+        let loops = if unlimited {
+            u64::MAX
+        } else {
+            cfg.loop_iterations
+        };
+        bump(progress, |p| {
+            p.iter_total
+                .store(if unlimited { 0 } else { loops }, Ordering::Relaxed);
+        });
+        for loop_idx in 0..loops {
+            // Per-iteration UI counters restart; they are folded into
+            // the progress totals (which never dip) and the cumulative
+            // figures stay in the report.
+            bump(progress, |p| {
+                p.iter_current.store(loop_idx + 1, Ordering::Relaxed);
+                p.fold_iteration();
+            });
+            if loop_idx > 0 {
+                info!(loop_idx, "slave: starting next within-session iteration");
+            }
+            // Pacing is re-anchored every loop so loop 2.. do not fire
+            // instantly because every captured timestamp is past.
+            let epoch = now_ns();
+            for (idx, frame) in script.frames.iter().enumerate() {
+                if let Some(target) = script.target_ns(cfg, idx) {
+                    if let Err(e) = link.wait_until(epoch + target) {
+                        return fail(link, &e, at_idx(&e, "during pace", idx));
+                    }
+                }
+                if let Err(e) = link.send_script_frame(&frame.asdu) {
+                    warn!(error = %e.describe(), idx, "slave: send aborted");
+                    return fail(link, &e, at_idx(&e, "sending I-frame", idx));
+                }
+            }
+        }
+    }
+
+    // 5. Idle-serve: keep the RTU alive (GI/CI answers, TESTFR, acks)
+    //    after the script, like a real outstation. The master closing,
+    //    or the user stopping the run, is the normal way out.
+    let idle_start = now_ns();
+    let idle_secs = session
+        .idle_serve_secs
+        .unwrap_or(crate::asdu::DEFAULT_IDLE_SERVE_SECS);
+    let idle_deadline = Some(idle_start + secs_to_ns(idle_secs));
+    debug!(idle_secs, "slave: script done, idle-serving");
+    let r = link.service(idle_deadline, |_| false);
+    link.report.protocol.idle_serve_ms = now_ns().saturating_sub(idle_start) / 1_000_000;
+    match r {
+        Ok(()) => {
+            // idle_serve_secs elapsed: let in-flight frames be
+            // acknowledged, acknowledge the master, then close.
+            match link.drain_pending() {
+                Ok(()) | Err(LinkEnd::PeerClosed) | Err(LinkEnd::Cancelled) => {}
+                Err(e) => {
+                    let msg = format!("{} after idle-serve", e.describe());
+                    return fail(link, &e, msg);
+                }
+            }
+            link.flush_ack();
+            None
+        }
+        Err(LinkEnd::PeerClosed) | Err(LinkEnd::Cancelled) => None,
+        Err(e) => {
+            let msg = format!("{} during idle-serve", e.describe());
+            fail(link, &e, msg)
+        }
+    }
+}
+
+#[cfg(test)]
+#[path = "session_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+#[path = "command_tests.rs"]
+mod command_tests;
+
+#[cfg(test)]
+#[path = "fault_tests.rs"]
+mod fault_tests;
+
+#[cfg(test)]
+#[path = "robustness_tests.rs"]
+mod robustness_tests;

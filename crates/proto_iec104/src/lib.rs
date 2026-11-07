@@ -17,33 +17,26 @@ use protoplay::{
 };
 
 pub mod analysis;
-pub mod inventory;
-pub mod responder;
+pub mod apci;
 pub mod apdu;
 pub mod asdu;
+pub mod commands;
+pub mod faults;
+pub mod interrogation;
+pub mod inventory;
+mod link;
+#[cfg(test)]
+mod mockpeer;
+pub mod responder;
 pub mod session;
+pub mod viability;
 
-/// Cheap I-frame counter — walks the APDU stream looking for valid
-/// I-frame APCIs. Used by `quick_viability` to attribute per-RTU
-/// message counts without decoding ASDU bodies.
+/// Cheap I-frame counter used by `quick_viability` to attribute
+/// per-RTU message counts without decoding ASDU bodies. Uses the
+/// canonical [`apci::frames`] walker, so it counts exactly the I-frames
+/// the replayer will send and the pacing extractor will time.
 fn count_iframes(payload: &[u8]) -> usize {
-    let mut n = 0usize;
-    let mut i = 0usize;
-    while i + 6 <= payload.len() {
-        if payload[i] != 0x68 {
-            i += 1;
-            continue;
-        }
-        let ln = payload[i + 1] as usize;
-        if ln < 4 || i + 2 + ln > payload.len() {
-            break;
-        }
-        if payload[i + 2] & 0x01 == 0 {
-            n += 1;
-        }
-        i += 2 + ln;
-    }
-    n
+    apci::count_iframes(payload)
 }
 
 pub struct Iec104Replayer;
@@ -73,6 +66,10 @@ impl ProtoReplayer for Iec104Replayer {
         Readiness::Ready
     }
 
+    fn validate_config(&self, proto_config: Option<&str>) -> anyhow::Result<()> {
+        asdu::validate_proto_config(proto_config)
+    }
+
     fn run(&self, cfg: ProtoRunCfg) -> ProtoReport {
         match cfg.role {
             Role::Master => session::run_session(cfg),
@@ -83,32 +80,15 @@ impl ProtoReplayer for Iec104Replayer {
     /// Walk the IEC 104 APCI framing in `payload` and emit one
     /// timestamp per I-frame, derived from `packet_offsets`. The first
     /// I-frame anchors at 0; subsequent frames are wall-clock-relative
-    /// to it. Length-prefixed frames are detected by the 0x68 start
-    /// byte + 1-byte APCI+ASDU length, with an I-frame discriminated
-    /// by the low bit of CF1 being 0.
+    /// to it. Framing (including resync on a mid-flow capture) is the
+    /// canonical [`apci::frames`] walk, so index `k` of the result
+    /// times the same `k`-th I-frame the replayer extracts.
     fn extract_message_times_ns(
         &self,
         payload: &[u8],
         packet_offsets: &[(u64, usize)],
     ) -> Vec<u64> {
-        let mut starts: Vec<usize> = Vec::new();
-        let mut i = 0usize;
-        while i + 6 <= payload.len() {
-            if payload[i] != 0x68 {
-                i += 1;
-                continue;
-            }
-            let ln = payload[i + 1] as usize;
-            if i + 2 + ln > payload.len() {
-                break;
-            }
-            let cf1 = payload[i + 2];
-            if cf1 & 0x01 == 0 {
-                // I-frame
-                starts.push(i);
-            }
-            i += 2 + ln;
-        }
+        let starts = apci::iframe_offsets(payload);
         if starts.len() < 2 {
             return Vec::new();
         }
@@ -130,249 +110,18 @@ impl ProtoReplayer for Iec104Replayer {
             }
         };
         let t0 = ts_for(starts[0]);
-        starts.iter().map(|&b| ts_for(b).saturating_sub(t0)).collect()
+        starts
+            .iter()
+            .map(|&b| ts_for(b).saturating_sub(t0))
+            .collect()
     }
 
-    /// IEC 104-aware pcap viability analysis. Counts unique
-    /// client/server IPs on port 2404, sums per-side TCP payload
-    /// bytes, computes a memory estimate for fleet replay, and
-    /// distinguishes mid-flow vs clean-handshake flows in the
-    /// notes — surfaced in the UI so users know when to expect
-    /// the replayer's mid-flow synthesis to fire.
-    fn quick_viability(
-        &self,
-        p: &dyn LoadedPcapView,
-        file_size_bytes: u64,
-    ) -> ProtoViability {
-        use std::collections::HashSet;
-        const TARGET_PORT: u16 = 2404;
-        let mut client_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
-        let mut server_ips: HashSet<std::net::Ipv4Addr> = HashSet::new();
-        let mut client_payload_bytes: u64 = 0;
-        let mut server_payload_bytes: u64 = 0;
-        let mut midflow_flows: u64 = 0;
-        let mut clean_handshake_flows: u64 = 0;
-        let mut slave_flow_indices: Vec<(usize, std::net::Ipv4Addr)> = Vec::new();
-        for f in p.flows() {
-            let (server_ip, server_port) = match f.server { Some(x) => x, None => continue };
-            if server_port != TARGET_PORT { continue; }
-            let (client_ip, _) = match f.client { Some(x) => x, None => continue };
-            client_ips.insert(client_ip);
-            server_ips.insert(server_ip);
-            if f.saw_syn {
-                clean_handshake_flows += 1;
-            } else {
-                midflow_flows += 1;
-            }
-            let (cb, sb) = p.flow_payload_bytes(f.flow_idx);
-            client_payload_bytes += cb;
-            server_payload_bytes += sb;
-            slave_flow_indices.push((f.flow_idx, server_ip));
-        }
-        let sessions_master_mode = client_ips.len() as u64;
-        let sessions_slave_mode = server_ips.len() as u64;
-        let mb = |b: u64| (b + 1024 * 1024 - 1) / (1024 * 1024);
-        let parsed_store_mb = mb(file_size_bytes);
-        let max_session_count = sessions_master_mode.max(sessions_slave_mode);
-        let session_payload_mb = mb(client_payload_bytes.max(server_payload_bytes));
-        let reservoir_mb = mb(max_session_count * 80 * 1024);
-        let stack_mb = max_session_count * 2;
-        let estimated_peak_mb =
-            parsed_store_mb + session_payload_mb + reservoir_mb + stack_mb + 32;
-        let (verdict, verdict_reason): (&str, String) = if file_size_bytes
-            > 8 * 1024 * 1024 * 1024
-            || max_session_count > 1500
-        {
-            (
-                "not_recommended",
-                format!(
-                    "{} sessions and a {} MB pcap exceed comfortable single-host limits",
-                    max_session_count,
-                    file_size_bytes / (1024 * 1024)
-                ),
-            )
-        } else if file_size_bytes > 2 * 1024 * 1024 * 1024 || max_session_count > 500 {
-            (
-                "heavy",
-                format!(
-                    "{} sessions / {} MB pcap - needs a roomy host (>= {} MB free RAM)",
-                    max_session_count,
-                    file_size_bytes / (1024 * 1024),
-                    estimated_peak_mb
-                ),
-            )
-        } else if file_size_bytes > 500 * 1024 * 1024 || max_session_count > 100 {
-            (
-                "caution",
-                format!(
-                    "{} sessions / {} MB pcap - feasible but expect ~{} MB peak RAM",
-                    max_session_count,
-                    file_size_bytes / (1024 * 1024),
-                    estimated_peak_mb
-                ),
-            )
-        } else if max_session_count == 0 {
-            (
-                "ok",
-                "no IEC 104 flows on port 2404 - fine for raw replay; benchmark mode has nothing to drive".into(),
-            )
-        } else {
-            (
-                "ok",
-                format!(
-                    "{} session(s) and {} MB pcap - easy to replay on this host",
-                    max_session_count,
-                    file_size_bytes / (1024 * 1024)
-                ),
-            )
-        };
-        let mut notes = Vec::new();
-        let mut per_rtu_bytes: std::collections::BTreeMap<std::net::Ipv4Addr, u64> =
-            std::collections::BTreeMap::new();
-        let mut per_rtu_msgs: std::collections::BTreeMap<std::net::Ipv4Addr, u64> =
-            std::collections::BTreeMap::new();
-        if max_session_count == 0 {
-            notes.push(
-                "no TCP flow with server_port=2404 found - benchmark mode would have nothing to do"
-                    .into(),
-            );
-        } else {
-            notes.push(format!(
-                "{} unique client IPs talk to port 2404 (master-mode session count)",
-                sessions_master_mode
-            ));
-            notes.push(format!(
-                "{} unique server IPs listen on port 2404 (slave-mode session count)",
-                sessions_slave_mode
-            ));
-            notes.push(format!(
-                "{} MB of client TCP payload, {} MB of server TCP payload across all relevant flows",
-                client_payload_bytes / (1024 * 1024),
-                server_payload_bytes / (1024 * 1024),
-            ));
-            if midflow_flows > 0 {
-                notes.push(format!(
-                    "{} of {} flows are mid-flow (no SYN observed) - the replayer will synthesize a fresh TCP+STARTDT prelude and resync to the first clean APCI boundary; {} flows had a clean handshake in the capture",
-                    midflow_flows,
-                    midflow_flows + clean_handshake_flows,
-                    clean_handshake_flows,
-                ));
-            }
-
-            // CA / IOA inventory overview — ingest each slave flow's
-            // server-side payload into a per-RTU point database so the
-            // upload summary tells the operator how rich each RTU's
-            // dataset is. This is the same Inventory the slave-replayer
-            // builds at session start to back GI/CI synthesis. We also
-            // record per-RTU bytes + I-frame counts here so the run-
-            // config picker can show a traffic chart per RTU.
-            let mut per_rtu_iao_count: std::collections::BTreeMap<std::net::Ipv4Addr, usize> =
-                std::collections::BTreeMap::new();
-            let mut total_unique_cas: std::collections::BTreeSet<u16> =
-                std::collections::BTreeSet::new();
-            let mut total_ioa_count: usize = 0;
-            let mut type_id_counts: std::collections::BTreeMap<u8, usize> =
-                std::collections::BTreeMap::new();
-            let mut rtus_with_inventory: usize = 0;
-            for (flow_idx, server_ip) in &slave_flow_indices {
-                let payload = p.flow_server_payload(*flow_idx);
-                per_rtu_bytes.insert(*server_ip, payload.len() as u64);
-                per_rtu_msgs.insert(*server_ip, count_iframes(&payload) as u64);
-                if payload.is_empty() {
-                    continue;
-                }
-                let mut inv = inventory::Inventory::default();
-                inv.ingest_payload(&payload);
-                if inv.is_empty() {
-                    continue;
-                }
-                rtus_with_inventory += 1;
-                per_rtu_iao_count.insert(*server_ip, inv.len());
-                for ((ca, _ioa), entry) in &inv.entries {
-                    total_unique_cas.insert(*ca);
-                    total_ioa_count += 1;
-                    *type_id_counts.entry(entry.type_id).or_insert(0) += 1;
-                }
-            }
-            if rtus_with_inventory > 0 {
-                let counts: Vec<usize> = per_rtu_iao_count.values().copied().collect();
-                let min_ioa = *counts.iter().min().unwrap_or(&0);
-                let max_ioa = *counts.iter().max().unwrap_or(&0);
-                let mean_ioa = if counts.is_empty() {
-                    0
-                } else {
-                    counts.iter().sum::<usize>() / counts.len()
-                };
-                notes.push(format!(
-                    "CA/IOA inventory: {} unique (CA, IOA) points across {} common address(es) on {} RTU(s) (per-RTU IOAs: min {}, mean {}, max {})",
-                    total_ioa_count,
-                    total_unique_cas.len(),
-                    rtus_with_inventory,
-                    min_ioa,
-                    mean_ioa,
-                    max_ioa,
-                ));
-                if !type_id_counts.is_empty() {
-                    let mut top: Vec<(u8, usize)> =
-                        type_id_counts.iter().map(|(t, c)| (*t, *c)).collect();
-                    top.sort_by(|a, b| b.1.cmp(&a.1));
-                    let top_str: Vec<String> = top
-                        .iter()
-                        .take(5)
-                        .map(|(t, c)| format!("type {} ({})", t, c))
-                        .collect();
-                    notes.push(format!(
-                        "dominant ASDU types in inventory: {}",
-                        top_str.join(", ")
-                    ));
-                }
-            }
-        }
-        if file_size_bytes > 1024 * 1024 * 1024 {
-            notes.push(
-                "pcap is larger than 1 GB; pcapload reads it fully into RAM (no mmap path yet)"
-                    .into(),
-            );
-        }
-        if max_session_count > 256 {
-            notes.push(
-                "session count exceeds 256 - ensure `ulimit -n` is large enough for one socket per session".into(),
-            );
-        }
-        let mut sorted_servers: Vec<std::net::Ipv4Addr> = server_ips.into_iter().collect();
-        sorted_servers.sort();
-        let slave_rtus: Vec<protoplay::RtuTraffic> = sorted_servers
-            .into_iter()
-            .map(|ip| protoplay::RtuTraffic {
-                ip: ip.to_string(),
-                payload_bytes: per_rtu_bytes.get(&ip).copied().unwrap_or(0),
-                messages: per_rtu_msgs.get(&ip).copied().unwrap_or(0),
-                duration_ms: 0,
-            })
-            .collect();
-        let mut sorted_clients: Vec<std::net::Ipv4Addr> = client_ips.into_iter().collect();
-        sorted_clients.sort();
-        let master_clients: Vec<protoplay::RtuTraffic> = sorted_clients
-            .into_iter()
-            .map(|ip| protoplay::RtuTraffic {
-                ip: ip.to_string(),
-                payload_bytes: 0,
-                messages: 0,
-                duration_ms: 0,
-            })
-            .collect();
-        ProtoViability {
-            client_payload_bytes,
-            server_payload_bytes,
-            sessions_master_mode,
-            sessions_slave_mode,
-            estimated_peak_mb,
-            verdict: verdict.into(),
-            verdict_reason,
-            notes,
-            slave_rtus,
-            master_clients,
-        }
+    /// IEC 104-aware pcap viability analysis, see [`viability`]:
+    /// session counts per role, per-endpoint figures of the flow each
+    /// endpoint would replay, a memory estimate and notes (mid-flow
+    /// captures, reconnects, TCP gaps, the CA/IOA inventory).
+    fn quick_viability(&self, p: &dyn LoadedPcapView, file_size_bytes: u64) -> ProtoViability {
+        viability::quick_viability(p, file_size_bytes)
     }
 
     /// IEC 104 analyzer: walk playback vs target, both original vs
@@ -398,5 +147,165 @@ impl ProtoReplayer for Iec104Replayer {
         iteration_starts_ms: &[f64],
     ) -> Option<FleetDriftTimeline> {
         analysis::aggregate_iec104_fleet_drift(per_slave, iteration_starts_ms)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::apdu::Apdu;
+    use protoplay::{FlowView, LoadedPcapView};
+
+    fn sp_frame(ns: u16, ioa: u8) -> Vec<u8> {
+        Apdu::I {
+            ns,
+            nr: 0,
+            asdu: vec![1, 1, 3, 0, 1, 0, ioa, 0, 0, 1],
+        }
+        .serialize()
+    }
+
+    /// Mid-flow stream: a leading partial frame with a stray 0x68, ten
+    /// I-frames interleaved with S frames, a truncated tail. One packet
+    /// per I-frame with ts = 1000 * (index + 1) ns.
+    fn midflow_stream() -> (Vec<u8>, Vec<(u64, usize)>) {
+        let mut s = vec![0x12, 0x68, 0x01, 0x00];
+        let mut offs = vec![(0u64, 0usize)];
+        for k in 0..10u16 {
+            offs.push((1000 * (k as u64 + 1), s.len()));
+            s.extend(sp_frame(k, k as u8));
+            if k % 4 == 0 {
+                s.extend(Apdu::S { nr: k }.serialize());
+            }
+        }
+        s.extend(&sp_frame(10, 10)[..5]);
+        (s, offs)
+    }
+
+    #[test]
+    fn counts_and_times_agree_on_midflow_capture() {
+        let (s, offs) = midflow_stream();
+        assert_eq!(count_iframes(&s), 10);
+        let times = Iec104Replayer.extract_message_times_ns(&s, &offs);
+        assert_eq!(times.len(), 10);
+        // Frame k sits in packet k+1, so relative times are 1000*k.
+        let want: Vec<u64> = (0..10).map(|k| 1000 * k).collect();
+        assert_eq!(times, want);
+    }
+
+    #[test]
+    fn lone_start_byte_and_short_garbage() {
+        assert_eq!(count_iframes(&[0x68]), 0);
+        assert_eq!(count_iframes(&[0x68, 0x02, 0x00, 0x00, 0x00, 0x00]), 0);
+        assert!(Iec104Replayer
+            .extract_message_times_ns(&[0x68], &[(0, 0)])
+            .is_empty());
+    }
+
+    struct FakePcap {
+        /// (flow, server payload, gap offsets in the server payload)
+        flows: Vec<(FlowView, Vec<u8>, Vec<usize>)>,
+    }
+
+    impl LoadedPcapView for FakePcap {
+        fn flows(&self) -> Box<dyn Iterator<Item = FlowView> + '_> {
+            Box::new(self.flows.iter().map(|f| f.0))
+        }
+        fn flow_payload_bytes(&self, flow_idx: usize) -> (u64, u64) {
+            (0, self.flows[flow_idx].1.len() as u64)
+        }
+        fn with_flow_side(
+            &self,
+            flow_idx: usize,
+            side: protoplay::FlowSide,
+            f: &mut dyn FnMut(&protoplay::FlowSideView<'_>),
+        ) {
+            let (_, payload, gaps) = &self.flows[flow_idx];
+            if side == protoplay::FlowSide::Server && !payload.is_empty() {
+                f(&protoplay::FlowSideView {
+                    payload,
+                    gap_offsets: gaps,
+                    missing_bytes: 10 * gaps.len() as u64,
+                });
+            }
+        }
+        fn packet_count(&self) -> u64 {
+            1000
+        }
+    }
+
+    fn rtu_flow(
+        idx: usize,
+        port: u16,
+        n: u16,
+        gaps: Vec<usize>,
+    ) -> (FlowView, Vec<u8>, Vec<usize>) {
+        let rtu: std::net::Ipv4Addr = "10.0.0.5".parse().unwrap();
+        let master: std::net::Ipv4Addr = "10.0.0.1".parse().unwrap();
+        let mut payload = Vec::new();
+        for k in 0..n {
+            payload.extend(sp_frame(k, (idx * 50) as u8 + k as u8));
+        }
+        (
+            FlowView {
+                flow_idx: idx,
+                client: Some((master, port)),
+                server: Some((rtu, 2404)),
+                saw_syn: true,
+            },
+            payload,
+            gaps,
+        )
+    }
+
+    /// N18: an RTU seen in several flows (reconnects) is described by
+    /// the flow it replays, the most contiguous and largest one, not by
+    /// the first flow nor by the sum; the notes say so and report the
+    /// gaps of the replayed flows.
+    #[test]
+    fn viability_describes_the_best_flow_per_rtu() {
+        // Flow 0: 5 frames with a gap after the first one; flow 1: 3
+        // clean frames; flow 2: 2 clean frames.
+        let pcap = FakePcap {
+            flows: vec![
+                rtu_flow(0, 40000, 5, vec![16]),
+                rtu_flow(1, 40001, 3, vec![]),
+                rtu_flow(2, 40002, 2, vec![]),
+            ],
+        };
+        let v = Iec104Replayer.quick_viability(&pcap, 1000);
+        assert_eq!(v.slave_rtus.len(), 1);
+        // Flow 0's longest contiguous run is 4 frames (64 bytes), flow
+        // 1's is 3 (48): flow 0 wins on contiguity.
+        assert_eq!(v.slave_rtus[0].payload_bytes, 80);
+        assert_eq!(v.slave_rtus[0].messages, 5);
+        assert_eq!(v.server_payload_bytes, 80);
+        let notes = v.notes.join("\n");
+        assert!(
+            notes.contains("1 RTU(s) and 1 master(s) appear in several flows"),
+            "{notes}"
+        );
+        assert!(
+            notes.contains(
+                "1 of the 1 flows the slave role would replay have TCP capture gaps (10 bytes"
+            ),
+            "{notes}"
+        );
+        assert!(notes.contains("5 unique (CA, IOA) points"), "{notes}");
+
+        // A clean flow as long as the gapped flow's longest run wins
+        // (fewer gaps), whatever the order.
+        let pcap = FakePcap {
+            flows: vec![
+                rtu_flow(0, 40000, 5, vec![16]),
+                rtu_flow(1, 40001, 4, vec![]),
+            ],
+        };
+        let v = Iec104Replayer.quick_viability(&pcap, 1000);
+        assert_eq!(v.slave_rtus[0].payload_bytes, 64);
+        assert_eq!(v.slave_rtus[0].messages, 4);
+        assert!(!v.notes.join("\n").contains("capture gaps"));
+        // 1000 packets: the parsed capture costs more than the file.
+        assert!(v.estimated_peak_mb >= 33, "{}", v.estimated_peak_mb);
     }
 }

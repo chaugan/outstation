@@ -1,6 +1,6 @@
-//! Top-level `outstation` binary — the user-facing CLI. For now it
-//! exposes only the synchronous `run` path; the web UI will eventually
-//! live beside it as `outstation serve`.
+//! Top-level `outstation` binary — the user-facing CLI: pcap
+//! inspection, a synchronous `run`, the web UI (`serve`), a headless
+//! benchmark with assertions (`bench`) and host cleanup (`cleanup`).
 
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
@@ -26,24 +26,146 @@ struct Cli {
 #[derive(Subcommand)]
 enum Cmd {
     /// List the sources and TCP flows found in a pcap.
-    ListSources {
-        pcap: PathBuf,
-    },
+    ListSources { pcap: PathBuf },
     /// List all registered protocol-aware replayer modules.
     ListProtocols,
-    /// Replay a pcap. Every IPv4 source gets its own TAP on an
+    /// Replay a pcap. Every IPv4 source gets its own veth port on an
     /// auto-managed bridge; the bridge optionally enslaves a physical
     /// NIC for real egress.
     Run(RunArgs),
     /// Start the web UI (axum backend + embedded SPA).
-    Serve {
-        /// Address to bind, e.g. 127.0.0.1:8080
-        #[arg(long, default_value = "127.0.0.1:8080")]
-        bind: std::net::SocketAddr,
+    Serve(ServeArgs),
+    /// Run one benchmark headless (same code path as the web UI),
+    /// analyse its own capture, check assertions and write a JSON
+    /// report. Exit 0 = all assertions passed, 1 = an assertion
+    /// failed, 2 = the run failed or was interrupted.
+    Bench(BenchArgs),
+    /// Undo host network changes left by runs: IP aliases, our marked
+    /// bridges and veths, journaled sysctls and NIC offloads, and
+    /// iptables rules tagged `outstation-run-<id>`. Idempotent; used as
+    /// the systemd unit's ExecStopPost.
+    Cleanup {
+        /// State directory (default: parent of OUTSTATION_LIBRARY_DIR,
+        /// i.e. /var/lib/outstation).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Clean up even while a live `serve` or `bench` holds the state
+        /// directory. This tears down its active run.
+        #[arg(long)]
+        force: bool,
     },
 }
 
+#[derive(clap::Args)]
+struct ServeArgs {
+    /// Address to bind, e.g. 127.0.0.1:8080. The systemd unit binds
+    /// 0.0.0.0:8080 for LAN access.
+    #[arg(long, default_value = "127.0.0.1:8080")]
+    bind: std::net::SocketAddr,
 
+    /// Extra Host header names to accept (repeatable or
+    /// comma-separated), on top of IP literals, localhost and this
+    /// machine's host names. Also read from OUTSTATION_ALLOW_HOSTS.
+    #[arg(long = "allow-host", value_name = "HOST")]
+    allow_host: Vec<String>,
+
+    /// Extra trusted browser origins (scheme://host[:port], repeatable
+    /// or comma-separated) for a reverse proxy that serves the UI under
+    /// another site, e.g. https://portal.example. Also read from
+    /// OUTSTATION_ALLOW_ORIGINS.
+    #[arg(long = "allow-origin", value_name = "ORIGIN")]
+    allow_origin: Vec<String>,
+
+    /// Keep run history in memory only. Without this flag the server
+    /// refuses to start when the run database cannot be opened.
+    #[arg(long)]
+    ephemeral: bool,
+
+    /// Largest accepted upload (library and analysis), in MiB.
+    /// Default 1024 or OUTSTATION_MAX_UPLOAD_MB.
+    #[arg(long, value_name = "MIB")]
+    max_upload_mb: Option<u64>,
+
+    /// Total size cap for stored replay captures, in MiB. Oldest
+    /// captures are evicted first. Default 10240 or
+    /// OUTSTATION_CAPTURE_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    capture_max_mb: Option<u64>,
+
+    /// Per-run capture size cap, in MiB (0 = none): a capture that
+    /// reaches it stops recording and the run is marked
+    /// capture_truncated. Default 4096 or OUTSTATION_CAPTURE_RUN_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    capture_run_max_mb: Option<u64>,
+
+    /// Finished runs kept in memory; older ones are read from the
+    /// database when asked for. Default 500 or OUTSTATION_RUNS_IN_MEMORY.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u64).range(1..))]
+    runs_in_memory: Option<u64>,
+
+    /// Total size quota of the pcap library, in MiB; uploads that
+    /// would exceed it are refused. Default: no quota, or
+    /// OUTSTATION_LIBRARY_MAX_MB.
+    #[arg(long, value_name = "MIB")]
+    library_max_mb: Option<u64>,
+
+    /// CP56Time2a drift tolerance for automatic and on-demand
+    /// analyses, in ms. Default 50 or OUTSTATION_CP56_TOLERANCE_MS.
+    #[arg(long, value_name = "MS", value_parser = parse_cp56_tolerance)]
+    cp56_tolerance_ms: Option<f64>,
+
+    /// Do not analyse finished benchmark runs automatically. Also
+    /// OUTSTATION_AUTO_ANALYZE=0.
+    #[arg(long)]
+    no_auto_analyze: bool,
+}
+
+#[derive(clap::Args)]
+struct BenchArgs {
+    /// Source pcap. Without it, the profile's `pcap_id` is looked up in
+    /// `<state-dir>/library`.
+    #[arg(long)]
+    pcap: Option<PathBuf>,
+
+    /// Run request JSON: a `POST /api/run` body or a profile exported
+    /// from `GET /api/profiles/:id`. `mode` defaults to benchmark.
+    #[arg(long)]
+    profile: PathBuf,
+
+    /// Assertion `<metric><op><number>`, repeatable. Metrics: score,
+    /// p50_ms, p90_ms, p99_ms, max_ms, throughput, sessions_failed,
+    /// delivered_pct, verdict_failures. Ops: >=, <=, ==, >, <.
+    #[arg(long = "assert", value_name = "EXPR", value_parser = parse_assertion)]
+    asserts: Vec<webui::bench::Assertion>,
+
+    /// Write the JSON report here (`-` = stdout).
+    #[arg(long)]
+    report: Option<PathBuf>,
+
+    /// State directory for host-state journals and captures (default:
+    /// parent of OUTSTATION_LIBRARY_DIR, i.e. /var/lib/outstation).
+    #[arg(long)]
+    state_dir: Option<PathBuf>,
+
+    /// Mirror capture path (default
+    /// `<state-dir>/captures/bench_<run id>.pcap`).
+    #[arg(long)]
+    capture: Option<PathBuf>,
+
+    /// Analyse in "correct" mode: the target is the device recorded in
+    /// the pcap, so its replies are compared byte for byte too.
+    #[arg(long)]
+    correct: bool,
+
+    /// CP56Time2a drift tolerance for the analysis, in ms (default 50).
+    #[arg(long, value_name = "MS", default_value_t = webui::DEFAULT_CP56_TOLERANCE_MS,
+          value_parser = parse_cp56_tolerance)]
+    cp56_tolerance_ms: f64,
+}
+
+fn parse_assertion(s: &str) -> Result<webui::bench::Assertion, String> {
+    s.parse()
+}
 
 #[derive(clap::Args)]
 struct RunArgs {
@@ -63,13 +185,15 @@ struct RunArgs {
 
     /// Physical interface to enslave to the bridge so traffic can leave
     /// the host. Omit for isolated loopback/dev runs — the bridge and
-    /// its TAPs will still be created, but nothing will reach the LAN.
+    /// its veth ports will still be created, but nothing will reach the LAN.
     #[arg(long)]
     nic: Option<String>,
 
     #[arg(long, default_value = "pcr_br0")]
     bridge: String,
 
+    /// Name prefix of the per-source veth ports (the option keeps its
+    /// historical name).
     #[arg(long, default_value = "pcr_t")]
     tap_prefix: String,
 
@@ -99,60 +223,204 @@ struct RunArgs {
     warmup: u64,
 }
 
+/// ANSI colours only on an interactive terminal, never under journald
+/// (F079).
+fn use_ansi() -> bool {
+    use std::io::IsTerminal;
+    std::env::var_os("JOURNAL_STREAM").is_none()
+        && std::env::var_os("NO_COLOR").is_none()
+        && std::io::stdout().is_terminal()
+}
+
+/// Most file-descriptor limit we ask for.
+const NOFILE_TARGET: u64 = 1 << 20;
+
+/// Raise the soft open-file limit towards the hard limit (at most
+/// [`NOFILE_TARGET`]). Each session holds a few descriptors: about 2
+/// per master session and 4 per slave-role RTU (sockets, listener,
+/// capture), so 400 RTUs need about 1,500, more than the soft limit of
+/// 1,024 that systemd services and many login shells start with.
+/// Returns `(before, after)`, or `None` when the limit cannot be read.
+// `rlim_t` is u64 on 64-bit Linux but not everywhere.
+#[allow(clippy::unnecessary_cast)]
+fn raise_nofile_limit() -> Option<(u64, u64)> {
+    let mut r = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit only writes the struct we pass.
+    if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) } != 0 {
+        return None;
+    }
+    let before = r.rlim_cur as u64;
+    let want = (r.rlim_max as u64).min(NOFILE_TARGET);
+    if before >= want {
+        return Some((before, before));
+    }
+    r.rlim_cur = want as libc::rlim_t;
+    // SAFETY: setrlimit only reads the struct we pass.
+    if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) } != 0 {
+        return Some((before, before));
+    }
+    Some((before, want))
+}
+
 fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
+        .with_ansi(use_ansi())
         .init();
+    if let Some((before, after)) = raise_nofile_limit() {
+        if after > before {
+            tracing::debug!(before, after, "raised the open-file limit");
+        } else if after < 4096 {
+            tracing::warn!(
+                limit = after,
+                "open-file limit is low; runs with a few hundred sessions may fail (raise LimitNOFILE / ulimit -n)"
+            );
+        }
+    }
     let cli = Cli::parse();
     match cli.cmd {
         Cmd::ListSources { pcap } => {
             let p = load(&pcap)?;
-            println!("{} sources, {} flows, {} packets, {} non-ip",
-                p.sources.len(), p.flows.len(), p.packets.len(), p.non_ip_count);
+            println!(
+                "{} sources, {} flows, {} packets, {} non-ip",
+                p.sources.len(),
+                p.flows.len(),
+                p.packets.len(),
+                p.non_ip_count
+            );
             for (ip, s) in &p.sources {
                 println!(
                     "  {:<15} {:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}  {:>8} pkts  {:>3} flows{}",
                     ip,
-                    s.src_mac[0], s.src_mac[1], s.src_mac[2],
-                    s.src_mac[3], s.src_mac[4], s.src_mac[5],
+                    s.src_mac[0],
+                    s.src_mac[1],
+                    s.src_mac[2],
+                    s.src_mac[3],
+                    s.src_mac[4],
+                    s.src_mac[5],
                     s.packet_count,
                     s.flow_indices.len(),
-                    if s.mac_collision { "  MAC collision" } else { "" }
+                    if s.mac_collision {
+                        "  MAC collision"
+                    } else {
+                        ""
+                    }
                 );
             }
         }
         Cmd::ListProtocols => {
             let registry = proto_registry::build();
-            println!(
-                "{:<20} {:<8} {}",
-                "name", "status", "well-known ports"
-            );
+            println!("{:<20} {:<8} well-known ports", "name", "status");
             for m in &registry {
                 let status = match m.readiness() {
                     protoplay::Readiness::Ready => "ready",
                     protoplay::Readiness::Stub => "stub",
                 };
-                let ports: Vec<String> = m
-                    .well_known_ports()
-                    .iter()
-                    .map(|p| p.to_string())
-                    .collect();
+                let ports: Vec<String> =
+                    m.well_known_ports().iter().map(|p| p.to_string()).collect();
                 println!("{:<20} {:<8} {}", m.name(), status, ports.join(","));
             }
         }
         Cmd::Run(args) => run_cmd(args)?,
-        Cmd::Serve { bind } => {
+        Cmd::Serve(args) => {
+            let mut cfg = webui::ServeConfig::from_env(args.bind);
+            for h in &args.allow_host {
+                cfg.allow_hosts.extend(webui::split_hosts(h));
+            }
+            for o in &args.allow_origin {
+                cfg.allow_origins.extend(webui::split_origins(o));
+            }
+            cfg.ephemeral = args.ephemeral;
+            if let Some(mb) = args.max_upload_mb {
+                cfg.max_upload_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(mb) = args.capture_max_mb {
+                cfg.capture_max_total_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(ms) = args.cp56_tolerance_ms {
+                cfg.cp56_tolerance_ms = ms;
+            }
+            if let Some(mb) = args.capture_run_max_mb {
+                cfg.capture_run_max_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if let Some(n) = args.runs_in_memory {
+                cfg.runs_in_memory = n as usize;
+            }
+            if let Some(mb) = args.library_max_mb {
+                cfg.library_max_bytes = mb.saturating_mul(1024 * 1024);
+            }
+            if args.no_auto_analyze {
+                cfg.auto_analyze = false;
+            }
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()?;
-            rt.block_on(async move {
-                webui::serve(bind).await
-            })?;
+            rt.block_on(async move { webui::serve(cfg).await })?;
+        }
+        Cmd::Bench(args) => {
+            let code = bench_cmd(args);
+            std::process::exit(code);
+        }
+        Cmd::Cleanup { state_dir, force } => {
+            let dir = state_dir.unwrap_or_else(webui::default_state_dir);
+            cleanup_cmd(&dir, force)?;
         }
     }
     Ok(())
+}
+
+fn parse_cp56_tolerance(s: &str) -> Result<f64, String> {
+    let v: f64 = s.trim().parse().map_err(|e| format!("{e}"))?;
+    webui::check_cp56_tolerance(v)
+}
+
+/// `outstation cleanup`: refuse while a live server or bench holds the
+/// state directory, unless `force` (N7).
+fn cleanup_cmd(dir: &std::path::Path, force: bool) -> Result<()> {
+    let _lock = match webui::statelock::StateLock::acquire(dir, "cleanup") {
+        Ok(l) => Some(l),
+        Err(e) => match e.downcast::<webui::statelock::LockHeld>() {
+            Ok(held) if force => {
+                tracing::warn!(%held, "--force: cleaning up while another process holds the state directory");
+                None
+            }
+            Ok(held) => anyhow::bail!(
+                "{held}. It undoes its own host changes when it stops; \
+                 pass --force to clean up anyway (this tears down its active run)"
+            ),
+            Err(e) => return Err(e),
+        },
+    };
+    webui::host_cleanup(dir)
+}
+
+fn bench_cmd(args: BenchArgs) -> i32 {
+    let opts = webui::bench::BenchOptions {
+        pcap: args.pcap,
+        profile: args.profile,
+        asserts: args.asserts,
+        report: args.report,
+        state_dir: args.state_dir.unwrap_or_else(webui::default_state_dir),
+        capture: args.capture,
+        correct_mode: args.correct,
+        cp56_tolerance_ms: args.cp56_tolerance_ms,
+    };
+    let mut report = webui::bench::run(&opts);
+    if let Some(path) = &opts.report {
+        if let Err(e) = webui::bench::write_report(path, &report) {
+            eprintln!("error: {e:#}");
+            report.exit_code = webui::bench::EXIT_RUN_ERROR;
+        }
+    }
+    if opts.report.as_deref() != Some(std::path::Path::new("-")) {
+        print!("{}", webui::bench::summary_text(&report));
+    }
+    report.exit_code
 }
 
 fn run_cmd(args: RunArgs) -> Result<()> {
@@ -163,8 +431,8 @@ fn run_cmd(args: RunArgs) -> Result<()> {
     let cfg = RunConfig {
         target_ip: args.target_ip,
         target_mac,
-        bridge_name: args.bridge,
-        tap_prefix: args.tap_prefix,
+        bridge_name: Some(args.bridge),
+        tap_prefix: Some(args.tap_prefix),
         egress_nic: args.nic,
         speed: args.speed,
         top_speed: args.top_speed,
@@ -178,6 +446,7 @@ fn run_cmd(args: RunArgs) -> Result<()> {
         startup_delay_secs: args.warmup,
         capture_path: None,
         iterations: 1,
+        ..RunConfig::default()
     };
 
     let report = run_sched(pcap, cfg, RunContext::default()).context("run failed")?;
@@ -212,4 +481,144 @@ fn run_cmd(args: RunArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::unnecessary_cast)]
+    fn nofile_limit_is_raised_to_the_hard_limit() {
+        let mut r = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: getrlimit/setrlimit only touch the struct we pass.
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
+        let hard = r.rlim_max as u64;
+        // Start from the soft limit systemd gives services.
+        r.rlim_cur = hard.min(1024) as libc::rlim_t;
+        assert_eq!(unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &r) }, 0);
+        let want = hard.min(NOFILE_TARGET).max(hard.min(1024));
+        assert_eq!(raise_nofile_limit(), Some((hard.min(1024), want)));
+        assert_eq!(unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) }, 0);
+        assert_eq!(r.rlim_cur as u64, want);
+        // Idempotent.
+        assert_eq!(raise_nofile_limit(), Some((want, want)));
+    }
+
+    #[test]
+    fn serve_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "outstation",
+            "serve",
+            "--bind",
+            "0.0.0.0:8080",
+            "--allow-host",
+            "a.lan,b.lan",
+            "--allow-host",
+            "c.lan",
+            "--allow-origin",
+            "https://Portal.Example/",
+            "--ephemeral",
+            "--max-upload-mb",
+            "10",
+            "--library-max-mb",
+            "2048",
+            "--cp56-tolerance-ms",
+            "250",
+            "--runs-in-memory",
+            "50",
+            "--capture-run-max-mb",
+            "100",
+        ])
+        .unwrap();
+        let Cmd::Serve(a) = cli.cmd else {
+            panic!("not serve")
+        };
+        assert_eq!(a.bind.port(), 8080);
+        assert!(a.ephemeral);
+        let hosts: Vec<String> = a
+            .allow_host
+            .iter()
+            .flat_map(|h| webui::split_hosts(h))
+            .collect();
+        assert_eq!(hosts, ["a.lan", "b.lan", "c.lan"]);
+        let origins: Vec<String> = a
+            .allow_origin
+            .iter()
+            .flat_map(|o| webui::split_origins(o))
+            .collect();
+        assert_eq!(origins, ["https://portal.example"]);
+        assert_eq!(a.max_upload_mb, Some(10));
+        assert_eq!(a.library_max_mb, Some(2048));
+        assert_eq!(a.cp56_tolerance_ms, Some(250.0));
+        assert_eq!(a.runs_in_memory, Some(50));
+        assert_eq!(a.capture_run_max_mb, Some(100));
+        assert!(Cli::try_parse_from(["outstation", "serve", "--cp56-tolerance-ms", "-5"]).is_err());
+    }
+
+    #[test]
+    fn bench_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "outstation",
+            "bench",
+            "--pcap",
+            "/x.pcap",
+            "--profile",
+            "run.json",
+            "--assert",
+            "score>=99",
+            "--assert",
+            "p99_ms<=500",
+            "--assert",
+            "sessions_failed==0",
+            "--report",
+            "out.json",
+            "--state-dir",
+            "/s",
+        ])
+        .unwrap();
+        let Cmd::Bench(b) = cli.cmd else {
+            panic!("not bench")
+        };
+        assert_eq!(b.asserts.len(), 3);
+        assert_eq!(b.asserts[1].to_string(), "p99_ms<=500");
+        assert_eq!(b.report, Some(PathBuf::from("out.json")));
+        assert_eq!(b.state_dir, Some(PathBuf::from("/s")));
+        // A bad assertion is a usage error before anything runs.
+        assert!(Cli::try_parse_from([
+            "outstation",
+            "bench",
+            "--profile",
+            "r.json",
+            "--assert",
+            "latency<1"
+        ])
+        .is_err());
+        let Cmd::Serve(a) = Cli::try_parse_from(["outstation", "serve", "--no-auto-analyze"])
+            .unwrap()
+            .cmd
+        else {
+            panic!("not serve")
+        };
+        assert!(a.no_auto_analyze);
+    }
+
+    #[test]
+    fn serve_defaults_to_loopback_and_cleanup_parses() {
+        let Cmd::Serve(a) = Cli::try_parse_from(["outstation", "serve"]).unwrap().cmd else {
+            panic!("not serve")
+        };
+        assert_eq!(a.bind.to_string(), "127.0.0.1:8080");
+        let Cmd::Cleanup { state_dir, .. } =
+            Cli::try_parse_from(["outstation", "cleanup", "--state-dir", "/x"])
+                .unwrap()
+                .cmd
+        else {
+            panic!("not cleanup")
+        };
+        assert_eq!(state_dir, Some(PathBuf::from("/x")));
+    }
 }

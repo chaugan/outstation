@@ -11,10 +11,10 @@ path = "src/lib.rs"
 anyhow = { workspace = true }
 tracing = { workspace = true }
 rusqlite = { version = "0.32", features = ["bundled"] }
-tokio = { workspace = true }
+tokio = { workspace = true, features = ["fs", "io-util", "sync", "time"] }
 axum = { workspace = true, features = ["ws"] }
 tower = { workspace = true }
-tower-http = { workspace = true }
+tower-http = { workspace = true, features = ["catch-panic"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 pcapload = { path = "../pcapload" }
@@ -22,3 +22,11 @@ sched = { path = "../sched" }
 netctl = { path = "../netctl" }
 protoplay = { path = "../protoplay" }
 proto_registry = { path = "../proto_registry" }
+libc = { workspace = true }
+tokio-util = { version = "0.7", features = ["io"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tempfile = "3"
+
+[dev-dependencies]
+tokio-tungstenite = "0.24"
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

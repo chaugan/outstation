@@ -27,17 +27,24 @@ fn main() -> Result<()> {
     println!("packets      : {}", p.packets.len());
     println!("non-ip       : {}", p.non_ip_count);
     println!("malformed    : {}", p.malformed_count);
+    println!("ipv6         : {}", p.ingest.ipv6_packets);
+    println!("ip fragments : {}", p.ingest.ip_fragments);
+    println!("vlan tagged  : {}", p.ingest.vlan_tagged_packets);
+    println!("skipped link : {}", p.ingest.unsupported_link_packets);
     println!(
         "duration     : {:.3} s",
         (p.last_ts_ns.saturating_sub(p.first_ts_ns)) as f64 / 1e9
     );
     println!("sources      : {}", p.sources.len());
     println!("tcp flows    : {}", p.flows.len());
+    for note in p.ingest_notes() {
+        println!("note         : {note}");
+    }
     println!();
 
     println!(
-        "{:<17} {:<17} {:>10} {:>12} {:>6} {}",
-        "src ip", "src mac", "packets", "bytes", "flows", "mac_collision"
+        "{:<17} {:<17} {:>10} {:>12} {:>6} mac_collision",
+        "src ip", "src mac", "packets", "bytes", "flows"
     );
     for (ip, s) in &p.sources {
         println!(
@@ -54,8 +61,8 @@ fn main() -> Result<()> {
     if !p.flows.is_empty() {
         println!();
         println!(
-            "{:<4} {:<21} {:<21} {:>8} {}",
-            "idx", "client", "server", "packets", "state"
+            "{:<4} {:<21} {:<21} {:>8} state",
+            "idx", "client", "server", "packets"
         );
         for (i, f) in p.flows.iter().enumerate() {
             let client = f
@@ -94,10 +101,13 @@ fn main() -> Result<()> {
         println!();
         for (i, pkt) in p.packets.iter().enumerate() {
             let kind = match &pkt.kind {
-                PacketKind::Tcp { role, flags, .. } => format!("TCP {:?} flags={:02x}", role, flags),
+                PacketKind::Tcp { role, flags, .. } => {
+                    format!("TCP {:?} flags={:02x}", role, flags)
+                }
                 PacketKind::Udp => "UDP".into(),
                 PacketKind::Icmp => "ICMP".into(),
                 PacketKind::IpOther { proto } => format!("IP proto={}", proto),
+                PacketKind::IpFragment { proto } => format!("IP fragment proto={}", proto),
                 PacketKind::NonIp { ethertype } => format!("non-ip eth=0x{:04x}", ethertype),
                 PacketKind::Malformed => "MALFORMED".into(),
             };
