@@ -684,3 +684,14 @@ function emptyStateHtml(o) {
   if (o.action) h += `<div class="btn-row es-action">${o.action}</div>`;
   return h + '</div>';
 }
+
+// IPv4 fields open the decimal keypad on phones (inputmode="decimal").
+// In comma locales (e.g. Norwegian iOS) that keypad has "," and no ".",
+// so commas typed or pasted into an IPv4 field become dots.
+document.addEventListener('input', e => {
+  const t = e.target;
+  if (!(t instanceof HTMLInputElement) || !t.hasAttribute('data-ipv4') || !t.value.includes(',')) return;
+  const pos = t.selectionStart;
+  t.value = t.value.replace(/,/g, '.');
+  if (pos != null) { try { t.setSelectionRange(pos, pos); } catch (_) { /* not focusable */ } }
+}, true); // capture: runs before the form's own input/validation handlers

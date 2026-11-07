@@ -602,7 +602,7 @@ function slaveRowHtml(r, p, idx, s) {
   let listen;
   if (live && p.state === 'pending' && !p.cancelled) {
     const v = slaveVerify.get(key);
-    listen = `<span class="inline"><input class="slave-ip" type="text" value="${esc(ip)}" data-fk="${fk}-ip" data-run="${r.id}" data-idx="${idx}" aria-label="Listen IP for RTU ${esc(p.src_ip || idx)}" spellcheck="false" autocomplete="off">` +
+    listen = `<span class="inline"><input class="slave-ip" type="text" inputmode="decimal" data-ipv4 value="${esc(ip)}" data-fk="${fk}-ip" data-run="${r.id}" data-idx="${idx}" aria-label="Listen IP for RTU ${esc(p.src_ip || idx)}" spellcheck="false" autocomplete="off">` +
       `<span class="port">:${esc(p.listen_port)}</span>` +
       `<button type="button" class="btn btn-text" data-act="slave-verify" data-run="${r.id}" data-idx="${idx}" data-fk="${fk}-verify">Verify</button></span>` +
       (v ? `<span class="verify ${v.cls}">${esc(v.text)}</span>` : '');

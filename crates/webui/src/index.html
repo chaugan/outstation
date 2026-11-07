@@ -172,7 +172,7 @@
       <div class="grid">
         <div class="field">
           <label for="cfg-target-ip" id="cfg-target-ip-label">Target IP</label>
-          <input id="cfg-target-ip" type="text" inputmode="decimal" placeholder="10.0.0.50" spellcheck="false" autocomplete="off" aria-describedby="cfg-target-ip-hint cfg-target-ip-err">
+          <input id="cfg-target-ip" type="text" inputmode="decimal" data-ipv4 placeholder="10.0.0.50" spellcheck="false" autocomplete="off" aria-describedby="cfg-target-ip-hint cfg-target-ip-err">
           <p class="hint" id="cfg-target-ip-hint"></p>
           <p class="field-err" id="cfg-target-ip-err"></p>
         </div>
@@ -189,7 +189,7 @@
         </div>
         <div class="field" data-mode="benchmark" data-role="master">
           <label for="cfg-master-bind-ip">Master bind IP <span class="opt">optional</span></label>
-          <input id="cfg-master-bind-ip" type="text" inputmode="decimal" placeholder="captured master IP" spellcheck="false" autocomplete="off" aria-describedby="cfg-master-bind-ip-hint cfg-master-bind-ip-err">
+          <input id="cfg-master-bind-ip" type="text" inputmode="decimal" data-ipv4 placeholder="captured master IP" spellcheck="false" autocomplete="off" aria-describedby="cfg-master-bind-ip-hint cfg-master-bind-ip-err">
           <p class="hint" id="cfg-master-bind-ip-hint">Source IP for every master session. Empty: each captured master's own IP.</p>
           <p class="field-err" id="cfg-master-bind-ip-err"></p>
         </div>
@@ -412,7 +412,7 @@
         </div>
         <div class="field span-2">
           <label for="cfg-scada-gw-ip">SCADA-side gateway IP</label>
-          <input id="cfg-scada-gw-ip" type="text" inputmode="decimal" placeholder="10.0.0.1" spellcheck="false" autocomplete="off" aria-describedby="cfg-scada-gw-ip-err">
+          <input id="cfg-scada-gw-ip" type="text" inputmode="decimal" data-ipv4 placeholder="10.0.0.1" spellcheck="false" autocomplete="off" aria-describedby="cfg-scada-gw-ip-err">
           <p class="field-err" id="cfg-scada-gw-ip-err"></p>
         </div>
         <div class="field span-2">
