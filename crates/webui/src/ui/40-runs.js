@@ -38,7 +38,7 @@ async function pollRuns() {
   clearTimeout(poll.timer);
   let delay = 4000;
   try {
-    const res = await api(`/api/runs?limit=${RUNS_PAGE}`, 'GET', null, { timeout: 10000 });
+    const res = await api(`api/runs?limit=${RUNS_PAGE}`, 'GET', null, { timeout: 10000 });
     if (res.ok && Array.isArray(res.data)) {
       const fresh = res.data;
       const minFresh = fresh.length ? fresh[fresh.length - 1].id : Infinity;
@@ -76,7 +76,7 @@ async function loadOlderRuns() {
   olderRuns.busy = true;
   renderRuns();
   const before = S.runs.length ? Math.min(...S.runs.map(r => r.id)) : '';
-  const res = await api(`/api/runs?limit=${RUNS_PAGE}&before=${before}`, 'GET', null, { timeout: 20000 });
+  const res = await api(`api/runs?limit=${RUNS_PAGE}&before=${before}`, 'GET', null, { timeout: 20000 });
   olderRuns.busy = false;
   if (!res.ok || !Array.isArray(res.data)) { notify(`Could not load older runs: ${res.error || 'bad reply'}`); renderRuns(); return; }
   const have = new Set(S.runs.map(r => r.id));
@@ -139,7 +139,7 @@ async function refreshExpandedDetails() {
     if (!r) { runUi.expanded.delete(id); continue; }
     const cached = S.runDetail.get(id);
     if (cached && cached.status === r.status && r.status !== 'running') continue;
-    const res = await api(`/api/runs/${id}`, 'GET', null, { timeout: 15000 });
+    const res = await api(`api/runs/${id}`, 'GET', null, { timeout: 15000 });
     if (res.ok && res.data) S.runDetail.set(id, res.data);
     else if (!cached) S.runDetail.set(id, { _error: res.error || 'could not load details' });
   }
@@ -393,7 +393,7 @@ function runActionsHtml(r, expanded) {
   items.push(mi('run-load', 'Load into Configure'));
   if (r.mode === 'benchmark' && !live) items.push(mi('run-compare', 'Compare with…'));
   if (r.mode === 'benchmark' && !live && la) items.push(`<a role="menuitem" tabindex="-1" class="menu-item" href="#/analysis/${r.id}">New analysis…</a>`);
-  if (r.has_capture) items.push(`<a role="menuitem" tabindex="-1" class="menu-item" href="/api/runs/${r.id}/download" download>Download capture</a>`);
+  if (r.has_capture) items.push(`<a role="menuitem" tabindex="-1" class="menu-item" href="api/runs/${r.id}/download" download>Download capture</a>`);
   if (!live) items.push(`<button type="button" role="menuitem" tabindex="-1" class="menu-item danger" data-act="run-delete" data-id="${r.id}" data-fk="run-${r.id}-delete">Delete run</button>`);
   return `<div class="btn-row">${acts.join('')}${menuHtml(`run-menu-${r.id}`, `More actions for run ${r.id}`, items)}</div>`;
 }
@@ -434,7 +434,7 @@ async function rerunRun(id) {
   }
   if (!ok) { setRunMsg(id, '', ''); return; }
   setRunMsg(id, 'muted', 'Starting the re-run…');
-  const res = await api(`/api/runs/${id}/rerun${req.force ? '?force=true' : ''}`, 'POST', null, { timeout: 120000 });
+  const res = await api(`api/runs/${id}/rerun${req.force ? '?force=true' : ''}`, 'POST', null, { timeout: 120000 });
   if (!res.ok) {
     let msg;
     if (res.code === 'run_active') {
@@ -489,7 +489,7 @@ function suggestBaseline(id) {
 // Refetch one run after an analysis event: its detail and its
 // latest_analysis / auto_analysis in the list.
 async function refetchRun(id) {
-  const res = await api(`/api/runs/${id}`, 'GET', null, { timeout: 15000 });
+  const res = await api(`api/runs/${id}`, 'GET', null, { timeout: 15000 });
   if (res.ok && res.data && typeof res.data === 'object') {
     if (runUi.expanded.has(id) || S.runDetail.has(id)) S.runDetail.set(id, res.data);
     const row = S.runs.find(x => x.id === id);
@@ -630,7 +630,7 @@ document.addEventListener('change', async e => {
   if (t.classList && t.classList.contains('slave-ip')) {
     const v = t.value.trim();
     if (!isIPv4(v)) { notify(`"${v}" is not an IPv4 address.`); return; }
-    const res = await apiAction('Set listen IP', `/api/runs/${t.dataset.run}/slaves/${t.dataset.idx}`, 'PATCH', { listen_ip: v });
+    const res = await apiAction('Set listen IP', `api/runs/${t.dataset.run}/slaves/${t.dataset.idx}`, 'PATCH', { listen_ip: v });
     if (res.ok) slaveVerify.delete(`${t.dataset.run}/${t.dataset.idx}`);
     pollRunsSoon();
   }
@@ -659,10 +659,10 @@ async function verifySlave(runId, idx) {
   const ip = input ? input.value.trim() : '';
   const key = `${runId}/${idx}`;
   if (!isIPv4(ip)) { slaveVerify.set(key, { cls: 'bad', text: 'not an IPv4 address' }); renderRuns(); return; }
-  await apiAction('Set listen IP', `/api/runs/${runId}/slaves/${idx}`, 'PATCH', { listen_ip: ip });
+  await apiAction('Set listen IP', `api/runs/${runId}/slaves/${idx}`, 'PATCH', { listen_ip: ip });
   slaveVerify.set(key, { cls: '', text: 'probing…' });
   renderRuns();
-  const res = await api('/api/verify-ip', 'POST', { ip }, { timeout: 30000 });
+  const res = await api('api/verify-ip', 'POST', { ip }, { timeout: 30000 });
   const d = res.data || {};
   let v;
   if (!res.ok || d.error) v = { cls: 'bad', text: res.error || d.error };
@@ -942,12 +942,12 @@ actions({
   },
   'run-stop': async b => {
     b.disabled = true;
-    const res = await apiAction(`Stop run #${b.dataset.id}`, `/api/runs/${b.dataset.id}/stop`, 'POST');
+    const res = await apiAction(`Stop run #${b.dataset.id}`, `api/runs/${b.dataset.id}/stop`, 'POST');
     if (res.ok) announce(`Stop requested for run ${b.dataset.id}`);
     pollRunsSoon();
   },
   'run-start-all': async b => {
-    const res = await apiAction('Start all pending', `/api/runs/${b.dataset.id}/slaves/start_all`, 'POST');
+    const res = await apiAction('Start all pending', `api/runs/${b.dataset.id}/slaves/start_all`, 'POST');
     if (res.ok && res.data && typeof res.data.started === 'number') announce(`${res.data.started} sessions started`);
     pollRunsSoon();
   },
@@ -961,7 +961,7 @@ actions({
     const next = card && (card.nextElementSibling || card.previousElementSibling);
     deferDelete({
       key: 'run-' + id,
-      url: `/api/runs/${id}`,
+      url: `api/runs/${id}`,
       message: `Run #${id} deleted, with its capture.`,
       returnFocus: el('runs-filter'),
       hide: () => {
@@ -971,7 +971,7 @@ actions({
       },
       restore: () => { renderRuns(); },
       commit: async () => {
-        const res = await apiAction(`Delete run #${id}`, `/api/runs/${id}`, 'DELETE');
+        const res = await apiAction(`Delete run #${id}`, `api/runs/${id}`, 'DELETE');
         if (res.ok) {
           runUi.expanded.delete(id);
           S.runDetail.delete(id);
@@ -983,11 +983,11 @@ actions({
     });
   },
   'slave-start': async b => {
-    await apiAction('Start listening', `/api/runs/${b.dataset.run}/slaves/${b.dataset.idx}/start`, 'POST');
+    await apiAction('Start listening', `api/runs/${b.dataset.run}/slaves/${b.dataset.idx}/start`, 'POST');
     pollRunsSoon();
   },
   'slave-stop': async b => {
-    await apiAction('Stop session', `/api/runs/${b.dataset.run}/slaves/${b.dataset.idx}/stop`, 'POST');
+    await apiAction('Stop session', `api/runs/${b.dataset.run}/slaves/${b.dataset.idx}/stop`, 'POST');
     pollRunsSoon();
   },
   'slave-verify': b => verifySlave(b.dataset.run, b.dataset.idx),
@@ -1026,7 +1026,7 @@ const gapCache = new Map();
 async function fetchGapHistogram(id) {
   if (gapCache.has(id)) return;
   gapCache.set(id, 'loading');
-  const res = await api(`/api/runs/${id}/gaps`, 'GET', null, { timeout: 60000 });
+  const res = await api(`api/runs/${id}/gaps`, 'GET', null, { timeout: 60000 });
   gapCache.set(id, res.ok && res.data && Array.isArray(res.data.original) ? res.data : { error: res.error || 'bad reply' });
   renderRuns();
 }

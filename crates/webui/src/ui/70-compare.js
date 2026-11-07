@@ -169,7 +169,7 @@ async function runCompare() {
   setText(el('cmp-msg'), `Comparing ${runNum(a)} with ${runNum(b)}…`);
   setCmpError('');
   el('cmp-btn').disabled = true;
-  const res = await api(`/api/runs/${a}/compare/${b}${q.toString() ? '?' + q : ''}`, 'GET', null, { timeout: 60000 });
+  const res = await api(`api/runs/${a}/compare/${b}${q.toString() ? '?' + q : ''}`, 'GET', null, { timeout: 60000 });
   if (seq !== cmp.seq) return;
   el('cmp-btn').disabled = false;
   if (res.ok && res.data && typeof res.data === 'object') {
@@ -221,7 +221,7 @@ async function cmpAnalyze(id, btn) {
   cmp.busy.add(id);
   if (btn) { btn.disabled = true; btn.textContent = `Analysing run #${id}…`; }
   setText(el('cmp-msg'), `Analysing the replay capture of run #${id}…`);
-  const res = await api(`/api/runs/${id}/analyze`, 'POST', null, { timeout: 0 });
+  const res = await api(`api/runs/${id}/analyze`, 'POST', null, { timeout: 0 });
   cmp.busy.delete(id);
   if (!res.ok || !res.data) {
     setText(el('cmp-msg'), '');

@@ -184,7 +184,7 @@ function renderHealth(st) {
 }
 
 async function loadStatus() {
-  const res = await api('/api/status');
+  const res = await api('api/status');
   if (!res.ok || !res.data || typeof res.data !== 'object') return;
   S.status = res.data;
   const v = 'v' + res.data.version;
@@ -215,7 +215,7 @@ let _es = null;
 function startRunEvents() {
   if (!window.EventSource) { conn.sse = 'unsupported'; renderConn(); return; }
   if (_es) return;
-  const es = new EventSource('/api/events');
+  const es = new EventSource('api/events');
   _es = es;
   es.onopen = () => { conn.sse = 'open'; renderConn(); };
   es.onerror = () => {
@@ -267,7 +267,7 @@ function startRunEvents() {
 // Shared lists: protocols and NICs.
 
 async function loadProtocols() {
-  const res = await api('/api/protocols');
+  const res = await api('api/protocols');
   if (!res.ok || !Array.isArray(res.data)) {
     setText(el('foot-protocols'), 'unavailable');
     return;
@@ -278,7 +278,7 @@ async function loadProtocols() {
 }
 
 async function loadNics() {
-  const res = await api('/api/nics');
+  const res = await api('api/nics');
   if (!res.ok || !Array.isArray(res.data)) {
     S.nics = [];
     emit('nics', S.nics);

@@ -33,7 +33,7 @@ Every request passes a same-origin guard ([`security.rs`](../crates/webui/src/se
 
 1. **Host.** The `Host` header must be an IP literal, `localhost`, one of this machine's host names (kernel host name, `hostname.domainname`, resolver canonical name), or a name allowed with `serve --allow-host NAME` or `OUTSTATION_ALLOW_HOSTS=name1,name2`. Otherwise: 403 `host_not_allowed` (no header at all: 403 `host_missing`).
 2. **Origin.** Every request that is not `GET`, `HEAD` or `OPTIONS`, and every WebSocket upgrade, must carry an `Origin` whose `host[:port]` equals the `Host` header (case-insensitive). A browser sends it on its own. When there is no `Origin`, `Sec-Fetch-Site: same-origin` is accepted instead.
-   - A different origin: 403 `cross_origin`.
+   - A different origin: 403 `cross_origin`, unless it is listed with `serve --allow-origin ORIGIN` or `OUTSTATION_ALLOW_ORIGINS` (exact `scheme://host[:port]`, case-insensitive, trailing `/` ignored). Use this for a reverse proxy that rewrites `Host`.
    - Neither header: 403 `origin_required`.
 
 **Scripts must send `Origin` on every POST, PUT, PATCH and DELETE.** Copy the scheme, host and port you put in the URL:

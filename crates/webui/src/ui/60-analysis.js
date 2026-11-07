@@ -106,7 +106,7 @@ function renderRunInfo() {
 }
 
 async function loadPrevAnalyses(runId) {
-  const res = await api(`/api/runs/${runId}/analyses`);
+  const res = await api(`api/runs/${runId}/analyses`);
   const box = el('an-prev');
   if (!box || _prevListFor !== runId) return;
   if (!res.ok || !Array.isArray(res.data) || !res.data.length) { box.textContent = ''; return; }
@@ -148,7 +148,7 @@ async function runAnalysis() {
   fd.append('mode', mode);
   fd.append('run_id', String(r.id));
   fd.append('cp56_tolerance_ms', String(tol));
-  const res = await api(`/api/analyze?run_id=${r.id}`, 'POST', fd, { timeout: 0 });
+  const res = await api(`api/analyze?run_id=${r.id}`, 'POST', fd, { timeout: 0 });
   btn.disabled = false;
   updateAnalyzeBtn();
   if (!res.ok || !res.data || typeof res.data !== 'object') {
@@ -170,7 +170,7 @@ async function analyzeOwnCapture(runId) {
   renderRunInfo();
   setText(el('an-msg'), `Analysing the replay capture of ${runNum(runId)}…`);
   setHTML(el('an-error'), '', { force: true });
-  const res = await api(`/api/runs/${runId}/analyze`, 'POST', null, { timeout: 0 });
+  const res = await api(`api/runs/${runId}/analyze`, 'POST', null, { timeout: 0 });
   an.ownBusy = false;
   renderRunInfo();
   if (!res.ok || !res.data) {
@@ -198,7 +198,7 @@ function analyzeErrorHint(code) {
 
 async function openStoredAnalysis(id) {
   setText(el('an-msg'), `Loading analysis #${id}…`);
-  const res = await api(`/api/analyses/${encodeURIComponent(id)}`);
+  const res = await api(`api/analyses/${encodeURIComponent(id)}`);
   if (!res.ok || !res.data) { setText(el('an-msg'), ''); notify(`Could not load analysis #${id}: ${res.error}`); return; }
   setText(el('an-msg'), `Showing stored analysis #${id}.`);
   showReport(res.data, Number(id));
@@ -276,7 +276,7 @@ function renderAnalysis() {
   h += '<div class="btn-row an-export">';
   if (an.analysisId != null) {
     // Self-contained, printable HTML export of the stored analysis (F131).
-    const rep = `/api/analyses/${encodeURIComponent(an.analysisId)}/report.html`;
+    const rep = `api/analyses/${encodeURIComponent(an.analysisId)}/report.html`;
     h += `<a class="btn btn-secondary" id="an-report-html" href="${rep}?download=1" download>Download HTML report</a>` +
       `<a class="btn btn-text" href="${rep}" target="_blank" rel="noopener">Printable report</a>`;
   }
@@ -569,7 +569,7 @@ document.addEventListener('toggle', async e => {
   let d = an.details.get(ip);
   if (!d && an.analysisId != null) {
     box.textContent = 'Loading…';
-    const res = await api(`/api/analyses/${an.analysisId}/endpoints/${encodeURIComponent(ip)}`);
+    const res = await api(`api/analyses/${an.analysisId}/endpoints/${encodeURIComponent(ip)}`);
     if (!res.ok) { box.innerHTML = `<div class="err-box">Could not load the detail: ${esc(res.error)}</div>`; delete node.dataset.loaded; return; }
     d = res.data;
     an.details.set(ip, d);

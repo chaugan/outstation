@@ -155,7 +155,7 @@ async function loadRunIntoConfigure(id) {
 
 // GET /api/runs/:id and its stored request.
 async function fetchRunRequest(id) {
-  const res = await api(`/api/runs/${id}`, 'GET', null, { timeout: 15000 });
+  const res = await api(`api/runs/${id}`, 'GET', null, { timeout: 15000 });
   if (!res.ok || !res.data || typeof res.data !== 'object') return { error: res.error || 'could not load the run' };
   if (!res.data.request) return { error: `run #${id} was recorded before run settings were stored, so its settings are unknown.`, run: res.data };
   return { request: res.data.request, run: res.data };
@@ -199,7 +199,7 @@ function renderProfiles() {
 }
 
 async function refreshProfiles() {
-  const res = await api('/api/profiles');
+  const res = await api('api/profiles');
   if (!res.ok || !Array.isArray(res.data)) {
     prof.loaded = true;
     setProfError(`Could not load the profiles: ${esc(res.error || 'bad reply')}`);
@@ -274,7 +274,7 @@ async function saveProfileAs() {
   const clean = String(name).trim();
   await profBusy(async () => {
     setProfStatus(`Saving “${clean}”…`);
-    const res = await api('/api/profiles', 'POST', { name: clean, request: profileRequest() });
+    const res = await api('api/profiles', 'POST', { name: clean, request: profileRequest() });
     if (!res.ok) {
       setProfStatus('');
       setProfError(`Profile not saved. ${explainProfileError(res, clean)}`);
@@ -294,7 +294,7 @@ async function loadProfile() {
   if (!p) return;
   setProfError('');
   await profBusy(async () => {
-    const res = await api(`/api/profiles/${p.id}`);
+    const res = await api(`api/profiles/${p.id}`);
     if (!res.ok || !res.data) { setProfError(`Could not load “${esc(p.name)}”: ${explainProfileError(res, p.name)}`); return; }
     const notes = applyRequestToForm(res.data.request || {});
     setProfStatus(`Loaded profile “${res.data.name}”.${notes.length ? ' ' + notes.join(' ') : ''}`, notes.length ? 'warn' : 'ok');
@@ -316,7 +316,7 @@ async function overwriteProfile() {
   });
   if (!ok) return;
   await profBusy(async () => {
-    const res = await api(`/api/profiles/${p.id}`, 'PUT', { request: profileRequest() });
+    const res = await api(`api/profiles/${p.id}`, 'PUT', { request: profileRequest() });
     if (!res.ok) { setProfError(`“${esc(p.name)}” was not overwritten. ${explainProfileError(res, p.name)}`); await refreshProfiles(); return; }
     await refreshProfiles();
     setProfStatus(`Overwrote profile “${p.name}” with the current form.`, 'ok');
@@ -337,7 +337,7 @@ async function renameProfile() {
   const clean = String(name).trim();
   if (clean === p.name) return;
   await profBusy(async () => {
-    const res = await api(`/api/profiles/${p.id}`, 'PUT', { name: clean });
+    const res = await api(`api/profiles/${p.id}`, 'PUT', { name: clean });
     if (!res.ok) { setProfError(`Not renamed. ${explainProfileError(res, clean)}`); return; }
     await refreshProfiles();
     setProfStatus(`Renamed “${p.name}” to “${clean}”.`, 'ok');
@@ -353,7 +353,7 @@ function deleteProfile() {
   setProfError('');
   deferDelete({
     key: 'profile-' + p.id,
-    url: `/api/profiles/${p.id}`,
+    url: `api/profiles/${p.id}`,
     message: `Deleted profile “${p.name}”.`,
     returnFocus: el('prof-select'),
     hide: () => {
@@ -370,7 +370,7 @@ function deleteProfile() {
       setProfStatus(`Kept profile “${p.name}”.`, 'ok');
     },
     commit: async () => {
-      const res = await api(`/api/profiles/${p.id}`, 'DELETE');
+      const res = await api(`api/profiles/${p.id}`, 'DELETE');
       if (!res.ok && res.code !== 'not_found') { setProfError(`Profile “${esc(p.name)}” was not deleted: ${esc(res.error)}`); }
       await refreshProfiles();
     },

@@ -11,6 +11,11 @@
 //!   equals `Host`, or, when no `Origin` is sent, `Sec-Fetch-Site:
 //!   same-origin`. Requests with neither header are refused, so
 //!   scripted clients must send `Origin: http://<host:port>`.
+//! * **Reverse proxies.** A proxy that rewrites `Host` (such as one that
+//!   publishes the UI under a path prefix on another site) makes the
+//!   browser's `Origin` differ from `Host`. Such origins are accepted
+//!   only when listed with `--allow-origin` / `OUTSTATION_ALLOW_ORIGINS`
+//!   (exact `scheme://host[:port]` match).
 
 use std::net::{IpAddr, SocketAddr};
 
@@ -120,12 +125,21 @@ fn is_ws_upgrade(headers: &HeaderMap) -> bool {
         .is_some_and(|v| v.eq_ignore_ascii_case("websocket"))
 }
 
+/// `Origin` value in the form `--allow-origin` entries are compared in:
+/// lower case, no trailing slash.
+pub(crate) fn normalize_origin(origin: &str) -> String {
+    origin.trim().trim_end_matches('/').to_ascii_lowercase()
+}
+
 /// Decide whether a request passes. `Err` carries the refusal.
+/// `allow_origins` holds extra trusted origins (already normalized),
+/// e.g. a reverse proxy's public URL.
 pub(crate) fn check_request(
     method: &Method,
     headers: &HeaderMap,
     local_names: &[String],
     allow: &[String],
+    allow_origins: &[String],
 ) -> Result<(), AppError> {
     let forbidden = |code, msg: String| AppError::new(StatusCode::FORBIDDEN, code, msg);
     let host = headers
@@ -148,12 +162,21 @@ pub(crate) fn check_request(
     }
     if let Some(origin) = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) {
         let same = origin_authority(origin).is_some_and(|a| a.eq_ignore_ascii_case(host.trim()));
-        return if same {
+        let trusted = !same && {
+            let o = normalize_origin(origin);
+            allow_origins.contains(&o)
+        };
+        return if same || trusted {
             Ok(())
         } else {
             Err(forbidden(
                 "cross_origin",
-                format!("cross-origin request refused (Origin {origin:?}, Host {host:?})"),
+                format!(
+                    "cross-origin request refused (Origin {origin:?}, Host {host:?}); \
+                     if this UI is served through a reverse proxy, start the server \
+                     with --allow-origin {}",
+                    normalize_origin(origin)
+                ),
             ))
         };
     }
@@ -183,6 +206,7 @@ pub(crate) async fn origin_guard(
         req.headers(),
         &state.host_names,
         &state.cfg.allow_hosts,
+        &state.cfg.allow_origins,
     ) {
         tracing::warn!(method = %req.method(), uri = %req.uri(), code = e.code, "request refused by origin guard");
         return e.into_response();
@@ -303,44 +327,48 @@ mod tests {
         }
     }
 
+    fn check(m: &Method, h: &HeaderMap, n: &[String], a: &[String]) -> Result<(), AppError> {
+        check_request(m, h, n, a, &[])
+    }
+
     #[test]
     fn origin_rules() {
         let n: Vec<String> = vec![];
         let h = "10.0.0.5:8080";
         // GET without Origin is fine; bad Host is not.
-        assert!(check_request(&Method::GET, &hm(&[("host", h)]), &n, &n).is_ok());
-        assert!(check_request(&Method::GET, &hm(&[("host", "evil.example")]), &n, &n).is_err());
+        assert!(check(&Method::GET, &hm(&[("host", h)]), &n, &n).is_ok());
+        assert!(check(&Method::GET, &hm(&[("host", "evil.example")]), &n, &n).is_err());
         // POST needs a matching Origin or same-origin fetch metadata.
-        assert!(check_request(&Method::POST, &hm(&[("host", h)]), &n, &n).is_err());
-        assert!(check_request(
+        assert!(check(&Method::POST, &hm(&[("host", h)]), &n, &n).is_err());
+        assert!(check(
             &Method::POST,
             &hm(&[("host", h), ("origin", "http://10.0.0.5:8080")]),
             &n,
             &n
         )
         .is_ok());
-        assert!(check_request(
+        assert!(check(
             &Method::POST,
             &hm(&[("host", h), ("origin", "http://evil.example")]),
             &n,
             &n
         )
         .is_err());
-        assert!(check_request(
+        assert!(check(
             &Method::POST,
             &hm(&[("host", h), ("origin", "null")]),
             &n,
             &n
         )
         .is_err());
-        assert!(check_request(
+        assert!(check(
             &Method::DELETE,
             &hm(&[("host", h), ("sec-fetch-site", "same-origin")]),
             &n,
             &n
         )
         .is_ok());
-        assert!(check_request(
+        assert!(check(
             &Method::POST,
             &hm(&[("host", h), ("sec-fetch-site", "cross-site")]),
             &n,
@@ -348,14 +376,14 @@ mod tests {
         )
         .is_err());
         // WebSocket upgrade is a GET but still needs Origin.
-        assert!(check_request(
+        assert!(check(
             &Method::GET,
             &hm(&[("host", h), ("upgrade", "websocket")]),
             &n,
             &n
         )
         .is_err());
-        assert!(check_request(
+        assert!(check(
             &Method::GET,
             &hm(&[
                 ("host", h),
@@ -366,5 +394,41 @@ mod tests {
             &n
         )
         .is_ok());
+    }
+
+    #[test]
+    fn allowed_origins_pass_behind_a_proxy() {
+        let n: Vec<String> = vec![];
+        // A proxy rewrote Host to the backend address.
+        let h = "localhost:18110";
+        let allow = vec![normalize_origin("https://Portal.Example/")];
+        for (m, extra) in [
+            (Method::POST, None),
+            (Method::GET, Some(("upgrade", "websocket"))),
+        ] {
+            let mut hs = vec![("host", h), ("origin", "https://portal.example")];
+            hs.extend(extra);
+            assert!(check_request(&m, &hm(&hs), &n, &n, &allow).is_ok());
+            // Not listed: refused, and the message names the flag.
+            let e = check_request(&m, &hm(&hs), &n, &n, &[]).unwrap_err();
+            assert_eq!(e.code, "cross_origin");
+            assert!(
+                e.message.contains("--allow-origin https://portal.example"),
+                "{}",
+                e.message
+            );
+        }
+        // Scheme and port must match exactly.
+        for bad in [
+            "http://portal.example",
+            "https://portal.example:8443",
+            "https://evil.portal.example",
+        ] {
+            let hs = [("host", h), ("origin", bad)];
+            assert!(
+                check_request(&Method::POST, &hm(&hs), &n, &n, &allow).is_err(),
+                "{bad}"
+            );
+        }
     }
 }
