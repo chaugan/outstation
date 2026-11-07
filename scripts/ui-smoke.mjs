@@ -324,6 +324,14 @@ async function engineWalk(browser, name, viewport, deep, scheme = 'light') {
     const filtered = await page.locator('#rtu-tbody tr').count();
     check(filtered > 0 && filtered < 200, `filter narrows the list (${filtered} rows)`);
     await page.fill('#rtu-filter', '');
+    // Comma-locale decimal keypads (Norwegian iOS) have "," but no ".":
+    // commas typed into an IPv4 field become dots, with no error shown.
+    await page.fill('#cfg-target-ip', '');
+    await page.click('#cfg-target-ip');
+    await page.keyboard.type('10,9,8,7');
+    const commaIp = await page.inputValue('#cfg-target-ip');
+    const commaErr = ((await page.textContent('#cfg-target-ip-err')) || '').trim();
+    check(commaIp === '10.9.8.7' && !commaErr, `commas in an IPv4 field become dots (${commaIp}${commaErr ? '; ' + commaErr : ''})`);
     await page.fill('#cfg-target-ip', '10.9.8.7');
     await page.waitForTimeout(400);
     await page.reload();
